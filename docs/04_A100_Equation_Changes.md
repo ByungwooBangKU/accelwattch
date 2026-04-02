@@ -1,8 +1,9 @@
 # AccelWattch를 A100에 적용할 때의 Equation 변화 분석
 
 > **목적**: AccelWattch의 모든 수식(Eq.1~14)이 V100→A100으로 바뀔 때 구체적으로 무엇이 변하는지 분석  
-> **방법**: V100/A100 실제 `gpgpusim.config` 값 기반 비교 + 아키텍처 차이 반영  
-> **작성일**: 2026-04-02  
+> **기준 모델**: NVIDIA A100 SXM4 **80GB** (HBM2e, 400W TDP)  
+> **방법**: V100/A100 실제 `gpgpusim.config` 값 + [NVIDIA A100 Tensor Core GPU Architecture Whitepaper](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf) 기반 비교  
+> **작성일**: 2026-04-02 (rev.1)  
 
 ---
 
@@ -17,7 +18,8 @@
 7. [Eq.(13)~(14): Quadratic Programming 변화](#7-eq13eq14-quadratic-programming-변화)
 8. [A100 수치 예시: sgemm 커널](#8-a100-수치-예시-sgemm-커널)
 9. [고려해야 할 핵심 사항 체크리스트](#9-고려해야-할-핵심-사항-체크리스트)
-10. [자가점검: 정확성 검증](#10-자가점검-정확성-검증)
+10. [A100 실험을 위한 코드 설계 반영 검토](#10-a100-실험을-위한-코드-설계-반영-검토)
+11. [자가점검: 정확성 검증](#11-자가점검-정확성-검증)
 
 ---
 
@@ -30,8 +32,9 @@
 | `gpgpu_n_clusters` (=SM 수) | **80** | **108** | +35% | Idle SM 모델, Static Power |
 | `gpgpu_n_mem` (메모리 파티션) | 32 | **40** | +25% | DRAM/MC power |
 | `gpgpu_n_sub_partition_per_mchannel` | 2 | **4** | 2x | L2 bank 구조 |
-| Core Clock (MHz) | 1132 | **1410** | +25% | DVFS, Dynamic Power |
-| DRAM Clock (MHz) | 850 | **1512** | +78% | Memory power |
+| Core Clock (MHz) | 1132 (base), 1380 (boost) | 1095 (base), **1410** (boost) | - | DVFS, Dynamic Power |
+| SM Clock DVFS 범위 | ~200-1380 MHz | **210-1410 MHz (81단계, 15MHz 간격)** | - | DVFS 실험 설계 |
+| Memory Clock (MHz) | 850 | **1593 (SXM4 80GB, 고정!)** | +87% | ★ DVFS 불가 |
 | `gpgpu_num_sp_units` (FP32) | 4 | 4 | 동일 | - |
 | `gpgpu_num_int_units` (INT32) | 4 | 4 | 동일* | ★ 주의 |
 | `gpgpu_num_dp_units` (FP64) | 4 | 4 | 동일* | ★ 주의 |
@@ -44,14 +47,57 @@
 | L1D (unified) size | 128KB | **192KB** | +50% | Cache power |
 | Shared memory max | 96KB | **164KB** | +71% | Shared mem power |
 | L2 sub-partitions total | 32×2=64 | 40×4=**160** | 2.5x | L2 power |
-| Tech node | 12nm | **7nm** | -42% | 전체 power scaling |
+| L2 cache 총 용량 | 6144KB | **40MB** | 6.5x | L2 power, tech scaling |
+| Tech node | 12nm | **7nm** (TSMC N7) | -42% | 전체 power scaling |
+| TDP | 250W | **400W** (SXM4 80GB) | +60% | P_const 비율 |
+| Memory | HBM2, 900GB/s | **HBM2e, 2039GB/s** (SXM4 80GB) | 2.3x | DRAM power |
+| HBM Stacks | 4 | **5 (8-Hi, 16GB/stack)** | - | MC power |
+| Memory Controllers | 32 (128-bit pseudo-ch) | **40 (= 10×512-bit MC, pseudo-ch 단위)** | - | MC/DRAM power |
 
 > **★ 주의**: `gpgpu_num_sp/int/dp_units = 4`는 sub-core model에서 **processing block당 유닛 수**이다.  
 > V100: 각 block에 전용 INT32 16개 + 전용 FP32 16개 = 실제로 4×16=**64 INT + 64 FP** per SM  
+> **★ gpgpusim.config의 DRAM clock**: config의 `1512`는 PCIe 모델 기준이다. SXM4 80GB는 **1593 MHz**이므로, 실험 시 수정 필요.
+
+### 1.2 A100 SXM4 80GB 공식 스펙 (NVIDIA Ampere Architecture Whitepaper 기반)
+
+> 출처: [NVIDIA A100 Tensor Core GPU Architecture Whitepaper](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf)
+
+| 항목 | A100 SXM4 80GB |
+|------|----------------|
+| GPU 다이 | GA100, 826mm², 54.2B 트랜지스터, TSMC 7nm |
+| Full GA100 | 128 SMs, 8192 FP32 cores, 6 HBM2 stacks, 12×512-bit MC |
+| A100 제품 (harvested) | **108 SMs**, 6912 FP32 cores, **5 HBM2e stacks**, **10×512-bit MC** |
+| SM당 구성 | 4 Processing Blocks, 각각: 16 FP32(전용) + 16 FP32/INT32(공유) + 8 FP64 + 1 Tensor Core(3rd gen) + 4 LD/ST + 1 SFU |
+| Tensor Core | 3rd gen, 지원 타입: FP16, BF16, **TF32**, INT8, INT4, **2:4 Sparsity** |
+| Register File | 65536 × 32-bit per SM, **32 banks** |
+| L1 Data Cache + Shared Memory | **192 KB** unified (adaptive: L1 최대 128KB or ShMem 최대 164KB) |
+| L2 Cache | **40 MB** (2개 파티션, 10 MC × 4 sub-partition = 40 slices × 4 = 160 sub-partitions) |
+| Memory | **HBM2e**, 5 stacks (8-Hi, 16GB/stack), **80GB** 총 용량 |
+| Memory Clock | **1593 MHz (고정, DVFS 불가)** |
+| Memory Bandwidth | **2,039 GB/s** (5120-bit bus) |
+| SM Clock 범위 | **210 ~ 1410 MHz** (81단계, 15MHz 간격, nvidia-smi -lgc로 조절) |
+| Base / Boost Clock | 1095 MHz / 1410 MHz |
+| TDP | **400W** (max 460W) |
+| NVLink | 3세대, 600 GB/s 양방향 |
+| PCIe | Gen4 |
+| MIG | 1세대, 최대 7 인스턴스 |
+
+### 1.3 A100 40GB vs 80GB 차이점 (Power Modeling 관점)
+
+| 항목 | A100 40GB | A100 80GB |
+|------|-----------|-----------|
+| Memory | HBM2 | **HBM2e** |
+| Memory Clock | 1215 MHz | **1593 MHz** |
+| Bandwidth | 1,555 GB/s | **2,039 GB/s** |
+| HBM Stack | 5 (4-Hi, 8GB/stack) | **5 (8-Hi, 16GB/stack)** |
+| GPU Silicon (GA100) | 동일 | 동일 |
+| SM 수, Clock | 동일 | 동일 |
+
+> **Power Modeling 영향**: Memory clock이 31% 더 높으므로 P_const'에 포함되는 HBM2e 기본 전력이 40GB 모델보다 높다. DRAM dynamic power (DRAMP, MCP)도 더 높은 memory clock으로 인해 증가한다. **본 문서의 모든 분석은 A100 SXM4 80GB를 기준으로 한다.**
+
+### 1.4 아키텍처 수준 핵심 차이 (Whitepaper 기반)
 > A100: 각 block에 공유 FP32/INT32 16개 + 전용 FP32 16개 = 실제로 4×(16+16)=**64 FP32+64 FP32/INT32** per SM  
 > **config 파일의 숫자가 같더라도 내부 동작이 근본적으로 다르다.**
-
-### 1.2 아키텍처 수준 핵심 차이
 
 ```
 V100 SM 내부 구조 (Processing Block 1개):
@@ -108,61 +154,76 @@ A100: P_total = m'C'V'²f' + n'V' + P_const'
 | V (voltage) | ~0.8V | ~0.75V (추정) | 7nm 저전압 |
 | P_const | **32.3W** | **~50-65W** (추정) | 보드 복잡도↑, 400W TDP |
 
-### 2.3 Eq.(3): DVFS 모델 — 핵심 변화
+### 2.3 Eq.(3): DVFS 모델 — 상세 분석
+
+#### A100의 Clock Domain 구조
+
+A100의 전력 모델을 정확하게 세우려면 먼저 A100의 clock domain 구조를 정확히 이해해야 한다.
+
+gpgpusim.config에서는 다음과 같이 4개 clock domain이 정의되어 있다:
 
 ```
-V100: P_total = βCf³ + τf + P_const       (단일 clock domain)
+V100: -gpgpu_clock_domains 1132.0:1132.0:1132.0:850.0
+                            Core   :Icnt   :L2    :DRAM
 
-A100: P_total = β_sm·C_sm·f_sm³ + β_mem·C_mem·f_mem³
-             + τ_sm·f_sm + τ_mem·f_mem + P_const'
-```
-
-**변화 이유:**
-
-V100의 clock domains (`gpgpusim.config`):
-```
--gpgpu_clock_domains 1132.0:1132.0:1132.0:850.0
-                     Core   :Icnt   :L2    :DRAM
-→ Core/Icnt/L2가 동일 → 사실상 2개 domain (Core, DRAM)
+A100: -gpgpu_clock_domains 1410:1410:1410:1512
+                            Core:Icnt:L2  :DRAM
 ```
 
-A100의 clock domains:
-```
--gpgpu_clock_domains 1410:1410:1410:1512
-                     Core:Icnt:L2  :DRAM
-→ Core와 DRAM clock이 더 독립적으로 제어됨
-→ 실제 HW에서는 SM clock과 Memory clock이 독립 DVFS
-```
+그러나 **실제 A100 하드웨어에서의 DVFS 동작**은 config 파일에서 보이는 것과 크게 다르다. 핵심적으로, A100 SXM4 80GB에서 사용자가 조절할 수 있는 클럭은 **SM clock 하나뿐**이며, HBM2e의 memory clock은 1593 MHz로 **고정**되어 있다. 이는 `nvidia-smi -q -d SUPPORTED_CLOCKS` 명령으로 확인할 수 있는데, memory clock에 대해 단 하나의 값(1593 MHz)만 보고된다.
 
-**실험 방법 변화:**
-```
-V100: nvidia-smi로 SM clock만 변경 → 단일 변수 실험 가능
-A100: SM clock과 Memory clock을 독립 변경해야 함
-      → 2차원 실험 grid 필요
-      → 각 (f_sm, f_mem) 조합에서 P_total 측정
-      → 2변수 다항식 fitting
-```
+이 사실이 AccelWattch의 Eq.(3)에 미치는 영향은 매우 크다. V100에서 AccelWattch가 채택한 DVFS-aware constant power model은 GPU 전체의 클럭 주파수 `f`를 하나의 변수로 취급하여, 다양한 `f`에서 전력을 측정한 뒤 3차 다항식으로 fitting하고, `f=0`으로 외삽하여 P_const를 추정했다. 이 방법이 가능했던 이유는 V100에서 SM clock을 변경하면 GPU 전체의 전력 특성이 단일 변수의 함수로 충분히 설명될 수 있었기 때문이다.
 
-**예상 실험 설계:**
-```
-f_sm  ∈ {210, 420, 630, 840, 1050, 1200, 1410} MHz  (7개)
-f_mem ∈ {600, 900, 1215, 1512} MHz                   (4개)
-→ 28개 (f_sm, f_mem) 조합 × 5개 microbenchmark = 140회 측정
-
-각 조합에서:
-  P_total(f_sm, f_mem) = β_sm·f_sm³ + β_mem·f_mem³ + τ_sm·f_sm + τ_mem·f_mem + P_const
-  
-모든 f = 0 → y절편 = P_const (추정)
-```
-
-### 2.4 고려사항: V≈kf 가정의 유효성
+A100에서도 이 방법론의 **기본 구조는 그대로 유지된다**. SM clock만 변수이고 memory clock은 상수이므로, 오히려 V100보다 단순한 단일 변수 모델이 적용 가능하다:
 
 ```
-V100 (12nm): V-F 관계가 비교적 선형 → V≈kf 합리적
-A100 (7nm):  V-F 관계가 비선형화 → V≈k₁f + k₂f² 또는 더 복잡
-             → Eq.(3)의 f³ 지수가 정확하지 않을 수 있음
-             → 실측 fitting에서 지수를 자유 파라미터로 둘 수 있음:
-               P ∝ f^α (α를 2.5~3.5 범위에서 fitting)
+V100: P_total = βCf³ + τf + P_const       (f = SM clock, 단일 변수)
+
+A100: P_total = β'C'f_sm³ + τ'f_sm + P_const'     (f_sm = SM clock, 단일 변수)
+```
+
+여기서 P_const'는 V100의 P_const와 달리 **HBM2e memory의 고정 전력도 포함**한다. 즉:
+
+```
+P_const'(A100) = P_board(팬, 전압조정기 등) + P_mem(HBM2e @ 1593MHz 고정)
+
+이는 V100의 P_const보다 클 수밖에 없다:
+  V100 P_const = 32.3W (보드 + 메모리의 일부)
+  A100 P_const' ≈ 50-65W (추정, 보드 + HBM2e 고정 전력 포함)
+```
+
+다만, 메모리 전력이 P_const'에 흡수된다는 것은 AccelWattch의 dynamic power component 중 DRAMP(DRAM power)과 MCP(Memory Controller power)의 해석에 영향을 준다. DRAMP/MCP가 포착하는 것은 **접근 패턴에 따른 추가 dynamic power**이며, 메모리 서브시스템의 기본 유지 전력(idle HBM2e power)은 P_const'에 포함된다.
+
+#### 실험 설계
+
+A100에서 P_const'를 측정하는 실험은 V100과 거의 동일한 방법론으로 수행할 수 있다:
+
+1. SM clock을 210 MHz부터 1410 MHz까지 15 MHz 간격(81단계)으로 변경 가능하다. 실험에서는 대표적인 7~10개 주파수를 선택하면 충분하다.
+2. 각 주파수에서 동일한 microbenchmark(INT_MEM, NANOSLEEP, INT_ADD, FP_ADD, FP_MUL 등)를 실행하며 NVML로 전력을 측정한다.
+3. 측정된 (f_sm, P_total) 데이터를 `P = β'C'f³ + τ'f + P_const'` 형태로 3차 다항식 fitting한다.
+4. f_sm = 0으로 외삽하면 y절편이 P_const'이다.
+
+```
+실험 설계:
+  f_sm ∈ {210, 420, 630, 840, 1050, 1200, 1350, 1410} MHz  (8개 포인트)
+  benchmarks: INT_MEM, NANOSLEEP, INT_ADD, FP_ADD, FP_MUL  (5개)
+  → 40회 측정 (각 5회 반복 → 200회)
+  → V100과 동일한 단일 변수 fitting
+```
+
+memory clock은 1593 MHz로 고정이므로 별도로 변경할 필요가 없으며, 2차원 grid 실험도 불필요하다.
+
+#### V≈kf 가정의 유효성
+
+A100(7nm)에서 V≈kf(전압이 주파수에 선형 비례) 가정이 여전히 성립하는지는 실험으로 확인해야 한다. 7nm FinFET에서는 V-F 관계가 V100(12nm)보다 더 비선형적일 수 있다. 만약 선형 가정이 크게 어긋난다면, 3차 다항식의 지수가 정확히 3이 아닐 수 있으며, `P = α·f^n + τf + P_const'` 형태에서 n을 자유 파라미터로 fitting하는 것도 고려할 수 있다(n ∈ [2.5, 3.5]). 그러나 AccelWattch 논문에서 V100에 대해 Pearson r = 0.998을 달성했으므로, A100에서도 먼저 n=3으로 fitting을 시도하고 잔차를 확인하는 것이 합리적이다.
+
+#### gpgpusim.config DRAM Clock 값에 대한 참고
+
+gpgpusim.config의 `-gpgpu_clock_domains` 마지막 값은 시뮬레이터에서 사용하는 DRAM clock 파라미터이며, 실제 A100 80GB SXM4의 HBM2e memory clock(1593 MHz)과 다를 수 있다. config에는 `1512`로 되어 있는데, 이는 A100 PCIe 80GB 모델의 memory clock에 해당한다. **SXM4 80GB 기준 실험을 위해서는 이 값을 1593으로 수정해야 한다.**
+
+```
+# A100 SXM4 80GB 기준 수정
+-gpgpu_clock_domains 1410:1410:1410:1593
 ```
 
 ---
@@ -707,7 +768,105 @@ print("Scaling factors:", x.value)
 
 ---
 
-## 10. 자가점검: 정확성 검증
+## 10. A100 실험을 위한 코드 설계 반영 검토
+
+### 10.1 현재 코드에서 A100 실험 가능 여부
+
+| 파일 | A100 대응 상태 | 필요 작업 |
+|------|--------------|----------|
+| `SM80_A100/gpgpusim.config` | ✅ 존재 | DRAM clock 1512→**1593** 수정 (SXM4 80GB) |
+| `SM80_A100/trace.config` | ✅ 존재 | Tensor latency 12/8 등 확인 완료 |
+| `SM80_A100/accelwattch_sass_sim.xml` | ❌ **미존재** | 신규 생성 필수 |
+| `gpgpusim.config -power_simulation_enabled` | `0` (비활성) | `1`로 변경 + XML 파일 필요 |
+| `ampere_opcode.h` | ✅ 기본 opcode 정의됨 | TF32, BF16, Sparse 관련 opcode 추가 필요 |
+| `accelwattch_component_mapping.h` | ⚠ Ampere opcode 일부 매핑 | TF32, BF16 등 신규 component 매핑 추가 |
+| `gen_sim_power_csv.py` | ⚠ Volta 전용 config만 | A100 config 추가 (`ampere_sass_sim` 등) |
+| `quadprog_solver.m` | ⚠ 31차원 고정 | 차원 확장 (31→35+), 제약조건 추가 |
+| `gpgpu_sim_wrapper.cc:calculate_static_power()` | ⚠ 9개 카테고리 | INT/FP concurrent 등 신규 카테고리 추가 |
+| `gpgpu_sim_wrapper.cc:update_components_power()` | ⚠ 22개 component | TF32P, BF16P 등 신규 component 추가 |
+| `XML_Parse.h` | ⚠ scaling_coefficients[64] | 신규 counter 인덱스 추가 |
+| `core.cc:IdleCoreEnergy` | ✅ `num_idle_cores` 사용 | SM 수 108은 config에서 자동 반영 |
+
+### 10.2 실험 전 필수 코드 변경 목록
+
+```
+Phase 0: 최소 변경으로 A100 baseline 실험 (기존 22 component로)
+──────────────────────────────────────────────────────────────
+1. SM80_A100/gpgpusim.config
+   -gpgpu_clock_domains 1410:1410:1410:1593   ← 1512→1593 수정
+   -power_simulation_enabled 1                  ← 0→1 수정
+
+2. SM80_A100/accelwattch_sass_sim.xml          ← 신규 생성
+   - V100 XML을 복사하여 템플릿으로 사용
+   - core_tech_node: 23 → 7
+   - constant_power: 32.3 → 재측정값 (DVFS 실험 후)
+   - idle_core_power: 0.283 → 재측정값
+   - static_cat*_flane/addlane: 모두 재측정값
+   - 모든 dynamic scaling factors: 초기값 1.0 → QP 최적화 후 대체
+
+3. gen_sim_power_csv.py
+   - all_configs에 "ampere_sass_sim" 추가
+   - kernelnames dict에 A100 validation kernel 추가
+
+Phase 1: Component 확장 (TF32, BF16, Sparsity 등)
+──────────────────────────────────────────────────────────────
+4. gpu-simulator/ISA_Def/trace_opcode.h
+   - SM80 전용 opcode 확인 및 누락분 추가
+
+5. gpu-simulator/ISA_Def/accelwattch_component_mapping.h
+   - TF32__OP, BF16__OP, SPARSE__OP enum 추가
+   - HMMA 명령어의 TF32/BF16 variant 구분 로직 추가
+     (trace_driven.cc에서 operand type 분석)
+
+6. .vendor/gpgpu-sim_distribution/src/accelwattch/gpgpu_sim_wrapper.cc
+   a) update_components_power(): TF32P, BF16P, SPARSEP 등 추가
+   b) calculate_static_power(): cat7~cat10 + concurrent 카테고리 추가
+   c) power component label/enum 확장
+
+7. .vendor/gpgpu-sim_distribution/src/accelwattch/XML_Parse.h
+   - scaling_coefficients 배열에 TF32_ACC, BF16_ACC 등 인덱스 추가
+   - static_cat7~cat10, static_concurrent 파라미터 추가
+
+8. util/accelwattch/quadprog_solver.m (또는 Python 대체)
+   - 행렬 차원 31 → 35+ 확장
+   - 신규 제약조건 추가
+```
+
+### 10.3 A100 실험 워크플로우
+
+```
+[Step 1] A100 DVFS 실험으로 P_const' 측정
+  nvidia-smi --lock-gpu-clocks=210,210   (최저 SM clock)
+  ... 벤치마크 실행, NVML로 전력 측정 ...
+  nvidia-smi --lock-gpu-clocks=1410,1410 (최고 SM clock)
+  ... 벤치마크 실행, NVML로 전력 측정 ...
+  → 8개 주파수 × 5개 벤치마크 = 40회 측정
+  → 3차 다항식 fitting → P_const' 추출
+
+[Step 2] A100 Static Power 측정
+  microbenchmark with varying #active_threads (1~32)
+  microbenchmark with varying #active_SMs (1~108)
+  → firstLane, addLane, idle_core_power 도출
+
+[Step 3] A100 NVBit Trace 수집
+  util/tracer_nvbit/run_hw_trace.py -B <benchmarks> -D <gpu_id>
+  → SM80 SASS traces 생성
+
+[Step 4] Accel-Sim 시뮬레이션 (with AccelWattch)
+  util/job_launching/run_simulations.py -C A100-Accelwattch_SASS_SIM ...
+  → activity factors + 초기 power 추정
+
+[Step 5] QP 최적화
+  quadprog_solver 실행 → scaling factors 도출
+  → XML config 업데이트 → 재시뮬레이션 → 수렴까지 반복
+
+[Step 6] Validation
+  독립 validation kernel set으로 MAPE 측정
+```
+
+---
+
+## 11. 자가점검: 정확성 검증
 
 ### 10.1 Config 값 검증
 
@@ -718,9 +877,11 @@ print("Scaling factors:", x.value)
 | V100 Core Clock | 1132 MHz | `gpgpu_clock_domains 1132.0:...` | ✓ |
 | A100 Core Clock | 1410 MHz | `gpgpu_clock_domains 1410:...` | ✓ |
 | V100 DRAM Clock | 850 MHz | `gpgpu_clock_domains ...:850.0` | ✓ |
-| A100 DRAM Clock | 1512 MHz | `gpgpu_clock_domains ...:1512` | ✓ |
+| A100 DRAM Clock (config) | 1512 MHz | `gpgpu_clock_domains ...:1512` | ✓ (config값) |
+| A100 DRAM Clock (실제 SXM4 80GB) | **1593 MHz** | NVIDIA Whitepaper/Datasheet | ⚠ config 수정 필요 |
+| A100 Memory Clock DVFS | **고정 (단일 값)** | `nvidia-smi -q -d SUPPORTED_CLOCKS` | ✓ 확인 |
 | V100 Mem Partitions | 32 | `gpgpu_n_mem 32` | ✓ |
-| A100 Mem Partitions | 40 | `gpgpu_n_mem 40` | ✓ |
+| A100 Mem Partitions | 40 (=10 MC × pseudo-ch) | `gpgpu_n_mem 40` | ✓ |
 | V100 Sub-partitions/ch | 2 | `gpgpu_n_sub_partition_per_mchannel 2` | ✓ |
 | A100 Sub-partitions/ch | 4 | `gpgpu_n_sub_partition_per_mchannel 4` | ✓ |
 | V100 Reg Banks | 16 | `gpgpu_num_reg_banks 16` | ✓ |
@@ -731,13 +892,20 @@ print("Scaling factors:", x.value)
 | V100 idle_core_power | 0.283W | XML `idle_core_power=0.283` | ✓ |
 | V100 static_cat2_flane | 18.618W | XML `static_cat2_flane=18.618` | ✓ |
 | V100 static_cat6_flane | 48.949W | XML `static_cat6_flane=48.949` | ✓ |
-| A100 power_simulation | 미지원 | `power_simulation_enabled 0` | ✓ (확인) |
+| A100 power_simulation | 비활성 | `power_simulation_enabled 0` | ✓ (XML 미존재로 비활성) |
+| A100 SM Clock 범위 | 210-1410 MHz, 81단계 | NVIDIA 문서 + arXiv:2502.20075 | ✓ |
+| A100 HBM2e Memory Clock | 1593 MHz 고정 | NVIDIA Datasheet, nvidia-smi | ✓ |
+| A100 TDP (SXM4 80GB) | 400W | NVIDIA Datasheet | ✓ |
+| A100 L2 Cache | 40MB | NVIDIA Whitepaper | ✓ |
+| A100 HBM Stacks | 5 (8-Hi) | NVIDIA Whitepaper | ✓ |
+| Ampere Whitepaper 참조 여부 | 참조함 | Section 1.2에 URL 명시 | ✓ |
 
-### 10.2 수식 일관성 검증
+### 11.2 수식 일관성 검증
 
 | 검증 항목 | 결과 |
 |----------|------|
 | Eq.(1) 구조가 A100에서도 성립하는가? | ✓ 물리적 분해이므로 아키텍처 무관 |
+| Eq.(3) DVFS: A100 memory clock **고정(1593MHz)** 반영 | ✓ **단일 변수(f_sm) 모델, P_const'에 HBM 전력 포함** |
 | Eq.(3) V≈kf 가정: V100에서 검증됨, A100에서 재검증 필요 | ⚠ 명시함 |
 | Eq.(5) Half-warp: V100의 16+16 구조 전제 → A100 변경 필요 | ✓ 상세 분석 |
 | Eq.(10) 80→108 변경 명시 | ✓ |
@@ -745,8 +913,12 @@ print("Scaling factors:", x.value)
 | INT/FP 공유 경로 문제 식별 | ✓ Section 3 상세 분석 |
 | TF32/BF16/Sparsity 신규 component | ✓ Section 6 |
 | A100 config에 AccelWattch XML 미존재 확인 | ✓ `power_simulation_enabled 0` |
+| 코드 수정 대상 파일 12개 식별 | ✓ Section 10 코드 설계 검토 |
+| gpgpusim.config DRAM clock 오류 발견 | ✓ **1512(PCIe)→1593(SXM4 80GB) 수정 필요** |
+| NVIDIA Ampere Whitepaper 참조 | ✓ Section 1.2에 URL + 상세 스펙 |
+| A100 40GB vs 80GB 차이 문서화 | ✓ Section 1.3 |
 
-### 10.3 추정값 합리성 검증
+### 11.3 추정값 합리성 검증
 
 | 항목 | 추정값 | 검증 |
 |------|--------|------|
@@ -756,7 +928,7 @@ print("Scaling factors:", x.value)
 | A100 idle_core_power | ~0.2W/SM | 7nm에서 V100(0.283W) 대비 감소 → ✓ 공정 스케일링 |
 | Dynamic power 23-43% 증가 | 95-110W vs 77W | SM +35%, clock +25% → ✓ 합리적 |
 
-### 10.4 발견된 불확실성
+### 11.4 발견된 불확실성
 
 | # | 불확실한 사항 | 해결 방법 |
 |---|-------------|----------|
@@ -770,6 +942,7 @@ print("Scaling factors:", x.value)
 
 ---
 
-> **결론**: AccelWattch를 A100에 적용할 때 수식의 **구조(형태)**는 대부분 유지되지만, **파라미터 값과 component 수**가 크게 변한다. 가장 큰 도전은 (1) INT32/FP32 공유 실행경로에 따른 Static Power Model 재설계, (2) TF32/BF16/Sparsity 신규 component 추가, (3) 7nm 공정에서의 DVFS/Constant Power 재보정이다.  
+> **결론**: AccelWattch를 A100 SXM4 80GB에 적용할 때 수식의 **구조(형태)**는 대부분 유지되지만, **파라미터 값과 component 수**가 크게 변한다. 특히 Eq.(3)의 DVFS 모델은 **A100의 HBM2e memory clock이 1593MHz로 고정**이므로 V100과 동일한 단일 변수(f_sm) 모델이 적용 가능하며, P_const'에 HBM의 고정 전력이 포함된다. 가장 큰 도전은 (1) INT32/FP32 공유 실행경로에 따른 Static Power Model 재설계, (2) TF32/BF16/Sparsity 신규 component 추가, (3) 7nm 공정에서의 Constant Power 재보정이다. 코드 수정 대상 12개 파일과 실험 워크플로우는 Section 10에 정리하였다.  
+> 참고 자료: [NVIDIA A100 Tensor Core GPU Architecture Whitepaper (PDF)](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf)  
 > 이전 문서: [03_Equation_Examples.md](03_Equation_Examples.md) — V100 수치 예시  
 > 개선 포인트 전체: [02_Improvement_Points.md](02_Improvement_Points.md)
