@@ -22,32 +22,41 @@
 
 ---
 
+## 우선순위 체계
+
+모든 작업에 다음 4단계 우선순위를 부여한다. 상위 우선순위가 완료되지 않으면 하위로 진행하지 않는다.
+
+| 우선순위 | 의미 | 색상 | 기준 |
+|---------|------|------|------|
+| **P0-Critical** | 이것 없이는 나머지가 불가능한 전제 조건 | 🔴 빨강 | HW 접근, P_const 측정, baseline XML |
+| **P1-High** | MAPE를 크게 개선하는 핵심 기술 작업 | 🟠 주황 | INT/FP 공유경로, TF32/BF16, QP solver |
+| **P2-Medium** | 연구의 핵심 기여(논문의 차별점) | 🔵 파랑 | 가상 가속기 설계, Design Space Exploration |
+| **P3-Normal** | 완성도를 높이는 작업 | 🟢 초록 | 논문 작성, Sparsity, Half-warp 구현 |
+
+아래 Priority Matrix는 각 작업의 **Impact(MAPE 개선 또는 연구 기여도)**와 **Effort(투입 노력)**를 시각화한 것이다. 좌상단(Quick Wins)을 먼저 수행하고, 우상단(Strategic Investments)을 Phase 2-3에서 수행한다.
+
+![Priority Matrix](images/fig4_priority_matrix.png)
+
+---
+
 ## 전체 로드맵 요약
 
 ```
-Month 1-2:  기반 구축 — A100 power model 재현 및 검증
-Month 3-4:  모델 확장 — 신규 component 추가, QP solver 고도화
-Month 5-6:  Design Space Exploration — 가상 가속기 설계 및 전력 예측
-Month 7-8:  논문화 — 결과 분석, 모델 정확도 검증, 논문 작성
+Month 1-2:  [P0] 기반 구축 — A100 power model 재현 및 검증
+Month 3-4:  [P1] 모델 확장 — 신규 component 추가, QP solver 고도화
+Month 5-6:  [P2] Design Space Exploration — 가상 가속기 설계 및 전력 예측
+Month 7-8:  [P3] 논문화 — 결과 분석, 모델 정확도 검증, 논문 작성
 ```
 
-```
-                        M1    M2    M3    M4    M5    M6    M7    M8
-Phase 1: 기반 구축      ████  ████
-Phase 2: 모델 확장                ████  ████
-Phase 3: DSE                            ████  ████  ████
-Phase 4: 논문화                                     ████  ████  ████
-─────────────────────────────────────────────────────────────────────
-마일스톤           MS1▲      MS2▲      MS3▲            MS4▲      MS5▲
-```
+![Gantt Chart](images/fig1_gantt_timeline.png)
 
-| 마일스톤 | 시점 | 산출물 |
-|---------|------|--------|
-| **MS1** | M2 끝 | A100 baseline MAPE < 15% 달성 |
-| **MS2** | M4 끝 | 신규 component 포함 MAPE < 12% 달성 |
-| **MS3** | M5 끝 | 가상 가속기 3개 설계 및 전력 예측 완료 |
-| **MS4** | M7 끝 | 논문 초고 완성 |
-| **MS5** | M8 끝 | 논문 투고 |
+| 마일스톤 | 시점 | 산출물 | 판단 기준 |
+|---------|------|--------|----------|
+| **MS1** | M2 끝 | A100 baseline power model | MAPE < 15%이면 통과. 20% 이상이면 Phase 2 앞당김 |
+| **MS2** | M4 끝 | 확장 모델 (TF32/BF16/Concurrent) | MAPE < 12%이면 통과. V100(9.2%) 대비 합리적 수준 |
+| **MS3** | M5 끝 | 가상 가속기 3개 전력 보고서 | Power breakdown + Perf/Watt 비교 완료 |
+| **MS4** | M7 끝 | 논문 초고 | 모든 Figure/Table 포함 |
+| **MS5** | M8 끝 | 논문 투고 | MICRO/ISCA/HPCA 중 택 1 |
 
 ---
 
@@ -100,6 +109,10 @@ AccelWattch를 A100 SXM4 80GB에서 재현하여, 기존 모델이 최신 GPU에
 | Validation → MAPE 측정 | **MS1 목표: MAPE < 15%**. V100의 9.2%보다 높겠지만, technology scaling만으로도 합리적 수준 |
 
 **MS1 판단 기준**: MAPE 15% 이하면 AccelWattch의 기본 프레임워크가 A100에서도 동작함을 확인. 15% 이상이면 Phase 2의 component 확장이 더 절실한 것으로 판단.
+
+아래 그래프는 각 Phase를 거치며 기대되는 MAPE 개선 추이이다. Phase 1에서 14%로 시작하여 Phase 2에서 11% → 8%로 개선되는 것을 목표로 한다.
+
+![MAPE Trajectory](images/fig2_mape_trajectory.png)
 
 ---
 
@@ -202,6 +215,16 @@ AccelWattch 논문이 이미 입증한 것은 "Volta 모델을 Pascal/Turing에 
 | 파라미터 sensitivity 분석 | SM 수, Tensor Core 수, L2 크기 등을 ±20% 변화시켰을 때 전력/성능 변화율 측정. "어떤 파라미터가 전력에 가장 민감한가?" |
 | Pareto frontier 도출 | 성능 vs 전력의 Pareto 최적 설계점들을 찾아 "이 이상은 전력을 늘려도 성능이 안 오른다"는 한계 식별 |
 | **MS3**: 가상 가속기 3개의 전력 예측 보고서 완성 | Component별 breakdown, 워크로드별 비교, design trade-off 분석 포함 |
+
+아래 두 Figure는 Phase 3에서 생산할 분석 결과의 예시이다.
+
+**Figure 3**은 A100 대비 3개 가상 가속기의 component별 power breakdown을 보여준다. Accel-A(AI Training)는 Tensor Core 전력이 2배이지만 FP32를 절반으로 줄여 총 전력을 270W로 억제한다. Accel-B(AI Inference)는 200W TDP로 설계하여 에너지 효율을 극대화한다.
+
+![Power Breakdown](images/fig3_power_breakdown.png)
+
+**Figure 5**는 각 가속기의 Performance/Watt 프로파일을 레이더 차트로 비교한다. 각 설계가 어떤 지표에 특화되었는지 한눈에 파악할 수 있다. Accel-A는 Tensor TFLOPS/W에서, Accel-B는 Inference TOPS/W에서, Accel-C는 FP64 TFLOPS/W에서 A100을 초과한다.
+
+![Perf/Watt Radar](images/fig5_radar_perfwatt.png)
 
 ---
 
