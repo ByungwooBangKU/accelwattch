@@ -7,6 +7,14 @@
 
 ---
 
+## 전체 Procedure 개요
+
+아래 Figure는 AccelWattch 논문의 Figure 1(AccelWattch power modeling flowchart)을 가상 가속기에 맞게 재구성한 것이다. 왼쪽(Constant/Static/Idle power), 중앙(uBenchmark + PTX 시뮬레이션), 오른쪽(QP 최적화 + Validation)의 3열 구조로 진행되며, 추론 전용 가속기에서의 축소 사항을 함께 표시했다.
+
+![Virtual Accelerator Power Modeling Procedure](images/fig6_virtual_accel_procedure.png)
+
+---
+
 ## 1. Accel-Sim의 두 가지 시뮬레이션 모드
 
 Accel-Sim은 GPU 워크로드를 시뮬레이션하는 두 가지 경로를 제공한다.
