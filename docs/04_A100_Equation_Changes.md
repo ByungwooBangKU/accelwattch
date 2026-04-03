@@ -942,6 +942,69 @@ Phase 1: Component 확장 (TF32, BF16, Sparsity 등)
 
 ---
 
+## 부록: 추론 전용 가속기 적용 시 Equation 변화
+
+추론(Inference) 전용 가속기를 설계할 경우, FP64, SFU 대부분, 대용량 레지스터 등이 불필요해진다. 이에 따른 수식 변화를 정리한다. (상세 component 분석은 [02_Improvement_Points.md Section 12](02_Improvement_Points.md#12-추론-전용-가속기의-component-최적화) 참조)
+
+### Eq.(10) 변화: SM 수 축소 + 제거된 유닛
+
+범용 A100:
+```
+P_total = P_dyn + P_static,yLanes,mode,perActiveSM · k + P_perIdleSM · (108 − k) + P_const'
+          ↑ 27개 component
+```
+
+추론 전용 가속기 (예: Accel-B, SM 216개 소형화, 200W TDP):
+```
+P_total = P_dyn + P_static,yLanes,perActiveSM · k + P_perIdleSM · (216 − k) + P_const'
+          ↑ 15~17개 component (FP64, SFU 대부분 제거)
+```
+
+### Eq.(11) 변화: Component 수 N 축소
+
+범용: N = 27 (A100)
+```
+         27
+P_dyn = Σ  (aᵢ · Eᵢ / T)     ← FP64, SFU(sin,log,sqrt), FP_DIV 포함
+        i=1
+```
+
+추론 전용: N = 15~17
+```
+         17
+P_dyn = Σ  (aᵢ · Eᵢ / T)     ← FP64 관련 3개 제거, SFU 3개 제거, FP32 축소
+        i=1
+```
+
+제거되는 항: DPUP, DP_MULP, DP_DIVP(=0), FP_SINP, FP_LGP, FP_SQRTP 등
+추가되는 항: INT8_TENSORP, INT4_TENSORP (저정밀 추론 전용 Tensor)
+
+### Eq.(14) 변화: QP solver 차원 축소
+
+```
+범용:    argmin ‖A(102×31) · X(31) − b(102)‖²     → 31차원, 13개 제약
+추론:    argmin ‖A(60×20) · X(20) − b(60)‖²       → 20차원, 8개 제약
+```
+
+FP64 관련 제약(`FPU ≤ DPU`, `FP_MUL ≤ DP_MUL`)이 전부 제거되고, microbenchmark도 60개 수준으로 축소 가능하다. 이는 실험 시간을 약 40% 단축한다.
+
+### Static Power 변화
+
+FP64 코어, SFU 대부분, 대용량 레지스터가 제거되면 static power의 firstLane 값이 크게 감소한다:
+
+```
+범용 A100 (INT+FP, cat2 추정):
+  P_static = firstLane(~20W) + addLane(~0.5W) × 31 = ~35.5W
+
+추론 전용 (INT+INT8_TENSOR):
+  P_static = firstLane(~8W) + addLane(~0.2W) × 31 = ~14.2W
+  → static power 60% 절감
+```
+
+유닛 수가 줄어들면 SM당 leakage가 감소하므로 idle_core_power도 낮아진다. 전체적으로 추론 전용 가속기는 동일 공정에서 범용 GPU 대비 **40~55% 낮은 총 전력**이 예상된다.
+
+---
+
 > **결론**: AccelWattch를 A100 SXM4 80GB에 적용할 때 수식의 **구조(형태)**는 대부분 유지되지만, **파라미터 값과 component 수**가 크게 변한다. 특히 Eq.(3)의 DVFS 모델은 **A100의 HBM2e memory clock이 1593MHz로 고정**이므로 V100과 동일한 단일 변수(f_sm) 모델이 적용 가능하며, P_const'에 HBM의 고정 전력이 포함된다. 가장 큰 도전은 (1) INT32/FP32 공유 실행경로에 따른 Static Power Model 재설계, (2) TF32/BF16/Sparsity 신규 component 추가, (3) 7nm 공정에서의 Constant Power 재보정이다. 코드 수정 대상 12개 파일과 실험 워크플로우는 Section 10에 정리하였다.  
 > 참고 자료: [NVIDIA A100 Tensor Core GPU Architecture Whitepaper (PDF)](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf)  
 > 이전 문서: [03_Equation_Examples.md](03_Equation_Examples.md) — V100 수치 예시  

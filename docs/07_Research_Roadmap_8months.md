@@ -182,13 +182,41 @@ AccelWattch 논문이 이미 입증한 것은 "Volta 모델을 Pascal/Turing에 
 | 가속기 | 설계 철학 | A100 대비 변경점 | 목표 워크로드 |
 |--------|----------|-----------------|-------------|
 | **Accel-A**: AI Training 특화 | Tensor Core 2배, FP32 절반, L2 2배 | SM당 Tensor 8개, FP32 32개, L2 80MB | LLM 학습 |
-| **Accel-B**: AI Inference 특화 | INT8/INT4 강화, SM 수 증가, TDP 절반 | SM 216개 (축소), INT8 전용 유닛, 200W | 추론 서버 |
+| **Accel-B**: AI Inference 특화 | INT8/INT4 강화, FP64/SFU 제거, TDP 절반 | SM 216개(소형화), INT8 전용 Tensor, FP64 없음, 200W | 추론 서버 |
 | **Accel-C**: HPC 특화 | FP64 2배, HBM 대역폭 1.5배 | SM당 FP64 64개, 메모리 3TB/s | 과학 시뮬레이션 |
 
 이 설계들이 의미있는 이유:
 - **Accel-A**: 현재 H100이 가는 방향과 유사하지만, FP32를 과감히 줄인 극단적 설계. "Tensor Core에 all-in하면 전력 효율이 얼마나 좋아지는가?"에 답함
-- **Accel-B**: Inference 전용 칩(Groq, AWS Inferentia 등)의 방향. "SM을 작게 만들고 많이 넣으면?"에 답함
+- **Accel-B**: Inference 전용 칩(Groq, AWS Inferentia 등)의 방향. FP64 전체 제거, SFU 대폭 축소, 레지스터 절반으로 줄여 SM을 소형화하고 수를 2배로 늘림. "불필요한 유닛을 제거하면 같은 면적에서 추론 처리량이 얼마나 늘어나는가?"에 답함. 이것이 **우리 연구의 핵심 설계 대상**이다. (상세 component 분석: [02 문서 Section 12](02_Improvement_Points.md#12-추론-전용-가속기의-component-최적화))
 - **Accel-C**: 과학 계산용. "FP64를 극단적으로 강화하면 전력 비용이 얼마인가?"에 답함
+
+#### Accel-B 상세 설계 (추론 전용 가속기)
+
+```
+┌─ Accel-B SM (소형화) ─────────────────────┐
+│ Processing Block (×4):                     │
+│   ├─ 8× INT32 cores (주소 계산용, 축소)   │
+│   ├─ 8× FP16/BF16 cores (mixed precision) │
+│   ├─ 0× FP64 cores (완전 제거)            │
+│   ├─ 2× INT8/INT4 Tensor Core (강화)      │
+│   ├─ 0× SFU (제거, lookup table 대체)     │
+│   └─ 2× LD/ST units                       │
+│                                            │
+│ Register File: 32768개 (절반)              │
+│ L1D + Shared Memory: 96KB (축소)           │
+│ Instruction Cache: 64KB                    │
+└────────────────────────────────────────────┘
+× 216 SMs (소형이므로 많이 배치)
++ L2 Cache: 60MB (강화, 모델 파라미터 캐싱)
++ HBM2e: 40GB (학습 불필요, 용량 축소)
++ TDP: 200W
+
+AccelWattch Power Component (15개로 축소):
+  제거: DPUP, DP_MULP, FP_SINP, FP_LGP, FP_SQRTP, FP_DIVP, DP_DIVP
+  축소: FPUP, SHRDP, RFP, INTP
+  강화: INT8_TENSORP(신규), L2CP
+  유지: IBP, ICP, DCP, CCP, SCHEDP, PIPEP, DRAMP, NOCP
+```
 
 **주 19-20: gpgpusim.config 및 XML 생성**
 

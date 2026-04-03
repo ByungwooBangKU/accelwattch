@@ -20,9 +20,10 @@
 9. [P7: Technology Scaling 정교화](#9-p7-technology-scaling-정교화)
 10. [P8: SASS Opcode 매핑 확장](#10-p8-sass-opcode-매핑-확장)
 11. [P9: ML-Hybrid 모델링 도입](#11-p9-ml-hybrid-모델링-도입)
-12. [예상 Equation 변화](#12-예상-equation-변화)
-13. [최신 관련 연구 동향](#13-최신-관련-연구-동향)
-14. [실행 로드맵](#14-실행-로드맵)
+12. [추론 전용 가속기의 Component 최적화](#12-추론-전용-가속기의-component-최적화)
+13. [예상 Equation 변화](#13-예상-equation-변화)
+14. [최신 관련 연구 동향](#14-최신-관련-연구-동향)
+15. [실행 로드맵](#15-실행-로드맵)
 
 ---
 
@@ -641,7 +642,131 @@ P_hybrid = P_analytical + model.predict(features_test)
 
 ---
 
-## 12. 예상 Equation 변화
+## 12. 추론 전용 가속기의 Component 최적화
+
+학습(Training)이 아닌 추론(Inference) 전용 가속기를 설계할 경우, 필요하지 않은 하드웨어 유닛을 제거하여 전력과 면적을 크게 절감할 수 있다. AccelWattch의 22개 dynamic power component 중 상당수가 불필요해지므로, power model도 이에 맞게 단순화된다.
+
+### 12.1 추론 전용 가속기에서 제거 가능한 Component
+
+추론 워크로드의 특성: FP32/FP16/INT8 위주 연산, 배치 크기 고정, gradient 계산 없음, 가중치(weight)는 읽기 전용.
+
+| Component | Training 시 역할 | 추론에서 필요? | 제거 시 영향 | 근거 |
+|-----------|----------------|--------------|------------|------|
+| **DPUP** (FP64) | Gradient 누적, 수치 안정성 | **제거 가능** | Dynamic power 2~5% 절감 | 추론은 FP32 이하 정밀도면 충분. FP64는 과학 계산/학습 전용 |
+| **DP_MULP** (FP64 곱셈) | FP64 FMA 연산 | **제거 가능** | 위와 동일 | FP64 유닛 전체 불필요 |
+| **FP_DIVP** (FP 나눗셈) | Softmax, LayerNorm의 나눗셈 | **축소 가능** | 소폭 절감 | 추론에서 나눗셈은 역수 곱셈(reciprocal multiply)으로 대체 가능. SFU 1개면 충분 |
+| **FP_SQRTP** (제곱근) | BatchNorm, LayerNorm | **축소 가능** | 소폭 절감 | 추론에서 sqrt는 pre-computed 가능 |
+| **FP_LGP** (로그) | Softmax log, loss 계산 | **제거 가능** | SFU power 절감 | loss 계산은 학습 전용. 추론은 argmax만 필요 |
+| **FP_EXP** (지수) | Softmax exp | **축소 가능** | 소폭 절감 | Softmax는 lookup table 또는 근사로 대체 가능 |
+| **FP_SINP** (삼각함수) | Position encoding 등 | **제거 가능** | 소폭 절감 | Pre-computed table로 대체 |
+| **FPUP** (FP32 add/cmp) | 범용 FP32 연산 | **축소 가능** | Dynamic power 절감 | INT8/INT4 추론에서는 FP32 코어 수를 줄일 수 있음 |
+| **SHRDP** (Shared Memory) | Tiling, 중간 결과 공유 | **축소 가능** | Cache power 절감 | 추론은 고정 패턴이므로 더 작은 shared memory로 충분 |
+| **RFP** (Register File) | 대용량 레지스터 (학습 시 중간값 다수) | **축소 가능** | 상당한 절감 (V100에서 전체의 ~11%) | 추론은 학습보다 레지스터 사용이 적음. 65536→32768개로 절반 가능 |
+
+### 12.2 추론 전용에서 유지/강화해야 하는 Component
+
+| Component | 추론에서의 역할 | 방향 | 근거 |
+|-----------|--------------|------|------|
+| **TENSORP** (Tensor Core) | INT8/INT4 행렬 곱셈 | **강화** | 추론의 핵심 연산. INT8 Tensor Core 수 증가 또는 전용 INT8 MAC 유닛 추가 |
+| **INTP** (INT32 ALU) | 주소 계산, 인덱싱 | **유지** | 메모리 주소 계산에 항상 필요 |
+| **INT_MULP** (INT 곱셈) | Quantization scaling | **유지** | INT8 양자화 시 scale factor 곱셈 |
+| **DCP** (L1D Cache) | Weight/activation 읽기 | **유지/강화** | 추론은 weight가 읽기 전용 → 캐시 적중률 높음. 크기 유지 또는 확대 |
+| **L2CP** (L2 Cache) | 모델 파라미터 캐싱 | **강화** | 추론 모델 전체가 L2에 들어가면 DRAM 접근 대폭 감소 → 전력 절감 |
+| **DRAMP** (DRAM) | 입력 데이터, 대형 모델 | **유지** | 대역폭은 유지하되 DRAM 용량 축소 가능 (학습 시 gradient 저장 불필요) |
+| **IBP, ICP** (명령어 버퍼/캐시) | 명령어 fetch | **유지** | 아키텍처 기본 구성 |
+| **SCHEDP, PIPEP** (스케줄러, 파이프라인) | 실행 제어 | **유지** | 아키텍처 기본 구성 |
+
+### 12.3 Component 수 비교
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│          Power Component 수 비교                             │
+├────────────────┬─────────┬─────────┬─────────────────────────┤
+│                │ V100    │ A100    │ 추론 전용 가속기         │
+│                │ (범용)  │ (범용)  │ (Accel-B)               │
+├────────────────┼─────────┼─────────┼─────────────────────────┤
+│ FP64 관련      │ 3개     │ 3개     │ 0개 (전부 제거)         │
+│ SFU 관련       │ 4개     │ 4개     │ 1개 (EXP만 축소 유지)   │
+│ FP32 관련      │ 2개     │ 2개     │ 1개 (축소)              │
+│ INT 관련       │ 4개     │ 4개     │ 2개 (INT + INT_MUL)     │
+│ Tensor/INT8    │ 1개     │ 3개     │ 4개 (INT8/INT4/FP16/BF16)│
+│ 캐시/메모리    │ 7개     │ 7개     │ 6개 (Shared 축소)       │
+│ 인프라         │ 3개     │ 3개     │ 3개 (유지)              │
+├────────────────┼─────────┼─────────┼─────────────────────────┤
+│ Dynamic 합계   │ 22개    │ 27개    │ 15~17개                 │
+│ Non-dynamic    │ 3개     │ 3개     │ 3개 (유지)              │
+└────────────────┴─────────┴─────────┴─────────────────────────┘
+```
+
+### 12.4 추론 전용 가속기의 전력 구성 변화 (예상)
+
+```
+V100 sgemm (범용, 148W):              추론 전용 Accel-B (INT8 GEMM, ~80W):
+┌──────────────────────┐              ┌──────────────────────┐
+│ ■■■■ RFP     15.8W   │              │ ■■ RFP        6W     │ ← 절반
+│ ■■■■ FP_MUL  12.4W   │              │                      │ ← FP_MUL 거의 없음
+│ ■■■ DCP       8.5W   │              │ ■■ DCP        7W     │
+│ ■■ PIPEP      6.2W   │              │ ■■ PIPEP      5W     │
+│ ■■ L2CP       5.2W   │              │ ■■■ L2CP      8W     │ ← 강화
+│ ■■ INTP       5.1W   │              │ ■ INTP        3W     │ ← 축소
+│ ■■ SCHEDP     4.5W   │              │ ■ SCHEDP      3W     │
+│ ■ SHRDP       4.2W   │              │ ■ SHRDP       2W     │ ← 축소
+│ ■ NOCP        3.8W   │              │ ■ NOCP        3W     │
+│ ■ IBP         3.2W   │              │ ■ IBP         2W     │
+│ ■ ICP         2.8W   │              │ ■ ICP         2W     │
+│ ■ DRAMP       2.4W   │              │ ■ DRAMP       3W     │
+│ ■ FPUP        1.8W   │              │ ■■■■ INT8_TENSOR 12W │ ← 핵심!
+│   DPUP        0.0W   │              │   DPUP        0W     │ ← 제거
+│   TENSOR      0.0W   │              │   FP64        0W     │ ← 제거
+│   (기타)      1.6W   │              │   (기타)      1W     │
+├──────────────────────┤              ├──────────────────────┤
+│ ★ P_static   38.6W   │              │ ★ P_static   10W     │ ← 유닛 감소로 대폭↓
+│ ★ P_const    32.3W   │              │ ★ P_const    15W     │ ← 보드 단순화
+├──────────────────────┤              ├──────────────────────┤
+│ Total       148.3W   │              │ Total        ~82W    │ ← 45% 절감!
+└──────────────────────┘              └──────────────────────┘
+```
+
+### 12.5 추론 전용 가속기의 Power Model 단순화
+
+**QP solver 차원 축소:**
+
+```
+범용 GPU:   A(102 × 31) × X(31 × 1) = b(102 × 1)   → 31차원 최적화
+추론 전용:  A(80 × 20)  × X(20 × 1) = b(80 × 1)    → 20차원 최적화
+```
+
+차원이 줄어들면:
+- QP solver의 수렴이 빨라짐 (변수 감소)
+- 더 적은 microbenchmark로도 충분 (제거된 유닛의 벤치 불필요)
+- Overfitting 위험 감소 (파라미터/데이터 비율 개선)
+- 제약조건도 단순화 (FP64 관련 제약 전부 제거)
+
+**Static Power 카테고리 축소:**
+
+```
+범용 GPU: 9개 카테고리 (INT, INT+FP, INT+FP+DP, INT+FP+SFU, ...)
+추론 전용: 4~5개 카테고리로 충분
+  - INT only (주소 계산)
+  - INT + INT8_TENSOR (핵심 추론 연산)
+  - INT + FP16 (Mixed precision 추론)
+  - INT + FP32 (후처리)
+  - LIGHT (idle)
+```
+
+### 12.6 추론 전용 가속기 설계 시 주의사항
+
+1. **Quantization 정확도 검증**: INT8/INT4로 정밀도를 낮추면 전력은 줄지만 추론 정확도가 떨어질 수 있다. Power model과 별도로 accuracy-power trade-off 분석이 필요하다.
+
+2. **Batch size 고정 가정**: 추론은 보통 batch size가 작고 고정적이므로, SM occupancy가 학습보다 낮을 수 있다. Idle SM power(P_perIdleSM)의 비중이 상대적으로 커진다.
+
+3. **Memory bandwidth vs Compute**: 추론은 학습보다 **memory-bound**인 경우가 많다 (weight 읽기 중심). 따라서 DRAMP/L2CP의 전력 비중이 상대적으로 높아지고, 연산 유닛 전력 비중은 낮아진다.
+
+4. **Latency 제약**: 추론은 throughput뿐 아니라 latency도 중요하다. SM 수를 무한정 줄이면 전력은 줄지만 latency가 늘어나는 trade-off가 있다.
+
+---
+
+## 13. 예상 Equation 변화
 
 ### 12.1 현재 AccelWattch 전체 모델
 
@@ -692,7 +817,7 @@ where:
 
 ---
 
-## 13. 최신 관련 연구 동향
+## 14. 최신 관련 연구 동향
 
 ### 13.1 AccelWattch 이후 주요 연구 방향
 
@@ -713,7 +838,7 @@ where:
 
 ---
 
-## 14. 실행 로드맵
+## 15. 실행 로드맵
 
 ### Phase 1: 기반 구축 (1-2개월)
 
