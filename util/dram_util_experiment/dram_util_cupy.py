@@ -124,21 +124,31 @@ def main() -> None:
     ap.add_argument("--out-dir", type=str, default="reports")
     ap.add_argument("--tag", type=str, default="",
                     help="extra suffix on output file names")
+    ap.add_argument("--device", type=int, default=0,
+                    help="CUDA device index (multi-GPU systems)")
     args = ap.parse_args()
 
     # ---- GPU info & buffer sizing ----
-    dev = cp.cuda.Device(0)
+    dev = cp.cuda.Device(args.device)
     dev.use()
-    p = cp.cuda.runtime.getDeviceProperties(0)
+    p = cp.cuda.runtime.getDeviceProperties(args.device)
     gpu_name = prop(p, "name")
     sm_count = p["multiProcessorCount"]
     l2_bytes = p["l2CacheSize"]
+
+    # GPU slug for per-GPU output files (A100 / RTX3090 / H100 자동 식별).
+    def _slugify(name: str) -> str:
+        import re
+        s = re.sub(r"(?i)nvidia|geforce|pcie|sxm\d?|\bhbm\d*\b|\bon\b", "", name)
+        s = re.sub(r"[^a-zA-Z0-9]+", "_", s).strip("_").lower()
+        return s or "gpu"
+    gpu_slug = _slugify(gpu_name)
 
     if args.buf_bytes is None:
         args.buf_bytes = max(1 << 30, l2_bytes * 64)
     n_f4 = args.buf_bytes // 16  # float4 = 16 bytes
 
-    print(f"[info] GPU={gpu_name}  SMs={sm_count}  "
+    print(f"[info] GPU={gpu_name} (slug={gpu_slug})  SMs={sm_count}  "
           f"L2={l2_bytes/(1<<20):.1f} MiB  "
           f"buf={args.buf_bytes/(1<<30):.2f} GiB  n_f4={n_f4}")
     if _nvrtc_path:
@@ -211,41 +221,60 @@ def main() -> None:
         poller.stop()
         poller.join(timeout=1.0)
 
+    # ---- convert % to GB/s using measured peak ----
+    # pynvml memory util% = memory-controller busy fraction; scale by the
+    # calibrated peak (one pass fully saturates the DRAM) to recover GB/s.
+    def to_gbps(pct: float) -> float:
+        return pct / 100.0 * peak_gbps
+
     # ---- save CSV ----
     out_dir = Path(args.out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     suffix = f"_{args.tag}" if args.tag else ""
-    csv_path = out_dir / f"util_cupy_{stamp}{suffix}.csv"
+    csv_path = out_dir / f"util_cupy_{gpu_slug}_{stamp}{suffix}.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t_s", "mem_util_pct", "gpu_util_pct", "phase"])
-        w.writerows(poller.rows)
+        w.writerow(["t_s", "mem_util_pct", "gpu_util_pct",
+                    "bandwidth_gbps", "phase"])
+        for t_s, mem_pct, gpu_pct, ph in poller.rows:
+            w.writerow([t_s, mem_pct, gpu_pct, f"{to_gbps(mem_pct):.2f}", ph])
     print(f"[save] {csv_path}  ({len(poller.rows)} samples)")
 
-    # ---- summary ----
+    # ---- summary (GB/s) ----
     print()
-    print(f"{'phase':<10} {'target%':>8} {'mean':>8} {'std':>8} {'n':>6}")
-    print("-" * 48)
+    print(f"peak DRAM read BW (calibrated) = {peak_gbps:.1f} GB/s")
+    print()
+    hdr = f"{'phase':<10} {'target':>7} {'expected':>10} {'measured':>10} {'std':>8} {'n':>6}"
+    print(hdr)
+    print(f"{'':<10} {'(%)':>7} {'(GB/s)':>10} {'(GB/s)':>10} {'(GB/s)':>8}")
+    print("-" * len(hdr))
     for target in args.targets:
         tag = f"util_{target}"
-        vals = [r[1] for r in poller.rows if r[3] == tag]
+        vals = [to_gbps(r[1]) for r in poller.rows if r[3] == tag]
+        expected = peak_gbps * target / 100.0
         if vals:
             a = np.asarray(vals, dtype=float)
-            print(f"{tag:<10} {target:>8} {a.mean():>8.2f} {a.std():>8.2f} {len(a):>6}")
+            print(f"{tag:<10} {target:>7} {expected:>10.1f} "
+                  f"{a.mean():>10.1f} {a.std():>8.1f} {len(a):>6}")
         else:
-            print(f"{tag:<10} {target:>8} {'--':>8} {'--':>8} {0:>6}")
+            print(f"{tag:<10} {target:>7} {expected:>10.1f} "
+                  f"{'--':>10} {'--':>8} {0:>6}")
 
-    # ---- plot ----
+    # ---- plot (GB/s) ----
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         t  = [r[0] for r in poller.rows]
-        m  = [r[1] for r in poller.rows]
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(t, m, lw=0.8, color="#1f77b4", label="DRAM (mem ctrl) util")
-        # shade phase regions
+        bw = [to_gbps(r[1]) for r in poller.rows]
+        t_max = max(t) if t else 1.0
+
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.plot(t, bw, lw=0.8, color="#1f77b4",
+                label=f"measured (pynvml mem util × {peak_gbps:.0f} GB/s peak)")
+
+        # target reference lines + phase shading
         phase_ranges: dict[str, tuple[float, float]] = {}
         for r in poller.rows:
             ph = r[3]
@@ -253,19 +282,26 @@ def main() -> None:
                 lo, hi = phase_ranges.get(ph, (r[0], r[0]))
                 phase_ranges[ph] = (min(lo, r[0]), max(hi, r[0]))
         for ph, (lo, hi) in phase_ranges.items():
-            tgt = int(ph.split("_")[1])
-            ax.axhspan(tgt - 3, tgt + 3, xmin=lo / max(t), xmax=hi / max(t),
-                       color="red", alpha=0.08)
-            ax.hlines(tgt, lo, hi, color="red", ls=":", lw=1.0)
-            ax.text((lo + hi) / 2, tgt + 4, ph, ha="center", fontsize=9,
-                    color="red")
+            tgt_pct  = int(ph.split("_")[1])
+            tgt_gbps = peak_gbps * tgt_pct / 100.0
+            ax.hlines(tgt_gbps, lo, hi, color="red", ls="--", lw=1.2)
+            ax.text((lo + hi) / 2, tgt_gbps + peak_gbps * 0.03,
+                    f"{ph} → {tgt_gbps:.0f} GB/s",
+                    ha="center", fontsize=9, color="red")
+
         ax.set_xlabel("time (s)")
-        ax.set_ylabel("utilization (%)")
-        ax.set_ylim(-5, 110)
-        ax.set_title(f"DRAM read utilization — {gpu_name}")
-        ax.legend(loc="upper right")
+        ax.set_ylabel("DRAM read bandwidth (GB/s)")
+        ax.set_ylim(-peak_gbps * 0.05, peak_gbps * 1.15)
+        ax.set_title(f"DRAM read bandwidth — {gpu_name}  "
+                     f"(peak {peak_gbps:.0f} GB/s)")
+        # Right-side secondary axis in % for reference.
+        ax2 = ax.twinx()
+        ax2.set_ylim(ax.get_ylim()[0] / peak_gbps * 100.0,
+                     ax.get_ylim()[1] / peak_gbps * 100.0)
+        ax2.set_ylabel("utilization (%)")
+        ax.legend(loc="upper left")
         ax.grid(True, alpha=0.3)
-        png = out_dir / f"util_cupy_{stamp}{suffix}.png"
+        png = out_dir / f"util_cupy_{gpu_slug}_{stamp}{suffix}.png"
         fig.tight_layout()
         fig.savefig(png, dpi=130)
         print(f"[save] {png}")
