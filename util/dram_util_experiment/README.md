@@ -31,13 +31,25 @@ RTX 3090 (WSL2) 에서 CuPy 버전으로 바로 검증 완료 — `reports/` 하
 
 | 파일 | 설명 |
 |---|---|
-| `dram_util_cupy.py` | **CuPy 버전** — NVRTC 로 커널 JIT + pynvml 폴링 + 자동 플롯 |
+| `dram_util_cupy.py` | **CuPy 버전** — NVRTC 로 커널 JIT + pynvml 폴링 + 자동 플롯 (GB/s + %) |
 | `run_cupy.sh` | CuPy 버전 launcher (`cupy/nvtx/pynvml` 있는 python 자동 탐지) |
+| `run_nsys_cupy.sh` | **CuPy 스크립트를 nsys 로 프로파일링** (NVTX + GPU Metrics) |
 | `dram_util.cu` | Native CUDA 스트리밍 read 커널 + 호스트 duty cycling |
 | `Makefile` | `SM` 변수로 arch 지정 (기본 `sm_86` = RTX 3090) |
-| `run_nsys.sh` | 빌드 + `nsys profile` (GPU metrics 샘플링) + sqlite + 분석 |
+| `run_nsys.sh` | C++ 빌드 + `nsys profile` (GPU metrics 샘플링) + sqlite + 분석 |
 | `run_nsys_a100.sh` | A100 80GB 프리셋 (`SM=80`, 버퍼 8 GiB) → `run_nsys.sh` 로 exec |
 | `analyze.py` | nsys sqlite 에서 phase 별 DRAM read 지표 평균/표준편차 계산 |
+
+## GPU 자동 대응
+
+CuPy 가 `cudaGetDeviceProperties` 로 GPU 를 식별하므로 RTX 3090 / A100 / H100
+모두 별도 설정 없이 동작한다.
+
+- 버퍼 크기: `max(1 GiB, 64 × L2)` 자동 산정 (L2 6 MiB → 1 GiB, L2 40 MiB → 2.6 GiB)
+- 피크 BW: 실제 1 pass 실행으로 calibration (HBM2e / GDDR6X 차이 자동 반영)
+- 출력 파일명에 GPU slug 포함 → 여러 GPU 실험 결과 섞이지 않음
+  예) `util_cupy_rtx_3090_20260417_141108.csv`, `util_cupy_a100_80gb_20260417_...csv`
+- 다중 GPU 시스템은 `--device N` 으로 인덱스 선택
 
 ## A. CuPy 버전 (권장, 빠른 재현)
 
@@ -63,27 +75,53 @@ python3 dram_util_cupy.py --targets 25 50 75 100 --phase-seconds 10
 
 ### 출력
 
-- `reports/util_cupy_<timestamp>.csv` — (t_s, mem_util_pct, gpu_util_pct, phase)
-- `reports/util_cupy_<timestamp>.png` — 시계열 플롯 (4 단 계단)
-- 콘솔에 phase 별 평균/표준편차 요약
+- `reports/util_cupy_<gpu_slug>_<timestamp>.csv`
+  컬럼: `t_s, mem_util_pct, gpu_util_pct, bandwidth_gbps, phase`
+- `reports/util_cupy_<gpu_slug>_<timestamp>.png`
+  좌 Y축: **DRAM read bandwidth (GB/s)** · 우 Y축: **utilization (%)**
+  빨간 점선: 각 phase 의 target BW
+- 콘솔에 phase 별 expected/measured GB/s 요약
 
-예시 (RTX 3090):
+예시 (RTX 3090, peak 719 GB/s):
 ```
-phase       target%     mean      std      n
-------------------------------------------------
-util_25          25    30.49     6.11    476
-util_50          50    51.55     9.33    476
-util_75          75    79.45     9.86    476
-util_100        100    98.12    13.56    480
+phase       target   expected   measured      std      n
+               (%)     (GB/s)     (GB/s)   (GB/s)
+--------------------------------------------------------
+util_25         25      179.7      204.4     72.3    474
+util_50         50      359.3      369.9     67.7    477
+util_75         75      539.0      518.6     61.6    476
+util_100       100      718.7      706.6     92.3    477
 ```
+
+![example](reports/util_cupy_rtx_3090_20260417_141108.png)
 
 ### 주요 옵션
 
+- `--device N` — CUDA 디바이스 인덱스 (다중 GPU 시스템)
 - `--buf-bytes N` — 버퍼 크기 (기본 `max(1 GiB, 64 * L2)`)
 - `--phase-seconds` — phase 당 길이 (기본 10)
 - `--window-ms` — duty cycle 창 크기 (기본 20)
 - `--targets 10 30 60 90` — 커스텀 계단
 - `--poll-hz` — pynvml 폴링 주파수 (기본 50)
+- `--tag NAME` — 출력 파일 추가 suffix (실험 변형 구분용)
+
+### CuPy + nsys 프로파일링
+
+`nsys` 가 있으면 pynvml 보다 정확한 DRAM throughput 시계열을 얻을 수 있음:
+
+```bash
+./run_nsys_cupy.sh                      # 기본
+./run_nsys_cupy.sh --phase-seconds 5    # 시간 단축
+./run_nsys_cupy.sh --no-metrics         # GPU metrics 샘플링 끔 (WSL2/권한 제약시)
+
+# 결과 확인
+nsys-ui reports/nsys_cupy_*.nsys-rep
+```
+
+타임라인에서 확인할 것:
+- **NVTX 행** — `util_25 / util_50 / util_75 / util_100` 각 10 s + `gap`
+- **GPU Metrics 행** — DRAM Read Throughput 이 25/50/75/100% 계단
+- **CUDA HW → Kernels 행** — `stream_read` 커널 duty cycle 패턴
 
 ## B. Native CUDA + nsys (세밀한 프로파일링)
 

@@ -1,5 +1,5 @@
-# Future runs land here — ignore by default, but the example RTX 3090 run below is committed.
+# Future runs land here — ignore by default. Committed example run below.
 *
 !.gitignore
-!util_cupy_20260417_132930.csv
-!util_cupy_20260417_132930.png
+!util_cupy_rtx_3090_20260417_141108.csv
+!util_cupy_rtx_3090_20260417_141108.png
