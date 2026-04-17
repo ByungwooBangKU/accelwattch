@@ -93,7 +93,53 @@ util_75         75      539.0      518.6     61.6    476
 util_100       100      718.7      706.6     92.3    477
 ```
 
-![example](reports/util_cupy_rtx_3090_20260417_141108.png)
+![example](reports/util_cupy_rtx_3090_20260417_182915.png)
+
+### 실효 BW 해석 (중요)
+
+스크립트 시작 시 **GPU 진단 + 이론 피크 대비 효율** 을 자동 출력한다:
+
+```
+[diag] ECC:          current=True pending=True   (ECC on → HBM 실효 BW ~ 이론치의 88–90%)
+[diag] mem bus:      5120-bit
+[diag] clocks now:   SM 1410 / max 1410 MHz,  MEM 1593 / max 1593 MHz
+[diag] power:        250 W / cap 300 W,  temp 45 °C,  persistence=1
+[calib] 1.380 ms/pass (best of 3)  ~1779.1 GB/s achieved peak DRAM read
+[peak]  published theoretical: 2039 GB/s  → achieved / theoretical = 87.2%
+[peak]  참고: HBM2e + ECC on 에서 85–90% 가 정상 범위 (A100/H100)
+```
+
+**이론치 대비 실효치 기대 범위 (정상 범위)**
+
+| GPU | 이론 peak | 실측 peak (streaming) | 비고 |
+|---|---|---|---|
+| RTX 3090 (GDDR6X, no ECC) | 936 GB/s | 880–900 GB/s (93–96%) | 소비자용 |
+| A100 80GB (HBM2e, ECC on) | 2039 GB/s | 1700–1800 GB/s (83–88%) | ECC overhead ~10–12% |
+| A100 40GB (HBM2, ECC on)  | 1555 GB/s | 1350–1450 GB/s (87–93%) | |
+| H100 SXM (HBM3, ECC on)   | 3350 GB/s | 2700–3000 GB/s (80–90%) | |
+
+**스크립트의 각 phase 는 "achieved peak" 기준으로 계단을 만듦**:
+- `util_100` ≈ 측정된 최대값 (이론치 아님)
+- `util_25` = achieved peak × 0.25
+- 이론치와 차이는 "scale up 가능한 여분" 이 아니라 **이 GPU 로 도달 불가능한 marketing headroom**
+
+**실효치가 위 표보다 낮을 때 체크 포인트**:
+
+1. **ECC 상태**: `nvidia-smi -q -d ECC` → `Current: Enabled` 면 ~10% 손실 (정상).
+   비활성화: `sudo nvidia-smi -e 0` 후 재부팅 (프로덕션 비권장, 메모리 용량도 감소)
+2. **클럭 throttling**: `nvidia-smi --query-gpu=clocks.mem,clocks.sm --format=csv` 가
+   max 보다 낮으면 열/파워 제한. `nvidia-smi --query-gpu=clocks_throttle_reasons.active --format=csv`
+   로 원인 확인
+3. **파워 리밋**: `power.draw` ≈ `power.limit` 이면 파워 캡 걸린 상태.
+   `sudo nvidia-smi -pl <watts>` 로 상향
+4. **Persistence mode**: `sudo nvidia-smi -pm 1` — 드라이버 언로드/재초기화로 인한 레이턴시 제거
+5. **다른 프로세스**: `nvidia-smi` 로 GPU 점유 중인 백그라운드 확인
+6. **TDR (WSL2)**: CuPy 버전은 duty cycle 로 장기 커널 타임아웃 우회 (100% phase 도 짧게 쪼갬)
+
+**왜 "이론치" 가 marketing 숫자인가**: 공식 `2 × memoryClockRate × busWidth ÷ 8` 은
+GDDR 류에 맞지만 HBM 은 per-pin 데이터율이 `memoryClockRate` 와 다름. NVIDIA 자체
+`bandwidthTest`, BabelStream 도 A100 에서 1500–1800 GB/s 수준으로 보고 (= **memory-bound
+kernel 의 물리적 상한**).
 
 ### 주요 옵션
 
