@@ -1,11 +1,19 @@
 # DRAM Read Utilization 실험
 
 GPU DRAM **read utilization** 을 **25% → 50% → 75% → 100%** 로 각각 10초씩
-계단 형태로 강제 구동하고, Nsight Systems 타임라인에서 검증하기 위한
-자동화 도구 모음.
+계단 형태로 강제 구동하고, 타임라인에서 검증하기 위한 자동화 도구 모음.
 
 AccelWattch GPU 전력 모델 검증(특히 DRAM 전력 항) 에서 **원하는 BW utilization
 수준을 제어한 microbenchmark** 가 필요해서 만들었음.
+
+## 두 가지 구현 방식
+
+| 구현 | 요구사항 | 검증 방법 | 특징 |
+|---|---|---|---|
+| **CuPy (Python)** | `pip` 만 (nvcc / CUDA toolkit 불필요) | `pynvml` 폴링 → CSV + PNG | 빠르게 재현, 그래프 자동 생성 |
+| **Native CUDA (C++)** | `nvcc` + `nsys` | Nsight Systems 타임라인 | 세밀한 프로파일, GPU Metrics 샘플링 |
+
+RTX 3090 (WSL2) 에서 CuPy 버전으로 바로 검증 완료 — `reports/` 하위 PNG 참조.
 
 ## 원리
 
@@ -13,59 +21,90 @@ AccelWattch GPU 전력 모델 검증(특히 DRAM 전력 항) 에서 **원하는 
   피크 DRAM read BW 포화.
 - **Host-side duty cycling**: 20 ms 윈도우 안에서 `target%` 만큼만 커널을
   실행하고 나머지는 `sleep` → 10 s 평균으로 DRAM read utilization 이
-  25/50/75/100% 로 수렴. 창이 작아서 Nsight Systems 의 throughput 샘플 그래프
-  도 평탄하게 보임.
-- **100% phase**: 단일 커널 런치로 10 초짜리 포화 구동 (큐가 비지 않음).
+  25/50/75/100% 로 수렴.
 - **NVTX range**: 각 phase 를 `util_25 / util_50 / util_75 / util_100` 로 라벨,
-  경계는 0.5 s `gap` range 로 분리 → nsys 타임라인에서 눈으로 바로 구분 가능.
+  경계는 0.5 s `gap` range 로 분리.
+- **CuPy 버전**은 100% phase 도 동일 duty cycle 로 처리 (WSL2 WDDM TDR 방지).
+  Native 버전은 100% 를 단일 커널 런치로 구동.
 
 ## 파일
 
 | 파일 | 설명 |
 |---|---|
-| `dram_util.cu` | 스트리밍 read 커널 + 호스트 duty cycling 드라이버 |
+| `dram_util_cupy.py` | **CuPy 버전** — NVRTC 로 커널 JIT + pynvml 폴링 + 자동 플롯 |
+| `run_cupy.sh` | CuPy 버전 launcher (`cupy/nvtx/pynvml` 있는 python 자동 탐지) |
+| `dram_util.cu` | Native CUDA 스트리밍 read 커널 + 호스트 duty cycling |
 | `Makefile` | `SM` 변수로 arch 지정 (기본 `sm_86` = RTX 3090) |
-| `run_nsys.sh` | 빌드 + `nsys profile` (GPU metrics 샘플링 포함) + sqlite export + 분석 |
+| `run_nsys.sh` | 빌드 + `nsys profile` (GPU metrics 샘플링) + sqlite + 분석 |
 | `run_nsys_a100.sh` | A100 80GB 프리셋 (`SM=80`, 버퍼 8 GiB) → `run_nsys.sh` 로 exec |
 | `analyze.py` | nsys sqlite 에서 phase 별 DRAM read 지표 평균/표준편차 계산 |
 
-## 요구사항
+## A. CuPy 버전 (권장, 빠른 재현)
+
+### 설치 (이미 python 환경에 CuPy 가 있다면 `nvtx` 만 추가)
+
+```bash
+pip install cupy-cuda12x nvidia-cuda-nvrtc-cu12 pynvml nvtx matplotlib
+```
+
+- `cupy-cuda12x` : CUDA 12.x 런타임 (드라이버만 있으면 동작, nvcc 불필요)
+- `nvidia-cuda-nvrtc-cu12` : libnvrtc (JIT 컴파일러). CuPy wheel 이 항상 포함하는 건 아님
+- `pynvml` : memory-controller utilization 폴링
+- `nvtx` : phase 라벨 (nsys 있을 때 타임라인에 표시)
+
+### 실행
+
+```bash
+cd util/dram_util_experiment
+./run_cupy.sh
+# 또는 직접
+python3 dram_util_cupy.py --targets 25 50 75 100 --phase-seconds 10
+```
+
+### 출력
+
+- `reports/util_cupy_<timestamp>.csv` — (t_s, mem_util_pct, gpu_util_pct, phase)
+- `reports/util_cupy_<timestamp>.png` — 시계열 플롯 (4 단 계단)
+- 콘솔에 phase 별 평균/표준편차 요약
+
+예시 (RTX 3090):
+```
+phase       target%     mean      std      n
+------------------------------------------------
+util_25          25    30.49     6.11    476
+util_50          50    51.55     9.33    476
+util_75          75    79.45     9.86    476
+util_100        100    98.12    13.56    480
+```
+
+### 주요 옵션
+
+- `--buf-bytes N` — 버퍼 크기 (기본 `max(1 GiB, 64 * L2)`)
+- `--phase-seconds` — phase 당 길이 (기본 10)
+- `--window-ms` — duty cycle 창 크기 (기본 20)
+- `--targets 10 30 60 90` — 커스텀 계단
+- `--poll-hz` — pynvml 폴링 주파수 (기본 50)
+
+## B. Native CUDA + nsys (세밀한 프로파일링)
+
+### 요구사항
 
 - CUDA Toolkit 12.x 이상 (`nvcc`)
-- Nsight Systems 2024.x 이상 (`nsys`) — GPU metrics sampling 위해 최신 권장
-- NVIDIA 드라이버
-- `--gpu-metrics-device` 사용 시 관리자 프로파일링 권한:
+- Nsight Systems 2024.x 이상 (`nsys`)
+- `--gpu-metrics-device` 사용 시:
   ```
   # /etc/modprobe.d/nvidia.conf
   options nvidia NVreg_RestrictProfilingToAdminUsers=0
   ```
-  변경 후 재부팅.
 
-## 사용
-
-### RTX 3090 (기본)
+### 실행
 
 ```bash
-cd util/dram_util_experiment
-./run_nsys.sh
-```
+./run_nsys.sh            # RTX 3090 기본 (sm_86, 1 GiB)
+./run_nsys_a100.sh       # A100 80GB (sm_80, 8 GiB)
 
-### A100 80GB
-
-```bash
-./run_nsys_a100.sh
-```
-
-### 옵션
-
-- `--no-build` — 바이너리 재사용 (재컴파일 생략)
-- `--no-analyze` — sqlite export/분석 스킵
-
-### 수동 실행
-
-```bash
-make SM=86                          # 또는 SM=80 (A100), SM=90 (H100)
-DRAM_BUF_BYTES=$((2*1024**3)) \
+# 수동
+make SM=86
 nsys profile -o report \
   --trace=cuda,nvtx --sample=none \
   --gpu-metrics-device=0 --gpu-metrics-frequency=10000 \
@@ -105,18 +144,26 @@ util_100   DRAM Read Throughput                    100    99.2     0.8      1024
 
 - **WSL2**: `--gpu-metrics-device` 샘플링이 드라이버/nsys 버전에 따라 제한될 수
   있음. 실패 시 해당 플래그를 빼고 NVTX + 커널 타임라인만으로 점유율을 확인
-  (kernel active time / phase time ≈ target util).
+  (kernel active time / phase time ≈ target util). CuPy 버전은 pynvml 로
+  대체 검증 가능.
+- **pynvml memory utilization**: "memory controller 가 busy 였던 시간 비율".
+  NVML 내부 샘플 주기 (수백 ms) 때문에 분산이 있어 25% target 이 ~30% 로
+  약간 높게 측정될 수 있음. 계단 구분은 뚜렷함.
 - **L2 cache bypass**: 커널은 `__ldcg` 를 쓰고 버퍼 크기는 `max(1 GiB, 64 × L2)`
   로 자동 결정되어 read 가 전부 DRAM 까지 내려가도록 함.
 - **Read-only**: 저장(`sink`) 은 dead store (센티넬 조건부) 이므로 DRAM write
   utilization 은 0 에 수렴. Read 를 측정하고 싶을 때만 쓸 것.
 - **피크 BW 기준**: 각 GPU 이론 피크 대비 utilization 이므로, 실제 측정된 peak
   GB/s 는 calibration 로그의 `[calib] ... GB/s peak DRAM read` 값을 참고.
+- **CuPy + libnvrtc**: `cupy-cuda12x` wheel 이 libnvrtc 를 항상 포함하지는
+  않음. 로드 실패 시 `nvidia-cuda-nvrtc-cu12` 를 별도 설치. 스크립트는
+  `.local/.../nvidia/cuda_nvrtc/lib/libnvrtc.so.12` 를 자동 preload.
 
 ## 확장
 
 - **write utilization 실험**: 커널을 `sink[i] = v` 형태로 바꾸면 DRAM write 버전.
-- **다른 계단 (예: 10/30/60/90)**: `dram_util.cu` 의 `targets[]` 수정.
-- **phase 길이 변경**: `phase_ms` (기본 10000.0) 수정.
-- **duty 윈도우 변경**: `window_ms` (기본 20.0) — 더 작게 하면 그래프가 더
-  평탄해지지만 런치 오버헤드 비중이 커짐.
+- **다른 계단 (예: 10/30/60/90)**: CuPy 는 `--targets 10 30 60 90`,
+  Native 는 `dram_util.cu` 의 `targets[]` 수정.
+- **phase 길이 변경**: CuPy 는 `--phase-seconds`, Native 는 `phase_ms`.
+- **duty 윈도우 변경**: CuPy 는 `--window-ms`, Native 는 `window_ms`
+  (기본 20.0). 더 작게 하면 그래프가 더 평탄해지지만 런치 오버헤드 비중이 커짐.
