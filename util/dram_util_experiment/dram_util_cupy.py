@@ -277,23 +277,30 @@ def main() -> None:
         ms = cp.cuda.get_elapsed_time(start, end) / CAL
         best_ms_per_pass = min(best_ms_per_pass, ms)
     ms_per_pass = best_ms_per_pass
-    peak_gbps = args.buf_bytes / (ms_per_pass * 1e-3) / 1e9
+    # `bytes / time` where `bytes` counts only user data — not ECC syndromes
+    # that share the HBM/GDDR bus. This is the "effective" (user-data) DRAM BW.
+    effective_bw_gbps = args.buf_bytes / (ms_per_pass * 1e-3) / 1e9
+    peak_gbps = effective_bw_gbps  # alias kept for downstream scaling
     print(f"[calib] {ms_per_pass:.3f} ms/pass (best of 3)  "
-          f"~{peak_gbps:.1f} GB/s achieved peak DRAM read")
+          f"~{effective_bw_gbps:.1f} GB/s effective (user-data) DRAM read BW")
 
-    # Compare against the published theoretical peak, if we know this GPU.
-    _k, known_peak = lookup_known_peak(gpu_slug)
-    if known_peak is not None:
-        eff = peak_gbps / known_peak * 100.0
-        print(f"[peak]  published theoretical: {known_peak:.0f} GB/s  "
-              f"→ achieved / theoretical = {eff:.1f}%")
-        if eff < 80.0:
-            print("[peak]  !! 실효 < 80%: ECC, clock throttling, 드라이버 TDR, "
-                  "백그라운드 프로세스 확인")
-        elif eff < 90.0:
-            print("[peak]  참고: HBM2e + ECC on 에서 85–90% 가 정상 범위 (A100/H100)")
+    # Compare against the datasheet raw-bus peak, if we know this GPU.
+    _k, raw_peak_gbps = lookup_known_peak(gpu_slug)
+    if raw_peak_gbps is not None:
+        eff_ratio = effective_bw_gbps / raw_peak_gbps * 100.0
+        print(f"[peak]  datasheet raw-bus peak  : {raw_peak_gbps:.0f} GB/s  "
+              f"(physical clk×width, includes ECC overhead & controller)")
+        print(f"[peak]  effective / raw          : {eff_ratio:.1f}%")
+        print("        (GDDR: ~93–96% / HBM+ECC on: ~83–90%  →  이것이 이 GPU 의 "
+              "프로그램 실효 상한)")
+        if eff_ratio < 80.0 and not (diag.get("ecc_on") is True and "HBM" in gpu_name):
+            print("[peak]  !! 80% 미만: clock throttling / power cap / TDR / "
+                  "background 프로세스 확인")
+        elif eff_ratio < 90.0 and diag.get("ecc_on"):
+            print("[peak]  ECC on → system-level ECC syndromes 가 bus BW 의 "
+                  "~10–12% 점유 (on-die ECC 는 별개, bus 에 투명)")
     else:
-        print(f"[peak]  (slug '{gpu_slug}' 의 published peak unknown — "
+        print(f"[peak]  (slug '{gpu_slug}' 의 datasheet peak unknown — "
               f"원하면 KNOWN_PEAK_GBPS 에 추가)")
 
     # ---- pynvml poller ----
@@ -353,12 +360,13 @@ def main() -> None:
 
     # ---- summary (GB/s) ----
     print()
-    if known_peak is not None:
-        print(f"peak DRAM read BW: achieved {peak_gbps:.1f} GB/s "
-              f"/ theoretical {known_peak:.0f} GB/s "
-              f"= {peak_gbps/known_peak*100:.1f}%")
+    if raw_peak_gbps is not None:
+        print(f"DRAM read BW: effective (user-data) {effective_bw_gbps:.1f} GB/s "
+              f"vs raw-bus {raw_peak_gbps:.0f} GB/s "
+              f"= {effective_bw_gbps/raw_peak_gbps*100:.1f}%")
     else:
-        print(f"peak DRAM read BW (calibrated) = {peak_gbps:.1f} GB/s")
+        print(f"effective DRAM read BW = {effective_bw_gbps:.1f} GB/s  "
+              f"(calibrated, user-data only)")
     print()
     hdr = f"{'phase':<10} {'target':>7} {'expected':>10} {'measured':>10} {'std':>8} {'n':>6}"
     print(hdr)
@@ -385,22 +393,24 @@ def main() -> None:
         bw = [to_gbps(r[1]) for r in poller.rows]
         t_max = max(t) if t else 1.0
 
-        # Y-axis ceiling = larger of achieved and (known) theoretical peak
-        y_top = max(peak_gbps, known_peak or 0) * 1.15
-        y_norm = known_peak if known_peak else peak_gbps
+        # Y-axis ceiling: larger of effective and raw-bus peak.
+        y_top  = max(effective_bw_gbps, raw_peak_gbps or 0) * 1.15
+        y_norm = raw_peak_gbps if raw_peak_gbps else effective_bw_gbps
 
         fig, ax = plt.subplots(figsize=(10, 4.5))
         ax.plot(t, bw, lw=0.8, color="#1f77b4",
-                label=f"measured (pynvml mem util × {peak_gbps:.0f} GB/s achieved)")
+                label=(f"measured effective BW "
+                       f"(pynvml mem util × {effective_bw_gbps:.0f} GB/s)"))
 
-        # Theoretical peak reference (if known) + achieved peak reference.
-        if known_peak is not None:
-            ax.axhline(known_peak, color="green", ls="-", lw=1.0, alpha=0.6,
-                       label=f"theoretical peak {known_peak:.0f} GB/s")
-        ax.axhline(peak_gbps, color="orange", ls="-", lw=1.0, alpha=0.6,
-                   label=f"achieved peak {peak_gbps:.0f} GB/s")
+        # Reference horizontals: raw bus (datasheet) + effective ceiling.
+        if raw_peak_gbps is not None:
+            ax.axhline(raw_peak_gbps, color="green", ls="-", lw=1.0, alpha=0.6,
+                       label=(f"raw-bus peak {raw_peak_gbps:.0f} GB/s "
+                              f"(datasheet, inc. ECC syndromes)"))
+        ax.axhline(effective_bw_gbps, color="orange", ls="-", lw=1.0, alpha=0.6,
+                   label=f"effective peak {effective_bw_gbps:.0f} GB/s (user-data)")
 
-        # target reference lines + phase shading
+        # Target reference lines (scaled against effective peak).
         phase_ranges: dict[str, tuple[float, float]] = {}
         for r in poller.rows:
             ph = r[3]
@@ -409,27 +419,27 @@ def main() -> None:
                 phase_ranges[ph] = (min(lo, r[0]), max(hi, r[0]))
         for ph, (lo, hi) in phase_ranges.items():
             tgt_pct  = int(ph.split("_")[1])
-            tgt_gbps = peak_gbps * tgt_pct / 100.0
+            tgt_gbps = effective_bw_gbps * tgt_pct / 100.0
             ax.hlines(tgt_gbps, lo, hi, color="red", ls="--", lw=1.2)
             ax.text((lo + hi) / 2, tgt_gbps + y_top * 0.02,
                     f"{ph} → {tgt_gbps:.0f} GB/s",
                     ha="center", fontsize=9, color="red")
 
         ax.set_xlabel("time (s)")
-        ax.set_ylabel("DRAM read bandwidth (GB/s)")
+        ax.set_ylabel("effective DRAM read BW (GB/s, user-data)")
         ax.set_ylim(-y_top * 0.05, y_top)
-        title_extra = ""
-        if known_peak:
-            title_extra = (f"  (achieved {peak_gbps:.0f} / theoretical "
-                           f"{known_peak:.0f} = {peak_gbps/known_peak*100:.0f}%)")
+        if raw_peak_gbps:
+            title_extra = (f"  (effective {effective_bw_gbps:.0f} / raw-bus "
+                           f"{raw_peak_gbps:.0f} = "
+                           f"{effective_bw_gbps/raw_peak_gbps*100:.0f}%)")
         else:
-            title_extra = f"  (peak {peak_gbps:.0f} GB/s)"
+            title_extra = f"  (effective {effective_bw_gbps:.0f} GB/s)"
         ax.set_title(f"DRAM read bandwidth — {gpu_name}{title_extra}")
-        # Right-side secondary axis in % of *theoretical* (or achieved, fallback).
+        # Right-side secondary axis in % of raw-bus peak (or effective fallback).
         ax2 = ax.twinx()
         ax2.set_ylim(ax.get_ylim()[0] / y_norm * 100.0,
                      ax.get_ylim()[1] / y_norm * 100.0)
-        ax2.set_ylabel(f"% of {('theoretical' if known_peak else 'achieved')} peak")
+        ax2.set_ylabel(f"% of {'raw-bus' if raw_peak_gbps else 'effective'} peak")
         ax.legend(loc="upper left")
         ax.grid(True, alpha=0.3)
         png = out_dir / f"util_cupy_{gpu_slug}_{stamp}{suffix}.png"
