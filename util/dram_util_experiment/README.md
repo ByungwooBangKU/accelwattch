@@ -93,53 +93,72 @@ util_75         75      539.0      518.6     61.6    476
 util_100       100      718.7      706.6     92.3    477
 ```
 
-![example](reports/util_cupy_rtx_3090_20260417_182915.png)
+![example](reports/util_cupy_rtx_3090_20260417_183743.png)
 
-### 실효 BW 해석 (중요)
+### "DRAM bandwidth" 용어 정리 (중요)
 
-스크립트 시작 시 **GPU 진단 + 이론 피크 대비 효율** 을 자동 출력한다:
+두 수치를 혼동하면 A100 의 1779 GB/s 가 "2039 기대치보다 낮다" 는 잘못된 해석이 됨.
 
+| 용어 | 의미 | 값 (A100 80GB) |
+|---|---|---|
+| **Raw-bus peak** (datasheet, "theoretical") | `2 × memoryClockRate × busWidth ÷ 8` — **HBM 물리 바스 전체 대역** (사용자 데이터 + ECC syndrome + 컨트롤러 헤더 모두 포함) | 2039 GB/s |
+| **Effective (user-data) peak** | 프로그램이 load/store 로 실제 얻을 수 있는 상한 — ECC syndrome · refresh · controller overhead 제외 | ~1779 GB/s |
+
+스크립트가 측정하는 것은 **effective BW** (buffer bytes / kernel time). A100 에서
+1779 ≠ 2039 인 이유는 **측정 오류가 아니라 정의 차이**.
+
+**효율 손실 분해 (A100 HBM2e, ECC on 기준)**
+
+| 출처 | 사용자 BW 영향 | 설명 |
+|---|---|---|
+| **On-die ECC (ODECC)** | **0%** | HBM 다이 내부 correction. 바스 밖에서 투명 |
+| **System-level ECC (in-band syndromes)** | **~10–12%** | syndrome 8B 가 사용자 데이터 64B 와 함께 HBM 바스를 점유 (64/72 ≈ 88.9%) |
+| Refresh / tRRD·tFAW / controller | ~3–5% | ECC off 상태에서도 남는 손실 |
+| **합계** | **~13–17%** → 실효 83–87% | |
+
+→ A100 의 87% 달성은 **ODECC 때문이 아님**. 사용자 데이터 바스를 공유하는
+**system-level ECC + 타이밍 오버헤드** 조합. HBM 다이 자체는 2039 GB/s raw 를
+낼 수 있지만, 그 중 ~12% 가 syndrome 전송에 쓰임.
+
+**GPU 별 기대 범위 (effective vs raw)**
+
+| GPU | Raw-bus peak | Effective peak (streaming) | 효율 | 비고 |
+|---|---|---|---|---|
+| RTX 3090 (GDDR6X) | 936 GB/s | 880–900 GB/s | 93–96% | consumer, no ECC |
+| A100 40GB (HBM2, ECC on)  | 1555 GB/s | 1350–1450 GB/s | 87–93% | |
+| A100 80GB (HBM2e, ECC on) | 2039 GB/s | 1700–1800 GB/s | 83–88% | |
+| H100 SXM (HBM3, ECC on)   | 3350 GB/s | 2700–3000 GB/s | 80–90% | |
+
+**각 phase 의 target 은 effective peak 기준**:
+- `util_100` → measured effective peak (raw 가 아님)
+- `util_25` → effective peak × 0.25
+- raw 와의 차이는 "scale up 가능한 여분" 이 아니라 **이 GPU 의 프로그램으로
+  도달 불가능한 영역** (ECC/controller 가 점유)
+
+**진단 출력 예시**:
 ```
 [diag] ECC:          current=True pending=True   (ECC on → HBM 실효 BW ~ 이론치의 88–90%)
 [diag] mem bus:      5120-bit
 [diag] clocks now:   SM 1410 / max 1410 MHz,  MEM 1593 / max 1593 MHz
-[diag] power:        250 W / cap 300 W,  temp 45 °C,  persistence=1
-[calib] 1.380 ms/pass (best of 3)  ~1779.1 GB/s achieved peak DRAM read
-[peak]  published theoretical: 2039 GB/s  → achieved / theoretical = 87.2%
-[peak]  참고: HBM2e + ECC on 에서 85–90% 가 정상 범위 (A100/H100)
+[calib] 1.380 ms/pass (best of 3)  ~1779.1 GB/s effective (user-data) DRAM read BW
+[peak]  datasheet raw-bus peak  : 2039 GB/s  (physical clk×width, includes ECC overhead & controller)
+[peak]  effective / raw          : 87.2%
+        (GDDR: ~93–96% / HBM+ECC on: ~83–90%  →  이것이 이 GPU 의 프로그램 실효 상한)
+[peak]  ECC on → system-level ECC syndromes 가 bus BW 의 ~10–12% 점유
+        (on-die ECC 는 별개, bus 에 투명)
 ```
 
-**이론치 대비 실효치 기대 범위 (정상 범위)**
+**효율이 기대 범위보다 낮을 때 체크 포인트**:
 
-| GPU | 이론 peak | 실측 peak (streaming) | 비고 |
-|---|---|---|---|
-| RTX 3090 (GDDR6X, no ECC) | 936 GB/s | 880–900 GB/s (93–96%) | 소비자용 |
-| A100 80GB (HBM2e, ECC on) | 2039 GB/s | 1700–1800 GB/s (83–88%) | ECC overhead ~10–12% |
-| A100 40GB (HBM2, ECC on)  | 1555 GB/s | 1350–1450 GB/s (87–93%) | |
-| H100 SXM (HBM3, ECC on)   | 3350 GB/s | 2700–3000 GB/s (80–90%) | |
-
-**스크립트의 각 phase 는 "achieved peak" 기준으로 계단을 만듦**:
-- `util_100` ≈ 측정된 최대값 (이론치 아님)
-- `util_25` = achieved peak × 0.25
-- 이론치와 차이는 "scale up 가능한 여분" 이 아니라 **이 GPU 로 도달 불가능한 marketing headroom**
-
-**실효치가 위 표보다 낮을 때 체크 포인트**:
-
-1. **ECC 상태**: `nvidia-smi -q -d ECC` → `Current: Enabled` 면 ~10% 손실 (정상).
-   비활성화: `sudo nvidia-smi -e 0` 후 재부팅 (프로덕션 비권장, 메모리 용량도 감소)
+1. **ECC 상태**: `nvidia-smi -q -d ECC` → `Current: Enabled` 면 ~10% 손실 (정상, 데이터센터 GPU 필수).
+   비활성화: `sudo nvidia-smi -e 0` 후 재부팅 (프로덕션 비권장, 메모리 용량도 ~6% 감소)
 2. **클럭 throttling**: `nvidia-smi --query-gpu=clocks.mem,clocks.sm --format=csv` 가
-   max 보다 낮으면 열/파워 제한. `nvidia-smi --query-gpu=clocks_throttle_reasons.active --format=csv`
-   로 원인 확인
+   max 보다 낮으면 열/파워 제한. 스크립트가 pynvml 의 `throttle_reasons` 도 같이 표시
 3. **파워 리밋**: `power.draw` ≈ `power.limit` 이면 파워 캡 걸린 상태.
-   `sudo nvidia-smi -pl <watts>` 로 상향
-4. **Persistence mode**: `sudo nvidia-smi -pm 1` — 드라이버 언로드/재초기화로 인한 레이턴시 제거
+   `sudo nvidia-smi -pl <watts>` 로 상향 가능
+4. **Persistence mode**: `sudo nvidia-smi -pm 1` — 드라이버 언로드/재초기화 레이턴시 제거
 5. **다른 프로세스**: `nvidia-smi` 로 GPU 점유 중인 백그라운드 확인
 6. **TDR (WSL2)**: CuPy 버전은 duty cycle 로 장기 커널 타임아웃 우회 (100% phase 도 짧게 쪼갬)
-
-**왜 "이론치" 가 marketing 숫자인가**: 공식 `2 × memoryClockRate × busWidth ÷ 8` 은
-GDDR 류에 맞지만 HBM 은 per-pin 데이터율이 `memoryClockRate` 와 다름. NVIDIA 자체
-`bandwidthTest`, BabelStream 도 A100 에서 1500–1800 GB/s 수준으로 보고 (= **memory-bound
-kernel 의 물리적 상한**).
 
 ### 주요 옵션
 
