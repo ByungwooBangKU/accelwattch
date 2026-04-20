@@ -101,14 +101,30 @@ def _check_cuda_and_fp8(r: PreflightResult) -> None:
     r.info["tensor_core_support"] = ", ".join(f"{k}={v}" for k, v in tc.items())
 
     # Transformer Engine — required for the fp8_te matmul variant.
+    # The bare `transformer-engine` PyPI package is a META package that
+    # errors at runtime; the real install needs `[pytorch]` extra AND
+    # `--no-build-isolation`.  Detect both "not installed" and "meta
+    # package stub" cases and surface the exact install command.
+    te_status = "NOT installed"
     try:
         import transformer_engine  # noqa: F401
-        r.info["transformer_engine"] = getattr(transformer_engine, "__version__", "installed")
+        try:
+            import transformer_engine.pytorch  # noqa: F401
+            te_status = getattr(transformer_engine, "__version__", "installed")
+        except Exception as e:
+            te_status = f"META-PACKAGE ONLY (broken): {e.__class__.__name__}"
     except ImportError:
-        r.info["transformer_engine"] = "NOT installed"
+        pass
+    r.info["transformer_engine"] = te_status
+    if te_status != "installed" and not te_status.replace(".", "").isdigit() \
+            and not te_status[0:1].isdigit():
+        hint = ("./install_transformer_engine.sh   "
+                "# or: pip install --no-build-isolation 'transformer-engine[pytorch]'")
         if cc[0] >= 9:
-            r.warn("H100 detected but transformer_engine missing — "
-                   "fp8_te variant will be skipped. `pip install transformer_engine`")
+            r.warn(f"H100 detected but TE missing/broken — fp8_te variant will be skipped. Fix: {hint}")
+        else:
+            r.warn(f"TE missing/broken — matmul_fp8_te will be skipped (would fall back to FP16 TC anyway). "
+                   f"To run the fallback for cross-GPU comparison: {hint}")
 
 
 def _check_pynvml(r: PreflightResult) -> None:

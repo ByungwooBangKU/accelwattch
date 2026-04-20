@@ -77,10 +77,41 @@ linearity (E_dyn ∝ N) 가 성립해야 (R² ≥ 0.99) 이 모델 폼이 유효
 pip install -r requirements.txt
 # torch 는 CUDA 런타임 맞춰서
 pip install torch --index-url https://download.pytorch.org/whl/cu121
-# H100 에서 native FP8 matmul 을 돌리려면
-pip install transformer_engine
+# matmul_fp8_te variant 를 돌리려면 (A100/H100 모두):
+./install_transformer_engine.sh
 python3 preflight.py
 ```
+
+### Transformer Engine 설치 주의사항
+
+`pip install transformer_engine` 만 치면 다음 에러가 뜹니다:
+
+```
+RuntimeError: Found empty `transformer-engine` meta package installed.
+Install `transformer-engine` with framework extensions via
+'pip3 install --no-build-isolation transformer-engine[pytorch,jax]==VERSION'
+```
+
+이유: PyPI 의 `transformer-engine` 단독은 **meta-package** (shim) 이고 실제 기능은 `[pytorch]` / `[jax]` extra 에 들어있습니다. 올바른 설치:
+
+```bash
+# 제공된 스크립트 사용 (권장) — nvcc / torch 사전점검 + 설치 + 검증
+./install_transformer_engine.sh
+# 버전 고정:  TE_VERSION=1.11.0 ./install_transformer_engine.sh
+# 수동 설치도 가능 :
+pip install --no-build-isolation 'transformer-engine[pytorch]'
+```
+
+**반드시 `--no-build-isolation`** : TE 는 설치 시 CUDA 커널을 JIT 컴파일하므로 현재 환경의 `torch` 헤더와 `nvcc` 를 봐야 합니다. 기본 build-isolation 은 격리된 temp venv 에서 빌드해 torch/nvcc 를 못 찾고 실패합니다.
+
+빌드 prerequisites:
+- CUDA toolkit (`nvcc` on PATH) — `torch` 런타임만 있으면 부족. `apt install cuda-toolkit-12-1` 또는 `conda install -c nvidia cuda-toolkit=12.1`
+- `cudnn-dev` (ubuntu) / `cudnn`
+- 빌드에 5–10분, 수 GB RAM 소모
+
+**A100 에서도 TE 를 설치하는 것이 의미 있나?** 네. A100 (sm_80) 에는 native FP8 tensor core 가 없어 TE 의 `fp8_autocast` 는 내부적으로 **FP16 Tensor Core 로 fallback** 합니다 (`notes` 컬럼에 "TE fallback" 이 찍힘). A100 의 `matmul_fp8_te` slope 가 `matmul_fp16_tc` 와 거의 동일하게 측정되는 것 자체가 **"FP8 이득은 Hopper 실리콘 의존"** 임을 증명하는 데이터 — cross-GPU 비교에서 빠져선 안 됩니다.
+
+TE 빌드가 정말 번거로운 경우에는 A100 에서 `--matmul-variants fp32:simt tf32:tc fp16:tc bf16:tc` 로 fp8_te 를 제외해도 됩니다. `compare_gpus.py` 는 한 쪽에만 있는 variant 를 자동으로 "—" 로 표시합니다.
 
 `preflight.py` 확인 항목:
 - `nvidia-smi` / `pynvml` 동작
