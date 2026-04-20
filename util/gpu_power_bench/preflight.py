@@ -85,10 +85,30 @@ def _check_cuda_and_fp8(r: PreflightResult) -> None:
     # Native FP8 tensor cores: Hopper (sm_90) + Ada (sm_89 partial). A100 is sm_80 → FP8 emulated.
     r.info["fp8_native"] = cc[0] >= 9
     if cc == (8, 0):
-        r.warn("A100 (sm_80) detected: FP8 will be EMULATED (no native tensor-core FP8); "
-               "results still valid for measuring FP8 conversion cost, but not peak FP8 throughput")
+        r.warn("A100 (sm_80) detected: FP8 elementwise EMULATED (no native tensor-core FP8); "
+               "matmul_fp8_te variant will fall back to FP16 TC (auto-tagged in notes)")
     elif cc[0] < 8:
         r.warn(f"compute capability {cc[0]}.{cc[1]} is older than A100 — FP16 tensor cores may be slow or absent")
+
+    # Tensor Core support matrix — informational, useful in the report.
+    tc = {
+        "fp16_tc":  cc[0] >= 7,                 # Volta+
+        "bf16_tc":  cc[0] >= 8,                 # Ampere+
+        "tf32_tc":  cc[0] >= 8,                 # Ampere+
+        "int8_tc":  cc[0] >= 7 and cc[1] >= 2,  # Turing+
+        "fp8_tc":   cc[0] >= 9,                 # Hopper+
+    }
+    r.info["tensor_core_support"] = ", ".join(f"{k}={v}" for k, v in tc.items())
+
+    # Transformer Engine — required for the fp8_te matmul variant.
+    try:
+        import transformer_engine  # noqa: F401
+        r.info["transformer_engine"] = getattr(transformer_engine, "__version__", "installed")
+    except ImportError:
+        r.info["transformer_engine"] = "NOT installed"
+        if cc[0] >= 9:
+            r.warn("H100 detected but transformer_engine missing — "
+                   "fp8_te variant will be skipped. `pip install transformer_engine`")
 
 
 def _check_pynvml(r: PreflightResult) -> None:

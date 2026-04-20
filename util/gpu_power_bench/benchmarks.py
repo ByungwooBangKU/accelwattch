@@ -217,3 +217,157 @@ DTYPES = ("fp16", "fp8")
 
 def all_specs(n_elements: int, device="cuda") -> list[BenchSpec]:
     return [build(op, dt, n_elements, device=device) for dt in DTYPES for op in OPS]
+
+
+# ============================================================================
+# Matmul variants — "Tensor Core vs CUDA Core" + "native FP8 via Transformer
+# Engine" comparison axis. These add up to 5 variants that sweep over the
+# matrix side length K (M = N = K for a square-square GEMM).
+# ============================================================================
+#
+# What each variant runs:
+#   matmul_fp32_simt : fp32 inputs, TF32 explicitly DISABLED → CUDA cores (SIMT)
+#                      MAD.  This is the Tensor-Core-off baseline.  Same FLOPs
+#                      as TC paths, vastly more joules — that delta is the
+#                      "Tensor Core energy advantage".
+#   matmul_tf32_tc   : fp32 inputs, TF32 enabled → TF32 Tensor Core path.
+#                      Ampere+ (sm_80+) only.  10-bit mantissa, 8-bit exponent.
+#   matmul_fp16_tc   : fp16 inputs → FP16 Tensor Core (wmma).  Both A100 & H100.
+#   matmul_bf16_tc   : bf16 inputs → BF16 Tensor Core.  Same peak as FP16 but
+#                      different numerics (more dynamic range).  Both A100/H100.
+#   matmul_fp8_te    : FP8 (E4M3) via Transformer Engine fp8_autocast on
+#                      te.Linear.  On H100 this hits native FP8 Tensor Cores;
+#                      TE on pre-Hopper falls back to FP16 TC — benchmark is
+#                      auto-skipped or tagged as "fallback" accordingly.
+#
+# Why these are the right variants:
+#   * fp32_simt is the only way to force "no Tensor Core" for a GEMM; PyTorch
+#     dispatches fp16/bf16 matmul to Tensor Core unconditionally on Ampere+.
+#   * tf32 vs fp16 TC on the same GPU measures the energy cost of
+#     mantissa width while keeping the same HW unit.
+#   * fp8 TE is the unique H100 capability we want to price vs A100 FP16 TC.
+#
+# Load axis: matrix side length K (M = N = K).  FLOPs per call = 2·K³.
+# Memory:    3 × K² elements (A, B, out).  K=8192 fp32 ≈ 768 MiB — fits on
+# both A100 40GB and H100.
+# ============================================================================
+
+# (dtype_label, compute_mode) — compute_mode ∈ {"simt", "tc", "te"}
+MATMUL_VARIANTS: tuple[tuple[str, str], ...] = (
+    ("fp32", "simt"),
+    ("tf32", "tc"),
+    ("fp16", "tc"),
+    ("bf16", "tc"),
+    ("fp8",  "te"),
+)
+
+
+_TORCH_DTYPES = {
+    "fp32": torch.float32,
+    "tf32": torch.float32,   # TF32 uses fp32 storage, TC kernel differs by flag
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
+
+def _make_matmul_fp32_simt(M, N, K, device):
+    a = torch.randn(M, K, dtype=torch.float32, device=device)
+    b = torch.randn(K, N, dtype=torch.float32, device=device)
+    def f():
+        # Flag flip is a cheap python bool assignment; re-asserting every call
+        # is defensive against another benchmark's builder having flipped it.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.matmul(a, b)
+    return f
+
+
+def _make_matmul_tf32_tc(M, N, K, device):
+    a = torch.randn(M, K, dtype=torch.float32, device=device)
+    b = torch.randn(K, N, dtype=torch.float32, device=device)
+    def f():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.matmul(a, b)
+    return f
+
+
+def _make_matmul_halfprec_tc(M, N, K, dtype, device):
+    a = torch.randn(M, K, dtype=dtype, device=device)
+    b = torch.randn(K, N, dtype=dtype, device=device)
+    def f():
+        torch.matmul(a, b)
+    return f
+
+
+def _make_matmul_fp8_te(M, N, K, device):
+    """FP8 GEMM via Transformer Engine. Native Tensor Core path on H100 only."""
+    try:
+        import transformer_engine.pytorch as te
+        from transformer_engine.common import recipe as te_recipe
+    except ImportError as e:
+        raise RuntimeError(
+            "transformer_engine is not installed — `pip install transformer_engine` "
+            "(required for the fp8_te variant; only meaningful on H100)"
+        ) from e
+    x = torch.randn(M, K, dtype=torch.float16, device=device)
+    # te.Linear expects (in_features, out_features); we map K → N.
+    # bias=False keeps the kernel pure GEMM for apples-to-apples FLOP counting.
+    linear = te.Linear(K, N, bias=False, params_dtype=torch.float16).to(device)
+    fp8_recipe = te_recipe.DelayedScaling(
+        fp8_format=te_recipe.Format.E4M3,
+        amax_history_len=16,
+        amax_compute_algo="max",
+    )
+    def f():
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            linear(x)
+    return f
+
+
+def build_matmul(K_size: int, dtype_label: str, mode: str,
+                 device: str | torch.device = "cuda") -> BenchSpec:
+    """Build one matmul BenchSpec (M = N = K = K_size)."""
+    M = N = K = K_size
+    cc = torch.cuda.get_device_capability()
+    notes = ""
+
+    if (dtype_label, mode) == ("fp32", "simt"):
+        fn = _make_matmul_fp32_simt(M, N, K, device)
+    elif (dtype_label, mode) == ("tf32", "tc"):
+        if cc[0] < 8:
+            raise RuntimeError(f"TF32 requires Ampere (sm_80) or newer (this GPU is sm_{cc[0]}{cc[1]})")
+        fn = _make_matmul_tf32_tc(M, N, K, device)
+    elif (dtype_label, mode) == ("fp16", "tc"):
+        fn = _make_matmul_halfprec_tc(M, N, K, torch.float16, device)
+    elif (dtype_label, mode) == ("bf16", "tc"):
+        if cc[0] < 8:
+            raise RuntimeError(f"BF16 requires Ampere (sm_80) or newer")
+        fn = _make_matmul_halfprec_tc(M, N, K, torch.bfloat16, device)
+    elif (dtype_label, mode) == ("fp8", "te"):
+        fn = _make_matmul_fp8_te(M, N, K, device)
+        if cc[0] < 9:
+            notes = ("fp8_te on pre-Hopper: TE falls back to FP16 tensor cores, "
+                     "not a native FP8 measurement")
+    else:
+        raise ValueError(f"unknown matmul variant ({dtype_label!r}, {mode!r})")
+
+    flops = 2 * M * N * K
+    n_out = M * N  # output element count (for sanity; primary metric is J/FLOP)
+    name = f"matmul_{dtype_label}_{mode}"
+    return BenchSpec(
+        name=name, op="matmul", dtype_label=dtype_label,
+        shape=(M, N, K), n_elements=n_out,
+        flops_per_call=flops, run=fn, notes=notes,
+    )
+
+
+def matmul_all_specs(K_size: int, device="cuda") -> list[BenchSpec]:
+    """Build every matmul variant at one K.  Variants that error (e.g. fp8_te
+    on a system without transformer_engine) are silently skipped; the caller
+    can note which were built."""
+    out = []
+    for dtype_label, mode in MATMUL_VARIANTS:
+        try:
+            out.append(build_matmul(K_size, dtype_label, mode, device))
+        except Exception:
+            continue
+    return out

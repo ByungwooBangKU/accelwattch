@@ -54,6 +54,10 @@ DEFAULT_LOADS = [
 ]
 QUICK_LOADS = [1 << 20, 1 << 22, 1 << 24]
 
+# Matrix side length K (M = N = K). FLOPs per call = 2·K³, memory = 3·K² elements.
+DEFAULT_MATMUL_SIZES = [512, 1024, 2048, 4096, 8192]
+QUICK_MATMUL_SIZES = [1024, 2048, 4096]
+
 
 def _slugify(name: str) -> str:
     s = re.sub(r"(?i)nvidia|geforce|pcie|sxm\d?|\bhbm\d*\b|\bon\b", "", name)
@@ -163,12 +167,34 @@ def main() -> int:
                     help="suffix for output filenames (separate runs / configs)")
     ap.add_argument("--skip-preflight", action="store_true")
     ap.add_argument("--poll-hz", type=int, default=100)
+    # --- matmul (Tensor Core vs CUDA-core + TE FP8) ---
+    ap.add_argument("--no-matmul", action="store_true",
+                    help="skip the matmul (Tensor Core / SIMT) sweep")
+    ap.add_argument("--matmul-sizes", type=int, nargs="+", default=None,
+                    help="square matrix side lengths (M=N=K); default: 512..8192")
+    ap.add_argument("--matmul-variants", nargs="+", default=None,
+                    help='matmul variants "dtype:mode" (default: all 5). '
+                         'choices: fp32:simt tf32:tc fp16:tc bf16:tc fp8:te')
     args = ap.parse_args()
 
     if args.quick:
         loads = QUICK_LOADS
+        matmul_sizes = QUICK_MATMUL_SIZES
     else:
         loads = args.loads or DEFAULT_LOADS
+        matmul_sizes = args.matmul_sizes or DEFAULT_MATMUL_SIZES
+
+    # Parse matmul variants list.
+    if args.matmul_variants is None:
+        matmul_variants = list(bm.MATMUL_VARIANTS)
+    else:
+        matmul_variants = []
+        for v in args.matmul_variants:
+            parts = v.split(":")
+            if len(parts) != 2:
+                print(f"bad --matmul-variants entry {v!r} (expected dtype:mode)")
+                return 1
+            matmul_variants.append(tuple(parts))
 
     # ---- preflight ---------------------------------------------------------
     if not args.skip_preflight:
@@ -208,93 +234,126 @@ def main() -> int:
     sampler = PowerSampler(handle, hz=args.poll_hz)
     sampler.start()
 
+    # ---- Build a unified list of "plans" — one per (op × dtype × load) ----
+    # Each plan has a `build()` callable that allocates tensors just-in-time
+    # so we never hold more than one cell's tensors at once.
+    plans: list[dict] = []
+    for dtype in args.dtypes:
+        for op in args.ops:
+            for N in loads:
+                plans.append({
+                    "category": "elementwise",
+                    "mode": "elementwise",
+                    "op": op, "dtype": dtype,
+                    "load_name": "n_elements", "load_value": N,
+                    "build": (lambda op=op, dtype=dtype, N=N:
+                              bm.build(op, dtype, N, device="cuda")),
+                })
+    if not args.no_matmul:
+        for dtype_label, mode in matmul_variants:
+            for K in matmul_sizes:
+                plans.append({
+                    "category": "matmul",
+                    "mode": mode,
+                    "op": "matmul", "dtype": dtype_label,
+                    "load_name": "K_size", "load_value": K,
+                    "build": (lambda K=K, d=dtype_label, m=mode:
+                              bm.build_matmul(K, d, m, device="cuda")),
+                })
+    total_cells = len(plans)
+    print(f"[info] scheduling {total_cells} cells "
+          f"(elementwise={sum(1 for p in plans if p['category']=='elementwise')}, "
+          f"matmul={sum(1 for p in plans if p['category']=='matmul')})")
+
     rows: list[dict] = []
-    total_cells = len(args.dtypes) * len(args.ops) * len(loads)
-    cell = 0
     try:
-        for dtype in args.dtypes:
-            for op in args.ops:
-                for N in loads:
-                    cell += 1
-                    print(f"\n[{cell}/{total_cells}] {dtype}_{op}  N={N}")
-                    # FP8 on pre-Hopper: still runs (emulated) but we flag it.
-                    try:
-                        spec = bm.build(op, dtype, N, device="cuda")
-                    except Exception as e:
-                        print(f"  ! build failed: {e}  — skipped")
-                        continue
-                    if spec.notes:
-                        print(f"  note: {spec.notes}")
+        for i, plan in enumerate(plans, 1):
+            label = f"{plan['op']}_{plan['dtype']}_{plan['mode']}"
+            print(f"\n[{i}/{total_cells}] {label}  {plan['load_name']}={plan['load_value']}")
 
-                    if not args.no_cooldown and args.cooldown_c > 0:
-                        wait_for_cooldown(handle, target_c=args.cooldown_c,
-                                          timeout_s=args.cooldown_timeout,
-                                          verbose=False)
+            try:
+                spec = plan["build"]()
+            except Exception as e:
+                print(f"  ! build failed: {e}  — skipped")
+                continue
+            if spec.notes:
+                print(f"  note: {spec.notes}")
 
-                    try:
-                        meas = run_measurement(spec, sampler,
-                                               window_ms=args.window_ms)
-                    except torch.cuda.OutOfMemoryError as e:
-                        print(f"  ! OOM at N={N}: {e}")
-                        del spec
-                        torch.cuda.empty_cache()
-                        continue
-                    except Exception as e:
-                        print(f"  ! run failed: {e}")
-                        del spec
-                        torch.cuda.empty_cache()
-                        continue
+            if not args.no_cooldown and args.cooldown_c > 0:
+                wait_for_cooldown(handle, target_c=args.cooldown_c,
+                                  timeout_s=args.cooldown_timeout,
+                                  verbose=False)
 
-                    # Energy decomposition.
-                    dyn_power = max(0.0, meas["avg_power_w"] - p_static)
-                    static_energy = p_static * meas["wall_s"]
-                    dyn_energy = max(0.0, meas["total_energy_j"] - static_energy)
+            try:
+                meas = run_measurement(spec, sampler, window_ms=args.window_ms)
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"  ! OOM at load={plan['load_value']}: {e}")
+                del spec
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                print(f"  ! run failed: {e}")
+                del spec
+                torch.cuda.empty_cache()
+                continue
 
-                    total_elements = spec.n_elements * meas["iters"]
-                    total_flops = spec.flops_per_call * meas["iters"]
+            # Energy decomposition: we subtract the baseline / static power
+            # (measured idle at program start) from the measured average
+            # power to get the dynamic (workload-attributable) component.
+            dyn_power = max(0.0, meas["avg_power_w"] - p_static)
+            static_energy = p_static * meas["wall_s"]
+            dyn_energy = max(0.0, meas["total_energy_j"] - static_energy)
 
-                    row = {
-                        "gpu": gpu_name,
-                        "compute_cap": f"{cc[0]}.{cc[1]}",
-                        "op": op,
-                        "dtype": dtype,
-                        "n_elements": spec.n_elements,
-                        "shape": "x".join(str(s) for s in spec.shape),
-                        "iters": meas["iters"],
-                        "ms_per_call": f"{meas['ms_per_call']:.4f}",
-                        "wall_s": f"{meas['wall_s']:.4f}",
-                        "flops_per_call": spec.flops_per_call,
-                        "total_flops": total_flops,
-                        "total_elements": total_elements,
-                        "static_power_w": f"{p_static:.3f}",
-                        "avg_power_w":    f"{meas['avg_power_w']:.3f}",
-                        "dyn_power_w":    f"{dyn_power:.3f}",
-                        "total_energy_j":  f"{meas['total_energy_j']:.4f}",
-                        "static_energy_j": f"{static_energy:.4f}",
-                        "dyn_energy_j":    f"{dyn_energy:.4f}",
-                        "j_per_element_total": f"{meas['total_energy_j']/total_elements:.3e}",
-                        "j_per_element_dyn":   f"{dyn_energy/total_elements:.3e}",
-                        "j_per_flop_total":    f"{meas['total_energy_j']/total_flops:.3e}",
-                        "j_per_flop_dyn":      f"{dyn_energy/total_flops:.3e}",
-                        "avg_temp_c":   f"{meas['avg_temp_c']:.1f}",
-                        "peak_temp_c":  meas["peak_temp_c"],
-                        "sm_clk_mhz":   meas["sm_clk_mhz"],
-                        "mem_clk_mhz":  meas["mem_clk_mhz"],
-                        "notes":        spec.notes,
-                    }
-                    rows.append(row)
-                    print(f"  E_total={meas['total_energy_j']:.3f} J, "
-                          f"E_dyn={dyn_energy:.3f} J, "
-                          f"P_avg={meas['avg_power_w']:.1f} W "
-                          f"(dyn {dyn_power:.1f} W), "
-                          f"T={meas['avg_temp_c']:.1f}°C (peak {meas['peak_temp_c']}), "
-                          f"iters={meas['iters']}, {meas['wall_s']:.2f}s")
-                    print(f"  J/elem (dyn)={row['j_per_element_dyn']}  "
-                          f"J/FLOP (dyn)={row['j_per_flop_dyn']}")
+            total_elements = spec.n_elements * meas["iters"]
+            total_flops = spec.flops_per_call * meas["iters"]
 
-                    # Free before the next cell to keep peak memory bounded.
-                    del spec
-                    torch.cuda.empty_cache()
+            row = {
+                "gpu": gpu_name,
+                "compute_cap": f"{cc[0]}.{cc[1]}",
+                "category": plan["category"],
+                "op": plan["op"],
+                "dtype": plan["dtype"],
+                "mode": plan["mode"],
+                "variant": spec.name,
+                "n_elements": spec.n_elements,
+                "shape": "x".join(str(s) for s in spec.shape),
+                "load_name": plan["load_name"],
+                "load_value": plan["load_value"],
+                "iters": meas["iters"],
+                "ms_per_call": f"{meas['ms_per_call']:.4f}",
+                "wall_s": f"{meas['wall_s']:.4f}",
+                "flops_per_call": spec.flops_per_call,
+                "total_flops": total_flops,
+                "total_elements": total_elements,
+                "static_power_w": f"{p_static:.3f}",
+                "avg_power_w":    f"{meas['avg_power_w']:.3f}",
+                "dyn_power_w":    f"{dyn_power:.3f}",
+                "total_energy_j":  f"{meas['total_energy_j']:.4f}",
+                "static_energy_j": f"{static_energy:.4f}",
+                "dyn_energy_j":    f"{dyn_energy:.4f}",
+                "j_per_element_total": f"{meas['total_energy_j']/total_elements:.3e}",
+                "j_per_element_dyn":   f"{dyn_energy/total_elements:.3e}",
+                "j_per_flop_total":    f"{meas['total_energy_j']/total_flops:.3e}",
+                "j_per_flop_dyn":      f"{dyn_energy/total_flops:.3e}",
+                "avg_temp_c":   f"{meas['avg_temp_c']:.1f}",
+                "peak_temp_c":  meas["peak_temp_c"],
+                "sm_clk_mhz":   meas["sm_clk_mhz"],
+                "mem_clk_mhz":  meas["mem_clk_mhz"],
+                "notes":        spec.notes,
+            }
+            rows.append(row)
+            print(f"  E_total={meas['total_energy_j']:.3f} J, "
+                  f"E_dyn={dyn_energy:.3f} J, "
+                  f"P_avg={meas['avg_power_w']:.1f} W "
+                  f"(dyn {dyn_power:.1f} W), "
+                  f"T={meas['avg_temp_c']:.1f}°C (peak {meas['peak_temp_c']}), "
+                  f"iters={meas['iters']}, {meas['wall_s']:.2f}s")
+            print(f"  J/elem (dyn)={row['j_per_element_dyn']}  "
+                  f"J/FLOP (dyn)={row['j_per_flop_dyn']}")
+
+            # Free before the next cell to keep peak memory bounded.
+            del spec
+            torch.cuda.empty_cache()
     finally:
         sampler.stop()
         pynvml.nvmlShutdown()

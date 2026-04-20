@@ -1,187 +1,245 @@
 # GPU Power-per-Operation Benchmark (A100 / H100)
 
-FP8 / FP16 × {MUL, ADD, Softmax, GeLU, LayerNorm} = **10 benchmarks**. 각 벤치마크를
-여러 load 크기로 sweep 하면서 NVML power 를 적분해 **Joule per operation** 을
-산출한다. 정적(idle) / 동적(workload) 전력을 분리하고, 실험 간 온도 cool-down
-및 안정성 로그 (온도/클럭/스로틀) 를 남긴다.
+> "같은 연산을 **어느 precision · 어느 compute unit** 에서 돌릴 때 몇 Joule 을
+> 쓰는가" 를 A100 과 H100 에서 동일 코드로 재서, AccelWattch 류 GPU power
+> model 의 per-op 계수 (`k_op`) 를 실측으로 뽑기 위한 microbenchmark.
 
-AccelWattch A100/H100 모델 검증을 위한 microbenchmark — GPU 가 같은 연산을
-precision 별로 수행할 때 watt-hour 가 어떻게 변하는지 지상진(ground truth)
-데이터를 얻는 용도.
+## 측정 대상 — 총 **15 가지 benchmark**
 
-## 무엇이 측정되나
+### A. Elementwise / reduction (10개, CUDA core 경로)
 
-| 항목 | 설명 |
+FP16 / FP8 × {MUL, ADD, Softmax, GeLU, LayerNorm}. **모두 SIMT CUDA core**
+에서 실행. Tensor Core 는 건드리지 않음. Load 축은 텐서 element 수 N.
+
+### B. Matmul (5개, Tensor Core vs CUDA core + TE FP8)
+
+M = N = K 의 정사각 GEMM. Load 축은 행렬 변 길이 K (FLOPs = 2·K³).
+
+| variant | compute unit | A100 (sm_80) | H100 (sm_90) | 의미 |
+|---|---|---|---|---|
+| `matmul_fp32_simt` | **CUDA cores** (TF32 off) | ✓ | ✓ | Tensor-Core-off baseline |
+| `matmul_tf32_tc`   | Tensor Core TF32 | ✓ | ✓ | A100 에서 도입된 TC precision |
+| `matmul_fp16_tc`   | Tensor Core FP16 | ✓ | ✓ | 양쪽 공통 reference |
+| `matmul_bf16_tc`   | Tensor Core BF16 | ✓ | ✓ | FP16 와 동속, 다른 dynamic range |
+| `matmul_fp8_te`    | Tensor Core FP8 (TE) | ✗ → FP16 fallback | ✓ **native** | H100 전용 이득 측정 |
+
+즉 (A) 는 precision 비교축, (B) 는 **"Tensor Core vs CUDA core" + "H100 native FP8 vs A100 FP16"** 비교축. 두 축이 직교해서 power model 의 서로 다른 항을 분리 측정해줍니다.
+
+## Power model context (왜 이 data 가 필요한가)
+
+GPU 1-차 에너지 모델:
+
+```
+E(workload) = P_static · T(workload)  +  Σ_op  k_op · N_op
+```
+
+- **`P_static`** : idle GPU power. program 시작 시 `measure_static_power()` 가 평균을 산출 → `static_power_w` 컬럼.
+- **`k_op`** : "해당 op 한 단위에 드는 dynamic Joule" 계수. 각 op 를 **여러 load 에 sweep** 해서 `E_dyn ~ N_op` 을 선형회귀 → **slope 가 곧 `k_op`**. `analyze.py` 가 계산.
+- **`N_op`** : 모델링 대상 워크로드가 수행하는 op 수 (PTX trace / nvprof counters 등에서 추출).
+- **`T(workload)`** : 워크로드 총 실행 시간 → static 에너지는 그 동안 소모.
+
+linearity (E_dyn ∝ N) 가 성립해야 (R² ≥ 0.99) 이 모델 폼이 유효. 깨지면 launch overhead dominant (load 너무 작음) 또는 BW saturation (너무 큼). sweep 범위를 조정하거나 linear regime 만 추출.
+
+## 무엇이 저장되나
+
+### per-cell CSV (`gpu_power_bench_<gpu>_<stamp>.csv`)
+
+한 행 = 하나의 (variant × load). 주요 컬럼:
+
+| 컬럼 | 의미 |
 |---|---|
-| `total_energy_j` | 측정 구간 NVML `power.draw` 를 사다리꼴 적분한 Joule |
-| `static_energy_j` | `P_static × wall_s` — 같은 구간에 idle 전력이 소모했을 에너지 |
-| `dyn_energy_j` | `total − static` — **workload 가 추가로 쓴 dynamic 에너지** |
-| `j_per_element_dyn` | `dyn_energy_j / (iters × N)` — **연산 하나당 dynamic Joule** |
-| `j_per_flop_dyn` | 추정 FLOP 기준 (MUL=1, Softmax≈5, GeLU≈8, LayerNorm≈8 per elem) |
-| `avg_power_w` / `dyn_power_w` | 구간 평균 전력 / (그-P_static) |
-| `avg_temp_c` / `peak_temp_c` | NVML 온도 폴링 평균/피크 — 안정성 검증 |
-| `sm_clk_mhz` / `mem_clk_mhz` | 구간 말미 클럭 — throttle 여부 판단 |
+| `category` | `elementwise` / `matmul` |
+| `op` | `mul/add/softmax/gelu/layernorm/matmul` |
+| `dtype` | `fp16/fp8/fp32/tf32/bf16` |
+| `mode` | `elementwise/simt/tc/te` |
+| `variant` | 통합 이름 (e.g. `matmul_fp8_te`) |
+| `load_name` / `load_value` | `n_elements` 또는 `K_size` |
+| `iters` | 해당 cell 의 반복 횟수 (측정창 길이 ≈ `--window-ms`) |
+| `total_elements` / `total_flops` | sweep 축 (linearity 회귀 입력) |
+| `static_power_w` | 이번 런 전체에서 고정된 P_static |
+| `avg_power_w` / `dyn_power_w` | 구간 평균 전력 / (그 - P_static) |
+| `total_energy_j` | NVML power 적분 (J) |
+| `static_energy_j` | `P_static × wall_s` |
+| `dyn_energy_j` | `total - static` — **dynamic 에너지** |
+| `j_per_element_total` / `_dyn` | J/elem (total 또는 dyn) |
+| `j_per_flop_total` / `_dyn` | J/FLOP (FLOP 추정치 기반) |
+| `avg_temp_c` / `peak_temp_c` | 구간 온도 — 안정성 확인용 |
+| `sm_clk_mhz` / `mem_clk_mhz` | 구간 말미 클럭 — throttle 여부 |
+| `notes` | 주의 메모 (e.g. "fp8 emulated", "TE fallback") |
 
-load 를 여러 단계로 변화시키면 `dyn_energy_j` ∝ `total_elements` 가
-**선형**이어야 하고, `j_per_element_dyn` 은 **flat** 해야 한다.
-`analyze.py` 가 각 (op, dtype) 에 대해 **R²** 를 계산해서 선형성을 수치화.
+### raw samples CSV (`_samples.csv`)
 
-## A100 vs H100 instruction set 차이 처리
+100 Hz NVML 폴링 결과 전체. `t_s, power_w, temp_c, sm_mhz, mem_mhz, gpu_util, mem_util, phase`. timeline plot / 재분석용.
 
-| dtype | A100 (sm_80) | H100 (sm_90) |
-|---|---|---|
-| FP16 | native Tensor Core | native Tensor Core |
-| FP8  | **emulated** (cast→fp16→cast 경로로 돌아감) | native Tensor Core (Transformer Engine) |
-
-- 벤치마크는 **동일 코드** 로 양쪽 GPU 에서 돌고, A100 에서는 FP8 결과 row 에
-  `notes="fp8 emulated (no native FP8 tensor cores on this GPU)"` 가 찍힌다.
-- 결과 해석: A100 의 FP8 측정은 "native FP8 대비 상한" 이 아니라
-  "A100 이 FP8 데이터를 처리할 때 실제로 쓰는 에너지" 이므로 여전히 유효.
-  H100 FP8 수치와 비교하면 Tensor Core FP8 의 에너지 효율 이득이 드러난다.
-
-## 설치
+## 설치 & 사전 점검
 
 ```bash
 pip install -r requirements.txt
-# torch 는 CUDA 버전에 맞게 별도 설치 (선택)
+# torch 는 CUDA 런타임 맞춰서
 pip install torch --index-url https://download.pytorch.org/whl/cu121
-```
-
-사전 점검:
-
-```bash
+# H100 에서 native FP8 matmul 을 돌리려면
+pip install transformer_engine
 python3 preflight.py
 ```
 
-확인 항목:
-- `nvidia-smi`, pynvml, torch 임포트
-- CUDA device 가 보이는지 / compute capability
-- `torch.float8_e4m3fn` / `float8_e5m2` 존재 (torch ≥ 2.1)
+`preflight.py` 확인 항목:
+- `nvidia-smi` / `pynvml` 동작
+- `torch.cuda.is_available()` + compute capability
+- `torch.float8_e4m3fn` 존재 여부 (torch ≥ 2.1)
+- Tensor Core support matrix (`fp16_tc/bf16_tc/tf32_tc/int8_tc/fp8_tc`)
+- `transformer_engine` 설치 (H100 에서 필수, A100 에선 선택)
 - NVML `power.draw` 읽기 가능 (Joule 적분 필수)
 - Persistence mode (권장: `sudo nvidia-smi -pm 1`)
 
-FAIL 이 뜨면 그 항목을 먼저 해결. A100 에서 "fp8 emulated" 경고는 정상.
+FAIL 항목은 해결 후 재실행. A100 에서 `fp8 emulated` 는 정상 경고.
 
 ## 실행
 
 ```bash
 cd util/gpu_power_bench
-./run_bench.sh                          # 전체 sweep (기본 load 6단계)
-./run_bench.sh --quick                  # 빠른 smoke 테스트 (load 3단계)
-./run_bench.sh --ops mul add --dtypes fp16   # 일부만
-./run_bench.sh --tag a100_run1          # 출력 파일에 suffix
 
-# 실험별 분리가 필요하면 cool-down 임계치 상향
-./run_bench.sh --cooldown-c 40 --cooldown-timeout 180
-./run_bench.sh --no-cooldown            # cool-down 생략 (빠름, 덜 안정적)
+# A100 full sweep (약 15–30분 with cool-down)
+./run_bench.sh --tag a100
+
+# H100 full sweep
+./run_bench.sh --tag h100
+
+# 빠른 smoke test (3 loads, 3 matmul sizes)
+./run_bench.sh --quick --tag smoke
+
+# 서브셋만
+./run_bench.sh --ops mul add --dtypes fp16     # FP16 eltwise mul/add
+./run_bench.sh --matmul-variants fp16:tc fp8:te --no-cooldown
+./run_bench.sh --no-matmul                     # elementwise 만
 ```
 
 주요 옵션:
 
-| 옵션 | 기본값 | 의미 |
+| 옵션 | 기본 | 설명 |
 |---|---|---|
 | `--device N` | 0 | CUDA 디바이스 인덱스 |
-| `--ops ...` | 전체 5 | `mul add softmax gelu layernorm` 중 선택 |
-| `--dtypes ...` | 전체 2 | `fp16 fp8` 중 선택 |
-| `--loads ...` | 256K..256M 6단계 | tensor element 수 직접 지정 |
-| `--quick` | — | `loads = [1M, 4M, 16M]` 로 축소 |
-| `--window-ms` | 1500 | 각 cell 측정 길이 (↑ NVML 노이즈 ↓) |
-| `--static-seconds` | 8 | 기준 idle 전력 측정 시간 |
-| `--cooldown-c` | 50 | 실험 간 도달해야 할 °C (`-1` 이면 비활성) |
+| `--ops ...` | 전체 5 | elementwise 연산 선택 |
+| `--dtypes ...` | `fp16 fp8` | elementwise dtype 선택 |
+| `--loads ...` | 256K..256M 6단 | elementwise load (tensor element 수) |
+| `--no-matmul` | off | matmul 벤치 skip |
+| `--matmul-sizes` | `512 1024 2048 4096 8192` | K 값 sweep |
+| `--matmul-variants` | 전체 5 | `dtype:mode` 형식 (e.g. `fp16:tc`) |
+| `--window-ms` | 1500 | cell 측정 길이 — 길수록 NVML 노이즈 ↓ |
+| `--static-seconds` | 8 | idle 측정 시간 |
+| `--cooldown-c` | 50 | 실험 간 목표 온도 (°C) — `-1` 이면 disable |
 | `--cooldown-timeout` | 120 | cool-down 최대 대기 (초) |
-| `--tag` | — | 출력 파일명에 suffix |
+| `--no-cooldown` | off | cool-down 생략 (빠름 / 덜 안정적) |
+| `--tag` | — | 출력 파일명 suffix |
 | `--poll-hz` | 100 | NVML 폴링 주파수 |
 
-## 출력
+## 분석
 
-```
-reports/
-  gpu_power_bench_a100_80gb_20260420_142301.csv           # per-cell 요약
-  gpu_power_bench_a100_80gb_20260420_142301_samples.csv   # 전체 NVML 타임라인
-  gpu_power_bench_a100_80gb_20260420_142301_summary.csv   # (analyze 실행 후)
-  gpu_power_bench_a100_80gb_20260420_142301_linearity.png # (analyze 실행 후)
-  gpu_power_bench_a100_80gb_20260420_142301_timeline.png  # (analyze 실행 후)
-```
-
-주요 CSV 컬럼은 상단 표 참조. `samples.csv` 는 raw NVML — time, power, temp,
-SM/MEM clock, util, phase label — 이라서 Nsight 없이도 timeline 재구성 가능.
-
-## 분석 / 플롯
+### 1. 단일 GPU 분석 — `analyze.py`
 
 ```bash
 python3 analyze.py reports/gpu_power_bench_a100_80gb_20260420_142301.csv
 ```
 
+생성물 (5개):
+
+| 파일 | 내용 |
+|---|---|
+| `<stem>_summary.csv` | **(category, op, dtype, mode) 별 `slope_dyn` = power-model 계수 `k_op`**, `R2_dyn` (선형성), 평균 power / temp |
+| `<stem>_linearity_elementwise.png` | op × dtype: `E_dyn vs N`, `wall vs N`, `J/elem` 3-row grid. log-log 에서 기울기 1 직선이 이상적 |
+| `<stem>_linearity_matmul.png` | matmul variant: `E_dyn vs FLOPs`, `wall vs FLOPs`, `J/FLOP` (x축이 FLOPs 인 이유는 K³ 스케일) |
+| `<stem>_joule_per_op_bar.png` | 좌: elementwise op 별 J/elem, 우: matmul variant 별 J/FLOP. 막대 위에 R² 표시 |
+| `<stem>_timeline.png` | 전체 런의 power / temp / SM·MEM clock 타임라인. 각 cell 구간이 살짝 shading |
+
+summary CSV 를 읽는 법:
+- `slope_dyn` (elementwise) = "이 op 의 J/element" → 그대로 `k_op` 로 사용
+- `slope_dyn` (matmul) = "이 variant 의 J/FLOP" → matmul `k_op`
+- `R2_dyn ≥ 0.99` 면 선형 모델 OK. 낮으면 해당 변형만 load 범위 좁혀서 재측정.
+
+### 2. A100 vs H100 비교 — `compare_gpus.py`
+
+```bash
+python3 compare_gpus.py \
+    reports/gpu_power_bench_a100_80gb_20260420_120000.csv \
+    reports/gpu_power_bench_h100_sxm_20260420_140000.csv \
+    --baseline a100_80gb --tag a100_vs_h100
+```
+
 생성물:
 
-1. **`_summary.csv`** — (op, dtype) 별:
-   - `slope_J_per_elem_dyn` : linear fit 기울기 = **실측 J/elem**
-   - `R2_dyn_vs_N` : 선형성 R² (≥ 0.99 이면 측정이 잘 된 것)
-   - `mean_dyn_power_w`, `mean_temp_c`, `peak_temp_c`
-2. **`_linearity.png`** — 3 × 5 grid: op 별로
-   - row 1: E_dyn vs load (log-log, 기울기 1 직선이 이상적)
-   - row 2: wall time vs load
-   - row 3: J/element (dyn) vs load (flat 해야 함)
-3. **`_timeline.png`** — 전체 런의 power / temp 타임라인.
-   각 cell 구간이 살짝 shading 되어 실험 경계 식별 가능.
+| 파일 | 내용 |
+|---|---|
+| `gpu_compare_<stamp>_summary.csv` | 모든 (GPU, variant) 의 `slope_dyn` + `ratio_vs_baseline` (= slope / baseline_GPU 의 slope) |
+| `gpu_compare_<stamp>_bar.png` | variant 별 J/op 를 GPU 를 hue 로 나눈 막대 그래프 (좌: elementwise, 우: matmul) |
+| `gpu_compare_<stamp>_heatmap.png` | (variant × GPU) 비율 heatmap — green < 1 (H100 이 싸다) / red > 1 (비싸다) |
+| `gpu_compare_<stamp>_static.png` | GPU 별 `P_static` 막대 — `E = P_static·T + Σ k_op·N_op` 의 정적 항 |
 
-## 안정성 검증 체크포인트
+**읽는 법 예시** (기대되는 결과):
+- `matmul_fp32_simt` 이 두 GPU 에서 단연 가장 큰 J/FLOP (TC 미사용)
+- `matmul_fp16_tc` 가 H100 에서 A100 대비 약 0.4–0.6× J/FLOP (TC 세대 개선)
+- `matmul_fp8_te` 는 **H100 에서만** FP16_tc 대비 2–3× 더 저렴; A100 에선 `notes` 에 "TE fallback to FP16 TC" 가 찍히고 slope 가 FP16_tc 와 비슷 → FP8 이득이 Hopper 실리콘 의존임을 실측으로 증명
+- Elementwise 는 BW bound 이므로 H100 이득은 HBM3/HBM2e 비율(≈ 1.5–2×) 을 반영
+- `P_static`: A100 SXM 약 50–60 W / H100 SXM 약 70–90 W (카드 스펙에 따름)
 
-실험 결과가 signal 이려면 다음이 유지되어야 한다:
+## A100 ↔ H100 support 매트릭스 (한눈에)
 
-1. **`R2_dyn_vs_N` ≥ 0.99** — energy 가 load 에 선형이면 `iters` 가 충분.
-   낮으면 `--window-ms` 를 늘리거나 `--poll-hz` 확인.
-2. **`peak_temp_c` 가 cool-down 임계(+15°C) 이내** — thermal throttle 없음.
-   초과 시 `--cooldown-c` 내리거나 `--cooldown-timeout` 증가.
-3. **`sm_clk_mhz` ≈ max SM clock** — `nvidia-smi -q -d CLOCK` 의 max 와 비교.
-   하락했으면 power cap 또는 thermal throttle. `nvidia-smi -pl <W>` 로 상향.
-4. **`j_per_element_dyn` 의 변동계수 < 5%** — load 별로 거의 같아야 정상.
-   값이 log-log 로 기울어지면 메모리 BW / launch overhead 에 dominated.
-5. **Persistence mode = ON** — `sudo nvidia-smi -pm 1`. 드라이버 재초기화
-   레이턴시가 짧은 kernel 에서 에너지 적분을 왜곡한다.
+| 기능 | A100 (sm_80) | H100 (sm_90) | 본 bench 가 드러내는 것 |
+|---|---|---|---|
+| FP32 CUDA core MAD | ✓ | ✓ | `matmul_fp32_simt` baseline |
+| TF32 Tensor Core | ✓ (A100 도입) | ✓ | `matmul_tf32_tc` |
+| FP16 Tensor Core | ✓ | ✓ (throughput ↑) | `matmul_fp16_tc` 두 GPU 간 비율 |
+| BF16 Tensor Core | ✓ | ✓ | `matmul_bf16_tc` — FP16 과 같은 속도 / 다른 numerics |
+| INT8 Tensor Core | ✓ | ✓ | (미구현 — 확장 후보) |
+| **FP8 Tensor Core** | ✗ | ✓ (E4M3 / E5M2) | `matmul_fp8_te` — H100 의 핵심 에너지 이득 |
+| Transformer Engine | fallback | native | 같은 `fp8_te` 코드가 A100 에선 FP16 TC 로 떨어짐 |
+| FP8 elementwise | 에뮬 (cast→fp16→cast) | 에뮬 (Tensor Core 가 아니라 SIMT elem) | `fp8_mul/add/softmax/...` 10개 |
+| DRAM | HBM2e 2039 GB/s raw | HBM3 ~3350 GB/s raw | Elementwise 에서 H100 이 대체로 더 싼 이유 |
 
-## 정적 / 동적 전력 분리
+## 안정성 체크리스트
 
-```
-P_total(t) = P_static + P_dynamic(t)
-E_total = ∫ P_total dt = P_static · T + ∫ P_dynamic dt
-         = E_static + E_dynamic
-```
+실험 결과가 **신뢰 가능한 signal** 이려면:
 
-`P_static` 은 실험 시작 시 `measure_static_power()` 로 idle 구간 평균을 뽑아
-고정 상수로 사용. 각 cell 의 `dyn_energy_j = total - P_static × wall_s`.
+1. **`R2_dyn ≥ 0.99`** (summary CSV 에서 per-variant) → linear 모델 OK. 낮으면 sweep 범위가 launch-overhead 또는 BW-saturation 을 포함.
+2. **`peak_temp_c ≤ cooldown_c + 15°C`** — thermal throttle 없음. 초과 시 `--cooldown-c` 내리고 `--cooldown-timeout` 올리기.
+3. **`sm_clk_mhz` ≈ max SM clock** — `nvidia-smi -q -d CLOCK` 의 Max 와 비교. 하락 → power cap 또는 thermal throttle. `sudo nvidia-smi -pl <W>` 로 상향.
+4. **`P_static` 분산 < 1 W** — baseline std 가 크면 background 프로세스. `nvidia-smi` 로 다른 proc 확인.
+5. **Persistence mode = ON** — `sudo nvidia-smi -pm 1`. 드라이버 재초기화 레이턴시 제거.
+6. **같은 GPU 의 서로 다른 run 간 `slope_dyn` 편차 < 5%** — 시간대 / 냉각 / 이웃 카드 thermal cross-talk 체크.
 
-**중요**: CPU-only idle 과 GPU idle 은 다르다. GPU 가 clock-gated 상태
-(SM 저주파수) 일 수도 있고 wake-up 에 overhead 가 있을 수도 있다. 따라서:
+## Power modeling 워크플로우 (권장)
 
-- `measure_static_power` 는 CUDA 컨텍스트가 살아있는 상태에서 호출 → wake-up
-  오버헤드를 baseline 안으로 흡수.
-- cool-down 후 다시 baseline 을 찍고 싶으면 `--static-seconds` 는 유지한 채
-  cell 마다 재측정하도록 코드를 수정 (현재는 시작 1회).
+1. A100 한 대에서 `./run_bench.sh --tag a100_run1` → CSV 생성.
+2. 같은 조건으로 최소 한 번 더 실행 (`_run2`) → 재현성 (slope 편차) 확인.
+3. H100 에서 동일. Transformer Engine 설치 전·후 두 번 돌리면 `fp8_te` 의 fallback vs native 도 같은 GPU 안에서 비교 가능.
+4. `analyze.py` 로 각 CSV → summary + 선형성 plot.
+5. `compare_gpus.py` 로 A100 run1 / A100 run2 / H100 run1 / H100 run2 통합 → cross-GPU ratio heatmap.
+6. `summary.csv` 의 `slope_dyn` 컬럼을 per-op `k_op` 테이블로 export → AccelWattch (또는 자체 모델) 의 연산별 에너지 항에 대입.
+7. 모델 예측 `E_model = P_static·T + Σ k_op·N_op` vs NVML 실측 `E_total` 을 실제 워크로드 (transformer layer, conv, 등) 로 검증.
 
-## 파일
+## 파일 구성
 
 | 파일 | 역할 |
 |---|---|
-| `preflight.py` | 의존성 / 드라이버 / FP8 support / NVML power 읽기 가능성 점검 |
-| `power_monitor.py` | NVML 폴러 + 에너지 적분 + static baseline + cool-down |
-| `benchmarks.py` | 10 benchmark factory (op × dtype), FP8 emulation 포함 |
-| `gpu_power_bench.py` | 메인 드라이버 (sweep → CSV) |
-| `analyze.py` | 선형성 plot + summary CSV |
-| `run_bench.sh` | 편의 launcher (persistence mode, deps 체크) |
-| `requirements.txt` | Python 의존성 |
+| `preflight.py` | deps / driver / TE / FP8 capability / NVML power 읽기 점검 |
+| `power_monitor.py` | NVML 폴러 + 에너지 적분 + `measure_static_power` + `wait_for_cooldown` |
+| `benchmarks.py` | 10 elementwise + 5 matmul = 15 benchmark factory |
+| `gpu_power_bench.py` | 드라이버 (plan 생성 → cool-down → warmup → 측정 → CSV) |
+| `analyze.py` | 단일 GPU summary CSV + 선형성 / bar / timeline plot |
+| `compare_gpus.py` | 복수 GPU 비교 summary + bar / heatmap / static plot |
+| `run_bench.sh` | persistence mode + deps 체크 + 런처 |
+| `requirements.txt` | torch≥2.1, pynvml, numpy, pandas, nvtx, matplotlib |
 
 ## 알려진 한계
 
-- **NVML `power.draw` 는 ~20 Hz 내부 갱신** 이라 100 Hz 폴링은 중복 샘플 존재.
-  평균/적분 관점에서는 정확하지만 peak power 가 아닌 **average** 를 볼 것.
-  더 높은 정밀도가 필요하면 NVML 대신 `nvidia-smi dmon` 혹은 HMC 외부 측정기.
-- **FP8 elementwise 는 에뮬레이션**: torch 의 float8 dtype 은 FP8 tensor core
-  GEMM 을 돌릴 때 의미가 있고, MUL/ADD 같은 eltwise 는 내부적으로 fp16 으로
-  promote 되어 실행된다. 본 벤치는 이 비용도 같이 재는 것을 의도함.
-- **H100 Transformer Engine 연동은 미구현**: 본격 FP8 GEMM 을 재고 싶으면
-  `transformer_engine.pytorch` 의 `fp8_autocast` 로 래핑한 matmul 벤치를 추가.
-  (현재 스펙은 eltwise + 정규화 연산 기준.)
-- **Softmax/LayerNorm FLOP 추정은 순수 element 기준**: 실제 커널은 reduction
-  패턴 때문에 FLOP 이 약간 많거나 적을 수 있음. 주 지표인 `j_per_element`
-  는 FLOP 가정과 무관.
+- **NVML `power.draw` 는 내부적으로 ~20 Hz 갱신**. 100 Hz 폴링은 중복 샘플을 포함 — 평균·적분은 정확하지만 "피크 power" 는 과소평가될 수 있음. 더 높은 정밀도가 필요하면 외부 HMC(HMP) 측정기.
+- **FP16 matmul 은 TC 를 강제로 끄기 어려움** — PyTorch 는 Ampere+ 에서 fp16 matmul 을 항상 TC 로 보냄. 따라서 "CUDA core 만" baseline 은 `matmul_fp32_simt` (TF32 off) 하나이며, 같은 precision 축의 CUDA core 대비 TC 비교는 제공되지 않음.
+- **Elementwise 는 memory-bound**: `j_per_element_dyn` 은 대부분 HBM read/write 에너지. compute-bound 모델 항을 직접 분리하고 싶다면 FMA 인텐시브 custom 커널 (dram_util_experiment 와 유사한 틀) 를 추가.
+- **FP8 elementwise 는 Tensor Core 와 무관** — cast→fp16→compute→cast 경로. H100 도 이 부분은 SIMT 에서 돔. TC FP8 이득은 `matmul_fp8_te` 에서만 나타남.
+- **FP8 scale factor 는 기본값**: 실제 학습/추론 파이프라인의 `DelayedScaling` amax history 동작과는 다름 — GEMM 자체 kernel 에너지 측정은 대표성 있으나, scale-update 오버헤드는 포함되지 않음.
+- **TF32/FP32 flag 는 global**: 벤치마크 커널 내부에서 매번 재설정하지만, 같은 프로세스 안의 다른 코드와 공유되므로 외부 코드와 병행 실행 금지.
+
+## 확장 아이디어
+
+- **INT8/INT4 Tensor Core 변형**: `matmul_int8_tc` 추가 (양자화 추론 모델용)
+- **Attention microbench**: scaled-dot-product + softmax 결합, FlashAttention 경로 비교
+- **Conv**: cuDNN TF32 / FP16 / BF16 경로 — transformer 외 CNN 모델링
+- **Per-SM power counters**: `nvidia-smi dmon -s pucvmet` 를 병행 로깅해 NVML board-level 과 SM-level 을 분리
