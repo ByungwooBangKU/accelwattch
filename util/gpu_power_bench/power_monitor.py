@@ -57,7 +57,7 @@ class PowerSampler(threading.Thread):
         super().__init__(daemon=True)
         self.h = handle
         self.interval = 1.0 / hz
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._phase = ""
         self.t0 = 0.0
         self.samples: list[PowerSample] = []
@@ -73,7 +73,7 @@ class PowerSampler(threading.Thread):
         super().start()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             now = time.perf_counter() - self.t0
             p_mw = _nvml_or(pynvml.nvmlDeviceGetPowerUsage, self.h, default=-1)
             temp = _nvml_or(pynvml.nvmlDeviceGetTemperature, self.h,
@@ -99,7 +99,7 @@ class PowerSampler(threading.Thread):
                 time.sleep(delay)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=2.0)
 
     # ----- analysis helpers over the in-memory sample buffer ------------------
