@@ -99,7 +99,10 @@ def plot_bar(all_summary: pd.DataFrame, out_png: Path) -> None:
     palette = {g: c for g, c in zip(gpus, ("#1f77b4", "#d62728", "#2ca02c",
                                            "#ff7f0e", "#9467bd"))}
 
+    any_emulated = False
+
     def _panel(ax, sub, metric_unit):
+        nonlocal any_emulated
         if sub.empty:
             ax.set_visible(False)
             return
@@ -107,17 +110,30 @@ def plot_bar(all_summary: pd.DataFrame, out_png: Path) -> None:
         xpos = np.arange(len(variants))
         w = 0.8 / max(1, len(gpus))
         for i, g in enumerate(gpus):
-            vals, r2s = [], []
+            vals, emus = [], []
             for v in variants:
                 r = sub[(sub["variant"] == v) & (sub["gpu"] == g)]
                 vals.append(r["slope_dyn"].iloc[0] if not r.empty else float("nan"))
-                r2s.append(r["R2_dyn"].iloc[0] if not r.empty else float("nan"))
+                if not r.empty and "emulated" in r.columns:
+                    emus.append(bool(int(r["emulated"].iloc[0])))
+                else:
+                    emus.append(False)
             bars = ax.bar(xpos + (i - (len(gpus) - 1) / 2) * w, vals, w,
-                          label=g, color=palette[g], alpha=0.9)
-            for rect, v in zip(bars, vals):
+                          label=g, color=palette[g], alpha=0.9,
+                          edgecolor="white")
+            # Hatch the bars where this (variant, GPU) measurement is emulated
+            # — e.g. matmul_fp8_te on A100, which is FP16-TC fallback. Keeps
+            # the bar visible so the sanity check (fallback ≈ fp16_tc) is
+            # obvious, but distinguishes it from a real FP8-TC measurement.
+            for rect, emu in zip(bars, emus):
+                if emu:
+                    rect.set_hatch("//")
+                    any_emulated = True
+            for rect, v, emu in zip(bars, vals, emus):
                 if not np.isnan(v):
+                    lbl = f"{v:.1e}" + (" *EMU" if emu else "")
                     ax.text(rect.get_x() + rect.get_width() / 2,
-                            rect.get_height(), f"{v:.1e}",
+                            rect.get_height(), lbl,
                             ha="center", va="bottom", fontsize=6, rotation=0)
         ax.set_xticks(xpos)
         ax.set_xticklabels(variants, rotation=30, ha="right")
@@ -131,7 +147,13 @@ def plot_bar(all_summary: pd.DataFrame, out_png: Path) -> None:
     _panel(axes[1], mm, "J / FLOP")
     axes[1].set_title("Matmul — dynamic J per FLOP")
     fig.suptitle("Cross-GPU comparison — per-op energy coefficient")
-    fig.tight_layout(); fig.savefig(out_png, dpi=130)
+    if any_emulated:
+        fig.text(0.5, -0.02,
+                 "hatched (///) + *EMU = emulated path (e.g. matmul_fp8_te on "
+                 "A100 is FP16-TC fallback, NOT native FP8). A correctly "
+                 "falling-back A100 fp8_te should overlap matmul_fp16_tc.",
+                 ha="center", fontsize=8, color="#d62728")
+    fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
 
 
@@ -174,7 +196,7 @@ def plot_heatmap(all_summary: pd.DataFrame, baseline_gpu: str,
     ax.set_title(f"J/op ratio vs baseline ({baseline_gpu})\n"
                  f"< 1 (green) = dest GPU is cheaper; > 1 (red) = more expensive")
     fig.colorbar(im, ax=ax, label="slope_dyn ratio (log scale)")
-    fig.tight_layout(); fig.savefig(out_png, dpi=130)
+    fig.tight_layout(); fig.savefig(out_png, dpi=160)
     print(f"[save] {out_png}")
 
 
@@ -194,7 +216,7 @@ def plot_static_power(statics: dict[str, float], out_png: Path) -> None:
     ax.set_ylabel("static (idle) power (W)")
     ax.set_title("P_static — the additive term in E(workload) = P_static·T + Σ k_op · N_op")
     ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout(); fig.savefig(out_png, dpi=130)
+    fig.tight_layout(); fig.savefig(out_png, dpi=160)
     print(f"[save] {out_png}")
 
 

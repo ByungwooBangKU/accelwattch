@@ -793,12 +793,11 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="where to write plots (default: same dir as csv)")
     ap.add_argument("--include-emulated", action="store_true",
-                    help="show emulated cells in plots (fp8 elementwise "
-                         "cast-compute-cast, fp8_te on pre-Hopper fallback). "
-                         "Hidden by default because their numbers reflect the "
-                         "underlying FP16 path, not native FP8 cost — plotting "
-                         "them next to the FP16 bars is misleading. They stay "
-                         "in the CSV/summary either way for debugging.")
+                    help="also show emulated ELEMENTWISE cells (fp8 "
+                         "cast-compute-cast). Emulated matmul (fp8_te fallback "
+                         "on pre-Hopper) is ALWAYS shown regardless of this "
+                         "flag, because its number — which should coincide "
+                         "with matmul_fp16_tc — is a useful sanity check.")
     args = ap.parse_args()
 
     csv_path = _resolve_csv(args)
@@ -841,26 +840,36 @@ def main() -> int:
                 "mean_temp_c", "peak_temp_c"]
         print(summary[cols].to_string(index=False))
 
-    # --- filter emulated rows out of the plots (keep them in the CSV) ------
-    # Rationale: on A100 the fp8_te bar is really an FP16-TC number, and the
-    # fp8_* elementwise bars on any GPU are cast-compute-cast via FP16. Putting
-    # them next to the real FP16 bars makes the plot misleading — "FP8 looks
-    # worse than FP16" is an artifact of the emulation, not the silicon. Hide
-    # them by default; users who want to inspect the emulation overhead can
-    # pass --include-emulated or just open the summary CSV.
+    # --- filter emulated ELEMENTWISE rows out of the plots -----------------
+    # We hide only emulated elementwise cells by default, because those are
+    # pure cast-compute-cast noise (PyTorch has no native FP8 elementwise
+    # kernel — see benchmarks.py). Emulated matmul rows (matmul_fp8_te on
+    # A100, where TE falls back to FP16 TC) stay visible: they're informative
+    # — the line should land on top of matmul_fp16_tc, which is the whole
+    # point of measuring the fallback. The plots already tag those bars as
+    # "[TC·FP16-fallback] *EMU" so readers can tell them apart.
     plot_df = df
     plot_summary = summary
     if not args.include_emulated:
+        def _keep_row(row) -> bool:
+            emu = int(row.get("emulated", 0) or 0)
+            if not emu:
+                return True
+            # Keep emulated matmul rows (A100 fp8_te fallback is useful info).
+            return row.get("category", "") == "matmul"
         if "emulated" in df.columns:
-            plot_df = df[df["emulated"].astype(int) == 0].copy()
+            mask = df.apply(_keep_row, axis=1)
+            plot_df = df[mask].copy()
         if "emulated" in summary.columns:
-            plot_summary = summary[summary["emulated"].astype(int) == 0].copy()
+            mask = summary.apply(_keep_row, axis=1)
+            plot_summary = summary[mask].copy()
         hidden_cells = len(df) - len(plot_df)
         hidden_variants = len(summary) - len(plot_summary)
         if hidden_cells or hidden_variants:
-            print(f"[filter] hiding {hidden_variants} emulated variants "
-                  f"({hidden_cells} rows) from plots — pass --include-emulated "
-                  f"to keep them. Full data remains in {summary_path.name}.")
+            print(f"[filter] hiding {hidden_variants} emulated elementwise "
+                  f"variants ({hidden_cells} rows) from plots — emulated "
+                  f"matmul stays visible. Pass --include-emulated to show "
+                  f"elementwise fp8 too. Full data: {summary_path.name}.")
 
     # --- plots ---
     plot_linearity_elementwise(plot_df, out_dir / f"{stem}_linearity_elementwise.png", gpu)
