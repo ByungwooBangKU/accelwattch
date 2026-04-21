@@ -347,10 +347,10 @@ E_dyn = k_op · N_op + c
 
 ### 6.4 `static_power.png` — P_static 측정 시각화
 
-**무엇을 보여주나** : 3 panel.
-- 좌: baseline idle trace (시간 vs power). flat 일수록 좋음.
-- 중: 각 cell 의 static vs dyn stacked bar.
-- 우: `E_static / E_total` 비율 — load 가 크거나 kernel 이 효율적일수록 비율 낮음.
+**무엇을 보여주나** : 세로 3 panel (위에서 아래로).
+- Top (A): baseline idle trace (시간 vs power). mean ± σ band 와 함께. flat 일수록 좋음.
+- Middle (B): 각 cell 의 static (회색) + dyn stacked bar. **각 sweep 그룹 위에 대괄호로 어떤 벤치 (`fp16·mul`, `matmul_fp16_tc`, …) 를 돌렸는지 라벨을 표시**하고, 그룹 사이에는 점선 구분자를 그린다.
+- Bottom (C): `E_static / E_total` 비율 — load 가 크거나 kernel 이 효율적일수록 비율 낮음. x축 label 은 45° 기울여서 겹침을 방지. sweep cell 수가 많으면 plot 폭이 자동으로 늘어난다 (최대 32 inch).
 
 **어떻게 읽나** :
 - idle trace stdev/mean > 5% 면 측정 환경 불안정 — background process 의심.
@@ -549,7 +549,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 |---|---|
 | `<stem>_summary.csv` | cell 당 1 행, `slope_dyn` / `R2_dyn` / `compute_unit` / `emulated` 등 집계 |
 | `<stem>_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
-| `<stem>_linearity_matmul.png` | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 포함 |
+| `<stem>_linearity_matmul.png` | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
 | `<stem>_joule_per_op_bar.png` | bar chart (좌: elementwise, 우: matmul) |
 | `<stem>_static_power.png` | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
 | `<stem>_temperature.png` | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
