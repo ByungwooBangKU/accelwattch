@@ -741,8 +741,19 @@ def main() -> int:
     df = pd.read_csv(args.csv)
     if df.empty:
         print("empty CSV"); return 1
-    out_dir = args.out_dir or args.csv.parent
+    # Output directory resolution:
+    #   1. --out-dir explicitly given  → use it
+    #   2. --reports-dir + --tag given → <reports-dir>/<tag>/  (so A100 and
+    #                                     H100 plots don't clobber each other)
+    #   3. otherwise                   → same directory as the CSV
+    if args.out_dir is not None:
+        out_dir = args.out_dir
+    elif args.reports_dir is not None and args.tag:
+        out_dir = args.reports_dir / args.tag
+    else:
+        out_dir = args.csv.parent
     out_dir.mkdir(exist_ok=True, parents=True)
+    print(f"[output] {out_dir}/")
     gpu = df["gpu"].iloc[0]
     stem = args.csv.stem
 
