@@ -407,6 +407,8 @@ E_dyn = k_op · N_op + c
 - **FP16 TC → FP8 TE** : ~2× 에너지 절감 — Hopper 의 핵심 세일즈 포인트.
 - **SIMT vs TC** : 10-20× 차이 — Tensor Core 쓰지 않으면 에너지 낭비 심각.
 - **Elementwise BW normalize ratio** ≈ 1 이면 모델 검증 성공.
+- **⚠️ FP8 elementwise ≥ FP16 elementwise 는 A100 / H100 모두에서 정상** : PyTorch 에 native FP8 elementwise kernel 이 없고 H100 의 FP8 실리콘은 Tensor Core (matmul) 에만 있다. 따라서 fp8_{mul,add,softmax,gelu,layernorm} 는 양 GPU 모두 `fp8 → fp16 → op → fp8` cast-compute-cast 로 실행되며, 4 개 커널 + FP16 중간 텐서 materialization 때문에 **FP16 보다 더 비싸게** 나온다. 이건 실험 버그가 아니라 SW 한계를 정직하게 반영한 값이다.
+- **⚠️ FP8 matmul 은 H100 에서만 의미가 있다** : `matmul_fp8_te` 는 **A100 에서 Transformer Engine 이 FP16 TC 경로로 자동 폴백**한다. 따라서 A100 CSV 의 `matmul_fp8_te` 수치는 `matmul_fp16_tc` 와 같은 HW 경로 (= 거의 같은 값) 여야 정상이며, `emulated=1` / `compute_unit="Tensor Core (FP16 fallback)"` 로 플래그된다. H100 에서만 native FP8 TC 경로가 활성화되어 FP16 TC 대비 ~2× 절감을 보인다. `analyze.py` 는 기본적으로 emulated 행을 플롯에서 숨기므로, A100 플롯에는 `matmul_fp8_te` bar 가 나타나지 않는 것이 정상 (볼 필요가 있으면 `--include-emulated`).
 
 ## 8. 설치 & 사전 점검
 
