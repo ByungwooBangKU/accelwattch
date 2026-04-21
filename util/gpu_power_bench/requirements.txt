@@ -1,0 +1,28 @@
+# GPU power-per-operation benchmark dependencies.
+#
+# Install (pick ONE torch variant matching your CUDA):
+#   pip install -r requirements.txt
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# FP8 dtypes (float8_e4m3fn / float8_e5m2) require torch >= 2.1.
+# Native FP8 tensor-core acceleration only on H100/Hopper (sm_90+).
+#
+# NOTE on transformer_engine (needed for the matmul_fp8_te variant):
+# The bare `transformer-engine` on PyPI is a META package — installing it
+# alone errors at runtime with "empty meta package installed". You MUST
+# install the pytorch extra AND disable build isolation:
+#
+#   ./install_transformer_engine.sh             # recommended
+#   # or manually:
+#   pip install --no-build-isolation 'transformer-engine[pytorch]'
+#
+# This compiles CUDA kernels from source (~5–10 min, needs nvcc in PATH).
+# Intentionally NOT listed below so `pip install -r requirements.txt`
+# doesn't silently fall into that trap.
+
+torch>=2.1
+numpy>=1.23
+pynvml>=11.5
+nvtx>=0.2.5
+matplotlib>=3.6
+pandas>=1.5
