@@ -193,7 +193,7 @@ def plot_linearity_elementwise(df: pd.DataFrame, out_png: Path, gpu: str) -> Non
     ops = [o for o in ("mul", "add", "softmax", "gelu", "layernorm")
            if o in ew["op"].unique()]
     dtypes = sorted(ew["dtype"].unique(), reverse=True)  # fp16 first
-    fig, axes = plt.subplots(3, len(ops), figsize=(4 * len(ops), 10),
+    fig, axes = plt.subplots(3, len(ops), figsize=(4.5 * len(ops), 12),
                              squeeze=False)
     colors = {"fp16": "#1f77b4", "fp8": "#d62728"}
     markers = {"fp16": "o", "fp8": "s"}
@@ -226,7 +226,7 @@ def plot_linearity_elementwise(df: pd.DataFrame, out_png: Path, gpu: str) -> Non
         ax_e.set_yscale("log"); ax_t.set_yscale("log")
 
     fig.suptitle(f"Elementwise benchmarks — {gpu}", y=1.00)
-    fig.tight_layout(); fig.savefig(out_png, dpi=130)
+    fig.tight_layout(); fig.savefig(out_png, dpi=160)
     print(f"[save] {out_png}")
 
 
@@ -239,11 +239,11 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     variants = sorted(mm["variant"].unique())
     if not variants:
         return
-    fig, axes = plt.subplots(3, 1, figsize=(10, 10), squeeze=False)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 13), squeeze=False)
     ax_e, ax_t, ax_j = axes[0][0], axes[1][0], axes[2][0]
     ax_e.set_title("matmul — E_dyn vs FLOPs (slope = J/FLOP)")
     ax_t.set_title("matmul — wall time vs FLOPs")
-    ax_j.set_title("matmul — J/FLOP (dyn)")
+    ax_j.set_title("matmul — J/FLOP (dyn)  [annotated with the swept K]")
     palette = {"matmul_fp32_simt": "#555555",
                "matmul_tf32_tc":   "#ff7f0e",
                "matmul_fp16_tc":   "#1f77b4",
@@ -257,6 +257,7 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
         ye = g["dyn_energy_j"].to_numpy(float)
         yt = g["wall_s"].to_numpy(float)
         yj = g["j_per_flop_dyn"].to_numpy(float)
+        ks = g["load_value"].to_numpy(int) if "load_value" in g.columns else None
         _, _, r2 = linear_fit(x, ye)
         c = palette.get(v, None)
         # Decorate the legend with the actual compute unit (CUDA vs TC) and
@@ -272,6 +273,19 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
                   label=f"{v} [{tag}]{star}  R²={r2:.3f}")
         ax_t.plot(x, yt, marker="o", color=c, label=f"{v} [{tag}]{star}")
         ax_j.plot(x, yj, marker="o", color=c, label=f"{v} [{tag}]{star}")
+        # Annotate each point in the sweep so the reader can see which K the
+        # point corresponds to (top panel) and the actual J/FLOP at that K
+        # (bottom panel). Matmul slopes depend heavily on problem size, so
+        # these numbers are what a power-model consumer actually needs.
+        if ks is not None:
+            for xi, yi, k in zip(x, ye, ks):
+                ax_e.annotate(f"K={k}", (xi, yi),
+                              textcoords="offset points", xytext=(5, 5),
+                              fontsize=7, color=c, alpha=0.85)
+            for xi, yi, k in zip(x, yj, ks):
+                ax_j.annotate(f"K={k}\n{yi:.2e}", (xi, yi),
+                              textcoords="offset points", xytext=(0, 6),
+                              ha="center", fontsize=6.5, color=c, alpha=0.9)
     for ax in (ax_e, ax_t, ax_j):
         ax.set_xscale("log"); ax.grid(True, alpha=0.3)
         ax.set_xlabel("total FLOPs (iters × 2MNK)")
@@ -289,7 +303,7 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
                  "*EMU = emulated / fallback path — NOT a native measurement "
                  "of the named dtype (e.g. fp8_te on pre-Hopper uses FP16 TC)",
                  ha="center", fontsize=8, color="#d62728")
-    fig.tight_layout(); fig.savefig(out_png, dpi=130, bbox_inches="tight")
+    fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
 
 
@@ -305,7 +319,7 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
     plt = _get_mpl()
     ew = summary[summary["category"] == "elementwise"]
     mm = summary[summary["category"] == "matmul"]
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5),
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6),
                              gridspec_kw={"width_ratios": [3, 2]})
 
     # ---- elementwise panel: grouped bar (op on x, dtype as hue) ----
@@ -407,7 +421,7 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
         ax.set_visible(False)
 
     fig.suptitle(f"Power-model coefficients — {gpu}")
-    fig.tight_layout(); fig.savefig(out_png, dpi=130, bbox_inches="tight")
+    fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
 
 
@@ -428,8 +442,13 @@ def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
     """
     plt = _get_mpl()
     have_trace = baseline_csv is not None and baseline_csv.exists()
-    fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(3, 1, height_ratios=[1.2, 2, 1.4], hspace=0.45)
+    # Width scales with the number of cells so the x-tick labels don't stack
+    # on top of each other when the sweep is long. Minimum 16" keeps small
+    # runs (~10 cells) readable; larger sweeps grow up to 32".
+    n_cells = len(df)
+    fig_w = max(16, min(32, 0.28 * n_cells + 10))
+    fig = plt.figure(figsize=(fig_w, 13))
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.2, 2.2, 1.6], hspace=0.55)
     ax_a = fig.add_subplot(gs[0])
     ax_b = fig.add_subplot(gs[1])
     ax_c = fig.add_subplot(gs[2], sharex=ax_b)
@@ -488,6 +507,7 @@ def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
     dyn_e = []
     share = []
     colors_dyn = []
+    groups = []           # one entry per cell: the "which experiment" string
     for r in rows:
         se = float(r["static_energy_j"])
         de = float(r["dyn_energy_j"])
@@ -497,34 +517,76 @@ def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
         dyn_e.append(de)
         share.append(100.0 * se / total if total > 0 else 0.0)
         colors_dyn.append("#ff7f0e" if r.get("category") == "matmul" else "#1f77b4")
+        # Group key = the experiment identity minus the swept load value.
+        # Every cell in the same sweep shares this key, so we can draw one
+        # bracket over the cells that belong to the same benchmark.
+        if r.get("category") == "matmul":
+            groups.append(str(r.get("variant", "matmul")))
+        else:
+            groups.append(f"{r.get('dtype', '')}·{r.get('op', '')}")
 
     x = np.arange(len(labels))
     ax_b.bar(x, stat_e, color="#b0b0b0", label="static energy (P_static · T)")
     ax_b.bar(x, dyn_e, bottom=stat_e, color=colors_dyn,
              label="dynamic energy (workload)")
     ax_b.set_ylabel("energy (J)")
-    ax_b.set_title("Per-cell energy breakdown — grey=static (idle overhead), "
-                   "blue=elementwise dyn, orange=matmul dyn")
+    ax_b.set_title("Per-cell energy breakdown — grey = static (idle overhead), "
+                   "blue = elementwise dyn, orange = matmul dyn")
     ax_b.grid(True, axis="y", alpha=0.3)
-    ax_b.legend(loc="upper left", fontsize=9)
-    ax_b.set_xticks(x)
-    ax_b.set_xticklabels([""] * len(labels))
+    ax_b.legend(loc="upper left", fontsize=10)
+    ax_b.tick_params(labelbottom=False)
+
+    # --- group brackets: one span per benchmark sweep -----------------------
+    # Compute contiguous runs of identical `groups[i]` and draw:
+    #   (a) a vertical separator between groups on panels B and C,
+    #   (b) a horizontal bracket + label above panel B naming the experiment.
+    # This is what the user asked for: "이 구간때 어떤 실험을 했는지 보여줘".
+    if groups:
+        y_top = (np.array(stat_e) + np.array(dyn_e)).max()
+        bracket_y = y_top * 1.08
+        text_y = y_top * 1.14
+        ax_b.set_ylim(0, y_top * 1.22)
+        runs = []
+        lo = 0
+        for i in range(1, len(groups) + 1):
+            if i == len(groups) or groups[i] != groups[lo]:
+                runs.append((lo, i - 1, groups[lo]))
+                lo = i
+        for start, end, name in runs:
+            ax_b.plot([start - 0.4, end + 0.4], [bracket_y, bracket_y],
+                      color="#333333", lw=1.0, clip_on=False)
+            ax_b.plot([start - 0.4, start - 0.4],
+                      [bracket_y, bracket_y - y_top * 0.015],
+                      color="#333333", lw=1.0, clip_on=False)
+            ax_b.plot([end + 0.4, end + 0.4],
+                      [bracket_y, bracket_y - y_top * 0.015],
+                      color="#333333", lw=1.0, clip_on=False)
+            ax_b.text((start + end) / 2.0, text_y, name,
+                      ha="center", va="bottom", fontsize=9,
+                      fontweight="bold", color="#222222")
+        # Dotted separators between sweeps extend across both panels.
+        for (_, end, _), (nxt_start, _, _) in zip(runs[:-1], runs[1:]):
+            sep = (end + nxt_start) / 2.0
+            for ax in (ax_b, ax_c):
+                ax.axvline(sep, color="#888888", lw=0.6, ls=":", alpha=0.8)
 
     bars_c = ax_c.bar(x, share, color=colors_dyn, alpha=0.7)
     ax_c.axhline(50.0, color="#d62728", lw=1, ls="--",
                  label="50 % — consider --window-ms ↑")
     for rect, s in zip(bars_c, share):
         ax_c.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
-                  f"{s:.0f}%", ha="center", va="bottom", fontsize=6)
+                  f"{s:.0f}%", ha="center", va="bottom", fontsize=7)
     ax_c.set_xticks(x)
-    ax_c.set_xticklabels(labels, rotation=80, ha="right", fontsize=7)
+    # 45° tick labels read left-to-right much more easily than the old 80°,
+    # which at 7pt visually collapsed to vertical streaks for long sweeps.
+    ax_c.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
     ax_c.set_ylabel("static share (%)")
     ax_c.set_ylim(0, max(100.0, max(share) * 1.1 if share else 100.0))
     ax_c.grid(True, axis="y", alpha=0.3)
-    ax_c.legend(loc="upper right", fontsize=8)
+    ax_c.legend(loc="upper right", fontsize=9)
 
     fig.suptitle(f"Static (idle) power diagnostics — {gpu}", y=0.995)
-    fig.savefig(out_png, dpi=130, bbox_inches="tight")
+    fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
 
 
@@ -538,7 +600,9 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
       any op's energy cost drifts with temperature.
     """
     plt = _get_mpl()
-    fig = plt.figure(figsize=(15, 11))
+    n_cells = len(df)
+    fig_w = max(17, min(32, 0.28 * n_cells + 11))
+    fig = plt.figure(figsize=(fig_w, 13))
     gs = fig.add_gridspec(3, 1, height_ratios=[2, 1.2, 2.2], hspace=0.55)
     ax_t = fig.add_subplot(gs[0])
     ax_c = fig.add_subplot(gs[1], sharex=ax_t)
@@ -582,11 +646,11 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
     ax_c.set_title("Cool-down time before each cell (flat = thermal state uniform across sweep)")
     ax_c.grid(True, axis="y", alpha=0.3)
     ax_c.set_xticks(x)
-    ax_c.set_xticklabels(labels, rotation=80, ha="right", fontsize=7)
+    ax_c.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
     for rect, v in zip(bars_c, cd):
         if v > 0:
             ax_c.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
-                      f"{v:.0f}", ha="center", va="bottom", fontsize=6)
+                      f"{v:.0f}", ha="center", va="bottom", fontsize=7)
 
     # ---- C: does J/op drift with temperature? ----
     # For every cell, plot (avg_temp_c, j_per_* dyn) colored by variant.
@@ -611,7 +675,7 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
                 ncol=1, frameon=False)
 
     fig.suptitle(f"Thermal diagnostics — {gpu}", y=0.995)
-    fig.savefig(out_png, dpi=130, bbox_inches="tight")
+    fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
 
 
@@ -625,7 +689,7 @@ def _short_label(r: dict) -> str:
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
     plt = _get_mpl()
     s = pd.read_csv(samples_csv)
-    fig, (ax_p, ax_t, ax_c) = plt.subplots(3, 1, sharex=True, figsize=(12, 8))
+    fig, (ax_p, ax_t, ax_c) = plt.subplots(3, 1, sharex=True, figsize=(16, 10))
     ax_p.plot(s["t_s"], s["power_w"], lw=0.6, color="#1f77b4")
     ax_p.set_ylabel("power (W)"); ax_p.grid(True, alpha=0.3)
     ax_t.plot(s["t_s"], s["temp_c"], lw=0.6, color="#d62728")
@@ -648,7 +712,7 @@ def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
             ax.axvspan(t0, t1, alpha=0.06, color="orange")
 
     fig.suptitle(f"Power / temp / clock timeline — {gpu}")
-    fig.tight_layout(); fig.savefig(out_png, dpi=130)
+    fig.tight_layout(); fig.savefig(out_png, dpi=160)
     print(f"[save] {out_png}")
 
 
