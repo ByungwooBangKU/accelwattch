@@ -568,22 +568,26 @@ matmul     matmul_fp8_te       Tensor Core                    0         8       
 matmul     matmul_fp8_te       Tensor Core (FP16 fallback)    1         8         J/FLOP     2.38e-13   0.997   (A100 — emulated)
 ```
 
-`emulated = 1` 행은 **기본적으로 플롯에서 숨김**입니다. 이유:
+`emulated = 1` 행의 기본 처리는 **카테고리별로 다릅니다**:
 
-- A100 의 `matmul_fp8_te` 는 실제로는 FP16 TC 경로로 실행되지만 라벨은 "fp8" 이라, FP16 bar 옆에 나란히 그리면 "FP8 이 FP16 보다 비싸 보이는" 착시가 생김. 같은 HW 경로를 이름만 바꿔서 두 번 그리는 셈.
-- FP8 elementwise (A100/H100 모두) 도 cast-compute-cast 로 FP16 kernel 을 경유하므로 동일한 착시 유발.
+| 카테고리 | 기본 플롯 노출 | 이유 |
+|---|---|---|
+| elementwise (fp8_{mul,add,softmax,gelu,layernorm}) | **숨김** | PyTorch 의 native FP8 elementwise 커널 부재로 인한 cast-compute-cast 오버헤드. FP16 bar 와 나란히 그리면 착시 유발. |
+| matmul (`matmul_fp8_te` A100 폴백) | **노출** (hatched + `*EMU` + `[TC·FP16-fallback]` 태그) | fp16_tc 와 같은 값에 수렴해야 정상 — 이 수렴 여부 자체가 TE 폴백이 제대로 동작했다는 sanity check 가 된다. |
 
-따라서 플롯에서만 자동 배제하고, **Summary CSV 에는 그대로 남김**. 필요하면 플래그로 복구:
+즉 A100 에서도 `_linearity_matmul.png`, `_joule_per_op_bar.png` 에 `matmul_fp8_te` bar 가 그려지고, H100 의 native FP8 수치와 시각적으로 직접 비교할 수 있습니다. cross-GPU 플롯 (`compare_gpus.py`) 에서도 `matmul_fp8_te` 가 두 GPU 모두 bar 로 나타나며, A100 쪽은 hatch + `*EMU` 주석으로 폴백임을 명시합니다.
+
+**Summary CSV 에는 두 카테고리 모두 그대로 남깁니다** (`_summary.csv`). 숨겨진 fp8 elementwise 까지 플롯에 포함하려면:
 
 ```bash
-# 숨겨진 emulated cell 까지 플롯에 포함
+# fp8 elementwise cast-compute-cast bar 까지 플롯에 포함
 python3 analyze.py --reports-dir reports/ --tag a100 --include-emulated
 ```
 
 배제 발생 시 콘솔에 다음과 같은 로그가 찍힙니다:
 
 ```
-[filter] hiding 6 emulated variants (54 rows) from plots — pass --include-emulated to keep them. Full data remains in ..._summary.csv.
+[filter] hiding 5 emulated elementwise variants (45 rows) from plots — emulated matmul stays visible. Pass --include-emulated to show elementwise fp8 too. Full data: ..._summary.csv.
 ```
 
 #### 9.5.3 Step 3 — 두 GPU 교차 비교
