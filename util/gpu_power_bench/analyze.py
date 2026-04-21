@@ -69,8 +69,15 @@ large) — you need to restrict the fit to the linear regime in that case.
 
 Usage
 -----
-    python3 analyze.py reports/gpu_power_bench_a100_*.csv
-    python3 analyze.py reports/gpu_power_bench_h100_*.csv --samples reports/...samples.csv
+    # form 1 — explicit CSV path
+    python3 analyze.py reports/gpu_power_bench_h100_20260421_*.csv
+
+    # form 2 — point at a reports/ directory and pick by tag
+    python3 analyze.py --reports-dir reports/ --tag h100
+    python3 analyze.py --reports-dir reports/ --tag a100
+
+    # add a global timeline if you have the sampler sidecar:
+    python3 analyze.py reports/foo.csv --samples reports/foo_samples.csv
 """
 
 from __future__ import annotations
@@ -647,9 +654,73 @@ def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
 
 # ---------------------------------------------------------------------------
 
+def _resolve_csv(args) -> Path | None:
+    """Find the benchmark CSV from whichever flags the user provided.
+
+    Two input forms are supported:
+      (1) positional path:  analyze.py reports/foo.csv
+      (2) dir + tag:        analyze.py --reports-dir reports/ --tag h100
+    Form (2) globs `gpu_power_bench_*{tag}*.csv` under the directory and
+    picks the most recent match (falling back to plain `gpu_power_bench_*.csv`
+    when no tag is given).
+    """
+    if args.csv is not None:
+        return args.csv
+    if args.reports_dir is None:
+        return None
+    d = args.reports_dir
+    if not d.is_dir():
+        print(f"error: --reports-dir {d} does not exist or is not a directory")
+        return None
+    # Prefer tag-suffixed files (those gpu_power_bench.py writes when --tag
+    # is used); otherwise match any per-cell CSV. We deliberately exclude
+    # sidecar CSVs (_baseline / _samples / _summary) so the user doesn't
+    # accidentally analyze the wrong file.
+    patterns = []
+    if args.tag:
+        patterns += [f"gpu_power_bench_*_{args.tag}.csv",
+                     f"gpu_power_bench_*{args.tag}*.csv"]
+    else:
+        patterns += ["gpu_power_bench_*.csv"]
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for pat in patterns:
+        for p in d.glob(pat):
+            if p in seen:
+                continue
+            name = p.name
+            if any(name.endswith(s) for s in ("_baseline.csv", "_baseline_stats.csv",
+                                              "_samples.csv", "_summary.csv")):
+                continue
+            seen.add(p)
+            candidates.append(p)
+    if not candidates:
+        print(f"error: no matching CSV in {d} "
+              f"(tag={args.tag!r}, pattern='gpu_power_bench_*.csv')")
+        return None
+    # Most recently modified file wins.
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if len(candidates) > 1:
+        print(f"[info] {len(candidates)} CSVs matched — using the most recent:")
+        for p in candidates[:5]:
+            print(f"         {p.name}")
+    return candidates[0]
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("csv", type=Path, help="benchmark CSV (per-cell rows)")
+    ap = argparse.ArgumentParser(
+        description="Analyse a gpu_power_bench CSV into plots + a summary.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Positional CSV (form 1) is optional so --reports-dir (form 2) works too.
+    ap.add_argument("csv", type=Path, nargs="?", default=None,
+                    help="benchmark CSV (per-cell rows); omit to use --reports-dir")
+    ap.add_argument("--reports-dir", type=Path, default=None,
+                    help="directory to search for gpu_power_bench_*.csv "
+                         "(used when the positional CSV is omitted)")
+    ap.add_argument("--tag", type=str, default=None,
+                    help="only consider CSVs whose filename contains this tag "
+                         "(matches gpu_power_bench_*_<tag>.csv)")
     ap.add_argument("--samples", type=Path, default=None,
                     help="raw NVML samples CSV (for timeline plot)")
     ap.add_argument("--baseline", type=Path, default=None,
@@ -658,6 +729,14 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="where to write plots (default: same dir as csv)")
     args = ap.parse_args()
+
+    csv_path = _resolve_csv(args)
+    if csv_path is None:
+        ap.print_usage()
+        print("error: give a CSV path positionally or use --reports-dir [--tag]")
+        return 2
+    args.csv = csv_path
+    print(f"[input] {csv_path}")
 
     df = pd.read_csv(args.csv)
     if df.empty:
