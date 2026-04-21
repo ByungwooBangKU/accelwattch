@@ -27,7 +27,17 @@ Reads one or more per-cell CSVs written by gpu_power_bench.py and emits:
      benchmark" view — good for reporting and for cross-checking against
      the summary CSV.
 
-  5. `<stem>_timeline.png`  (only if the companion *_samples.csv exists)
+  5. `<stem>_static_power.png`  (only if a *_baseline.csv is found)
+     Three panels showing the static (idle) power baseline:
+       * P_static(t) during the idle window with mean and ±σ band —
+         flat = clean idle; drift = clock ramp / stray process.
+       * Per-cell stacked bar of static_energy_j vs dyn_energy_j — shows
+         how much of each measurement was "just the GPU being on".
+       * Static-energy share (%) per cell — high share means the
+         workload is too short relative to static overhead; lengthen
+         --window-ms if you see >50% static on the biggest loads.
+
+  6. `<stem>_timeline.png`  (only if the companion *_samples.csv exists)
      Global power / temperature / SM-clock trace with each cell shaded —
      useful to eyeball thermal stability and clock throttling.
 
@@ -309,6 +319,130 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
     print(f"[save] {out_png}")
 
 
+def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
+                      out_png: Path, gpu: str) -> None:
+    """Static-power diagnostics — the P_static term in E = P_static·T + Σ k_op·N.
+
+    Panel A : idle power trace (if the baseline sidecar exists). A clean
+              idle should be a flat horizontal line within ~1 W of the mean.
+              Drift or spikes → another process on the GPU or clocks still
+              ramping down; the reported P_static will be pessimistic.
+    Panel B : stacked bar per cell, static_energy_j on bottom (grey) +
+              dyn_energy_j on top (blue for elementwise, orange for matmul).
+              Shows how much of each measurement is "just keeping the
+              GPU on" vs. "actually running the op".
+    Panel C : static-energy share (%) per cell. If this is >50% on any
+              cell, increase --window-ms until the dyn part dominates.
+    """
+    plt = _get_mpl()
+    have_trace = baseline_csv is not None and baseline_csv.exists()
+    fig = plt.figure(figsize=(14, 10))
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.2, 2, 1.4], hspace=0.45)
+    ax_a = fig.add_subplot(gs[0])
+    ax_b = fig.add_subplot(gs[1])
+    ax_c = fig.add_subplot(gs[2], sharex=ax_b)
+
+    # ---------------- A: idle-window power trace ----------------
+    p_static_mean = float(df["static_power_w"].astype(float).iloc[0])
+    if have_trace:
+        bdf = pd.read_csv(baseline_csv)
+        if not bdf.empty and bdf["power_w"].notna().any():
+            t = bdf["t_s"].to_numpy(float)
+            p = bdf["power_w"].to_numpy(float)
+            mean = float(np.mean(p))
+            std = float(np.std(p))
+            ax_a.plot(t, p, lw=0.8, color="#1f77b4", label=f"idle power (n={len(p)})")
+            ax_a.axhline(mean, color="#d62728", lw=1.2,
+                         label=f"mean = {mean:.2f} W")
+            ax_a.fill_between(t, mean - std, mean + std, color="#d62728",
+                              alpha=0.15, label=f"±σ ({std:.2f} W)")
+            if "temp_c" in bdf.columns and bdf["temp_c"].notna().any():
+                temp_mean = float(bdf["temp_c"].mean())
+                ax_a.set_title(f"P_static(t) during idle window  —  "
+                               f"{mean:.2f} ± {std:.2f} W  @ {temp_mean:.1f}°C")
+            else:
+                ax_a.set_title(f"P_static(t) during idle window  —  "
+                               f"{mean:.2f} ± {std:.2f} W")
+            ax_a.set_xlabel("time since sampler start (s)")
+            ax_a.set_ylabel("power (W)")
+            ax_a.grid(True, alpha=0.3)
+            ax_a.legend(loc="upper right", fontsize=8)
+        else:
+            ax_a.text(0.5, 0.5, "baseline CSV empty", ha="center", va="center",
+                      transform=ax_a.transAxes)
+            ax_a.set_axis_off()
+    else:
+        ax_a.text(0.5, 0.5,
+                  f"no *_baseline.csv found — showing CSV-recorded P_static = "
+                  f"{p_static_mean:.2f} W only",
+                  ha="center", va="center", transform=ax_a.transAxes)
+        ax_a.axhline(p_static_mean, color="#d62728", lw=1.2)
+        ax_a.set_ylabel("power (W)")
+        ax_a.set_title("P_static (from CSV column — no raw trace)")
+        ax_a.grid(True, alpha=0.3)
+
+    # ---------------- B+C: per-cell static vs dynamic energy ----------------
+    # Order: elementwise first (by op, dtype), then matmul (by variant, K).
+    def _cell_key(r):
+        cat = r.get("category", "elementwise")
+        if cat == "matmul":
+            return (1, r.get("variant", ""), int(r["load_value"]))
+        return (0, r["op"], r["dtype"], int(r["load_value"]))
+
+    rows = df.to_dict("records")
+    rows.sort(key=_cell_key)
+    labels = []
+    stat_e = []
+    dyn_e = []
+    share = []
+    colors_dyn = []
+    for r in rows:
+        se = float(r["static_energy_j"])
+        de = float(r["dyn_energy_j"])
+        total = se + de
+        labels.append(_short_label(r))
+        stat_e.append(se)
+        dyn_e.append(de)
+        share.append(100.0 * se / total if total > 0 else 0.0)
+        colors_dyn.append("#ff7f0e" if r.get("category") == "matmul" else "#1f77b4")
+
+    x = np.arange(len(labels))
+    ax_b.bar(x, stat_e, color="#b0b0b0", label="static energy (P_static · T)")
+    ax_b.bar(x, dyn_e, bottom=stat_e, color=colors_dyn,
+             label="dynamic energy (workload)")
+    ax_b.set_ylabel("energy (J)")
+    ax_b.set_title("Per-cell energy breakdown — grey=static (idle overhead), "
+                   "blue=elementwise dyn, orange=matmul dyn")
+    ax_b.grid(True, axis="y", alpha=0.3)
+    ax_b.legend(loc="upper left", fontsize=9)
+    ax_b.set_xticks(x)
+    ax_b.set_xticklabels([""] * len(labels))
+
+    bars_c = ax_c.bar(x, share, color=colors_dyn, alpha=0.7)
+    ax_c.axhline(50.0, color="#d62728", lw=1, ls="--",
+                 label="50 % — consider --window-ms ↑")
+    for rect, s in zip(bars_c, share):
+        ax_c.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+                  f"{s:.0f}%", ha="center", va="bottom", fontsize=6)
+    ax_c.set_xticks(x)
+    ax_c.set_xticklabels(labels, rotation=80, ha="right", fontsize=7)
+    ax_c.set_ylabel("static share (%)")
+    ax_c.set_ylim(0, max(100.0, max(share) * 1.1 if share else 100.0))
+    ax_c.grid(True, axis="y", alpha=0.3)
+    ax_c.legend(loc="upper right", fontsize=8)
+
+    fig.suptitle(f"Static (idle) power diagnostics — {gpu}", y=0.995)
+    fig.savefig(out_png, dpi=130, bbox_inches="tight")
+    print(f"[save] {out_png}")
+
+
+def _short_label(r: dict) -> str:
+    """Compact cell label used as x-tick in the static-power bar chart."""
+    if r.get("category") == "matmul":
+        return f"{r.get('variant','matmul')}·K{int(r['load_value'])}"
+    return f"{r['dtype']}·{r['op']}·N{int(r['load_value'])}"
+
+
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
     plt = _get_mpl()
     s = pd.read_csv(samples_csv)
@@ -346,6 +480,9 @@ def main() -> int:
     ap.add_argument("csv", type=Path, help="benchmark CSV (per-cell rows)")
     ap.add_argument("--samples", type=Path, default=None,
                     help="raw NVML samples CSV (for timeline plot)")
+    ap.add_argument("--baseline", type=Path, default=None,
+                    help="idle / static-power baseline CSV "
+                         "(auto-discovered as <stem>_baseline.csv)")
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="where to write plots (default: same dir as csv)")
     args = ap.parse_args()
@@ -374,6 +511,14 @@ def main() -> int:
     plot_linearity_elementwise(df, out_dir / f"{stem}_linearity_elementwise.png", gpu)
     plot_linearity_matmul(df, out_dir / f"{stem}_linearity_matmul.png", gpu)
     plot_joule_per_op_bar(summary, out_dir / f"{stem}_joule_per_op_bar.png", gpu)
+
+    # Static-power diagnostics (auto-discover the baseline sidecar).
+    if args.baseline is None:
+        cand = args.csv.with_name(stem + "_baseline.csv")
+        if cand.exists():
+            args.baseline = cand
+    plot_static_power(df, args.baseline,
+                      out_dir / f"{stem}_static_power.png", gpu)
 
     # Timeline (auto-discover samples file if not given).
     if args.samples is None:

@@ -227,8 +227,15 @@ def main() -> int:
                                     hz=args.poll_hz)
     p_static = baseline["power_w_mean"]
     print(f"[baseline] static power = {p_static:.1f} ± {baseline['power_w_std']:.2f} W  "
-          f"(min {baseline['power_w_min']:.1f} W, temp {baseline['temp_c_mean']:.1f}°C, "
-          f"n={baseline['n']})")
+          f"(min {baseline['power_w_min']:.1f} W, max {baseline['power_w_max']:.1f} W, "
+          f"temp {baseline['temp_c_mean']:.1f}°C, n={baseline['n']})")
+    # Sanity check: if stdev > 5% of mean, the "idle" wasn't really idle
+    # (background kernel, clock ramp, another process) — warn so the user
+    # knows the P_static they're subtracting is noisy.
+    if p_static > 0 and baseline["power_w_std"] / p_static > 0.05:
+        print(f"[baseline] WARN idle power stdev is {100*baseline['power_w_std']/p_static:.1f}% "
+              f"of mean — another process may be using the GPU, or clocks are ramping. "
+              f"Check the baseline plot before trusting dyn-power numbers.")
 
     # ---- sampler (runs for the whole sweep, phase is toggled per cell) ----
     sampler = PowerSampler(handle, hz=args.poll_hz)
@@ -373,6 +380,35 @@ def main() -> int:
     else:
         print("\n[warn] no rows collected — nothing saved")
         return 2
+
+    # Dump the idle / static-power baseline as a sidecar so analyze.py can
+    # draw a P_static(t) plot (flat line = idle was clean; sawtooth = bad).
+    # We also emit a 1-row stats CSV so downstream tools don't have to
+    # re-compute the mean/stdev.
+    baseline_path = out_dir / f"gpu_power_bench_{gpu_slug}_{stamp}{suffix}_baseline.csv"
+    with open(baseline_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_s", "power_w", "temp_c"])
+        for t_s, p_w, t_c in baseline.get("samples", []):
+            w.writerow([f"{t_s:.4f}", f"{p_w:.3f}", t_c])
+    stats_path = out_dir / f"gpu_power_bench_{gpu_slug}_{stamp}{suffix}_baseline_stats.csv"
+    with open(stats_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["gpu", "duration_s", "hz", "n",
+                    "p_static_w_mean", "p_static_w_std",
+                    "p_static_w_min", "p_static_w_max",
+                    "temp_c_mean", "temp_c_min", "temp_c_max"])
+        w.writerow([gpu_name, baseline.get("duration_s", args.static_seconds),
+                    baseline.get("hz", args.poll_hz), baseline["n"],
+                    f"{baseline['power_w_mean']:.3f}",
+                    f"{baseline['power_w_std']:.3f}",
+                    f"{baseline['power_w_min']:.3f}",
+                    f"{baseline['power_w_max']:.3f}",
+                    f"{baseline['temp_c_mean']:.2f}",
+                    baseline.get("temp_c_min", -1),
+                    baseline.get("temp_c_max", -1)])
+    print(f"[save] {baseline_path}  ({len(baseline.get('samples', []))} idle samples)")
+    print(f"[save] {stats_path}   (P_static = {p_static:.2f} W)")
 
     # Also dump raw power samples for the whole run so analyze.py can draw a
     # global timeline (power, temp, clocks) with phase labels.

@@ -71,6 +71,15 @@ linearity (E_dyn ∝ N) 가 성립해야 (R² ≥ 0.99) 이 모델 폼이 유효
 
 100 Hz NVML 폴링 결과 전체. `t_s, power_w, temp_c, sm_mhz, mem_mhz, gpu_util, mem_util, phase`. timeline plot / 재분석용.
 
+### baseline CSV (`_baseline.csv` + `_baseline_stats.csv`)
+
+프로그램 시작 직후 idle 8 초 (`--static-seconds`) 동안의 P_static 측정 원시 데이터:
+
+- `_baseline.csv` : `t_s, power_w, temp_c` per sample → `analyze.py` 의 `_static_power.png` 첫 panel 이 여기서 그려집니다. "정말 idle 이었나?" 를 눈으로 확인하는 용도.
+- `_baseline_stats.csv` : 1 행짜리 요약 — `p_static_w_mean/std/min/max`, `temp_c_mean/min/max`, `duration_s`, `hz`, `n`. cross-GPU 비교 스크립트나 외부 power-model 툴이 바로 가져다 쓰기 위한 형태.
+
+static power 의 신뢰도가 낮으면 (`std / mean > 5%`) 벤치마크 stdout 에 WARN 이 찍히니 해당 런의 결과는 한 번 더 확인하세요.
+
 ## 설치 & 사전 점검
 
 ```bash
@@ -171,7 +180,7 @@ cd util/gpu_power_bench
 python3 analyze.py reports/gpu_power_bench_a100_80gb_20260420_142301.csv
 ```
 
-생성물 (5개):
+생성물 (6개):
 
 | 파일 | 내용 |
 |---|---|
@@ -179,12 +188,18 @@ python3 analyze.py reports/gpu_power_bench_a100_80gb_20260420_142301.csv
 | `<stem>_linearity_elementwise.png` | op × dtype: `E_dyn vs N`, `wall vs N`, `J/elem` 3-row grid. log-log 에서 기울기 1 직선이 이상적 |
 | `<stem>_linearity_matmul.png` | matmul variant: `E_dyn vs FLOPs`, `wall vs FLOPs`, `J/FLOP` (x축이 FLOPs 인 이유는 K³ 스케일) |
 | `<stem>_joule_per_op_bar.png` | 좌: elementwise op 별 J/elem, 우: matmul variant 별 J/FLOP. 막대 위에 R² 표시 |
+| `<stem>_static_power.png` | **P_static 진단 3-panel** — idle 구간의 P(t) + mean/±σ 밴드, 셀별 `static_energy_j` vs `dyn_energy_j` 스택 막대, 셀별 static 비중(%) |
 | `<stem>_timeline.png` | 전체 런의 power / temp / SM·MEM clock 타임라인. 각 cell 구간이 살짝 shading |
 
 summary CSV 를 읽는 법:
 - `slope_dyn` (elementwise) = "이 op 의 J/element" → 그대로 `k_op` 로 사용
 - `slope_dyn` (matmul) = "이 variant 의 J/FLOP" → matmul `k_op`
 - `R2_dyn ≥ 0.99` 면 선형 모델 OK. 낮으면 해당 변형만 load 범위 좁혀서 재측정.
+
+static_power 플롯을 읽는 법:
+- **상단 (P_static trace)** : idle 8초 동안 power(t) 가 평평한 수평선이면 clean baseline. sawtooth / drift 면 다른 프로세스 GPU 공유 의심 — `nvidia-smi` 로 확인 후 재측정. σ/mean > 5% 면 벤치마크 stdout 에도 WARN 이 찍힘.
+- **중단 (static vs dyn 스택)** : 회색 = idle 에 놓여있어도 나갔을 에너지 (`P_static·T`), 파랑/주황 = 연산이 추가로 만든 에너지. dyn 이 회색보다 높아야 "그 연산을 측정한 값" 이라고 말할 수 있음.
+- **하단 (static share %)** : 50% 를 넘으면 측정창이 너무 짧아 노이즈가 큽니다. 해당 셀들은 `--window-ms 3000` 등으로 늘려 재측정.
 
 ### 2. A100 vs H100 비교 — `compare_gpus.py`
 

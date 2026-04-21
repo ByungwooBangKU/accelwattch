@@ -137,30 +137,44 @@ class PowerSampler(threading.Thread):
 # -------------------------------- utilities ----------------------------------
 
 def measure_static_power(handle, seconds: float = 5.0, hz: int = 100) -> dict:
-    """Sit idle for `seconds` and report mean/stdev/min of power & temp.
+    """Sit idle for `seconds` and report mean/stdev/min/max of power & temp.
 
     The returned mean power is the "static" (idle) power that we subtract
     from measurements to isolate the *dynamic* energy of the workload.
     Caller should drop any GPU allocations and synchronize before calling.
+
+    The raw per-sample trace is returned under the "samples" key so that
+    `gpu_power_bench.py` can persist it as a sidecar CSV — the idle trace
+    is what lets `analyze.py` draw a P_static(t) plot and verify that the
+    baseline was actually flat (no background kernel, no clock ramp).
     """
     sampler = PowerSampler(handle, hz=hz)
     sampler.start()
-    sampler.set_phase("idle")
+    sampler.set_phase("idle_baseline")
     time.sleep(seconds)
     sampler.stop()
 
     ps = [s.power_w for s in sampler.samples if s.power_w >= 0]
     ts = [s.temp_c for s in sampler.samples if s.temp_c >= 0]
+    trace = [(s.t, s.power_w, s.temp_c) for s in sampler.samples
+             if s.power_w >= 0]
     if not ps:
         return {"power_w_mean": -1.0, "power_w_std": -1.0, "power_w_min": -1.0,
-                "temp_c_mean": -1.0, "n": 0}
+                "power_w_max": -1.0, "temp_c_mean": -1.0, "n": 0,
+                "samples": []}
     import statistics as st
     return {
         "power_w_mean": st.fmean(ps),
         "power_w_std":  st.pstdev(ps) if len(ps) > 1 else 0.0,
         "power_w_min":  min(ps),
+        "power_w_max":  max(ps),
         "temp_c_mean":  (sum(ts) / len(ts)) if ts else -1.0,
+        "temp_c_min":   min(ts) if ts else -1,
+        "temp_c_max":   max(ts) if ts else -1,
+        "duration_s":   seconds,
+        "hz":           hz,
         "n":            len(ps),
+        "samples":      trace,
     }
 
 
