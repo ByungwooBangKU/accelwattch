@@ -494,16 +494,135 @@ GPU 0 에서 full sweep (15 cells × 9 loads = ~30-40 분) 을 돈다.
 
 ### 9.5 분석 단계
 
+전체 파이프라인은 **"sweep → per-GPU analyze → cross-GPU compare"** 의 3 단계로 진행됩니다. A100 과 H100 은 별개의 GPU 이므로 각각의 GPU 에서 sweep 을 돌려야 하며, 동일한 `reports/` 디렉토리에 누적하는 것을 권장합니다 (이름 prefix 로 자동 구분됨).
+
+#### 9.5.1 Step 1 — GPU 별 sweep 실행
+
+A100 머신에서:
+
 ```bash
-python3 analyze.py --reports-dir reports/ --tag a100
+cd util/gpu_power_bench
+./run_bench.sh --device 0 --tag a100
+# → reports/gpu_power_bench_a100_80gb_<stamp>_a100.csv
+# → reports/gpu_power_bench_a100_80gb_<stamp>_a100_baseline.csv
+# → reports/gpu_power_bench_a100_80gb_<stamp>_a100_baseline_stats.csv
+# → reports/gpu_power_bench_a100_80gb_<stamp>_a100_samples.csv
 ```
 
-각 plot 을 `reports/<tag>/` 아래에 생성한다.
-
-Cross-GPU 비교는:
+H100 머신에서 (같은 `--tag` 규약만 유지하면 ok):
 
 ```bash
-python3 compare_gpus.py --a100-dir reports/a100 --h100-dir reports/h100 --out reports/compare/
+./run_bench.sh --device 0 --tag h100
+# → reports/gpu_power_bench_h100_sxm_<stamp>_h100.csv
+# → 및 동일한 3 종 sidecar
+```
+
+파일 이름의 `_<tag>.csv` 접미사가 뒤에 오는 `analyze.py --tag` 검색 키로 쓰입니다. 여러 번 돌리면 같은 태그로 여러 timestamp 가 쌓이며, `analyze.py` 는 **가장 최근 수정된 파일**을 자동 선택 (여러 개 매칭 시 상위 5개를 콘솔에 로그).
+
+#### 9.5.2 Step 2 — per-GPU 분석 (plot 생성)
+
+두 가지 호출 방식 중 편한 쪽을 고르면 됩니다.
+
+**방식 A** — `--reports-dir` + `--tag` (권장):
+
+```bash
+python3 analyze.py --reports-dir reports/ --tag a100
+# → reports/a100/  아래에 모든 PNG + summary CSV 생성
+python3 analyze.py --reports-dir reports/ --tag h100
+# → reports/h100/  아래에 생성
+```
+
+`--tag` 를 함께 주면 출력이 자동으로 `<reports-dir>/<tag>/` 로 분리됩니다 (A100 과 H100 plot 이 섞이지 않도록).
+
+**방식 B** — CSV 를 직접 지정:
+
+```bash
+python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
+# → reports/  (CSV 와 같은 디렉토리) 아래에 PNG 들 생성
+```
+
+이 방식에선 `--out-dir` 로 직접 출력 위치를 바꿀 수 있습니다.
+
+**각 per-GPU 분석에서 나오는 파일** (`<stem>` = CSV 파일명에서 `.csv` 뺀 부분):
+
+| 파일 | 내용 |
+|---|---|
+| `<stem>_summary.csv` | cell 당 1 행, `slope_dyn` / `R2_dyn` / `compute_unit` / `emulated` 등 집계 |
+| `<stem>_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
+| `<stem>_linearity_matmul.png` | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 포함 |
+| `<stem>_joule_per_op_bar.png` | bar chart (좌: elementwise, 우: matmul) |
+| `<stem>_static_power.png` | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
+| `<stem>_temperature.png` | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
+| `<stem>_timeline.png` | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
+
+콘솔에는 summary 표가 다음 컬럼으로 출력됩니다:
+
+```
+category  variant              compute_unit                   emulated  n_points  fit_axis   slope_dyn  R2_dyn
+elementwise fp16_mul           CUDA core                      0         9         J/element  6.21e-12   0.997
+elementwise fp8_mul            CUDA core                      1         9         J/element  1.43e-11   0.993   (cast-compute-cast emulated)
+matmul     matmul_fp16_tc      Tensor Core                    0         8         J/FLOP     2.41e-13   0.998
+matmul     matmul_fp8_te       Tensor Core                    0         8         J/FLOP     1.12e-13   0.996   (H100 native)
+matmul     matmul_fp8_te       Tensor Core (FP16 fallback)    1         8         J/FLOP     2.38e-13   0.997   (A100 — emulated)
+```
+
+`emulated = 1` 행은 플롯에서도 hatch (`///`) 와 `*EMU` 마커로 구분됩니다.
+
+#### 9.5.3 Step 3 — 두 GPU 교차 비교
+
+두 GPU 의 per-cell CSV 를 함께 `compare_gpus.py` 에 넘기면 됩니다. 인자는 **positional CSV path** 방식입니다 (이전 문서의 `--a100-dir` / `--h100-dir` 는 잘못된 표기였음):
+
+```bash
+python3 compare_gpus.py \
+    reports/gpu_power_bench_a100_80gb_20260421_*_a100.csv \
+    reports/gpu_power_bench_h100_sxm_20260421_*_h100.csv \
+    --baseline a100_80gb \
+    --out-dir reports/compare \
+    --tag v1
+```
+
+- `--baseline` : ratio 계산의 분모가 될 GPU 이름 (CSV 의 `gpu` 컬럼 값 중 하나). 미지정 시 첫 번째 CSV 의 GPU.
+- `--out-dir` : 결과 PNG/CSV 저장 위치 (default `reports/`).
+- `--tag` : 출력 파일명에 붙는 식별자 (여러 실험 비교 시).
+
+**생성되는 파일**:
+
+| 파일 | 내용 |
+|---|---|
+| `gpu_compare_<stamp>_<tag>_summary.csv` | (variant × GPU) 슬로프 + ratio 표 |
+| `gpu_compare_<stamp>_<tag>_bar.png` | variant 별 J/op grouped bar (GPU 별 색) |
+| `gpu_compare_<stamp>_<tag>_heatmap.png` | ratio heatmap (녹색 < 1 = 효율 ↑) |
+| `gpu_compare_<stamp>_<tag>_static.png` | GPU 별 P_static 비교 |
+
+#### 9.5.4 한 GPU 만 있을 때
+
+A100 만 있거나 H100 만 있을 때는 Step 3 을 건너뛰고 Step 1–2 로 종료합니다. 결과 해석에는 `_summary.csv` 의 `slope_dyn` 컬럼과 `_joule_per_op_bar.png` 가 핵심입니다.
+
+#### 9.5.5 전체 디렉토리 구조 (참조)
+
+권장 워크플로우를 따르면 `reports/` 는 다음 형태가 됩니다:
+
+```
+reports/
+├── gpu_power_bench_a100_80gb_20260421_120000_a100.csv           # A100 per-cell
+├── gpu_power_bench_a100_80gb_20260421_120000_a100_baseline.csv
+├── gpu_power_bench_a100_80gb_20260421_120000_a100_baseline_stats.csv
+├── gpu_power_bench_a100_80gb_20260421_120000_a100_samples.csv
+├── gpu_power_bench_h100_sxm_20260421_140000_h100.csv            # H100 per-cell
+├── gpu_power_bench_h100_sxm_20260421_140000_h100_baseline.csv
+├── gpu_power_bench_h100_sxm_20260421_140000_h100_baseline_stats.csv
+├── gpu_power_bench_h100_sxm_20260421_140000_h100_samples.csv
+├── a100/                                                        # Step 2 output (A100)
+│   ├── <stem>_summary.csv
+│   ├── <stem>_linearity_elementwise.png
+│   └── … (다른 6 종 PNG)
+├── h100/                                                        # Step 2 output (H100)
+│   └── … (동일 7 종)
+└── compare/                                                     # Step 3 output
+    ├── gpu_compare_20260421_150000_v1_summary.csv
+    ├── gpu_compare_20260421_150000_v1_bar.png
+    ├── gpu_compare_20260421_150000_v1_heatmap.png
+    └── gpu_compare_20260421_150000_v1_static.png
 ```
 
 ## 10. 산출 파일 레퍼런스
