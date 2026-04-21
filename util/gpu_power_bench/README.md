@@ -63,7 +63,11 @@ linearity (E_dyn ∝ N) 가 성립해야 (R² ≥ 0.99) 이 모델 폼이 유효
 | `dyn_energy_j` | `total - static` — **dynamic 에너지** |
 | `j_per_element_total` / `_dyn` | J/elem (total 또는 dyn) |
 | `j_per_flop_total` / `_dyn` | J/FLOP (FLOP 추정치 기반) |
+| `start_temp_c` | cool-down 직후, 측정 시작 시점의 die 온도 |
 | `avg_temp_c` / `peak_temp_c` | 구간 온도 — 안정성 확인용 |
+| `temp_rise_c` | `peak - start` — 해당 op 가 GPU 를 얼마나 달궜는지 |
+| `cooldown_elapsed_s` | 해당 셀 직전 cool-down 실제 대기 시간 (초) |
+| `cooldown_reached` | `1` = 목표 온도 도달 / `0` = timeout (이 셀의 start_temp 가 높을 수 있음) |
 | `sm_clk_mhz` / `mem_clk_mhz` | 구간 말미 클럭 — throttle 여부 |
 | `notes` | 주의 메모 (e.g. "fp8 emulated", "TE fallback") |
 
@@ -160,14 +164,15 @@ cd util/gpu_power_bench
 | `--device N` | 0 | CUDA 디바이스 인덱스 |
 | `--ops ...` | 전체 5 | elementwise 연산 선택 |
 | `--dtypes ...` | `fp16 fp8` | elementwise dtype 선택 |
-| `--loads ...` | 256K..256M 6단 | elementwise load (tensor element 수) |
+| `--loads ...` | 128K..384M 9단 | elementwise load (tensor element 수). 3 orders of magnitude 를 9점으로 촘촘히 sweep — regression outlier 내성 확보 |
 | `--no-matmul` | off | matmul 벤치 skip |
-| `--matmul-sizes` | `512 1024 2048 4096 8192` | K 값 sweep |
+| `--matmul-sizes` | `512 1024 1536 2048 3072 4096 6144 8192` | K 값 sweep (8단). TC 스윗스팟 주변을 촘촘히 |
 | `--matmul-variants` | 전체 5 | `dtype:mode` 형식 (e.g. `fp16:tc`) |
-| `--window-ms` | 1500 | cell 측정 길이 — 길수록 NVML 노이즈 ↓ |
-| `--static-seconds` | 8 | idle 측정 시간 |
+| `--window-ms` | 3000 | cell 측정 길이 — 길수록 NVML 노이즈 ↓ (20 Hz 업데이트 ≈ 60 샘플/셀) |
+| `--static-seconds` | 12 | idle 측정 시간 |
 | `--cooldown-c` | 50 | 실험 간 목표 온도 (°C) — `-1` 이면 disable |
-| `--cooldown-timeout` | 120 | cool-down 최대 대기 (초) |
+| `--cooldown-min-s` | 5 | 온도와 무관하게 무조건 대기할 최소 시간. die 온도가 빨리 떨어져도 HBM/VRM 잔열은 남음 |
+| `--cooldown-timeout` | 180 | cool-down 최대 대기 (초) |
 | `--no-cooldown` | off | cool-down 생략 (빠름 / 덜 안정적) |
 | `--tag` | — | 출력 파일명 suffix |
 | `--poll-hz` | 100 | NVML 폴링 주파수 |
@@ -180,7 +185,7 @@ cd util/gpu_power_bench
 python3 analyze.py reports/gpu_power_bench_a100_80gb_20260420_142301.csv
 ```
 
-생성물 (6개):
+생성물 (7개):
 
 | 파일 | 내용 |
 |---|---|
@@ -189,6 +194,7 @@ python3 analyze.py reports/gpu_power_bench_a100_80gb_20260420_142301.csv
 | `<stem>_linearity_matmul.png` | matmul variant: `E_dyn vs FLOPs`, `wall vs FLOPs`, `J/FLOP` (x축이 FLOPs 인 이유는 K³ 스케일) |
 | `<stem>_joule_per_op_bar.png` | 좌: elementwise op 별 J/elem, 우: matmul variant 별 J/FLOP. 막대 위에 R² 표시 |
 | `<stem>_static_power.png` | **P_static 진단 3-panel** — idle 구간의 P(t) + mean/±σ 밴드, 셀별 `static_energy_j` vs `dyn_energy_j` 스택 막대, 셀별 static 비중(%) |
+| `<stem>_temperature.png` | **온도 진단 3-panel** — 셀별 start / avg / peak °C (Δ 라벨 포함), 셀별 cool-down 소요 시간, J/op vs avg_temp_c scatter |
 | `<stem>_timeline.png` | 전체 런의 power / temp / SM·MEM clock 타임라인. 각 cell 구간이 살짝 shading |
 
 summary CSV 를 읽는 법:
@@ -199,7 +205,12 @@ summary CSV 를 읽는 법:
 static_power 플롯을 읽는 법:
 - **상단 (P_static trace)** : idle 8초 동안 power(t) 가 평평한 수평선이면 clean baseline. sawtooth / drift 면 다른 프로세스 GPU 공유 의심 — `nvidia-smi` 로 확인 후 재측정. σ/mean > 5% 면 벤치마크 stdout 에도 WARN 이 찍힘.
 - **중단 (static vs dyn 스택)** : 회색 = idle 에 놓여있어도 나갔을 에너지 (`P_static·T`), 파랑/주황 = 연산이 추가로 만든 에너지. dyn 이 회색보다 높아야 "그 연산을 측정한 값" 이라고 말할 수 있음.
-- **하단 (static share %)** : 50% 를 넘으면 측정창이 너무 짧아 노이즈가 큽니다. 해당 셀들은 `--window-ms 3000` 등으로 늘려 재측정.
+- **하단 (static share %)** : 50% 를 넘으면 측정창이 너무 짧아 노이즈가 큽니다. 기본 `--window-ms 3000` 이어도 작은 load 는 overhead 지배적 — `--window-ms 6000` 으로 더 늘리거나 해당 로드를 제외.
+
+temperature 플롯을 읽는 법:
+- **상단 (start / avg / peak + Δ)** : start 가 셀마다 비슷해야 공정한 비교. `cooldown_reached=0` 인 셀이 많으면 start 가 들쑥날쑥해짐. 빨간 Δ 숫자는 해당 op 가 만드는 발열 특성 — matmul_fp32_simt 이 eltwise 보다 Δ 큰 게 정상.
+- **중단 (cool-down 시간)** : 앞 셀이 길게 연산했으면 뒷 셀의 cool-down 이 오래 걸림. 평평하면 열적 평형 유지됨. 우상향이면 `--cooldown-min-s` 를 올려야 함.
+- **하단 (J/op vs °C scatter)** : 같은 색(variant) 점들이 수평이면 온도 비의존. 우상향이면 "뜨거울수록 더 쓴다" → power modeling 에 온도 변수 추가 고려.
 
 ### 2. A100 vs H100 비교 — `compare_gpus.py`
 

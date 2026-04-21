@@ -178,12 +178,18 @@ def measure_static_power(handle, seconds: float = 5.0, hz: int = 100) -> dict:
     }
 
 
-def wait_for_cooldown(handle, target_c: int = 45, timeout_s: float = 120.0,
-                      poll_s: float = 1.0, verbose: bool = True) -> dict:
+def wait_for_cooldown(handle, target_c: int = 45, timeout_s: float = 180.0,
+                      poll_s: float = 1.0, min_s: float = 0.0,
+                      verbose: bool = True) -> dict:
     """Block until GPU temp falls at/below `target_c` or `timeout_s` elapses.
 
-    Returns a dict with the final temperature and elapsed wait time so the
-    driver can log per-experiment thermal context.
+    The `min_s` floor guarantees we always idle at least that long regardless
+    of the die temperature — important because the die sensor cools faster
+    than HBM / VRMs, and starting a new measurement while those are still
+    warm inflates the static-power baseline. Set to 0 to disable the floor.
+
+    Returns a dict with the final temperature, elapsed wait time, and a
+    `reached` flag so the driver can log per-experiment thermal context.
     """
     t0 = time.perf_counter()
     last_print = 0.0
@@ -193,11 +199,14 @@ def wait_for_cooldown(handle, target_c: int = 45, timeout_s: float = 120.0,
                        pynvml.NVML_TEMPERATURE_GPU, default=-1)
         elapsed = time.perf_counter() - t0
         if cur < 0:
-            # No temp sensor accessible → don't loop forever.
+            # No temp sensor accessible → obey the min-floor, then bail out.
+            if elapsed < min_s:
+                time.sleep(poll_s); continue
             return {"final_temp_c": -1, "elapsed_s": elapsed, "reached": False}
-        if cur <= target_c:
+        if cur <= target_c and elapsed >= min_s:
             if verbose:
-                print(f"[cooldown] {cur}°C ≤ {target_c}°C reached in {elapsed:.1f}s")
+                print(f"[cooldown] {cur}°C ≤ {target_c}°C reached in {elapsed:.1f}s "
+                      f"(min {min_s:.1f}s)")
             return {"final_temp_c": cur, "elapsed_s": elapsed, "reached": True}
         if elapsed >= timeout_s:
             if verbose:

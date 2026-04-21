@@ -44,18 +44,29 @@ import preflight
 
 # ---- defaults --------------------------------------------------------------
 
+# Coarse-but-thorough sweep: 9 elementwise load points spanning 3 orders
+# of magnitude. More points means the J/op regression is less sensitive to
+# any one outlier (e.g. a cell that collided with a thermal spike). Runtime
+# grows linearly; the defaults target maximum confidence, not minimum wall
+# time — use --quick for smoke tests.
 DEFAULT_LOADS = [
-    1 << 18,   # 256K
-    1 << 20,   # 1M
-    1 << 22,   # 4M
-    1 << 24,   # 16M
+    1 << 17,   # 128K   — tiny, launch-overhead regime
+    1 << 19,   # 512K
+    1 << 21,   # 2M
+    1 << 23,   # 8M
+    1 << 25,   # 32M
     1 << 26,   # 64M
-    1 << 28,   # 256M
+    1 << 27,   # 128M
+    1 << 28,   # 256M  — BW-bound regime
+    (1 << 28) + (1 << 27),  # 384M — extra top-end point so the BW-saturation
+                             # shoulder is well-characterised
 ]
 QUICK_LOADS = [1 << 20, 1 << 22, 1 << 24]
 
 # Matrix side length K (M = N = K). FLOPs per call = 2·K³, memory = 3·K² elements.
-DEFAULT_MATMUL_SIZES = [512, 1024, 2048, 4096, 8192]
+# 8 points: dense around the TC sweet spot (1024–4096) + one tiny (512, launch
+# overhead) and two big (6144, 8192) to expose BW saturation on FP32.
+DEFAULT_MATMUL_SIZES = [512, 1024, 1536, 2048, 3072, 4096, 6144, 8192]
 QUICK_MATMUL_SIZES = [1024, 2048, 4096]
 
 
@@ -153,13 +164,17 @@ def main() -> int:
                     help="tensor element counts; default: 256K..256M sweep")
     ap.add_argument("--quick", action="store_true",
                     help="short sweep for smoke-testing")
-    ap.add_argument("--window-ms", type=float, default=1500.0,
-                    help="target measurement window per cell (ms). Longer = lower NVML noise.")
-    ap.add_argument("--static-seconds", type=float, default=8.0,
+    ap.add_argument("--window-ms", type=float, default=3000.0,
+                    help="target measurement window per cell (ms). Longer = lower NVML noise; "
+                         "3000 ms gives ≈60 power samples per cell at 20 Hz NVML update rate.")
+    ap.add_argument("--static-seconds", type=float, default=12.0,
                     help="idle time to measure static/baseline power")
     ap.add_argument("--cooldown-c", type=int, default=50,
                     help="°C threshold to reach between experiments (set -1 to disable)")
-    ap.add_argument("--cooldown-timeout", type=float, default=120.0)
+    ap.add_argument("--cooldown-min-s", type=float, default=5.0,
+                    help="minimum idle time before starting a cell, even if already below "
+                         "--cooldown-c. Ensures HBM / VRM residual heat has time to dissipate.")
+    ap.add_argument("--cooldown-timeout", type=float, default=180.0)
     ap.add_argument("--no-cooldown", action="store_true",
                     help="skip thermal cool-down between cells")
     ap.add_argument("--out-dir", type=str, default="reports")
@@ -221,7 +236,8 @@ def main() -> int:
     torch.cuda.synchronize()
     if not args.no_cooldown and args.cooldown_c > 0:
         wait_for_cooldown(handle, target_c=args.cooldown_c,
-                          timeout_s=args.cooldown_timeout)
+                          timeout_s=args.cooldown_timeout,
+                          min_s=args.cooldown_min_s)
     print(f"[baseline] measuring static power for {args.static_seconds:.1f}s …")
     baseline = measure_static_power(handle, seconds=args.static_seconds,
                                     hz=args.poll_hz)
@@ -286,10 +302,16 @@ def main() -> int:
             if spec.notes:
                 print(f"  note: {spec.notes}")
 
+            cooldown_info = {"final_temp_c": -1, "elapsed_s": 0.0, "reached": False}
             if not args.no_cooldown and args.cooldown_c > 0:
-                wait_for_cooldown(handle, target_c=args.cooldown_c,
-                                  timeout_s=args.cooldown_timeout,
-                                  verbose=False)
+                cooldown_info = wait_for_cooldown(
+                    handle, target_c=args.cooldown_c,
+                    timeout_s=args.cooldown_timeout,
+                    min_s=args.cooldown_min_s,
+                    verbose=False)
+                print(f"  cooldown: {cooldown_info['elapsed_s']:.1f}s → "
+                      f"{cooldown_info['final_temp_c']}°C "
+                      f"{'(reached)' if cooldown_info['reached'] else '(TIMEOUT)'}")
 
             try:
                 meas = run_measurement(spec, sampler, window_ms=args.window_ms)
@@ -342,8 +364,13 @@ def main() -> int:
                 "j_per_element_dyn":   f"{dyn_energy/total_elements:.3e}",
                 "j_per_flop_total":    f"{meas['total_energy_j']/total_flops:.3e}",
                 "j_per_flop_dyn":      f"{dyn_energy/total_flops:.3e}",
-                "avg_temp_c":   f"{meas['avg_temp_c']:.1f}",
-                "peak_temp_c":  meas["peak_temp_c"],
+                "start_temp_c":      cooldown_info["final_temp_c"],
+                "avg_temp_c":        f"{meas['avg_temp_c']:.1f}",
+                "peak_temp_c":       meas["peak_temp_c"],
+                "temp_rise_c":       (meas["peak_temp_c"] - cooldown_info["final_temp_c"]
+                                      if cooldown_info["final_temp_c"] >= 0 else -1),
+                "cooldown_elapsed_s": f"{cooldown_info['elapsed_s']:.2f}",
+                "cooldown_reached":   int(bool(cooldown_info["reached"])),
                 "sm_clk_mhz":   meas["sm_clk_mhz"],
                 "mem_clk_mhz":  meas["mem_clk_mhz"],
                 "notes":        spec.notes,
@@ -353,7 +380,8 @@ def main() -> int:
                   f"E_dyn={dyn_energy:.3f} J, "
                   f"P_avg={meas['avg_power_w']:.1f} W "
                   f"(dyn {dyn_power:.1f} W), "
-                  f"T={meas['avg_temp_c']:.1f}°C (peak {meas['peak_temp_c']}), "
+                  f"T={cooldown_info['final_temp_c']}→{meas['peak_temp_c']}°C "
+                  f"(Δ{row['temp_rise_c']}, avg {meas['avg_temp_c']:.1f}°C), "
                   f"iters={meas['iters']}, {meas['wall_s']:.2f}s")
             print(f"  J/elem (dyn)={row['j_per_element_dyn']}  "
                   f"J/FLOP (dyn)={row['j_per_flop_dyn']}")
