@@ -566,7 +566,23 @@ matmul     matmul_fp8_te       Tensor Core                    0         8       
 matmul     matmul_fp8_te       Tensor Core (FP16 fallback)    1         8         J/FLOP     2.38e-13   0.997   (A100 — emulated)
 ```
 
-`emulated = 1` 행은 플롯에서도 hatch (`///`) 와 `*EMU` 마커로 구분됩니다.
+`emulated = 1` 행은 **기본적으로 플롯에서 숨김**입니다. 이유:
+
+- A100 의 `matmul_fp8_te` 는 실제로는 FP16 TC 경로로 실행되지만 라벨은 "fp8" 이라, FP16 bar 옆에 나란히 그리면 "FP8 이 FP16 보다 비싸 보이는" 착시가 생김. 같은 HW 경로를 이름만 바꿔서 두 번 그리는 셈.
+- FP8 elementwise (A100/H100 모두) 도 cast-compute-cast 로 FP16 kernel 을 경유하므로 동일한 착시 유발.
+
+따라서 플롯에서만 자동 배제하고, **Summary CSV 에는 그대로 남김**. 필요하면 플래그로 복구:
+
+```bash
+# 숨겨진 emulated cell 까지 플롯에 포함
+python3 analyze.py --reports-dir reports/ --tag a100 --include-emulated
+```
+
+배제 발생 시 콘솔에 다음과 같은 로그가 찍힙니다:
+
+```
+[filter] hiding 6 emulated variants (54 rows) from plots — pass --include-emulated to keep them. Full data remains in ..._summary.csv.
+```
 
 #### 9.5.3 Step 3 — 두 GPU 교차 비교
 

@@ -728,6 +728,13 @@ def main() -> int:
                          "(auto-discovered as <stem>_baseline.csv)")
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="where to write plots (default: same dir as csv)")
+    ap.add_argument("--include-emulated", action="store_true",
+                    help="show emulated cells in plots (fp8 elementwise "
+                         "cast-compute-cast, fp8_te on pre-Hopper fallback). "
+                         "Hidden by default because their numbers reflect the "
+                         "underlying FP16 path, not native FP8 cost — plotting "
+                         "them next to the FP16 bars is misleading. They stay "
+                         "in the CSV/summary either way for debugging.")
     args = ap.parse_args()
 
     csv_path = _resolve_csv(args)
@@ -770,19 +777,40 @@ def main() -> int:
                 "mean_temp_c", "peak_temp_c"]
         print(summary[cols].to_string(index=False))
 
+    # --- filter emulated rows out of the plots (keep them in the CSV) ------
+    # Rationale: on A100 the fp8_te bar is really an FP16-TC number, and the
+    # fp8_* elementwise bars on any GPU are cast-compute-cast via FP16. Putting
+    # them next to the real FP16 bars makes the plot misleading — "FP8 looks
+    # worse than FP16" is an artifact of the emulation, not the silicon. Hide
+    # them by default; users who want to inspect the emulation overhead can
+    # pass --include-emulated or just open the summary CSV.
+    plot_df = df
+    plot_summary = summary
+    if not args.include_emulated:
+        if "emulated" in df.columns:
+            plot_df = df[df["emulated"].astype(int) == 0].copy()
+        if "emulated" in summary.columns:
+            plot_summary = summary[summary["emulated"].astype(int) == 0].copy()
+        hidden_cells = len(df) - len(plot_df)
+        hidden_variants = len(summary) - len(plot_summary)
+        if hidden_cells or hidden_variants:
+            print(f"[filter] hiding {hidden_variants} emulated variants "
+                  f"({hidden_cells} rows) from plots — pass --include-emulated "
+                  f"to keep them. Full data remains in {summary_path.name}.")
+
     # --- plots ---
-    plot_linearity_elementwise(df, out_dir / f"{stem}_linearity_elementwise.png", gpu)
-    plot_linearity_matmul(df, out_dir / f"{stem}_linearity_matmul.png", gpu)
-    plot_joule_per_op_bar(summary, out_dir / f"{stem}_joule_per_op_bar.png", gpu)
+    plot_linearity_elementwise(plot_df, out_dir / f"{stem}_linearity_elementwise.png", gpu)
+    plot_linearity_matmul(plot_df, out_dir / f"{stem}_linearity_matmul.png", gpu)
+    plot_joule_per_op_bar(plot_summary, out_dir / f"{stem}_joule_per_op_bar.png", gpu)
 
     # Static-power diagnostics (auto-discover the baseline sidecar).
     if args.baseline is None:
         cand = args.csv.with_name(stem + "_baseline.csv")
         if cand.exists():
             args.baseline = cand
-    plot_static_power(df, args.baseline,
+    plot_static_power(plot_df, args.baseline,
                       out_dir / f"{stem}_static_power.png", gpu)
-    plot_temperature(df, summary,
+    plot_temperature(plot_df, plot_summary,
                      out_dir / f"{stem}_temperature.png", gpu)
 
     # Timeline (auto-discover samples file if not given).
