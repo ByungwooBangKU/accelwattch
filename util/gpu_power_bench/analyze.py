@@ -37,7 +37,19 @@ Reads one or more per-cell CSVs written by gpu_power_bench.py and emits:
          workload is too short relative to static overhead; lengthen
          --window-ms if you see >50% static on the biggest loads.
 
-  6. `<stem>_timeline.png`  (only if the companion *_samples.csv exists)
+  6. `<stem>_temperature.png`
+     Thermal context for every cell — three panels:
+       * per-cell (start / avg / peak) temperature bars. Start = the
+         cool-down floor the run began from; peak = the hottest sample
+         during the measurement window. A large gap between start and
+         peak (= temp_rise_c) means the workload heats the die fast.
+       * per-cell cool-down elapsed time (s). Flat → no thermal drift
+         across the sweep; rising → later cells are starting hotter.
+       * J/op (slope_dyn) vs avg_temp_c scatter. If a variant's points
+         line up with a positive slope, that op is getting more
+         expensive as the GPU warms — flag for temp-aware modelling.
+
+  7. `<stem>_timeline.png`  (only if the companion *_samples.csv exists)
      Global power / temperature / SM-clock trace with each cell shaded —
      useful to eyeball thermal stability and clock throttling.
 
@@ -436,6 +448,93 @@ def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
     print(f"[save] {out_png}")
 
 
+def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
+                     gpu: str) -> None:
+    """Thermal diagnostics per cell — complements the static-power plot.
+
+    - Top panel : start / avg / peak temp per cell (grouped bar).
+    - Mid panel : cool-down time spent before each cell (s).
+    - Bottom panel : J/op vs mean temp scatter per variant — shows whether
+      any op's energy cost drifts with temperature.
+    """
+    plt = _get_mpl()
+    fig = plt.figure(figsize=(15, 11))
+    gs = fig.add_gridspec(3, 1, height_ratios=[2, 1.2, 2.2], hspace=0.55)
+    ax_t = fig.add_subplot(gs[0])
+    ax_c = fig.add_subplot(gs[1], sharex=ax_t)
+    ax_s = fig.add_subplot(gs[2])
+
+    # ---- A+B: per-cell temperatures and cool-down time ----
+    def _cell_key(r):
+        cat = r.get("category", "elementwise")
+        if cat == "matmul":
+            return (1, r.get("variant", ""), int(r["load_value"]))
+        return (0, r["op"], r["dtype"], int(r["load_value"]))
+
+    rows = df.to_dict("records")
+    rows.sort(key=_cell_key)
+    labels = [_short_label(r) for r in rows]
+    x = np.arange(len(labels))
+    start = np.array([float(r.get("start_temp_c", -1)) for r in rows])
+    avg = np.array([float(r["avg_temp_c"]) for r in rows])
+    peak = np.array([float(r["peak_temp_c"]) for r in rows])
+    cd = np.array([float(r.get("cooldown_elapsed_s", 0)) for r in rows])
+
+    w = 0.27
+    ax_t.bar(x - w, np.where(start >= 0, start, 0), w, color="#8ecae6",
+             label="start (post-cooldown)")
+    ax_t.bar(x,      avg,  w, color="#ffb703", label="avg during cell")
+    ax_t.bar(x + w,  peak, w, color="#d62728", label="peak")
+    ax_t.set_ylabel("temperature (°C)")
+    ax_t.set_title("Per-cell thermal state — start (blue), avg (orange), peak (red)")
+    ax_t.grid(True, axis="y", alpha=0.3)
+    ax_t.legend(loc="upper left", fontsize=9, ncol=3)
+    ax_t.tick_params(labelbottom=False)
+    # Annotate Δ (temp_rise) above each peak bar so the reader sees how much
+    # heat this op added relative to its cool-down floor.
+    for xi, s, p in zip(x, start, peak):
+        if s >= 0 and p >= 0 and p > s:
+            ax_t.text(xi + w, p, f"Δ{int(p - s)}", ha="center", va="bottom",
+                      fontsize=6, color="#d62728")
+
+    bars_c = ax_c.bar(x, cd, color="#6a994e", alpha=0.85)
+    ax_c.set_ylabel("cooldown (s)")
+    ax_c.set_title("Cool-down time before each cell (flat = thermal state uniform across sweep)")
+    ax_c.grid(True, axis="y", alpha=0.3)
+    ax_c.set_xticks(x)
+    ax_c.set_xticklabels(labels, rotation=80, ha="right", fontsize=7)
+    for rect, v in zip(bars_c, cd):
+        if v > 0:
+            ax_c.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+                      f"{v:.0f}", ha="center", va="bottom", fontsize=6)
+
+    # ---- C: does J/op drift with temperature? ----
+    # For every cell, plot (avg_temp_c, j_per_* dyn) colored by variant.
+    variant_col = "variant" if "variant" in df.columns else "op"
+    groups = df.groupby(variant_col)
+    palette = plt.get_cmap("tab20")
+    for i, (name, g) in enumerate(groups):
+        xs = g["avg_temp_c"].astype(float).to_numpy()
+        cat = g["category"].iloc[0] if "category" in g else "elementwise"
+        if cat == "matmul":
+            ys = g["j_per_flop_dyn"].astype(float).to_numpy()
+        else:
+            ys = g["j_per_element_dyn"].astype(float).to_numpy()
+        ax_s.scatter(xs, ys, s=28, color=palette(i % 20), alpha=0.75,
+                     label=str(name), edgecolors="none")
+    ax_s.set_xlabel("avg GPU temperature during cell (°C)")
+    ax_s.set_ylabel("J / element (eltwise) or J / FLOP (matmul) — dynamic")
+    ax_s.set_yscale("log")
+    ax_s.grid(True, alpha=0.3)
+    ax_s.set_title("Per-cell energy vs temperature — horizontal cloud = no thermal sensitivity")
+    ax_s.legend(fontsize=6, loc="center left", bbox_to_anchor=(1.01, 0.5),
+                ncol=1, frameon=False)
+
+    fig.suptitle(f"Thermal diagnostics — {gpu}", y=0.995)
+    fig.savefig(out_png, dpi=130, bbox_inches="tight")
+    print(f"[save] {out_png}")
+
+
 def _short_label(r: dict) -> str:
     """Compact cell label used as x-tick in the static-power bar chart."""
     if r.get("category") == "matmul":
@@ -519,6 +618,8 @@ def main() -> int:
             args.baseline = cand
     plot_static_power(df, args.baseline,
                       out_dir / f"{stem}_static_power.png", gpu)
+    plot_temperature(df, summary,
+                     out_dir / f"{stem}_temperature.png", gpu)
 
     # Timeline (auto-discover samples file if not given).
     if args.samples is None:
