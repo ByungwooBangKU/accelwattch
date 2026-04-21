@@ -47,6 +47,19 @@ class BenchSpec:
     n_elements: int        # total element count
     flops_per_call: int    # estimated FLOPs in one call to f()
     run: Callable[[], None]
+    # HW path the main FLOPs actually execute on. One of:
+    #   "CUDA core"                    — SIMT lanes / regular CUDA cores
+    #   "Tensor Core"                  — native TC mma
+    #   "Tensor Core (FP16 fallback)"  — fp8_te on pre-Hopper GPUs
+    compute_unit: str = "CUDA core"
+    # True when the HW path does NOT match what a naive reader would assume
+    # from the benchmark name. Examples:
+    #   * fp8 elementwise on any GPU — PyTorch has no native FP8 elementwise
+    #     kernel so we cast fp8→fp16, compute in fp16, cast back. The reported
+    #     energy includes cast-kernel overhead, NOT "real" FP8 compute cost.
+    #   * matmul_fp8_te on A100 — Transformer Engine falls back to FP16
+    #     Tensor Core; the measurement is an FP16-TC number, not FP8.
+    emulated: bool = False
     notes: str = ""
 
 
@@ -199,13 +212,21 @@ def build(op: str, dtype_label: str, n_elements: int,
     fn = _BUILDERS[op](shape, dtype_label, device)
     flops = actual_n * FLOPS_PER_ELEMENT[op]
     name = f"{dtype_label}_{op}"
+    # Elementwise ops never hit Tensor Cores — TC is matmul-only silicon.
+    compute_unit = "CUDA core"
+    # FP8 elementwise is ALWAYS cast-compute-cast (regardless of GPU) because
+    # PyTorch has no native FP8 elementwise kernel. So the measurement on
+    # *any* GPU reflects cast-kernel overhead, not true FP8 compute cost.
+    emulated = (dtype_label == "fp8")
     notes = ""
-    if dtype_label == "fp8" and torch.cuda.get_device_capability()[0] < 9:
-        notes = "fp8 emulated (no native FP8 tensor cores on this GPU)"
+    if dtype_label == "fp8":
+        notes = ("fp8 emulated via FP16 cast-compute-cast "
+                 "(no native FP8 elementwise kernel in PyTorch)")
     return BenchSpec(
         name=name, op=op, dtype_label=dtype_label,
         shape=shape, n_elements=actual_n,
-        flops_per_call=flops, run=fn, notes=notes,
+        flops_per_call=flops, run=fn,
+        compute_unit=compute_unit, emulated=emulated, notes=notes,
     )
 
 
@@ -329,9 +350,12 @@ def build_matmul(K_size: int, dtype_label: str, mode: str,
     M = N = K = K_size
     cc = torch.cuda.get_device_capability()
     notes = ""
+    compute_unit = "Tensor Core"   # default for all matmul variants except SIMT
+    emulated = False
 
     if (dtype_label, mode) == ("fp32", "simt"):
         fn = _make_matmul_fp32_simt(M, N, K, device)
+        compute_unit = "CUDA core"
     elif (dtype_label, mode) == ("tf32", "tc"):
         if cc[0] < 8:
             raise RuntimeError(f"TF32 requires Ampere (sm_80) or newer (this GPU is sm_{cc[0]}{cc[1]})")
@@ -345,8 +369,13 @@ def build_matmul(K_size: int, dtype_label: str, mode: str,
     elif (dtype_label, mode) == ("fp8", "te"):
         fn = _make_matmul_fp8_te(M, N, K, device)
         if cc[0] < 9:
-            notes = ("fp8_te on pre-Hopper: TE falls back to FP16 tensor cores, "
-                     "not a native FP8 measurement")
+            # Pre-Hopper (A100 etc.) has no FP8 Tensor Core — TE falls back to
+            # the FP16 TC path. The measurement is therefore an FP16-TC number
+            # masquerading as FP8, and should be flagged.
+            compute_unit = "Tensor Core (FP16 fallback)"
+            emulated = True
+            notes = ("fp8_te on pre-Hopper: Transformer Engine falls back to "
+                     "FP16 Tensor Core — NOT a native FP8 measurement")
     else:
         raise ValueError(f"unknown matmul variant ({dtype_label!r}, {mode!r})")
 
@@ -356,7 +385,8 @@ def build_matmul(K_size: int, dtype_label: str, mode: str,
     return BenchSpec(
         name=name, op="matmul", dtype_label=dtype_label,
         shape=(M, N, K), n_elements=n_out,
-        flops_per_call=flops, run=fn, notes=notes,
+        flops_per_call=flops, run=fn,
+        compute_unit=compute_unit, emulated=emulated, notes=notes,
     )
 
 

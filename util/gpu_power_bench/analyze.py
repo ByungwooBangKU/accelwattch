@@ -110,6 +110,10 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     *J per element*.  For matmul rows we regress against total_FLOPs → slope
     is *J per FLOP* (which is the right axis since FLOPs scale as K³ while
     element count scales as K²).
+
+    Columns `compute_unit` and `emulated` are propagated so downstream tables
+    and plots can distinguish "CUDA core" vs "Tensor Core" paths, and flag
+    emulated cases (fp8 elementwise, fp8_te on pre-Hopper).
     """
     out = []
     group_keys = ["category", "op", "dtype", "mode"]
@@ -117,6 +121,12 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     for col in group_keys:
         if col not in df.columns:
             df[col] = "elementwise" if col in ("category", "mode") else df.get(col, "")
+    # Back-compat: older CSVs won't have compute_unit / emulated columns.
+    if "compute_unit" not in df.columns:
+        df["compute_unit"] = df["category"].map(
+            lambda c: "Tensor Core" if c == "matmul" else "CUDA core")
+    if "emulated" not in df.columns:
+        df["emulated"] = 0
     for (cat, op, dt, mode), g in df.groupby(group_keys):
         g = g.sort_values("total_elements")
         # Axis choice: FLOPs for matmul (K³ scaling), elements otherwise.
@@ -130,9 +140,14 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         y_tot = g["total_energy_j"].to_numpy(dtype=float)
         slope_dyn, _, r2_dyn = linear_fit(x, y_dyn)
         slope_tot, _, r2_tot = linear_fit(x, y_tot)
+        # compute_unit / emulated are constant within a group — take the first.
+        compute_unit = str(g["compute_unit"].iloc[0])
+        emulated = int(bool(g["emulated"].iloc[0]))
         out.append({
             "category": cat, "op": op, "dtype": dt, "mode": mode,
             "variant": f"{op}_{dt}_{mode}" if cat == "matmul" else f"{dt}_{op}",
+            "compute_unit": compute_unit,
+            "emulated":     emulated,
             "n_points": len(g),
             "fit_axis": unit,
             "slope_dyn":   slope_dyn,   # ← the power-modeling coefficient
@@ -237,9 +252,19 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
         yj = g["j_per_flop_dyn"].to_numpy(float)
         _, _, r2 = linear_fit(x, ye)
         c = palette.get(v, None)
-        ax_e.plot(x, ye, marker="o", color=c, label=f"{v}  R²={r2:.3f}")
-        ax_t.plot(x, yt, marker="o", color=c, label=v)
-        ax_j.plot(x, yj, marker="o", color=c, label=v)
+        # Decorate the legend with the actual compute unit (CUDA vs TC) and
+        # an "*EMU" marker when the measurement isn't the native HW path
+        # (fp8_te on A100 falls back to FP16 TC).
+        cu = str(g.get("compute_unit", pd.Series(["Tensor Core"])).iloc[0])
+        emu = int(g.get("emulated", pd.Series([0])).iloc[0])
+        tag = "TC" if cu.startswith("Tensor") else "CUDA"
+        if cu == "Tensor Core (FP16 fallback)":
+            tag = "TC·FP16-fallback"
+        star = " *EMU" if emu else ""
+        ax_e.plot(x, ye, marker="o", color=c,
+                  label=f"{v} [{tag}]{star}  R²={r2:.3f}")
+        ax_t.plot(x, yt, marker="o", color=c, label=f"{v} [{tag}]{star}")
+        ax_j.plot(x, yj, marker="o", color=c, label=f"{v} [{tag}]{star}")
     for ax in (ax_e, ax_t, ax_j):
         ax.set_xscale("log"); ax.grid(True, alpha=0.3)
         ax.set_xlabel("total FLOPs (iters × 2MNK)")
@@ -249,7 +274,15 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     ax_j.set_ylabel("J / FLOP (dyn)")
     ax_e.set_yscale("log"); ax_t.set_yscale("log"); ax_j.set_yscale("log")
     fig.suptitle(f"Matmul (Tensor Core vs CUDA core vs TE FP8) — {gpu}", y=1.00)
-    fig.tight_layout(); fig.savefig(out_png, dpi=130)
+    # If any variant was measured on the wrong HW path (e.g. fp8_te on A100
+    # silently using FP16 TC), spell that out below the plot so the reader
+    # doesn't mistake the FP8 bar for a real FP8 number.
+    if "emulated" in mm.columns and int(mm["emulated"].max()) == 1:
+        fig.text(0.5, -0.01,
+                 "*EMU = emulated / fallback path — NOT a native measurement "
+                 "of the named dtype (e.g. fp8_te on pre-Hopper uses FP16 TC)",
+                 ha="center", fontsize=8, color="#d62728")
+    fig.tight_layout(); fig.savefig(out_png, dpi=130, bbox_inches="tight")
     print(f"[save] {out_png}")
 
 
@@ -276,6 +309,7 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
         xpos = np.arange(len(ops))
         w = 0.8 / max(1, len(dtypes))
         colors = {"fp16": "#1f77b4", "fp8": "#d62728"}
+        has_emulated = False
         for i, dt in enumerate(dtypes):
             vals, r2s = [], []
             for op in ops:
@@ -285,8 +319,15 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
                 else:
                     vals.append(row["slope_dyn"].iloc[0])
                     r2s.append(row["R2_dyn"].iloc[0])
+                    if "emulated" in row.columns and int(row["emulated"].iloc[0]):
+                        has_emulated = True
+            # fp8 bars are drawn with a diagonal hatch to visually flag them
+            # as the cast-compute-cast emulation path.
+            emu_dt = (dt == "fp8")
+            label = f"{dt} [CUDA]" + (" *EMU" if emu_dt else "")
             bars = ax.bar(xpos + (i - (len(dtypes) - 1) / 2) * w, vals, w,
-                          label=dt, color=colors.get(dt, None), alpha=0.9)
+                          label=label, color=colors.get(dt, None), alpha=0.9,
+                          hatch="//" if emu_dt else None, edgecolor="white")
             for rect, r2 in zip(bars, r2s):
                 if not np.isnan(r2):
                     ax.text(rect.get_x() + rect.get_width() / 2,
@@ -295,7 +336,10 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
         ax.set_xticks(xpos); ax.set_xticklabels(ops)
         ax.set_ylabel("J / element (dynamic)  — regression slope")
         ax.set_yscale("log"); ax.legend(); ax.grid(True, axis="y", alpha=0.3)
-        ax.set_title("Elementwise — per-op energy coefficient")
+        subtitle = "Elementwise — per-op energy coefficient  (all on CUDA cores)"
+        if has_emulated:
+            subtitle += "\nfp8 bars = cast-compute-cast via FP16 (no native FP8 elementwise in PyTorch)"
+        ax.set_title(subtitle, fontsize=10)
     else:
         ax.set_visible(False)
 
@@ -311,23 +355,52 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
                    "matmul_bf16_tc":   "#2ca02c",
                    "matmul_fp8_te":    "#d62728"}
         colors = [palette.get(v, "gray") for v in mm2.index]
+        # Hatch fp8_te bar when it was measured on the fallback FP16 TC path
+        # (pre-Hopper). Readers should NOT interpret that height as FP8 cost.
+        def _emu(v):
+            if "emulated" in mm2.columns:
+                val = mm2.loc[v, "emulated"]
+                return bool(int(val)) if pd.notna(val) else False
+            return False
+        hatches = ["//" if _emu(v) else None for v in mm2.index]
         bars = ax.bar(range(len(mm2)), mm2["slope_dyn"].values,
-                      color=colors, alpha=0.9)
+                      color=colors, alpha=0.9, edgecolor="white")
+        for rect, h in zip(bars, hatches):
+            if h:
+                rect.set_hatch(h)
         for rect, r2 in zip(bars, mm2["R2_dyn"].values):
             if not np.isnan(r2):
                 ax.text(rect.get_x() + rect.get_width() / 2,
                         rect.get_height(), f"R²={r2:.2f}",
                         ha="center", va="bottom", fontsize=7)
+        # Build tick labels that carry the actual compute unit ([CUDA]/[TC])
+        # and a star when the variant was emulated (fp8_te fallback).
+        def _tick(v):
+            cu = str(mm2.loc[v, "compute_unit"]) if "compute_unit" in mm2.columns else ""
+            if cu.startswith("Tensor Core (FP16 fallback)"):
+                tag = "TC·FP16-fallback"
+            elif cu.startswith("Tensor"):
+                tag = "TC"
+            elif cu.startswith("CUDA"):
+                tag = "CUDA"
+            else:
+                tag = "?"
+            star = " *" if _emu(v) else ""
+            return f"{v}\n[{tag}]{star}"
         ax.set_xticks(range(len(mm2)))
-        ax.set_xticklabels(mm2.index, rotation=30, ha="right")
+        ax.set_xticklabels([_tick(v) for v in mm2.index],
+                           rotation=30, ha="right", fontsize=8)
         ax.set_ylabel("J / FLOP (dynamic)  — regression slope")
         ax.set_yscale("log"); ax.grid(True, axis="y", alpha=0.3)
-        ax.set_title("Matmul — per-variant energy coefficient")
+        title = "Matmul — per-variant energy coefficient"
+        if any(hatches):
+            title += "\n* hatched bar = emulated (not native for this dtype)"
+        ax.set_title(title, fontsize=10)
     else:
         ax.set_visible(False)
 
     fig.suptitle(f"Power-model coefficients — {gpu}")
-    fig.tight_layout(); fig.savefig(out_png, dpi=130)
+    fig.tight_layout(); fig.savefig(out_png, dpi=130, bbox_inches="tight")
     print(f"[save] {out_png}")
 
 
@@ -601,7 +674,8 @@ def main() -> int:
     print(f"[save] {summary_path}")
     with pd.option_context("display.width", 200, "display.max_columns", 20,
                            "display.float_format", lambda v: f"{v:.3e}"):
-        cols = ["category", "variant", "n_points", "fit_axis",
+        cols = ["category", "variant", "compute_unit", "emulated",
+                "n_points", "fit_axis",
                 "slope_dyn", "R2_dyn", "mean_dyn_power_w",
                 "mean_temp_c", "peak_temp_c"]
         print(summary[cols].to_string(index=False))
