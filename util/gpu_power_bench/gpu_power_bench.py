@@ -299,6 +299,8 @@ def main() -> int:
             except Exception as e:
                 print(f"  ! build failed: {e}  — skipped")
                 continue
+            tag = spec.compute_unit + ("  [EMULATED]" if spec.emulated else "")
+            print(f"  compute_unit: {tag}")
             if spec.notes:
                 print(f"  note: {spec.notes}")
 
@@ -344,6 +346,12 @@ def main() -> int:
                 "dtype": plan["dtype"],
                 "mode": plan["mode"],
                 "variant": spec.name,
+                # HW path the op actually runs on — see benchmarks.BenchSpec.
+                # "CUDA core" | "Tensor Core" | "Tensor Core (FP16 fallback)"
+                "compute_unit": spec.compute_unit,
+                # 1 if this is NOT the HW path a naive reader would assume
+                # (fp8 elementwise anywhere, fp8_te on pre-Hopper, etc.)
+                "emulated": int(bool(spec.emulated)),
                 "n_elements": spec.n_elements,
                 "shape": "x".join(str(s) for s in spec.shape),
                 "load_name": plan["load_name"],
