@@ -305,7 +305,7 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     variants = sorted(mm["variant"].unique())
     if not variants:
         return
-    fig, axes = plt.subplots(3, 1, figsize=(14, 13), squeeze=False)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 17), squeeze=False)
     ax_e, ax_t, ax_j = axes[0][0], axes[1][0], axes[2][0]
     ax_e.set_title("matmul — E_dyn vs FLOPs (slope = J/FLOP)")
     ax_t.set_title("matmul — wall time vs FLOPs")
@@ -360,6 +360,11 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     ax_t.set_ylabel("wall time (s)")
     ax_j.set_ylabel("J / FLOP (dyn)")
     ax_e.set_yscale("log"); ax_t.set_yscale("log"); ax_j.set_yscale("log")
+    # Give each panel extra headroom on its log y-axis so the per-point
+    # "K=..." / "J/FLOP" annotations don't overlap the top of the frame.
+    for ax in (ax_e, ax_t, ax_j):
+        ymin, ymax = ax.get_ylim()
+        ax.set_ylim(ymin, ymax * 6)
     fig.suptitle(f"Matmul (Tensor Core vs CUDA core vs TE FP8) — {gpu}", y=1.00)
     # If any variant was measured on the wrong HW path (e.g. fp8_te on A100
     # silently using FP16 TC), spell that out below the plot so the reader
@@ -699,7 +704,7 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
     plt = _get_mpl()
     n_cells = len(df)
     fig_w = max(17, min(32, 0.28 * n_cells + 11))
-    fig = plt.figure(figsize=(fig_w, 13))
+    fig = plt.figure(figsize=(fig_w, 17))
     gs = fig.add_gridspec(3, 1, height_ratios=[2, 1.2, 2.2], hspace=0.55)
     ax_t = fig.add_subplot(gs[0])
     ax_c = fig.add_subplot(gs[1], sharex=ax_t)
@@ -737,6 +742,9 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
         if s >= 0 and p >= 0 and p > s:
             ax_t.text(xi + w, p, f"Δ{int(p - s)}", ha="center", va="bottom",
                       fontsize=6, color="#d62728")
+    # Headroom so the Δ labels don't sit on the title bar.
+    tmax = float(np.nanmax(peak)) if len(peak) else 100.0
+    ax_t.set_ylim(0, tmax * 1.15 if tmax > 0 else 100)
 
     bars_c = ax_c.bar(x, cd, color="#6a994e", alpha=0.85)
     ax_c.set_ylabel("cooldown (s)")
@@ -785,132 +793,188 @@ def _short_label(r: dict) -> str:
 
 def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
                       out_png: Path, gpu: str) -> None:
-    """Energy-per-element grouped by cache locality regime, including the
-    regime-specific power-model coefficient.
+    """Energy-per-operation grouped by cache locality regime, for both
+    elementwise and matmul categories.
 
-    Three panels:
-      A : per-cell strip of j_per_element_dyn vs regime (mul/add/… on one
-          axis). Shows the raw spread within each regime.
-      B : regime-specific slope_dyn (from summarize_by_regime) as a grouped
-          bar — this is the `k_op` value the power model actually consumes
-          for each regime. Numeric value annotated on every bar.
-      C : per-regime mean dynamic power (W) — DRAM streaming isn't just
-          "more joules per element", it also runs at higher average power
-          because the memory subsystem is doing more work.
+    Layout is a 2 × 3 grid:
+      Row 1 — elementwise (ops: mul / add / softmax / gelu / layernorm)
+      Row 2 — matmul      (5 variants: fp32_simt / tf32_tc / fp16_tc / bf16_tc / fp8_te)
+    Columns (shared between rows):
+      A : per-cell strip of the per-op unit (J/elem or J/FLOP) vs regime.
+      B : regime-specific slope_dyn (k_op) from summarize_by_regime, with
+          numeric value annotated on each bar.
+      C : mean dynamic power (W) per regime — DRAM streaming raises
+          steady-state power, not just energy per op.
+
+    Matmul note: matmul has intrinsic reuse (O(K) per element), so even
+    DRAM-sized GEMMs often stay closer to compute-bound than elementwise
+    DRAM-streaming. The per-regime bars for matmul therefore typically
+    show a smaller gap than elementwise — that's physics, not a bug.
     """
     if "cache_regime" not in df.columns:
-        return
-    ew = df[df["category"] == "elementwise"].copy()
-    ew = ew[ew["cache_regime"].isin(["l2_resident", "l2_partial", "dram_stream"])]
-    if ew.empty:
         return
     plt = _get_mpl()
     regime_order = ["l2_resident", "l2_partial", "dram_stream"]
     regime_hit_rate = {"l2_resident": "~100%", "l2_partial": "~50%",
                        "dram_stream": "~0%"}
-    ew["cache_regime"] = pd.Categorical(ew["cache_regime"],
-                                        categories=regime_order, ordered=True)
-    ops = sorted(ew["op"].unique())
-    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(22, 7),
-                                           gridspec_kw={"width_ratios": [3, 3, 2]})
-    palette = plt.get_cmap("tab10")
-    op_colors = {op: palette(i) for i, op in enumerate(ops)}
     regime_x = {r: i for i, r in enumerate(regime_order)}
 
-    # ---- Panel A : per-cell strip ----------------------------------------
-    for op in ops:
-        for dt, marker in (("fp16", "o"), ("fp8", "s")):
-            g = ew[(ew["op"] == op) & (ew["dtype"] == dt)]
+    ew = df[df["category"] == "elementwise"].copy()
+    ew = ew[ew["cache_regime"].isin(regime_order)]
+    mm = df[df["category"] == "matmul"].copy()
+    mm = mm[mm["cache_regime"].isin(regime_order)]
+    if ew.empty and mm.empty:
+        return
+    if not ew.empty:
+        ew["cache_regime"] = pd.Categorical(ew["cache_regime"],
+                                            categories=regime_order, ordered=True)
+    if not mm.empty:
+        mm["cache_regime"] = pd.Categorical(mm["cache_regime"],
+                                            categories=regime_order, ordered=True)
+
+    n_rows = (1 if not ew.empty else 0) + (1 if not mm.empty else 0)
+    fig, axes = plt.subplots(n_rows, 3, figsize=(22, 7 * n_rows),
+                             gridspec_kw={"width_ratios": [3, 3, 2]},
+                             squeeze=False)
+
+    def _draw_row(row_ax, cat_df, cat_sum, cat_name, keys_key, key_palette,
+                  unit_col, unit_label, annot_scale, annot_suffix, title_prefix):
+        """Populate one (cat) row across the 3 shared-semantics columns."""
+        ax_a, ax_b, ax_c = row_ax
+        keys = [k for k in key_palette.keys() if k in cat_df[keys_key].unique()]
+        # Fallback: if the palette doesn't cover all keys (user added ops),
+        # append remaining keys in deterministic order.
+        extras = sorted(k for k in cat_df[keys_key].unique() if k not in keys)
+        keys = keys + extras
+        extra_cmap = plt.get_cmap("tab20")
+        colors = dict(key_palette)
+        for i, k in enumerate(extras):
+            colors[k] = extra_cmap(i % 20)
+
+        # --- Panel A: per-cell strip ---------------------------------------
+        for key in keys:
+            g = cat_df[cat_df[keys_key] == key]
             if g.empty:
                 continue
             xs = g["cache_regime"].map(regime_x).astype(float) \
-                + (0.05 * (hash(op + dt) % 7 - 3))
-            ys = g["j_per_element_dyn"].astype(float)
-            ax_a.scatter(xs, ys, s=42, color=op_colors[op], marker=marker,
-                         alpha=0.8, edgecolors="white",
-                         label=f"{op} {dt}")
-    ax_a.set_xticks(list(regime_x.values()))
-    ax_a.set_xticklabels([f"{r}\n({regime_hit_rate[r]} L2 hit)" for r in regime_order])
-    ax_a.set_ylabel("J / element (per cell, dynamic)")
-    ax_a.set_yscale("log")
-    ax_a.grid(True, axis="y", alpha=0.3)
-    ax_a.set_title("A. Raw spread — every sweep cell")
-    ax_a.legend(fontsize=8, ncol=2, loc="upper left",
-                bbox_to_anchor=(1.0, 1.0))
+                + (0.05 * (hash(str(key)) % 7 - 3))
+            ys = pd.to_numeric(g[unit_col], errors="coerce")
+            ax_a.scatter(xs, ys, s=42, color=colors[key], marker="o",
+                         alpha=0.8, edgecolors="white", label=str(key))
+        ax_a.set_xticks(list(regime_x.values()))
+        ax_a.set_xticklabels([f"{r}\n({regime_hit_rate[r]} L2 hit)"
+                              for r in regime_order])
+        ax_a.set_ylabel(f"{unit_label} (per cell, dynamic)")
+        ax_a.set_yscale("log")
+        ax_a.grid(True, axis="y", alpha=0.3)
+        ax_a.set_title(f"{title_prefix}A. Raw spread — every cell")
+        ax_a.legend(fontsize=8, ncol=1, loc="upper left",
+                    bbox_to_anchor=(1.0, 1.0))
 
-    # ---- Panel B : regime-specific k_op (slope_dyn) with annotations ------
-    # Draw from the by_regime summary so the numbers come from a proper
-    # regression (or median fallback for single-point regimes), not a raw
-    # per-cell J/elem.
-    width = 0.8 / max(1, len(ops))
-    xpos = np.arange(len(regime_order))
-    if by_regime is not None and not by_regime.empty:
-        ew_sum = by_regime[by_regime["category"] == "elementwise"]
-    else:
-        ew_sum = pd.DataFrame()
-    if ew_sum.empty:
-        ax_b.set_visible(False)
-    else:
-        for i, op in enumerate(ops):
-            vals, r2s = [], []
-            for r in regime_order:
-                row = ew_sum[(ew_sum["op"] == op) & (ew_sum["cache_regime"] == r)]
-                if row.empty:
-                    vals.append(np.nan); r2s.append(np.nan)
-                else:
-                    # Prefer slope_dyn; fall back to median if slope is NaN
-                    # (single-point regime where regression is undefined).
-                    sl = float(row["slope_dyn"].iloc[0])
-                    if not np.isfinite(sl):
-                        sl = float(row["median_j_per_unit"].iloc[0])
-                    vals.append(sl)
-                    r2s.append(float(row["R2_dyn"].iloc[0]))
-            bars = ax_b.bar(xpos + (i - (len(ops)-1)/2) * width, vals, width,
-                            label=op, color=op_colors[op], alpha=0.9,
-                            edgecolor="white")
-            # Annotate the bar with the k_op value (in pJ/elem for readability)
-            # and R² when it's a proper fit.
-            for rect, v, r2 in zip(bars, vals, r2s):
-                if np.isnan(v):
-                    continue
-                txt = f"{v*1e12:.2f} pJ"
-                if np.isfinite(r2):
-                    txt += f"\nR²={r2:.2f}"
-                ax_b.text(rect.get_x() + rect.get_width()/2,
-                          rect.get_height(), txt,
-                          ha="center", va="bottom", fontsize=7)
-        ax_b.set_xticks(xpos)
-        ax_b.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
-        ax_b.set_ylabel("k_op = slope_dyn  (J / element)")
-        ax_b.set_yscale("log")
-        ax_b.grid(True, axis="y", alpha=0.3)
-        ax_b.set_title("B. Power-model coefficient k_op per regime  "
-                       "(annotated in pJ/elem)")
-        ax_b.legend(fontsize=8, ncol=len(ops), loc="upper left")
+        # --- Panel B: k_op bars with numeric annotation --------------------
+        if cat_sum is None or cat_sum.empty:
+            ax_b.set_visible(False)
+        else:
+            width = 0.8 / max(1, len(keys))
+            xpos = np.arange(len(regime_order))
+            for i, key in enumerate(keys):
+                vals, r2s = [], []
+                for r in regime_order:
+                    row = cat_sum[(cat_sum[keys_key] == key)
+                                  & (cat_sum["cache_regime"] == r)]
+                    if row.empty:
+                        vals.append(np.nan); r2s.append(np.nan)
+                    else:
+                        sl = float(row["slope_dyn"].iloc[0])
+                        if not np.isfinite(sl):
+                            sl = float(row["median_j_per_unit"].iloc[0])
+                        vals.append(sl)
+                        r2s.append(float(row["R2_dyn"].iloc[0]))
+                bars = ax_b.bar(xpos + (i - (len(keys)-1)/2) * width, vals, width,
+                                label=str(key), color=colors[key], alpha=0.9,
+                                edgecolor="white")
+                for rect, v, r2 in zip(bars, vals, r2s):
+                    if np.isnan(v):
+                        continue
+                    v_p = v * annot_scale
+                    if abs(v_p) >= 1:
+                        vtxt = f"{v_p:.2f}"
+                    elif abs(v_p) >= 0.01:
+                        vtxt = f"{v_p:.3f}"
+                    else:
+                        vtxt = f"{v_p:.2e}"
+                    txt = f"{vtxt} {annot_suffix}"
+                    if np.isfinite(r2):
+                        txt += f"\nR²={r2:.2f}"
+                    ax_b.text(rect.get_x() + rect.get_width()/2,
+                              rect.get_height(), txt,
+                              ha="center", va="bottom", fontsize=7,
+                              linespacing=1.1)
+            ax_b.set_xticks(xpos)
+            ax_b.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
+            ax_b.set_ylabel(f"k_op = slope_dyn  ({unit_label})")
+            ax_b.set_yscale("log")
+            ax_b.grid(True, axis="y", alpha=0.3)
+            ax_b.set_title(f"{title_prefix}B. k_op per regime "
+                           f"(annotated in {annot_suffix})")
+            ax_b.legend(fontsize=8, ncol=min(len(keys), 3), loc="upper left")
+            # Extra headroom so two-line labels don't bump into the title.
+            ymin, ymax = ax_b.get_ylim()
+            ax_b.set_ylim(ymin, ymax * 5)
 
-    # ---- Panel C : mean dynamic power per regime --------------------------
-    mean_p = {}
-    for r in regime_order:
-        g = ew[ew["cache_regime"] == r]
-        vals = pd.to_numeric(g.get("dyn_power_w", pd.Series(dtype=float)),
-                             errors="coerce").dropna()
-        mean_p[r] = float(vals.mean()) if len(vals) else float("nan")
-    x_regime = list(range(len(regime_order)))
-    y_power  = [mean_p[r] for r in regime_order]
-    colors = ["#2ca02c", "#ff7f0e", "#d62728"]   # green → orange → red
-    bars_c = ax_c.bar(x_regime, y_power, color=colors, alpha=0.85)
-    for rect, v in zip(bars_c, y_power):
-        if not np.isnan(v):
-            ax_c.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
-                      f"{v:.0f} W", ha="center", va="bottom", fontsize=10)
-    ax_c.set_xticks(x_regime)
-    ax_c.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
-    ax_c.set_ylabel("mean dyn power  (W)")
-    ax_c.set_title("C. Steady-state dynamic power per regime")
-    ax_c.grid(True, axis="y", alpha=0.3)
+        # --- Panel C: mean dyn_power_w per regime --------------------------
+        mean_p = {}
+        for r in regime_order:
+            g = cat_df[cat_df["cache_regime"] == r]
+            vals = pd.to_numeric(g.get("dyn_power_w", pd.Series(dtype=float)),
+                                 errors="coerce").dropna()
+            mean_p[r] = float(vals.mean()) if len(vals) else float("nan")
+        x_regime = list(range(len(regime_order)))
+        y_power  = [mean_p[r] for r in regime_order]
+        bar_colors = ["#2ca02c", "#ff7f0e", "#d62728"]
+        bars_c = ax_c.bar(x_regime, y_power, color=bar_colors, alpha=0.85)
+        for rect, v in zip(bars_c, y_power):
+            if not np.isnan(v):
+                ax_c.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                          f"{v:.0f} W", ha="center", va="bottom", fontsize=10)
+        ax_c.set_xticks(x_regime)
+        ax_c.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
+        ax_c.set_ylabel("mean dyn power  (W)")
+        ax_c.set_title(f"{title_prefix}C. Steady-state dyn power per regime")
+        ax_c.grid(True, axis="y", alpha=0.3)
+        if y_power and not all(np.isnan(v) for v in y_power):
+            ymin, ymax = ax_c.get_ylim()
+            ax_c.set_ylim(ymin, ymax * 1.2)
+
+    ew_palette = {"mul": "#1f77b4", "add": "#2ca02c", "softmax": "#d62728",
+                  "gelu": "#9467bd", "layernorm": "#ff7f0e"}
+    mm_palette = {"matmul_fp32_simt": "#555555", "matmul_tf32_tc": "#ff7f0e",
+                  "matmul_fp16_tc":   "#1f77b4", "matmul_bf16_tc": "#2ca02c",
+                  "matmul_fp8_te":    "#d62728"}
+
+    ew_sum = (by_regime[by_regime["category"] == "elementwise"]
+              if by_regime is not None and not by_regime.empty else pd.DataFrame())
+    mm_sum = (by_regime[by_regime["category"] == "matmul"]
+              if by_regime is not None and not by_regime.empty else pd.DataFrame())
+
+    r = 0
+    if not ew.empty:
+        _draw_row(axes[r], ew, ew_sum, "elementwise",
+                  keys_key="op", key_palette=ew_palette,
+                  unit_col="j_per_element_dyn", unit_label="J / element",
+                  annot_scale=1e12, annot_suffix="pJ/elem",
+                  title_prefix="[Elementwise]  ")
+        r += 1
+    if not mm.empty:
+        _draw_row(axes[r], mm, mm_sum, "matmul",
+                  keys_key="variant", key_palette=mm_palette,
+                  unit_col="j_per_flop_dyn", unit_label="J / FLOP",
+                  annot_scale=1e12, annot_suffix="pJ/FLOP",
+                  title_prefix="[Matmul]  ")
 
     fig.suptitle(f"Cache-regime breakdown — {gpu}  "
-                 "(B. shows the k_op value the energy model uses)", y=1.00)
+                 "(B. columns show the k_op value the energy model uses)",
+                 y=1.00)
     fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
 
