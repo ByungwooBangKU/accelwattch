@@ -185,12 +185,23 @@ def main() -> int:
     # --- matmul (Tensor Core vs CUDA-core + TE FP8) ---
     ap.add_argument("--no-matmul", action="store_true",
                     help="skip the matmul (Tensor Core / SIMT) sweep")
+    ap.add_argument("--no-elementwise", action="store_true",
+                    help="skip the elementwise sweep. Useful for re-running "
+                         "just the matmul tail of a previous run — e.g. after "
+                         "fixing a transformer_engine install and wanting the "
+                         "8 fp8_te cells without redoing the 90 elementwise "
+                         "cells. Combine with --matmul-variants fp8:te to "
+                         "target matmul_fp8_te specifically.")
     ap.add_argument("--matmul-sizes", type=int, nargs="+", default=None,
                     help="square matrix side lengths (M=N=K); default: 512..8192")
     ap.add_argument("--matmul-variants", nargs="+", default=None,
                     help='matmul variants "dtype:mode" (default: all 5). '
                          'choices: fp32:simt tf32:tc fp16:tc bf16:tc fp8:te')
     args = ap.parse_args()
+
+    if args.no_elementwise and args.no_matmul:
+        print("[error] --no-elementwise and --no-matmul together select zero cells")
+        return 1
 
     if args.quick:
         loads = QUICK_LOADS
@@ -261,17 +272,18 @@ def main() -> int:
     # Each plan has a `build()` callable that allocates tensors just-in-time
     # so we never hold more than one cell's tensors at once.
     plans: list[dict] = []
-    for dtype in args.dtypes:
-        for op in args.ops:
-            for N in loads:
-                plans.append({
-                    "category": "elementwise",
-                    "mode": "elementwise",
-                    "op": op, "dtype": dtype,
-                    "load_name": "n_elements", "load_value": N,
-                    "build": (lambda op=op, dtype=dtype, N=N:
-                              bm.build(op, dtype, N, device="cuda")),
-                })
+    if not args.no_elementwise:
+        for dtype in args.dtypes:
+            for op in args.ops:
+                for N in loads:
+                    plans.append({
+                        "category": "elementwise",
+                        "mode": "elementwise",
+                        "op": op, "dtype": dtype,
+                        "load_name": "n_elements", "load_value": N,
+                        "build": (lambda op=op, dtype=dtype, N=N:
+                                  bm.build(op, dtype, N, device="cuda")),
+                    })
     if not args.no_matmul:
         for dtype_label, mode in matmul_variants:
             for K in matmul_sizes:
