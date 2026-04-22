@@ -440,8 +440,28 @@ H100 에서 `matmul_fp8_te` 를 실행하려면 Transformer Engine 이 필요하
 
 - CUDA toolkit / nvcc 존재 확인.
 - PyTorch 가 CUDA build 인지 확인.
-- `--no-build-isolation` 을 붙여 소스 빌드 (meta-package 함정 회피).
-- 빌드 후 `import transformer_engine.pytorch as te` 로 실제 임포트 검증.
+- `--no-build-isolation` + `[pytorch]` extra 로 소스 빌드 (meta-package 함정 회피).
+- 빌드 후 실제로 `te.Linear` + `fp8_autocast` forward 를 태워보고 torch backend `.so` 로드까지 검증 (단순 `import` 는 lazy 로딩 때문에 통과하므로 부족).
+
+#### 8.3.1 Troubleshooting: `could not find shared object file for transformer engine torch lib`
+
+`matmul_fp8_te` 셀 (H100 에서 8 K 값 × 1 variant = 8 cells) 이 전부 `build failed` 로 스킵되고 위 에러가 나온다면 **TE Python 모듈은 import 되지만 torch backend 공유 라이브러리 (`libtransformer_engine_torch.so`) 가 로딩되지 않는 상태**다. 원인 대부분은 다음 중 하나:
+
+1. **meta-package 설치** : `pip install transformer-engine` 만 하고 `[pytorch]` extra 를 안 붙임. `transformer_engine.pytorch` import 는 성공할 수도 있지만 `te.Linear()` 호출 시점에 `.so` 로딩이 실패.
+2. **torch 버전 불일치** : TE wheel 이 빌드된 torch 와 현재 설치된 torch ABI 가 달라서 prebuilt `.so` 가 load 되지 않음. 예: `torch==2.3` 으로 빌드된 TE wheel + `torch==2.1` 환경.
+3. **CUDA lib path 문제** : `LD_LIBRARY_PATH` 에 CUDA runtime libs 가 없거나 cudnn-dev 미설치.
+
+해결:
+
+```bash
+# 가장 확실한 방법 — 현재 torch 에 맞춰 TE 를 강제 소스 재빌드
+./install_transformer_engine.sh                         # 이 스크립트 자체가 재빌드 + runtime probe 포함
+
+# 동등한 수동 명령:
+pip install --force-reinstall --no-build-isolation 'transformer-engine[pytorch]'
+```
+
+재설치 후 `preflight.py` 를 다시 돌려 "transformer_engine" 항목이 **버전 문자열** 만 표시하는지 확인한다 (`torch-backend BROKEN (...)` 이 뜨면 아직 문제 있는 것). 문제가 해결될 때까지 H100 FP8 native TC 수치는 수집되지 않고, CSV 에는 `matmul_fp16_tc` 와 기타 variants 만 남는다.
 
 ### 8.4 환경 권장 사항
 

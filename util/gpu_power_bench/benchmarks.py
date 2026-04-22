@@ -320,24 +320,73 @@ def _make_matmul_halfprec_tc(M, N, K, dtype, device):
 
 
 def _make_matmul_fp8_te(M, N, K, device):
-    """FP8 GEMM via Transformer Engine. Native Tensor Core path on H100 only."""
+    """FP8 GEMM via Transformer Engine. Native Tensor Core path on H100 only.
+
+    Two distinct failure modes we need to surface with actionable messages:
+
+    1. Module not importable   → user never installed TE (or installed bare
+       `transformer-engine` meta-package without the `[pytorch]` extra).
+       Raises ImportError.
+    2. Module imports, but the compiled torch backend shared-object isn't
+       loadable at runtime — typically because the installed TE wheel was
+       built against a different torch version than the one we're running,
+       or CUDA libs aren't on the loader path. This surfaces as OSError
+       ("cannot open shared object file") or RuntimeError ("could not find
+       shared object file for transformer engine torch lib"). The import
+       line alone doesn't trigger it — `te.Linear(...)` / `fp8_autocast(...)`
+       does — so we build and warm the module here to fail early with a
+       clear message instead of a mid-sweep traceback.
+    """
+    _install_hint = (
+        "Run ./install_transformer_engine.sh (it checks prerequisites and "
+        "uses --no-build-isolation + the [pytorch] extra, which is the "
+        "combination that avoids the meta-package and shared-object traps)."
+    )
     try:
         import transformer_engine.pytorch as te
         from transformer_engine.common import recipe as te_recipe
     except ImportError as e:
         raise RuntimeError(
-            "transformer_engine is not installed — `pip install transformer_engine` "
-            "(required for the fp8_te variant; only meaningful on H100)"
+            f"transformer_engine not importable ({e}). {_install_hint}"
         ) from e
+    except (OSError, RuntimeError) as e:
+        # Import line can itself load the torch backend .so lazily on some
+        # TE versions; catch that here too.
+        raise RuntimeError(
+            f"transformer_engine imported but its torch backend shared "
+            f"library failed to load ({type(e).__name__}: {e}). This usually "
+            f"means the installed TE wheel was built against a different "
+            f"torch version, or the meta-package stub is installed. "
+            f"{_install_hint}"
+        ) from e
+
     x = torch.randn(M, K, dtype=torch.float16, device=device)
     # te.Linear expects (in_features, out_features); we map K → N.
     # bias=False keeps the kernel pure GEMM for apples-to-apples FLOP counting.
-    linear = te.Linear(K, N, bias=False, params_dtype=torch.float16).to(device)
-    fp8_recipe = te_recipe.DelayedScaling(
-        fp8_format=te_recipe.Format.E4M3,
-        amax_history_len=16,
-        amax_compute_algo="max",
-    )
+    try:
+        linear = te.Linear(K, N, bias=False, params_dtype=torch.float16).to(device)
+        fp8_recipe = te_recipe.DelayedScaling(
+            fp8_format=te_recipe.Format.E4M3,
+            amax_history_len=16,
+            amax_compute_algo="max",
+        )
+        # Warmup call — also forces the torch backend .so load path so
+        # a broken install fails during build() rather than inside the
+        # power-sampled loop.
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            linear(x)
+    except (OSError, RuntimeError) as e:
+        msg = str(e)
+        if ("shared object" in msg.lower()
+                or "transformer_engine_torch" in msg
+                or "libtransformer_engine" in msg):
+            raise RuntimeError(
+                f"transformer_engine loaded but the torch backend shared "
+                f"library is missing or unloadable ({type(e).__name__}: "
+                f"{e}). {_install_hint}"
+            ) from e
+        raise
+
     def f():
         with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
             linear(x)

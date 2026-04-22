@@ -98,12 +98,44 @@ set -x
 set +x
 
 # ---- 6. verify ----
+# Not enough to check `import transformer_engine.pytorch` — the torch backend
+# shared library is loaded lazily on the first te.Linear() call.  We actually
+# construct a tiny Linear and run it under fp8_autocast so a missing / ABI-
+# mismatched .so surfaces here instead of mid-benchmark.
 echo
-if "$PYTHON" -c "import transformer_engine.pytorch as te; print('  te version:', te.__version__)" 2>/dev/null; then
-    grn "OK — transformer_engine installed and importable."
+"$PYTHON" - <<'PY'
+import sys, traceback
+try:
+    import torch
+    import transformer_engine.pytorch as te
+    from transformer_engine.common import recipe as te_recipe
+    print("  te version:", getattr(te, "__version__", "unknown"))
+    linear = te.Linear(64, 64, bias=False, params_dtype=torch.float16)
+    if torch.cuda.is_available():
+        linear = linear.cuda()
+        x = torch.randn(64, 64, dtype=torch.float16, device="cuda")
+        r = te_recipe.DelayedScaling(fp8_format=te_recipe.Format.E4M3,
+                                     amax_history_len=4, amax_compute_algo="max")
+        with te.fp8_autocast(enabled=True, fp8_recipe=r):
+            linear(x)
+        print("  fp8_autocast forward pass: OK")
+    else:
+        print("  (no CUDA device visible — skipped fp8_autocast probe)")
+except Exception as e:
+    print("  VERIFY FAILED:", type(e).__name__, e)
+    traceback.print_exc()
+    sys.exit(1)
+PY
+rc=$?
+if [[ $rc -eq 0 ]]; then
+    grn "OK — transformer_engine installed and the torch backend .so loads."
     echo "   Run preflight again: $PYTHON preflight.py"
 else
-    red "install finished but 'import transformer_engine.pytorch' fails."
-    echo "   Check the pip output above for compile errors (usually nvcc / cudnn-dev missing)."
+    red "install finished but the te.Linear + fp8_autocast runtime probe failed."
+    echo "   Common causes:"
+    echo "     * torch version mismatch — rebuild TE against THIS torch:"
+    echo "         $PYTHON -m pip install --force-reinstall --no-build-isolation '$PKG'"
+    echo "     * missing CUDA libs on loader path — set LD_LIBRARY_PATH to CUDA libs"
+    echo "     * cudnn-dev / nvcc too old for the TE version"
     exit 1
 fi

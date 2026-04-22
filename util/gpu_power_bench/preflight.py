@@ -101,23 +101,42 @@ def _check_cuda_and_fp8(r: PreflightResult) -> None:
     r.info["tensor_core_support"] = ", ".join(f"{k}={v}" for k, v in tc.items())
 
     # Transformer Engine — required for the fp8_te matmul variant.
-    # The bare `transformer-engine` PyPI package is a META package that
-    # errors at runtime; the real install needs `[pytorch]` extra AND
-    # `--no-build-isolation`.  Detect both "not installed" and "meta
-    # package stub" cases and surface the exact install command.
+    # Three failure modes that each produce a different symptom:
+    #   (a) `transformer_engine` not installed at all            → ImportError
+    #   (b) meta-package stub only (no [pytorch] extra) —        → ImportError /
+    #       `import transformer_engine.pytorch` fails              ModuleNotFoundError
+    #   (c) pytorch extension .so missing or ABI-mismatched —    → OSError /
+    #       import passes but `te.Linear(...)` errors at runtime   RuntimeError
+    # The CI-friendly way to distinguish (b) and (c) is to actually instantiate
+    # a tiny te.Linear and run a forward pass under fp8_autocast; if that
+    # succeeds, the install is genuinely usable.
     te_status = "NOT installed"
+    te_ok = False
     try:
         import transformer_engine  # noqa: F401
+        te_status = getattr(transformer_engine, "__version__", "installed")
         try:
-            import transformer_engine.pytorch  # noqa: F401
-            te_status = getattr(transformer_engine, "__version__", "installed")
-        except Exception as e:
-            te_status = f"META-PACKAGE ONLY (broken): {e.__class__.__name__}"
+            import transformer_engine.pytorch as te
+            from transformer_engine.common import recipe as te_recipe
+            # Runtime probe: forces the torch-backend .so to load.
+            linear = te.Linear(64, 64, bias=False, params_dtype=torch.float16)
+            if torch.cuda.is_available():
+                linear = linear.cuda()
+                x = torch.randn(64, 64, dtype=torch.float16, device="cuda")
+                recipe = te_recipe.DelayedScaling(
+                    fp8_format=te_recipe.Format.E4M3,
+                    amax_history_len=4, amax_compute_algo="max")
+                with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                    linear(x)
+            te_ok = True
+        except (OSError, RuntimeError) as e:
+            te_status = f"torch-backend BROKEN ({type(e).__name__}: {str(e)[:120]})"
+        except ImportError as e:
+            te_status = f"META-PACKAGE ONLY (no [pytorch] extra): {e}"
     except ImportError:
         pass
     r.info["transformer_engine"] = te_status
-    if te_status != "installed" and not te_status.replace(".", "").isdigit() \
-            and not te_status[0:1].isdigit():
+    if not te_ok:
         hint = ("./install_transformer_engine.sh   "
                 "# or: pip install --no-build-isolation 'transformer-engine[pytorch]'")
         if cc[0] >= 9:
