@@ -852,20 +852,32 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
             colors[k] = extra_cmap(i % 20)
 
         # --- Panel A: per-cell strip ---------------------------------------
+        # Strip plot on a log scale — filter non-positive values. When a
+        # column has zero legitimate points after the filter (e.g. every
+        # matmul cell reported j_per_flop_dyn=0 because of a bad fit), the
+        # panel stays empty but we don't crash and don't let matplotlib
+        # auto-scale to absurd bounds.
+        any_a_pts = False
         for key in keys:
             g = cat_df[cat_df[keys_key] == key]
             if g.empty:
                 continue
+            ys_raw = pd.to_numeric(g[unit_col], errors="coerce")
+            mask = ys_raw.notna() & (ys_raw > 0)
+            if not mask.any():
+                continue
             xs = g["cache_regime"].map(regime_x).astype(float) \
                 + (0.05 * (hash(str(key)) % 7 - 3))
-            ys = pd.to_numeric(g[unit_col], errors="coerce")
-            ax_a.scatter(xs, ys, s=42, color=colors[key], marker="o",
+            ax_a.scatter(xs[mask.values], ys_raw[mask].values,
+                         s=42, color=colors[key], marker="o",
                          alpha=0.8, edgecolors="white", label=str(key))
+            any_a_pts = True
         ax_a.set_xticks(list(regime_x.values()))
         ax_a.set_xticklabels([f"{r}\n({regime_hit_rate[r]} L2 hit)"
                               for r in regime_order])
         ax_a.set_ylabel(f"{unit_label} (per cell, dynamic)")
-        ax_a.set_yscale("log")
+        if any_a_pts:
+            ax_a.set_yscale("log")
         ax_a.grid(True, axis="y", alpha=0.3)
         ax_a.set_title(f"{title_prefix}A. Raw spread — every cell")
         ax_a.legend(fontsize=8, ncol=1, loc="upper left",
@@ -877,6 +889,7 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
         else:
             width = 0.8 / max(1, len(keys))
             xpos = np.arange(len(regime_order))
+            positive_vals: list[float] = []   # used for safe log-scale ylim
             for i, key in enumerate(keys):
                 vals, r2s = [], []
                 for r in regime_order:
@@ -886,16 +899,23 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
                         vals.append(np.nan); r2s.append(np.nan)
                     else:
                         sl = float(row["slope_dyn"].iloc[0])
-                        if not np.isfinite(sl):
-                            sl = float(row["median_j_per_unit"].iloc[0])
+                        if not np.isfinite(sl) or sl <= 0:
+                            # Fall back to the median of per-cell J/unit when
+                            # the regression slope is non-physical (NaN, ≤ 0
+                            # happens for single-point regimes with intercept
+                            # noise). Median is always a real positive J/unit
+                            # value if ANY cell had one.
+                            med = float(row["median_j_per_unit"].iloc[0])
+                            sl = med if np.isfinite(med) and med > 0 else np.nan
                         vals.append(sl)
                         r2s.append(float(row["R2_dyn"].iloc[0]))
                 bars = ax_b.bar(xpos + (i - (len(keys)-1)/2) * width, vals, width,
                                 label=str(key), color=colors[key], alpha=0.9,
                                 edgecolor="white")
                 for rect, v, r2 in zip(bars, vals, r2s):
-                    if np.isnan(v):
+                    if not np.isfinite(v) or v <= 0:
                         continue
+                    positive_vals.append(v)
                     v_p = v * annot_scale
                     if abs(v_p) >= 1:
                         vtxt = f"{v_p:.2f}"
@@ -913,14 +933,23 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
             ax_b.set_xticks(xpos)
             ax_b.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
             ax_b.set_ylabel(f"k_op = slope_dyn  ({unit_label})")
-            ax_b.set_yscale("log")
+            # Only switch to log scale when we actually have ≥ 1 positive bar
+            # — otherwise matplotlib can't pick finite log bounds and the
+            # figure expands unboundedly when bbox_inches="tight" is applied.
+            if positive_vals:
+                ax_b.set_yscale("log")
+                lo = min(positive_vals)
+                hi = max(positive_vals)
+                # Anchor the limits explicitly — don't ask matplotlib to
+                # auto-scale. 0.3× below lowest bar, 5× above highest. This
+                # guarantees the figure stays finite even when some bars are
+                # NaN / 0 and others are tiny (mixes of both produced the
+                # ~1.3 Gpx image earlier).
+                ax_b.set_ylim(lo * 0.3, hi * 5)
             ax_b.grid(True, axis="y", alpha=0.3)
             ax_b.set_title(f"{title_prefix}B. k_op per regime "
                            f"(annotated in {annot_suffix})")
             ax_b.legend(fontsize=8, ncol=min(len(keys), 3), loc="upper left")
-            # Extra headroom so two-line labels don't bump into the title.
-            ymin, ymax = ax_b.get_ylim()
-            ax_b.set_ylim(ymin, ymax * 5)
 
         # --- Panel C: mean dyn_power_w per regime --------------------------
         mean_p = {}
@@ -975,7 +1004,18 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
     fig.suptitle(f"Cache-regime breakdown — {gpu}  "
                  "(B. columns show the k_op value the energy model uses)",
                  y=1.00)
-    fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
+    fig.tight_layout()
+    # Belt-and-braces: even with the log-scale / positive-value guards above,
+    # clamp the final figure size so a single pathological artist can never
+    # balloon the PNG into a gigapixel decompression-bomb. 24 inches tall ≈
+    # 3840 px at 160 dpi, which is still generous for two stacked rows.
+    w_in, h_in = fig.get_size_inches()
+    if w_in > 40 or h_in > 24:
+        fig.set_size_inches(min(w_in, 40), min(h_in, 24))
+    # Fixed pad_inches instead of bbox_inches="tight" — the "tight" mode
+    # expands the crop to fit any overflowing artist, which is what let the
+    # figure grow to ~2500 in when a log-scale limit went infinite.
+    fig.savefig(out_png, dpi=160, pad_inches=0.3)
     print(f"[save] {out_png}")
 
 
