@@ -192,6 +192,13 @@ def main() -> int:
                          "8 fp8_te cells without redoing the 90 elementwise "
                          "cells. Combine with --matmul-variants fp8:te to "
                          "target matmul_fp8_te specifically.")
+    ap.add_argument("--cache-sweep", action="store_true",
+                    help="override --loads with exactly 3 elementwise points "
+                         "per (op, dtype) targeting the three cache regimes: "
+                         "L2-resident (~100%% L2 hit), L2-partial (~50%%), "
+                         "DRAM-stream (~0%% L2 hit). Sizes are derived from "
+                         "the detected L2 capacity of --device. Use this to "
+                         "isolate cache-locality effects on energy.")
     ap.add_argument("--matmul-sizes", type=int, nargs="+", default=None,
                     help="square matrix side lengths (M=N=K); default: 512..8192")
     ap.add_argument("--matmul-variants", nargs="+", default=None,
@@ -272,10 +279,22 @@ def main() -> int:
     # Each plan has a `build()` callable that allocates tensors just-in-time
     # so we never hold more than one cell's tensors at once.
     plans: list[dict] = []
+    l2_bytes = bm.get_l2_bytes(args.device)
+    if l2_bytes > 0:
+        print(f"[info] L2 cache size: {l2_bytes/(1<<20):.1f} MB "
+              f"(used to classify cache_regime for every row)")
+    else:
+        print("[info] L2 cache size not reported by torch — cache_regime=unknown")
     if not args.no_elementwise:
         for dtype in args.dtypes:
             for op in args.ops:
-                for N in loads:
+                # In cache-sweep mode, the global `--loads` is ignored and each
+                # (op, dtype) gets exactly 3 points sized for L2-resident /
+                # L2-partial / DRAM-stream regimes. Otherwise use the global
+                # load list (which itself may span all three regimes naturally).
+                per_op_loads = (bm.cache_sweep_points(op, dtype, l2_bytes)
+                                if args.cache_sweep else loads)
+                for N in per_op_loads:
                     plans.append({
                         "category": "elementwise",
                         "mode": "elementwise",
@@ -313,6 +332,7 @@ def main() -> int:
                 continue
             tag = spec.compute_unit + ("  [EMULATED]" if spec.emulated else "")
             print(f"  compute_unit: {tag}")
+            print(f"  cache_regime: {spec.cache_regime}")
             if spec.notes:
                 print(f"  note: {spec.notes}")
 
@@ -364,6 +384,9 @@ def main() -> int:
                 # 1 if this is NOT the HW path a naive reader would assume
                 # (fp8 elementwise anywhere, fp8_te on pre-Hopper, etc.)
                 "emulated": int(bool(spec.emulated)),
+                # Cache-locality regime classified from working-set vs L2.
+                # "l2_resident" / "l2_partial" / "dram_stream" / "unknown"
+                "cache_regime": spec.cache_regime,
                 "n_elements": spec.n_elements,
                 "shape": "x".join(str(s) for s in spec.shape),
                 "load_name": plan["load_name"],

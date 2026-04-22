@@ -60,6 +60,14 @@ class BenchSpec:
     #   * matmul_fp8_te on A100 — Transformer Engine falls back to FP16
     #     Tensor Core; the measurement is an FP16-TC number, not FP8.
     emulated: bool = False
+    # Cache/locality regime — classified from working-set vs L2 size. Lets the
+    # analyser separate L2-bound from DRAM-bound points instead of forcing a
+    # single regression line across a regime change.
+    #   "l2_resident"  — working set ≤ L2/2, ≈ 100% L2 hit after iter 1
+    #   "l2_partial"   — working set within [L2/2, 2·L2], thrashing / ~50%
+    #   "dram_stream"  — working set ≥ 2·L2, ≈ 0% L2 hit
+    #   "unknown"      — L2 size unavailable (legacy rows / non-CUDA)
+    cache_regime: str = "unknown"
     notes: str = ""
 
 
@@ -201,6 +209,98 @@ def _shape_for(op: str, n_elements: int) -> tuple[int, ...]:
     return (M, D)
 
 
+# ---------- L2 size + cache-regime classifier ------------------------------
+
+def _dtype_bytes(label: str) -> int:
+    """Storage bytes per element for a dtype label. Note: fp8 storage is
+    1 byte, but our cast-compute-cast benchmark materialises full fp16
+    intermediates too — the working-set for cache classification tracks the
+    DOMINANT resident tensor, which is the fp16 intermediate (2 bytes/elem)
+    when the path is emulated, and the storage dtype otherwise."""
+    if label == "fp16":
+        return 2
+    if label == "fp8":
+        # cast-compute-cast → fp16 intermediates dominate traffic
+        return 2
+    if label == "bf16":
+        return 2
+    if label == "fp32" or label == "tf32":
+        return 4
+    return 2   # conservative fallback
+
+
+def get_l2_bytes(device: int = 0) -> int:
+    """Return L2 cache size in bytes for the given CUDA device (0 if unknown)."""
+    try:
+        props = torch.cuda.get_device_properties(device)
+        # Attribute name varies across PyTorch versions.
+        for attr in ("L2_cache_size", "l2_cache_size"):
+            v = getattr(props, attr, None)
+            if v:
+                return int(v)
+    except Exception:
+        pass
+    return 0
+
+
+def classify_cache_regime(working_set_bytes: int, l2_bytes: int) -> str:
+    """Return a coarse cache-locality regime for a given working set.
+
+    Boundaries are set so each regime has a clear interpretation:
+      * working set ≤ L2/2              → fits with margin → ~100% L2 hit after
+                                          the first iteration (data stays resident
+                                          across subsequent kernel launches).
+      * L2/2 < working set ≤ 2·L2       → thrashing / partial hit (~50% as a
+                                          ballpark; actual depends on access
+                                          pattern and L2 replacement policy).
+      * working set > 2·L2              → every kernel streams from DRAM;
+                                          effective L2 hit rate near 0%.
+    These thresholds are deliberately conservative — the inner boundaries
+    aren't sharp, but they place each sweep point unambiguously in one bucket.
+    """
+    if l2_bytes <= 0:
+        return "unknown"
+    if working_set_bytes <= l2_bytes / 2:
+        return "l2_resident"
+    if working_set_bytes <= 2 * l2_bytes:
+        return "l2_partial"
+    return "dram_stream"
+
+
+def _elementwise_working_set(op: str, n_elements: int, bytes_per_elem: int) -> int:
+    """Bytes touched per kernel for a given op at a given size.
+
+    - mul/add : 2 reads + 1 write = 3·N·bytes_per_elem
+    - gelu    : 1 read + 1 write = 2·N·bytes_per_elem
+    - softmax / layernorm : 1 read + 1 write = 2·N·bytes_per_elem (+ weight/bias
+      are O(D) so negligible relative to N·D)
+    This is what the L2 actually has to hold (transient) for the kernel to
+    complete — the figure used to classify the regime.
+    """
+    if op in ("mul", "add"):
+        rw = 3
+    else:
+        rw = 2
+    return rw * n_elements * bytes_per_elem
+
+
+def cache_sweep_points(op: str, dtype_label: str, l2_bytes: int) -> list[int]:
+    """Return 3 N values that land cleanly in the 3 regimes for this op/dtype.
+
+    Target working-set ratios vs L2:
+      l2_resident : L2/8    (solid 100% hit)
+      l2_partial  : L2      (right at threshold → ~50%)
+      dram_stream : 8·L2    (clear DRAM streaming)
+    """
+    if l2_bytes <= 0:
+        # Fall back to 3 spread-out defaults — same as before this feature.
+        return [1 << 19, 1 << 23, 1 << 27]
+    b = _dtype_bytes(dtype_label)
+    rw = 3 if op in ("mul", "add") else 2
+    def n_for(ws): return max(1 << 14, int(ws) // (rw * b))
+    return [n_for(l2_bytes / 8), n_for(l2_bytes), n_for(8 * l2_bytes)]
+
+
 def build(op: str, dtype_label: str, n_elements: int,
           device: str | torch.device = "cuda") -> BenchSpec:
     if op not in _BUILDERS:
@@ -222,11 +322,17 @@ def build(op: str, dtype_label: str, n_elements: int,
     if dtype_label == "fp8":
         notes = ("fp8 emulated via FP16 cast-compute-cast "
                  "(no native FP8 elementwise kernel in PyTorch)")
+    # Cache regime — requires knowing L2 size on the ACTUAL target device.
+    dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
+    l2 = get_l2_bytes(dev_idx)
+    ws = _elementwise_working_set(op, actual_n, _dtype_bytes(dtype_label))
+    regime = classify_cache_regime(ws, l2)
     return BenchSpec(
         name=name, op=op, dtype_label=dtype_label,
         shape=shape, n_elements=actual_n,
         flops_per_call=flops, run=fn,
-        compute_unit=compute_unit, emulated=emulated, notes=notes,
+        compute_unit=compute_unit, emulated=emulated,
+        cache_regime=regime, notes=notes,
     )
 
 
@@ -431,11 +537,20 @@ def build_matmul(K_size: int, dtype_label: str, mode: str,
     flops = 2 * M * N * K
     n_out = M * N  # output element count (for sanity; primary metric is J/FLOP)
     name = f"matmul_{dtype_label}_{mode}"
+    # Cache regime for matmul: working set = A (M·K) + B (K·N) + C (M·N). Note
+    # matmul has intrinsic reuse (each element of A/B read K times) so even
+    # when the full working set exceeds L2, tile-level reuse recovers a big
+    # fraction of hits. The regime label still distinguishes "small GEMMs
+    # where everything fits" from "big GEMMs where tiles thrash".
+    ws_bytes = (M * K + K * N + M * N) * _dtype_bytes(dtype_label)
+    dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
+    regime = classify_cache_regime(ws_bytes, get_l2_bytes(dev_idx))
     return BenchSpec(
         name=name, op="matmul", dtype_label=dtype_label,
         shape=(M, N, K), n_elements=n_out,
         flops_per_call=flops, run=fn,
-        compute_unit=compute_unit, emulated=emulated, notes=notes,
+        compute_unit=compute_unit, emulated=emulated,
+        cache_regime=regime, notes=notes,
     )
 
 
