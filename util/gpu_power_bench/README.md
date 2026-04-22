@@ -500,19 +500,81 @@ GPU 0 에서 full sweep (15 cells × 9 loads = ~30-40 분) 을 돈다.
 ### 9.4 주요 옵션
 
 ```
---device N            대상 GPU index
---tag STR             출력 파일 태그 (예: a100, h100)
---window-ms MS        측정 window (default 3000)
---static-seconds S    idle baseline 측정 시간 (default 12)
---cooldown-c TEMP     cooldown 목표 온도 (default 45)
---cooldown-min-s S    cooldown 최소 대기 시간 (default 5)
---cooldown-timeout S  cooldown 최대 대기 (default 180)
---loads N1,N2,...     elementwise load list (manual override)
---matmul-sizes N1,... matmul M=N=K list
---skip-cells regex    정규식 매칭 cell 스킵
---only-cells regex    정규식 매칭 cell 만 실행
---out-dir DIR         output 디렉토리 (default reports/)
+--device N              대상 GPU index
+--tag STR               출력 파일 태그 (예: a100, h100)
+--window-ms MS          측정 window (default 3000)
+--static-seconds S      idle baseline 측정 시간 (default 12)
+--cooldown-c TEMP       cooldown 목표 온도 (default 45)
+--cooldown-min-s S      cooldown 최소 대기 시간 (default 5)
+--cooldown-timeout S    cooldown 최대 대기 (default 180)
+--loads N1 N2 ...       elementwise load list (manual override)
+--matmul-sizes N1 ...   matmul M=N=K list
+--matmul-variants ...   e.g. `fp8:te bf16:tc` (default: 5 variants 전부)
+--no-elementwise        elementwise sweep 생략 (재실행 / matmul-only 용)
+--no-matmul             matmul sweep 생략
+--skip-preflight        preflight check 우회 (이미 통과했을 때)
+--out-dir DIR           output 디렉토리 (default reports/)
 ```
+
+#### 9.4.1 실패한 cell 다시 돌리기 (예: TE 설치 수정 후 `matmul_fp8_te` 재측정)
+
+기본 sweep 은 **130 cells** 로 구성됩니다:
+- elementwise 90 = 2 dtypes (fp16, fp8) × 5 ops × 9 loads
+- matmul 40 = 5 variants × 8 K sizes
+
+순서대로 번호를 매기면 **cell 123–130 이 정확히 `matmul_fp8_te`** 의 K ∈ {512, 1024, 1536, 2048, 3072, 4096, 6144, 8192} 8 개입니다. TE 설치 문제로 이 8 개만 스킵됐다면 전체 130 cells 를 재측정할 필요 없이 이 부분만 다시 돌리면 됩니다 — 약 30 분 → 3 분으로 단축.
+
+**Step 1 — TE 재설치 + preflight 통과 확인**
+
+```bash
+cd util/gpu_power_bench
+./install_transformer_engine.sh        # 끝에 runtime probe 까지 성공해야 함
+python3 preflight.py                   # "transformer_engine: <version>" 가 찍혀야 정상
+```
+
+**Step 2 — matmul fp8_te 8 cells 만 재실행**
+
+```bash
+python3 gpu_power_bench.py \
+    --device 0 \
+    --no-elementwise \
+    --matmul-variants fp8:te \
+    --tag h100_fp8te_redo \
+    --out-dir reports/
+```
+
+출력: `reports/gpu_power_bench_<slug>_<stamp>_h100_fp8te_redo.csv` (8 rows) + baseline / samples sidecar. 런타임은 **Thermal cooldown 포함 약 3–5 분**.
+
+**Step 3 — 기존 CSV 와 병합**
+
+새 CSV 를 원본과 합쳐서 `analyze.py` 에 먹이려면 간단히 pandas 로 concat 하면 됩니다. 원본의 `matmul_fp8_te` 행은 비어 있으므로 중복도 없습니다.
+
+```bash
+python3 - <<'PY'
+import pandas as pd
+from pathlib import Path
+
+orig = Path("reports/gpu_power_bench_<slug>_<stamp>_h100.csv")       # 수정: 원본 파일명
+redo = Path("reports/gpu_power_bench_<slug>_<stamp>_h100_fp8te_redo.csv")  # 수정
+
+a = pd.read_csv(orig)
+b = pd.read_csv(redo)
+# redo 쪽 matmul_fp8_te 행만 뽑아 원본에 append (원본에 이미 있으면 교체)
+a = a[a["variant"] != "matmul_fp8_te"]
+merged = pd.concat([a, b[b["variant"] == "matmul_fp8_te"]], ignore_index=True)
+out = orig.with_name(orig.stem + "_merged.csv")
+merged.to_csv(out, index=False)
+print(f"wrote {out}  ({len(merged)} rows)")
+PY
+```
+
+**Step 4 — 병합된 CSV 로 분석**
+
+```bash
+python3 analyze.py reports/gpu_power_bench_<slug>_<stamp>_h100_merged.csv
+```
+
+> 참고: `static_power_w` 는 각 run 시작 시점에 측정되므로 원본 / 재실행 row 사이에 수 W 차이가 날 수 있습니다. `dyn_energy_j` 는 각자의 baseline 으로 이미 정규화되어 있어 분석에 영향 없습니다. 크게 차이나면 (`>10%`) 장비 상태가 변했다는 신호이므로 병합 대신 재실행 분을 독립적으로 보는 게 안전합니다.
 
 ### 9.5 분석 단계
 
