@@ -207,6 +207,31 @@ matmul 은 **compute dominated** 커널이며, 같은 문제를 다른 compute u
 - **9 points, 2배씩 2배 증가 + 끝점 1.5x** : log-linear 커버리지. R² 평가를 왜곡하는 dense cluster 피함.
 - **`iters` 자동계산** : `target_ms / per-iter-us`. 최소 window (`--window-ms 3000`) 를 채우도록 반복 횟수 결정.
 
+### 3.4 Cache locality regime — L2 hit rate 와 에너지
+
+elementwise 벤치마크는 memory-bound 이므로 **working-set 이 L2 에 얹히는지 여부가 J/element 를 1 order 이상 갈라놓습니다**. 각 cell 은 working-set 크기와 탐지된 L2 용량을 비교해 세 regime 으로 자동 분류됩니다:
+
+| `cache_regime` | Working-set 조건 | 해석 | 예상 L2 hit rate |
+|---|---|---|---|
+| `l2_resident` | `ws ≤ L2/2` | 여유있게 L2 안에 들어감. 두 번째 iter 부터 resident. | ≈ **100%** |
+| `l2_partial` | `L2/2 < ws ≤ 2·L2` | 경계 — thrashing / 일부 hit. | ≈ **50%** (rough) |
+| `dram_stream` | `ws > 2·L2` | 매 iter 마다 DRAM 에서 streaming. | ≈ **0%** |
+
+Working-set 정의:
+- `mul` / `add` : `3·N·bytes_per_elem` (a read + b read + out write)
+- `gelu` / `softmax` / `layernorm` : `2·N·bytes_per_elem`
+- `matmul` : `(M·K + K·N + M·N)·bytes_per_elem`. 단, matmul 은 reuse (`K` times per element) 가 있어서 대용량에서도 tile-level L2 hit 가 살아있습니다 — 라벨은 working-set 기준이므로 matmul_dram_stream 도 compute-bound 일 수 있음.
+
+**기본 sweep 은 이미 세 regime 을 다 포함** (A100 40MB L2 기준: `N≤8M` L2-resident, `N=32M` transition, `N≥64M` DRAM-stream). 분석 시 `cache_regime` 컬럼으로 grouping 하면 cache 효과를 분리해서 볼 수 있습니다.
+
+**3 regime 에 clean 하게 각각 1 포인트만 찍고 싶다면** `--cache-sweep` 플래그를 쓰면 각 (op, dtype) 마다 정확히 3 개 load size (L2/8, L2, 8·L2 working-set) 만 실행합니다:
+
+```bash
+python3 gpu_power_bench.py --device 0 --cache-sweep --tag h100_cache --out-dir reports/
+```
+
+출력은 평소처럼 CSV 에 쌓이고, `analyze.py` 는 `_cache_regime.png` 플롯을 새로 그립니다 (§6.5.1 참조).
+
 ## 4. 측정 방법론
 
 ### 4.1 NVML power telemetry
@@ -355,6 +380,16 @@ E_dyn = k_op · N_op + c
 **어떻게 읽나** :
 - idle trace stdev/mean > 5% 면 측정 환경 불안정 — background process 의심.
 - static share 가 50% 를 넘으면 "kernel 이 idle 보다 약간 바쁜 수준" — load 상한 늘림.
+
+### 6.4.1 `cache_regime.png` — L2 hit rate 별 J/element
+
+**무엇을 보여주나** : 좌 panel = 개별 cell 을 `(l2_resident / l2_partial / dram_stream)` x축에 strip plot 으로, 우 panel = (op × regime) 의 J/element median bar.
+
+**어떻게 읽나** :
+- **좌 panel 의 수직 gap 이 곧 cache miss 의 에너지 비용** — 같은 op 가 DRAM-stream 에서 L2-resident 대비 몇 배 비싼지 한 눈에. mul/add 에서 5-10x 정도가 일반적.
+- 점이 세 regime 사이에 "계단" 모양이 아니라 "비스듬한 선" 으로 퍼지면 working-set 경계가 L2 에 가깝다는 뜻 — transition 지점 근처에서 sub-regime 변동이 있다는 신호.
+- reduction op (softmax / layernorm) 는 elementwise 에 비해 세 regime 간격이 좁게 나옵니다. reduction 은 compute overhead 가 BW 만큼 차지하기 때문.
+- **fp8** 는 cast-compute-cast 때문에 regime 에 관계없이 fp16 대비 높게 나옵니다 — `--include-emulated` 로 비교.
 
 ### 6.5 `temperature.png` — 열 특성
 
@@ -635,6 +670,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
 | `<stem>_linearity_matmul.png` | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
 | `<stem>_joule_per_op_bar.png` | bar chart (좌: elementwise, 우: matmul) |
+| `<stem>_cache_regime.png` | L2-resident / L2-partial / DRAM-stream regime 별 J/element (strip + median bar) |
 | `<stem>_static_power.png` | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
 | `<stem>_temperature.png` | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
 | `<stem>_timeline.png` | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
@@ -738,6 +774,7 @@ reports/
 | `cell_id` | — | e.g. `fp16_softmax` |
 | `compute_unit` | — | `"CUDA core"` \| `"Tensor Core"` \| `"Tensor Core (FP16 fallback)"` — 실제 FLOP 을 수행한 HW path |
 | `emulated` | 0/1 | 1 이면 해당 cell 은 native 경로가 아님 (fp8 elementwise 전부, A100 의 `matmul_fp8_te`) |
+| `cache_regime` | — | `"l2_resident"` \| `"l2_partial"` \| `"dram_stream"` \| `"unknown"` — working-set 과 L2 용량 비교로 자동 분류 (§3.4 참조) |
 | `load` | elem or N | elementwise: element count; matmul: M=N=K |
 | `iters` | — | 자동 계산된 반복 횟수 |
 | `N_op` | count | elementwise: load · iters; matmul: 2·N³·iters |

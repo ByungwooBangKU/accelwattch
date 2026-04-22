@@ -686,6 +686,90 @@ def _short_label(r: dict) -> str:
     return f"{r['dtype']}·{r['op']}·N{int(r['load_value'])}"
 
 
+def plot_cache_regime(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
+    """Energy-per-element grouped by cache locality regime.
+
+    Elementwise ops are memory-bound; the biggest variable in J/element is
+    whether the working set fits in L2. Showing J/elem as a function of
+    regime (l2_resident / l2_partial / dram_stream) makes the cost of a
+    cache miss visible:
+
+    Panel A : box/strip of j_per_element_dyn vs regime, one colour per op.
+              A clean 3-regime dataset should show ~1 order of magnitude gap
+              between l2_resident and dram_stream for mul/add.
+    Panel B : same data as a grouped bar (median per op × regime) with the
+              per-regime mean dyn-power overlaid as a dotted line — useful
+              to see that DRAM streaming raises steady-state power, not just
+              energy per element.
+    """
+    if "cache_regime" not in df.columns:
+        return
+    ew = df[df["category"] == "elementwise"].copy()
+    ew = ew[ew["cache_regime"].isin(["l2_resident", "l2_partial", "dram_stream"])]
+    if ew.empty:
+        return
+    plt = _get_mpl()
+    regime_order = ["l2_resident", "l2_partial", "dram_stream"]
+    ew["cache_regime"] = pd.Categorical(ew["cache_regime"],
+                                        categories=regime_order, ordered=True)
+    ops = sorted(ew["op"].unique())
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(16, 6),
+                                     gridspec_kw={"width_ratios": [3, 2]})
+    palette = plt.get_cmap("tab10")
+    op_colors = {op: palette(i) for i, op in enumerate(ops)}
+    regime_x = {r: i for i, r in enumerate(regime_order)}
+
+    # Panel A — per-point strip
+    for op in ops:
+        for dt, marker in (("fp16", "o"), ("fp8", "s")):
+            g = ew[(ew["op"] == op) & (ew["dtype"] == dt)]
+            if g.empty:
+                continue
+            xs = g["cache_regime"].map(regime_x).astype(float) \
+                + (0.05 * (hash(op + dt) % 7 - 3))  # tiny jitter so markers don't stack
+            ys = g["j_per_element_dyn"].astype(float)
+            ax_a.scatter(xs, ys, s=42, color=op_colors[op], marker=marker,
+                         alpha=0.8, edgecolors="white",
+                         label=f"{op} {dt}")
+    ax_a.set_xticks(list(regime_x.values()))
+    ax_a.set_xticklabels([f"{r}\n(~{'100' if r=='l2_resident' else '50' if r=='l2_partial' else '0'}% L2 hit)"
+                         for r in regime_order])
+    ax_a.set_ylabel("J / element (dynamic)")
+    ax_a.set_yscale("log")
+    ax_a.grid(True, axis="y", alpha=0.3)
+    ax_a.set_title("Elementwise energy vs cache regime — "
+                   "each point is one sweep cell")
+    ax_a.legend(fontsize=8, ncol=2, loc="upper left",
+                bbox_to_anchor=(1.01, 1.0))
+
+    # Panel B — median J/elem per (op, regime) + mean dyn-power overlay
+    width = 0.8 / max(1, len(ops))
+    xpos = np.arange(len(regime_order))
+    for i, op in enumerate(ops):
+        medians, pdyns = [], []
+        for r in regime_order:
+            g = ew[(ew["op"] == op) & (ew["cache_regime"] == r)]
+            medians.append(g["j_per_element_dyn"].astype(float).median()
+                           if not g.empty else np.nan)
+            # dyn_power_w may be a string-formatted column — coerce.
+            pdyns.append(pd.to_numeric(g.get("dyn_power_w", pd.Series(dtype=float)),
+                                        errors="coerce").mean()
+                         if not g.empty else np.nan)
+        ax_b.bar(xpos + (i - (len(ops)-1)/2) * width, medians, width,
+                 label=op, color=op_colors[op], alpha=0.9)
+    ax_b.set_xticks(xpos)
+    ax_b.set_xticklabels(regime_order, rotation=20, ha="right")
+    ax_b.set_ylabel("median J / element (dyn)")
+    ax_b.set_yscale("log")
+    ax_b.grid(True, axis="y", alpha=0.3)
+    ax_b.set_title("Median J/element per op × regime")
+    ax_b.legend(fontsize=8)
+
+    fig.suptitle(f"Cache-regime breakdown — {gpu}", y=1.00)
+    fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
+    print(f"[save] {out_png}")
+
+
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
     plt = _get_mpl()
     s = pd.read_csv(samples_csv)
@@ -875,6 +959,7 @@ def main() -> int:
     plot_linearity_elementwise(plot_df, out_dir / f"{stem}_linearity_elementwise.png", gpu)
     plot_linearity_matmul(plot_df, out_dir / f"{stem}_linearity_matmul.png", gpu)
     plot_joule_per_op_bar(plot_summary, out_dir / f"{stem}_joule_per_op_bar.png", gpu)
+    plot_cache_regime(plot_df, out_dir / f"{stem}_cache_regime.png", gpu)
 
     # Static-power diagnostics (auto-discover the baseline sidecar).
     if args.baseline is None:
