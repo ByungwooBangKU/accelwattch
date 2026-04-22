@@ -379,14 +379,42 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
     Two panels side by side:
       * elementwise — bars grouped by op, color by dtype
       * matmul      — bars by variant
-    This is the picture that goes in a report: "here's how much it costs
-    per op on this GPU".
+    Each bar is annotated with both the numeric coefficient (pJ/element for
+    elementwise, pJ/FLOP for matmul — small-number-friendly units) and the
+    regression R², so the plot alone answers "how much does this op cost
+    on this GPU" without the reader having to open the CSV.
     """
     plt = _get_mpl()
     ew = summary[summary["category"] == "elementwise"]
     mm = summary[summary["category"] == "matmul"]
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6),
+    # Figure height bumped vs before: each bar now carries two lines of text
+    # ("0.31 pJ / R²=0.99"), which needs extra headroom on a log-scale y-axis.
+    fig, axes = plt.subplots(1, 2, figsize=(17, 7),
                              gridspec_kw={"width_ratios": [3, 2]})
+
+    def _annot(rect, value_j, r2, scale_label):
+        """Write '0.31 pJ\\nR²=0.99' on top of a bar, skipping NaNs."""
+        if value_j is None or np.isnan(value_j):
+            return
+        # Pick human-friendly precision: large values (>=100 pJ) get one
+        # decimal, smaller ones get two, very small (<0.1 pJ) use scientific.
+        v_p = value_j * 1e12   # J → pJ
+        if abs(v_p) >= 100:
+            vtxt = f"{v_p:.0f} {scale_label}"
+        elif abs(v_p) >= 1:
+            vtxt = f"{v_p:.2f} {scale_label}"
+        elif abs(v_p) >= 0.01:
+            vtxt = f"{v_p:.3f} {scale_label}"
+        else:
+            vtxt = f"{v_p:.2e} {scale_label}"
+        if np.isnan(r2):
+            label = vtxt
+        else:
+            label = f"{vtxt}\nR²={r2:.3f}"
+        ax = rect.axes
+        ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+                label, ha="center", va="bottom", fontsize=7,
+                linespacing=1.1)
 
     # ---- elementwise panel: grouped bar (op on x, dtype as hue) ----
     ax = axes[0]
@@ -415,18 +443,20 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
             bars = ax.bar(xpos + (i - (len(dtypes) - 1) / 2) * w, vals, w,
                           label=label, color=colors.get(dt, None), alpha=0.9,
                           hatch="//" if emu_dt else None, edgecolor="white")
-            for rect, r2 in zip(bars, r2s):
-                if not np.isnan(r2):
-                    ax.text(rect.get_x() + rect.get_width() / 2,
-                            rect.get_height(), f"R²={r2:.2f}",
-                            ha="center", va="bottom", fontsize=7)
+            for rect, v, r2 in zip(bars, vals, r2s):
+                _annot(rect, v, r2, "pJ/elem")
         ax.set_xticks(xpos); ax.set_xticklabels(ops)
         ax.set_ylabel("J / element (dynamic)  — regression slope")
         ax.set_yscale("log"); ax.legend(); ax.grid(True, axis="y", alpha=0.3)
-        subtitle = "Elementwise — per-op energy coefficient  (all on CUDA cores)"
+        subtitle = ("Elementwise — per-op energy coefficient (all on CUDA cores). "
+                    "Labels: slope (pJ/elem) + R²")
         if has_emulated:
             subtitle += "\nfp8 bars = cast-compute-cast via FP16 (no native FP8 elementwise in PyTorch)"
         ax.set_title(subtitle, fontsize=10)
+        # Bumping the upper ylim by ~1 decade on log scale so the two-line
+        # labels don't clip the title.
+        ymin, ymax = ax.get_ylim()
+        ax.set_ylim(ymin, ymax * 3)
     else:
         ax.set_visible(False)
 
@@ -442,8 +472,6 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
                    "matmul_bf16_tc":   "#2ca02c",
                    "matmul_fp8_te":    "#d62728"}
         colors = [palette.get(v, "gray") for v in mm2.index]
-        # Hatch fp8_te bar when it was measured on the fallback FP16 TC path
-        # (pre-Hopper). Readers should NOT interpret that height as FP8 cost.
         def _emu(v):
             if "emulated" in mm2.columns:
                 val = mm2.loc[v, "emulated"]
@@ -455,11 +483,11 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
         for rect, h in zip(bars, hatches):
             if h:
                 rect.set_hatch(h)
-        for rect, r2 in zip(bars, mm2["R2_dyn"].values):
-            if not np.isnan(r2):
-                ax.text(rect.get_x() + rect.get_width() / 2,
-                        rect.get_height(), f"R²={r2:.2f}",
-                        ha="center", va="bottom", fontsize=7)
+        for rect, v, r2 in zip(bars, mm2["slope_dyn"].values,
+                                mm2["R2_dyn"].values):
+            _annot(rect, float(v) if pd.notna(v) else float("nan"),
+                   float(r2) if pd.notna(r2) else float("nan"),
+                   "pJ/FLOP")
         # Build tick labels that carry the actual compute unit ([CUDA]/[TC])
         # and a star when the variant was emulated (fp8_te fallback).
         def _tick(v):
@@ -479,10 +507,13 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
                            rotation=30, ha="right", fontsize=8)
         ax.set_ylabel("J / FLOP (dynamic)  — regression slope")
         ax.set_yscale("log"); ax.grid(True, axis="y", alpha=0.3)
-        title = "Matmul — per-variant energy coefficient"
+        title = ("Matmul — per-variant energy coefficient. "
+                 "Labels: slope (pJ/FLOP) + R²")
         if any(hatches):
             title += "\n* hatched bar = emulated (not native for this dtype)"
         ax.set_title(title, fontsize=10)
+        ymin, ymax = ax.get_ylim()
+        ax.set_ylim(ymin, ymax * 3)
     else:
         ax.set_visible(False)
 
