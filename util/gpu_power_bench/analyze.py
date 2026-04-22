@@ -169,6 +169,72 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
+    """Same power-model regression as summarize(), but grouped additionally
+    by cache_regime.
+
+    Rationale: within a sweep, J/element for elementwise ops jumps by ~1
+    order of magnitude across the L2→DRAM boundary. Regressing through
+    all cells together produces a slope that's an uninformative mix of
+    the two regimes. Splitting the regression per regime yields the
+    regime-specific k_op coefficient the power model actually wants
+    ("joule per element while cache-resident" vs "while DRAM-streaming").
+
+    Returns one row per (category, op, dtype, mode, cache_regime). Rows
+    where the regime has <2 points report slope=NaN / R²=NaN because a
+    linear fit needs at least two samples; the median J/element is still
+    emitted so a coarser reading is possible.
+    """
+    if "cache_regime" not in df.columns:
+        return pd.DataFrame()
+    out = []
+    group_keys = ["category", "op", "dtype", "mode", "cache_regime"]
+    for col in ("category", "op", "dtype", "mode", "cache_regime"):
+        if col not in df.columns:
+            df[col] = "unknown"
+    if "compute_unit" not in df.columns:
+        df["compute_unit"] = df["category"].map(
+            lambda c: "Tensor Core" if c == "matmul" else "CUDA core")
+    if "emulated" not in df.columns:
+        df["emulated"] = 0
+    for (cat, op, dt, mode, regime), g in df.groupby(group_keys):
+        if regime == "unknown":
+            continue
+        g = g.sort_values("total_elements")
+        if cat == "matmul":
+            x = g["total_flops"].to_numpy(dtype=float)
+            y_per = g["j_per_flop_dyn"].astype(float)
+            unit = "J/FLOP"
+        else:
+            x = g["total_elements"].to_numpy(dtype=float)
+            y_per = g["j_per_element_dyn"].astype(float)
+            unit = "J/element"
+        y_dyn = g["dyn_energy_j"].to_numpy(dtype=float)
+        if len(g) >= 2:
+            slope_dyn, _, r2_dyn = linear_fit(x, y_dyn)
+        else:
+            # Single-point regime — use the per-point coefficient directly.
+            # This is the one case where we degrade the model to median.
+            slope_dyn, r2_dyn = float(y_per.iloc[0]), float("nan")
+        compute_unit = str(g["compute_unit"].iloc[0])
+        emulated = int(bool(g["emulated"].iloc[0]))
+        out.append({
+            "category": cat, "op": op, "dtype": dt, "mode": mode,
+            "cache_regime": regime,
+            "variant": f"{op}_{dt}_{mode}" if cat == "matmul" else f"{dt}_{op}",
+            "compute_unit": compute_unit,
+            "emulated":     emulated,
+            "n_points":     len(g),
+            "fit_axis":     unit,
+            "slope_dyn":      slope_dyn,          # regime-specific k_op
+            "R2_dyn":         r2_dyn,
+            "median_j_per_unit": float(y_per.median()),
+            "mean_dyn_power_w":  g["dyn_power_w"].astype(float).mean(),
+            "mean_temp_c":       g["avg_temp_c"].astype(float).mean(),
+        })
+    return pd.DataFrame(out)
+
+
 # ---------------------------------------------------------------------------
 # plots
 # ---------------------------------------------------------------------------
@@ -686,21 +752,20 @@ def _short_label(r: dict) -> str:
     return f"{r['dtype']}·{r['op']}·N{int(r['load_value'])}"
 
 
-def plot_cache_regime(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
-    """Energy-per-element grouped by cache locality regime.
+def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
+                      out_png: Path, gpu: str) -> None:
+    """Energy-per-element grouped by cache locality regime, including the
+    regime-specific power-model coefficient.
 
-    Elementwise ops are memory-bound; the biggest variable in J/element is
-    whether the working set fits in L2. Showing J/elem as a function of
-    regime (l2_resident / l2_partial / dram_stream) makes the cost of a
-    cache miss visible:
-
-    Panel A : box/strip of j_per_element_dyn vs regime, one colour per op.
-              A clean 3-regime dataset should show ~1 order of magnitude gap
-              between l2_resident and dram_stream for mul/add.
-    Panel B : same data as a grouped bar (median per op × regime) with the
-              per-regime mean dyn-power overlaid as a dotted line — useful
-              to see that DRAM streaming raises steady-state power, not just
-              energy per element.
+    Three panels:
+      A : per-cell strip of j_per_element_dyn vs regime (mul/add/… on one
+          axis). Shows the raw spread within each regime.
+      B : regime-specific slope_dyn (from summarize_by_regime) as a grouped
+          bar — this is the `k_op` value the power model actually consumes
+          for each regime. Numeric value annotated on every bar.
+      C : per-regime mean dynamic power (W) — DRAM streaming isn't just
+          "more joules per element", it also runs at higher average power
+          because the memory subsystem is doing more work.
     """
     if "cache_regime" not in df.columns:
         return
@@ -710,62 +775,111 @@ def plot_cache_regime(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
         return
     plt = _get_mpl()
     regime_order = ["l2_resident", "l2_partial", "dram_stream"]
+    regime_hit_rate = {"l2_resident": "~100%", "l2_partial": "~50%",
+                       "dram_stream": "~0%"}
     ew["cache_regime"] = pd.Categorical(ew["cache_regime"],
                                         categories=regime_order, ordered=True)
     ops = sorted(ew["op"].unique())
-    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(16, 6),
-                                     gridspec_kw={"width_ratios": [3, 2]})
+    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(22, 7),
+                                           gridspec_kw={"width_ratios": [3, 3, 2]})
     palette = plt.get_cmap("tab10")
     op_colors = {op: palette(i) for i, op in enumerate(ops)}
     regime_x = {r: i for i, r in enumerate(regime_order)}
 
-    # Panel A — per-point strip
+    # ---- Panel A : per-cell strip ----------------------------------------
     for op in ops:
         for dt, marker in (("fp16", "o"), ("fp8", "s")):
             g = ew[(ew["op"] == op) & (ew["dtype"] == dt)]
             if g.empty:
                 continue
             xs = g["cache_regime"].map(regime_x).astype(float) \
-                + (0.05 * (hash(op + dt) % 7 - 3))  # tiny jitter so markers don't stack
+                + (0.05 * (hash(op + dt) % 7 - 3))
             ys = g["j_per_element_dyn"].astype(float)
             ax_a.scatter(xs, ys, s=42, color=op_colors[op], marker=marker,
                          alpha=0.8, edgecolors="white",
                          label=f"{op} {dt}")
     ax_a.set_xticks(list(regime_x.values()))
-    ax_a.set_xticklabels([f"{r}\n(~{'100' if r=='l2_resident' else '50' if r=='l2_partial' else '0'}% L2 hit)"
-                         for r in regime_order])
-    ax_a.set_ylabel("J / element (dynamic)")
+    ax_a.set_xticklabels([f"{r}\n({regime_hit_rate[r]} L2 hit)" for r in regime_order])
+    ax_a.set_ylabel("J / element (per cell, dynamic)")
     ax_a.set_yscale("log")
     ax_a.grid(True, axis="y", alpha=0.3)
-    ax_a.set_title("Elementwise energy vs cache regime — "
-                   "each point is one sweep cell")
+    ax_a.set_title("A. Raw spread — every sweep cell")
     ax_a.legend(fontsize=8, ncol=2, loc="upper left",
-                bbox_to_anchor=(1.01, 1.0))
+                bbox_to_anchor=(1.0, 1.0))
 
-    # Panel B — median J/elem per (op, regime) + mean dyn-power overlay
+    # ---- Panel B : regime-specific k_op (slope_dyn) with annotations ------
+    # Draw from the by_regime summary so the numbers come from a proper
+    # regression (or median fallback for single-point regimes), not a raw
+    # per-cell J/elem.
     width = 0.8 / max(1, len(ops))
     xpos = np.arange(len(regime_order))
-    for i, op in enumerate(ops):
-        medians, pdyns = [], []
-        for r in regime_order:
-            g = ew[(ew["op"] == op) & (ew["cache_regime"] == r)]
-            medians.append(g["j_per_element_dyn"].astype(float).median()
-                           if not g.empty else np.nan)
-            # dyn_power_w may be a string-formatted column — coerce.
-            pdyns.append(pd.to_numeric(g.get("dyn_power_w", pd.Series(dtype=float)),
-                                        errors="coerce").mean()
-                         if not g.empty else np.nan)
-        ax_b.bar(xpos + (i - (len(ops)-1)/2) * width, medians, width,
-                 label=op, color=op_colors[op], alpha=0.9)
-    ax_b.set_xticks(xpos)
-    ax_b.set_xticklabels(regime_order, rotation=20, ha="right")
-    ax_b.set_ylabel("median J / element (dyn)")
-    ax_b.set_yscale("log")
-    ax_b.grid(True, axis="y", alpha=0.3)
-    ax_b.set_title("Median J/element per op × regime")
-    ax_b.legend(fontsize=8)
+    if by_regime is not None and not by_regime.empty:
+        ew_sum = by_regime[by_regime["category"] == "elementwise"]
+    else:
+        ew_sum = pd.DataFrame()
+    if ew_sum.empty:
+        ax_b.set_visible(False)
+    else:
+        for i, op in enumerate(ops):
+            vals, r2s = [], []
+            for r in regime_order:
+                row = ew_sum[(ew_sum["op"] == op) & (ew_sum["cache_regime"] == r)]
+                if row.empty:
+                    vals.append(np.nan); r2s.append(np.nan)
+                else:
+                    # Prefer slope_dyn; fall back to median if slope is NaN
+                    # (single-point regime where regression is undefined).
+                    sl = float(row["slope_dyn"].iloc[0])
+                    if not np.isfinite(sl):
+                        sl = float(row["median_j_per_unit"].iloc[0])
+                    vals.append(sl)
+                    r2s.append(float(row["R2_dyn"].iloc[0]))
+            bars = ax_b.bar(xpos + (i - (len(ops)-1)/2) * width, vals, width,
+                            label=op, color=op_colors[op], alpha=0.9,
+                            edgecolor="white")
+            # Annotate the bar with the k_op value (in pJ/elem for readability)
+            # and R² when it's a proper fit.
+            for rect, v, r2 in zip(bars, vals, r2s):
+                if np.isnan(v):
+                    continue
+                txt = f"{v*1e12:.2f} pJ"
+                if np.isfinite(r2):
+                    txt += f"\nR²={r2:.2f}"
+                ax_b.text(rect.get_x() + rect.get_width()/2,
+                          rect.get_height(), txt,
+                          ha="center", va="bottom", fontsize=7)
+        ax_b.set_xticks(xpos)
+        ax_b.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
+        ax_b.set_ylabel("k_op = slope_dyn  (J / element)")
+        ax_b.set_yscale("log")
+        ax_b.grid(True, axis="y", alpha=0.3)
+        ax_b.set_title("B. Power-model coefficient k_op per regime  "
+                       "(annotated in pJ/elem)")
+        ax_b.legend(fontsize=8, ncol=len(ops), loc="upper left")
 
-    fig.suptitle(f"Cache-regime breakdown — {gpu}", y=1.00)
+    # ---- Panel C : mean dynamic power per regime --------------------------
+    mean_p = {}
+    for r in regime_order:
+        g = ew[ew["cache_regime"] == r]
+        vals = pd.to_numeric(g.get("dyn_power_w", pd.Series(dtype=float)),
+                             errors="coerce").dropna()
+        mean_p[r] = float(vals.mean()) if len(vals) else float("nan")
+    x_regime = list(range(len(regime_order)))
+    y_power  = [mean_p[r] for r in regime_order]
+    colors = ["#2ca02c", "#ff7f0e", "#d62728"]   # green → orange → red
+    bars_c = ax_c.bar(x_regime, y_power, color=colors, alpha=0.85)
+    for rect, v in zip(bars_c, y_power):
+        if not np.isnan(v):
+            ax_c.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                      f"{v:.0f} W", ha="center", va="bottom", fontsize=10)
+    ax_c.set_xticks(x_regime)
+    ax_c.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
+    ax_c.set_ylabel("mean dyn power  (W)")
+    ax_c.set_title("C. Steady-state dynamic power per regime")
+    ax_c.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle(f"Cache-regime breakdown — {gpu}  "
+                 "(B. shows the k_op value the energy model uses)", y=1.00)
     fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
 
@@ -924,6 +1038,31 @@ def main() -> int:
                 "mean_temp_c", "peak_temp_c"]
         print(summary[cols].to_string(index=False))
 
+    # --- per-regime summary (regime-specific k_op) --------------------------
+    # Slope is regressed independently within each cache_regime, so the
+    # J/element coefficient doesn't mix L2-bound and DRAM-bound points.
+    # This is what the power model should consume when the caller knows
+    # the target workload's working-set size.
+    by_regime = summarize_by_regime(df)
+    if not by_regime.empty:
+        by_regime_path = out_dir / f"{stem}_summary_by_regime.csv"
+        by_regime.to_csv(by_regime_path, index=False)
+        print(f"[save] {by_regime_path}")
+        print("\nk_op per cache regime (J/element for elementwise, "
+              "J/FLOP for matmul):")
+        with pd.option_context("display.width", 200,
+                               "display.max_columns", 20,
+                               "display.float_format", lambda v: f"{v:.3e}"):
+            cols_r = ["variant", "compute_unit", "cache_regime",
+                      "n_points", "slope_dyn", "R2_dyn",
+                      "median_j_per_unit", "mean_dyn_power_w"]
+            # Sort so mul/add/… stay grouped and regimes cycle in order.
+            regime_rank = {"l2_resident": 0, "l2_partial": 1, "dram_stream": 2}
+            show = by_regime.assign(
+                _rk=by_regime["cache_regime"].map(regime_rank).fillna(99)
+            ).sort_values(["variant", "_rk"]).drop(columns="_rk")
+            print(show[cols_r].to_string(index=False))
+
     # --- filter emulated ELEMENTWISE rows out of the plots -----------------
     # We hide only emulated elementwise cells by default, because those are
     # pure cast-compute-cast noise (PyTorch has no native FP8 elementwise
@@ -959,7 +1098,17 @@ def main() -> int:
     plot_linearity_elementwise(plot_df, out_dir / f"{stem}_linearity_elementwise.png", gpu)
     plot_linearity_matmul(plot_df, out_dir / f"{stem}_linearity_matmul.png", gpu)
     plot_joule_per_op_bar(plot_summary, out_dir / f"{stem}_joule_per_op_bar.png", gpu)
-    plot_cache_regime(plot_df, out_dir / f"{stem}_cache_regime.png", gpu)
+    # Filter the by-regime summary in the same way (elementwise fp8 hidden
+    # by default) so annotations on the plot stay consistent with the
+    # other plots. Matmul rows are kept either way.
+    plot_by_regime = by_regime
+    if not args.include_emulated and not by_regime.empty:
+        plot_by_regime = by_regime[
+            (by_regime["emulated"].astype(int) == 0)
+            | (by_regime["category"] == "matmul")
+        ].copy()
+    plot_cache_regime(plot_df, plot_by_regime,
+                      out_dir / f"{stem}_cache_regime.png", gpu)
 
     # Static-power diagnostics (auto-discover the baseline sidecar).
     if args.baseline is None:

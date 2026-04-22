@@ -381,15 +381,31 @@ E_dyn = k_op · N_op + c
 - idle trace stdev/mean > 5% 면 측정 환경 불안정 — background process 의심.
 - static share 가 50% 를 넘으면 "kernel 이 idle 보다 약간 바쁜 수준" — load 상한 늘림.
 
-### 6.4.1 `cache_regime.png` — L2 hit rate 별 J/element
+### 6.4.1 `cache_regime.png` — L2 hit rate 별 J/element 와 regime-specific `k_op`
 
-**무엇을 보여주나** : 좌 panel = 개별 cell 을 `(l2_resident / l2_partial / dram_stream)` x축에 strip plot 으로, 우 panel = (op × regime) 의 J/element median bar.
+**무엇을 보여주나** : 가로 3 panel.
+
+- **Panel A (Raw spread)** : 개별 cell 의 `j_per_element_dyn` 을 regime x축에 strip plot. 한 regime 안의 세로 분포가 그 regime 의 내부 variance.
+- **Panel B (Power-model coefficient)** : `summarize_by_regime()` 이 각 `(op, dtype, cache_regime)` 에 대해 독립적으로 회귀한 `slope_dyn` (= `k_op`) 을 regime 별 grouped bar 로. **각 bar 에 pJ/elem 숫자와 R² 값이 직접 라벨링**되어 있어서 "L2 에서 mul 은 0.31 pJ/elem, DRAM 에서 5.53 pJ/elem" 식으로 바로 읽힘.
+- **Panel C (Steady-state dyn power)** : regime 별 평균 `dyn_power_w` 를 W 단위 bar 로. regime 이 뜨거워질수록 — 보통 L2 60W → partial 120W → DRAM 200W 근처 — **energy 뿐 아니라 순간 전력도 증가**.
 
 **어떻게 읽나** :
-- **좌 panel 의 수직 gap 이 곧 cache miss 의 에너지 비용** — 같은 op 가 DRAM-stream 에서 L2-resident 대비 몇 배 비싼지 한 눈에. mul/add 에서 5-10x 정도가 일반적.
-- 점이 세 regime 사이에 "계단" 모양이 아니라 "비스듬한 선" 으로 퍼지면 working-set 경계가 L2 에 가깝다는 뜻 — transition 지점 근처에서 sub-regime 변동이 있다는 신호.
-- reduction op (softmax / layernorm) 는 elementwise 에 비해 세 regime 간격이 좁게 나옵니다. reduction 은 compute overhead 가 BW 만큼 차지하기 때문.
+- **Panel B 가 power model 이 소비할 숫자** — 같은 op 의 `k_op` 가 regime 에 따라 1 order 차이나면 모델이 cache locality 를 인자로 받아야 한다는 뜻.
+- Panel A 의 수직 gap 이 곧 cache miss 의 에너지 비용. mul/add 에서 5–10× 가 일반적.
+- 점이 "계단" 이 아니라 "비스듬한 선" 이면 sweep point 가 L2 경계에 가까움 — transition 지점 근처에서 sub-regime 변동 신호.
+- reduction op (softmax/layernorm) 는 compute overhead 가 BW 만큼 있어서 regime 간격이 elementwise mul/add 보다 좁게 나옴.
 - **fp8** 는 cast-compute-cast 때문에 regime 에 관계없이 fp16 대비 높게 나옵니다 — `--include-emulated` 로 비교.
+
+**숫자로 확인하고 싶다면** `<stem>_summary_by_regime.csv` 를 여세요. 이 CSV 가 `(op, dtype, mode, cache_regime)` 당 한 행, `slope_dyn` 컬럼이 그 regime 의 `k_op` 입니다. 콘솔에도 analyze.py 실행 시 자동 출력됩니다:
+
+```
+k_op per cache regime (J/element for elementwise, J/FLOP for matmul):
+ variant     compute_unit  cache_regime  n_points   slope_dyn     R2_dyn   median_j_per_unit   mean_dyn_power_w
+ fp16_mul    CUDA core     l2_resident   4          3.02e-13      0.999    3.05e-13            60.0
+ fp16_mul    CUDA core     l2_partial    2          1.12e-12      1.000    9.63e-13            120.0
+ fp16_mul    CUDA core     dram_stream   3          4.08e-12      0.985    5.03e-12            200.0
+ ...
+```
 
 ### 6.5 `temperature.png` — 열 특성
 
@@ -667,6 +683,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | 파일 | 내용 |
 |---|---|
 | `<stem>_summary.csv` | cell 당 1 행, `slope_dyn` / `R2_dyn` / `compute_unit` / `emulated` 등 집계 |
+| `<stem>_summary_by_regime.csv` | `(op, dtype, mode, cache_regime)` 당 1 행 — regime 별 `slope_dyn` (= `k_op`), `R2_dyn`, `median_j_per_unit`, `mean_dyn_power_w` |
 | `<stem>_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
 | `<stem>_linearity_matmul.png` | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
 | `<stem>_joule_per_op_bar.png` | bar chart (좌: elementwise, 우: matmul) |
