@@ -44,30 +44,110 @@ import preflight
 
 # ---- defaults --------------------------------------------------------------
 
-# Coarse-but-thorough sweep: 9 elementwise load points spanning 3 orders
-# of magnitude. More points means the J/op regression is less sensitive to
-# any one outlier (e.g. a cell that collided with a thermal spike). Runtime
-# grows linearly; the defaults target maximum confidence, not minimum wall
-# time — use --quick for smoke tests.
+# Elementwise load sweep. Hit every cache regime with ≥ 2 points so the
+# per-regime regression in analyze.py isn't a single-point fallback, and
+# push the upper end high enough to touch realistic LLM activation sizes
+# (a 32 × 2048 × 4096 BF16 activation = 256M elements).
+#
+# Working-set rule of thumb for mul/add (3·N·bytes_per_elem) on fp16:
+#     N                  ws         regime on A100 (L2=40MB)    H100 (L2=50MB)
+#     128K (1<<17)       0.75 MB    l2_resident                 l2_resident
+#     1M   (1<<20)       6 MB       l2_resident                 l2_resident
+#     2M   (1<<21)      12 MB       l2_resident                 l2_resident
+#     8M   (1<<23)      48 MB       l2_partial (just past L2)   l2_partial
+#     16M  (1<<24)      96 MB       l2_partial                  l2_partial
+#     32M  (1<<25)     192 MB       dram_stream                 dram_stream
+#     64M  (1<<26)     384 MB       dram_stream                 dram_stream
+#     128M (1<<27)     768 MB       dram_stream                 dram_stream
+#     256M (1<<28)     1.5 GB       dram_stream                 dram_stream
+#     512M (1<<29)     3.0 GB       dram_stream                 dram_stream
+#     1G   (1<<30)     6.0 GB       dram_stream (~15% of A100)  dram_stream
+#
+# Memory safety: the largest point (1G mul fp16 ≈ 6 GB) fits on A100 40GB
+# with margin; fp8 emulation adds fp16 intermediates (~3× the footprint),
+# so for tight A100 environments the memory-aware cap in _filter_loads()
+# below drops cells that would exceed 25 % of HBM. That keeps the default
+# sweep identical across A100/H100 unless an op runs in a pathological
+# emulation path.
 DEFAULT_LOADS = [
-    1 << 17,   # 128K   — tiny, launch-overhead regime
-    1 << 19,   # 512K
+    1 << 17,   # 128K  — launch-overhead regime (every op is l2_resident here)
+    1 << 20,   # 1M
     1 << 21,   # 2M
-    1 << 23,   # 8M
-    1 << 25,   # 32M
+    1 << 23,   # 8M    — upper l2_resident / lower l2_partial
+    1 << 24,   # 16M   — solid l2_partial for mul/add (was a blind spot)
+    1 << 25,   # 32M   — entering dram_stream
     1 << 26,   # 64M
     1 << 27,   # 128M
-    1 << 28,   # 256M  — BW-bound regime
-    (1 << 28) + (1 << 27),  # 384M — extra top-end point so the BW-saturation
-                             # shoulder is well-characterised
+    1 << 28,   # 256M  — one realistic-size transformer activation
+    1 << 29,   # 512M  — deep dram_stream, catches BW-saturation plateau
+    1 << 30,   # 1G    — near the largest safe load on 40 GB A100
 ]
 QUICK_LOADS = [1 << 20, 1 << 22, 1 << 24]
 
-# Matrix side length K (M = N = K). FLOPs per call = 2·K³, memory = 3·K² elements.
-# 8 points: dense around the TC sweet spot (1024–4096) + one tiny (512, launch
-# overhead) and two big (6144, 8192) to expose BW saturation on FP32.
-DEFAULT_MATMUL_SIZES = [512, 1024, 1536, 2048, 3072, 4096, 6144, 8192]
+# Matrix side length K (M = N = K). FLOPs per call = 2·K³, memory = 3·K²
+# elements.  Dense around the TC sweet spot (1024–4096) + one tiny (512,
+# launch overhead) + three big (6144, 8192, 12288) to expose BW saturation
+# on FP32 and push matmul into dram_stream cache regime. K=12288 fp32 ≈
+# 1.7 GB — fits on both A100/H100 with margin.
+DEFAULT_MATMUL_SIZES = [512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288]
 QUICK_MATMUL_SIZES = [1024, 2048, 4096]
+
+
+# Fraction of the device's total HBM that one elementwise cell may consume.
+# At 0.25, a 40 GB A100 caps at 10 GB per-cell footprint — enough for 1B
+# fp16 elements (6 GB) plus fp8 cast-compute-cast intermediates.
+_MEM_SAFETY_FRACTION = 0.25
+
+
+def _cell_memory_bytes(op: str, dtype_label: str, n_elements: int) -> int:
+    """Conservative upper bound on DRAM footprint of a single elementwise cell.
+
+    mul/add           : 3 tensors (a, b, out)
+    gelu              : 2 tensors (in, out)
+    softmax/layernorm : 2 tensors (in, out) — reduction in fp32 done in-register
+    fp8 path          : each of those tensors may also materialise a full fp16
+                        intermediate (cast-compute-cast), so multiply by 3.
+    """
+    if op in ("mul", "add"):
+        tensors = 3
+    else:
+        tensors = 2
+    bytes_per_elem = {"fp16": 2, "fp8": 1}.get(dtype_label, 2)
+    base = tensors * n_elements * bytes_per_elem
+    # fp8 emulation path: add the fp16 shadow tensors.
+    if dtype_label == "fp8":
+        base += tensors * n_elements * 2
+    return base
+
+
+def _filter_loads(loads: list[int], ops: list[str], dtypes: list[str],
+                  hbm_bytes: int) -> list[int]:
+    """Drop load values that would exceed the per-cell HBM budget for any
+    of the planned (op, dtype) combinations. Returns the loads that are
+    safe for every combo; drops are logged so the user knows why the big
+    cells disappeared.
+    """
+    if hbm_bytes <= 0:
+        return loads
+    budget = int(hbm_bytes * _MEM_SAFETY_FRACTION)
+    kept: list[int] = []
+    dropped: list[tuple[int, str, int]] = []
+    for N in loads:
+        worst = max(_cell_memory_bytes(op, dt, N) for op in ops for dt in dtypes)
+        if worst <= budget:
+            kept.append(N)
+        else:
+            worst_case = max(((op, dt, _cell_memory_bytes(op, dt, N))
+                              for op in ops for dt in dtypes),
+                             key=lambda t: t[2])
+            dropped.append((N, f"{worst_case[0]}/{worst_case[1]}", worst_case[2]))
+    if dropped:
+        print(f"[memcheck] HBM={hbm_bytes/(1<<30):.1f} GB, "
+              f"budget={budget/(1<<30):.1f} GB per cell ({int(_MEM_SAFETY_FRACTION*100)}%)")
+        for N, worst, mb in dropped:
+            print(f"[memcheck]   dropped N={N:,} "
+                  f"(worst case {worst} ≈ {mb/(1<<30):.2f} GB)")
+    return kept
 
 
 def _slugify(name: str) -> str:
@@ -285,6 +365,18 @@ def main() -> int:
               f"(used to classify cache_regime for every row)")
     else:
         print("[info] L2 cache size not reported by torch — cache_regime=unknown")
+    # Memory budget: drop elementwise loads that would OOM on this HBM.
+    # Done up-front (before the sampler starts any work) so the user sees
+    # the filter decisions logged at the top of the run.
+    try:
+        hbm_bytes = int(torch.cuda.get_device_properties(args.device).total_memory)
+    except Exception:
+        hbm_bytes = 0
+    if hbm_bytes > 0:
+        print(f"[info] HBM total: {hbm_bytes/(1<<30):.1f} GB "
+              f"(per-cell budget: {int(_MEM_SAFETY_FRACTION*100)}% = "
+              f"{hbm_bytes*_MEM_SAFETY_FRACTION/(1<<30):.1f} GB)")
+    safe_loads = _filter_loads(loads, list(args.ops), list(args.dtypes), hbm_bytes)
     if not args.no_elementwise:
         for dtype in args.dtypes:
             for op in args.ops:
@@ -293,7 +385,7 @@ def main() -> int:
                 # L2-partial / DRAM-stream regimes. Otherwise use the global
                 # load list (which itself may span all three regimes naturally).
                 per_op_loads = (bm.cache_sweep_points(op, dtype, l2_bytes)
-                                if args.cache_sweep else loads)
+                                if args.cache_sweep else safe_loads)
                 for N in per_op_loads:
                     plans.append({
                         "category": "elementwise",
