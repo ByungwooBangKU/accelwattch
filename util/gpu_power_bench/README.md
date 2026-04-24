@@ -206,46 +206,51 @@ matmul 은 **compute dominated** 커널이며, 같은 문제를 다른 compute u
   : launch overhead 가 커질 정도로 작지 않으면서 모니터 window 안에 여러 iteration 이 들어갈 만큼 작음. 모든 op 가 확실히 `l2_resident` regime 에 들어가는 anchor point.
 
 **최대 load** (`1<<30` = 1 G elem)
-  : 40 GB A100 HBM 의 ~15 % 수준. `mul` fp16 기준 working set 6 GB, fp8 (cast-compute-cast intermediate 포함) 기준 ~9 GB. 실제 HBM 의 몇 % 까지 쓰는지가 아니라 **"단일 cell 이 HBM 의 25 % 를 초과하지 않을 것"** 이 기준 (아래 참조). 이 상한 덕에 LLM inference 의 큰 activation tensor (예: batch × seq × hidden = 32 × 2048 × 4096 = 256 M, 또는 8k seq 에서 4× 큰 것) 까지 sweep 이 직접 커버.
+  : **80 GB A100 (HBM2E) / 80 GB H100** 기준 `mul` fp16 working set 6 GB (~8 %), fp8 (cast-compute-cast intermediate 포함) 기준 ~9 GB (~11 %). 기준은 **"단일 cell 이 HBM 의 25 % 를 초과하지 않을 것"** (아래 참조). 이 상한 덕에 LLM inference 의 큰 activation tensor (예: batch × seq × hidden = 32 × 2048 × 4096 = 256 M, 또는 8k seq 에서 4× 큰 것) 까지 sweep 이 직접 커버.
 
 **11 points, 2× 로그 스케일 (중간에 `1<<24` = 16 M 추가)**
-  : 4 개의 `l2_resident` / 2 개의 `l2_partial` / 5 개의 `dram_stream` point 를 모든 regime 에 2 개 이상 배치해서 **§3.4 per-regime regression** 이 single-point fallback 으로 떨어지지 않도록. 이전 9-point 설계에서 `l2_partial` 이 1 point 뿐이었던 맹점을 해소.
+  : cache regime 을 5 bucket 으로 쪼갰을 때 (§3.4 참조) 모든 bucket 에 최소 1 point 가 들어가도록 배치. 이전 9-point 설계에서 `l2_partial` 이 1 point 뿐이었던 맹점 해소.
 
 **메모리 안전장치 (`_MEM_SAFETY_FRACTION = 0.25`)**
-  : sweep 시작 전에 `torch.cuda.get_device_properties(device).total_memory` 로 HBM 용량을 확인하고, 각 (op, dtype, N) 조합의 **worst-case 메모리 footprint** (fp8 는 fp16 intermediate 포함 3× 계수) 가 HBM × 25 % 를 넘으면 그 N 을 자동 drop 합니다. 로그:
+  : sweep 시작 전에 `torch.cuda.get_device_properties(device).total_memory` 로 HBM 용량을 확인하고, 각 (op, dtype, N) 조합의 **worst-case 메모리 footprint** (fp8 는 fp16 intermediate 포함 3× 계수) 가 HBM × 25 % 를 넘으면 그 N 을 자동 drop 합니다. 예시 로그:
 ```
+[info] HBM total: 80.0 GB (per-cell budget: 25% = 20.0 GB)         ← A100/H100 80GB 는 모두 통과
 [info] HBM total: 40.0 GB (per-cell budget: 25% = 10.0 GB)
-[memcheck] dropped N=1,073,741,824 (worst case softmax/fp8 ≈ 9.00 GB)
+[memcheck] dropped N=1,073,741,824 (worst case softmax/fp8 ≈ 9.00 GB)   ← 구형 40GB 카드에서만 drop
 ```
-A100 40 GB + fp8 sweep 에서 최상위 point 1 개가 drop 될 수 있지만 나머지는 그대로 진행 — 측정이 통째로 중단되지 않음.
+80 GB GPU 에서는 11 point 모두 그대로 진행. 40 GB 이하 카드는 최상위 point 1–2 개만 자동 drop 되고 나머지는 정상 수행.
 
 **`iters` 자동계산**
   : `target_ms / per-iter-us`. 최소 window (`--window-ms 3000`) 를 채우도록 반복 횟수 결정. load 가 커져 per-iter 시간이 길어지면 iter 수가 자동으로 줄어들어 **wall time 은 cell 당 일정**.
 
 ### 3.4 Cache locality regime — L2 hit rate 와 에너지
 
-elementwise 벤치마크는 memory-bound 이므로 **working-set 이 L2 에 얹히는지 여부가 J/element 를 1 order 이상 갈라놓습니다**. 각 cell 은 working-set 크기와 탐지된 L2 용량을 비교해 세 regime 으로 자동 분류됩니다:
+elementwise 벤치마크는 memory-bound 이므로 **working-set 이 L2 에 얹히는지 여부가 J/element 를 1 order 이상 갈라놓습니다**. 각 cell 은 working-set 크기와 탐지된 L2 용량을 비교해 **5 단계 L2 hit rate bucket** 으로 자동 분류됩니다 (기존 3-bucket 체계에서 세분화):
 
-| `cache_regime` | Working-set 조건 | 해석 | 예상 L2 hit rate |
+| `cache_regime` | Working-set 조건 | 예상 L2 hit rate | 해석 |
 |---|---|---|---|
-| `l2_resident` | `ws ≤ L2/2` | 여유있게 L2 안에 들어감. 두 번째 iter 부터 resident. | ≈ **100%** |
-| `l2_partial` | `L2/2 < ws ≤ 2·L2` | 경계 — thrashing / 일부 hit. | ≈ **50%** (rough) |
-| `dram_stream` | `ws > 2·L2` | 매 iter 마다 DRAM 에서 streaming. | ≈ **0%** |
+| `l2_hit_100` | `ws ≤ L2/4` | ≈ **100 %** | 여유있게 L2 안에 들어감. 두 번째 iter 부터 완전 resident. |
+| `l2_hit_75`  | `L2/4 < ws ≤ L2/2` | ≈ **75 %** | L2 에 거의 다 들어가지만 약간의 eviction. |
+| `l2_hit_50`  | `L2/2 < ws ≤ 2·L2` | ≈ **50 %** | L2 경계 — thrashing / 절반 수준 hit. |
+| `l2_hit_25`  | `2·L2 < ws ≤ 4·L2` | ≈ **25 %** | L2 를 크게 초과. 대부분 miss, 일부 spatial reuse 만 살아남음. |
+| `l2_hit_0`   | `ws > 4·L2` | ≈ **0 %** | 매 iter 마다 DRAM 에서 streaming. |
+
+경계는 L2 크기를 중심으로 `L2/4, L2/2, 2·L2, 4·L2` 의 **log-symmetric** 배치 — hit rate 가 100 % → 0 % 로 매끄럽게 내려가는 trend 를 볼 수 있도록 설계했습니다. 기존 3-bucket CSV (`l2_resident` / `l2_partial` / `dram_stream`) 도 `analyze.py` 에서 자동으로 5-bucket 으로 매핑되어 backward-compatible 하게 분석됩니다.
 
 Working-set 정의:
 - `mul` / `add` : `3·N·bytes_per_elem` (a read + b read + out write)
 - `gelu` / `softmax` / `layernorm` : `2·N·bytes_per_elem`
-- `matmul` : `(M·K + K·N + M·N)·bytes_per_elem`. 단, matmul 은 reuse (`K` times per element) 가 있어서 대용량에서도 tile-level L2 hit 가 살아있습니다 — 라벨은 working-set 기준이므로 matmul_dram_stream 도 compute-bound 일 수 있음.
+- `matmul` : `(M·K + K·N + M·N)·bytes_per_elem`. 단, matmul 은 reuse (`K` times per element) 가 있어서 대용량에서도 tile-level L2 hit 가 살아있습니다 — 라벨은 working-set 기준이므로 matmul 의 `l2_hit_0` 도 compute-bound 일 수 있음.
 
-**기본 sweep 은 이미 세 regime 을 다 포함** (A100 40MB L2 기준: `N≤8M` L2-resident, `N=32M` transition, `N≥64M` DRAM-stream). 분석 시 `cache_regime` 컬럼으로 grouping 하면 cache 효과를 분리해서 볼 수 있습니다.
+**기본 sweep 은 이미 5 regime 을 다 포함** (A100 40 MB L2 기준: `N≤1M` l2_hit_100, `N=2M-8M` l2_hit_75, `N=16M` l2_hit_50, `N=32M` l2_hit_25, `N≥64M` l2_hit_0). 분석 시 `cache_regime` 컬럼으로 grouping 하면 cache 효과를 분리해서 볼 수 있습니다.
 
-**3 regime 에 clean 하게 각각 1 포인트만 찍고 싶다면** `--cache-sweep` 플래그를 쓰면 각 (op, dtype) 마다 정확히 3 개 load size (L2/8, L2, 8·L2 working-set) 만 실행합니다:
+**5 regime 에 각각 1 포인트만 찍고 싶다면** `--cache-sweep` 플래그를 쓰면 각 (op, dtype) 마다 정확히 **5 개** load size 만 실행 (working-set targets: `L2/8`, `L2/3`, `L2`, `3·L2`, `8·L2` — 각 bucket 의 log 중심):
 
 ```bash
 python3 gpu_power_bench.py --device 0 --cache-sweep --tag h100_cache --out-dir reports/
 ```
 
-출력은 평소처럼 CSV 에 쌓이고, `analyze.py` 는 `_cache_regime.png` 플롯을 새로 그립니다 (§6.5.1 참조).
+출력은 평소처럼 CSV 에 쌓이고, `analyze.py` 는 `_02_cache_regime.png` 플롯을 새로 그립니다 (§6.4.1 참조).
 
 ## 4. 측정 방법론
 
@@ -699,13 +704,15 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 |---|---|
 | `<stem>_summary.csv` | cell 당 1 행, `slope_dyn` / `R2_dyn` / `compute_unit` / `emulated` 등 집계 |
 | `<stem>_summary_by_regime.csv` | `(op, dtype, mode, cache_regime)` 당 1 행 — regime 별 `slope_dyn` (= `k_op`), `R2_dyn`, `median_j_per_unit`, `mean_dyn_power_w` |
-| `<stem>_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
-| `<stem>_linearity_matmul.png` | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
-| `<stem>_joule_per_op_bar.png` | bar chart (좌: elementwise, 우: matmul) |
-| `<stem>_cache_regime.png` | L2-resident / L2-partial / DRAM-stream regime 별 J/element (strip + median bar) |
-| `<stem>_static_power.png` | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
-| `<stem>_temperature.png` | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
-| `<stem>_timeline.png` | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
+| `<stem>_01_powermodel_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
+| `<stem>_01_powermodel_linearity_matmul.png`      | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
+| `<stem>_01_powermodel_coefficient_bar.png`       | bar chart — 좌 elementwise, 우 matmul. 각 bar 에 pJ/elem (또는 pJ/FLOP) + R² 값 라벨 |
+| `<stem>_02_cache_regime.png`                     | 5-bucket L2 hit rate 별 J/element / J/FLOP (strip + k_op bar + steady-state dyn power) |
+| `<stem>_03_baseline_static_power.png`            | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
+| `<stem>_04_thermal_diagnostics.png`              | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
+| `<stem>_05_trace_timeline.png`                   | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
+
+파일명은 **그룹 번호 prefix (`01_powermodel`, `02_cache`, `03_baseline`, `04_thermal`, `05_trace`)** 를 붙여서 `ls` / file manager 정렬 시 **읽는 순서대로** 나열됩니다: 모델 검증 → cache 분석 → baseline 진단 → thermal → raw trace.
 
 콘솔에는 summary 표가 다음 컬럼으로 출력됩니다:
 
@@ -725,7 +732,7 @@ matmul     matmul_fp8_te       Tensor Core (FP16 fallback)    1         8       
 | elementwise (fp8_{mul,add,softmax,gelu,layernorm}) | **숨김** | PyTorch 의 native FP8 elementwise 커널 부재로 인한 cast-compute-cast 오버헤드. FP16 bar 와 나란히 그리면 착시 유발. |
 | matmul (`matmul_fp8_te` A100 폴백) | **노출** (hatched + `*EMU` + `[TC·FP16-fallback]` 태그) | fp16_tc 와 같은 값에 수렴해야 정상 — 이 수렴 여부 자체가 TE 폴백이 제대로 동작했다는 sanity check 가 된다. |
 
-즉 A100 에서도 `_linearity_matmul.png`, `_joule_per_op_bar.png` 에 `matmul_fp8_te` bar 가 그려지고, H100 의 native FP8 수치와 시각적으로 직접 비교할 수 있습니다. cross-GPU 플롯 (`compare_gpus.py`) 에서도 `matmul_fp8_te` 가 두 GPU 모두 bar 로 나타나며, A100 쪽은 hatch + `*EMU` 주석으로 폴백임을 명시합니다.
+즉 A100 에서도 `_01_powermodel_linearity_matmul.png`, `_01_powermodel_coefficient_bar.png` 에 `matmul_fp8_te` bar 가 그려지고, H100 의 native FP8 수치와 시각적으로 직접 비교할 수 있습니다. cross-GPU 플롯 (`compare_gpus.py`) 에서도 `matmul_fp8_te` 가 두 GPU 모두 bar 로 나타나며, A100 쪽은 hatch + `*EMU` 주석으로 폴백임을 명시합니다.
 
 **Summary CSV 에는 두 카테고리 모두 그대로 남깁니다** (`_summary.csv`). 숨겨진 fp8 elementwise 까지 플롯에 포함하려면:
 
@@ -768,7 +775,7 @@ python3 compare_gpus.py \
 
 #### 9.5.4 한 GPU 만 있을 때
 
-A100 만 있거나 H100 만 있을 때는 Step 3 을 건너뛰고 Step 1–2 로 종료합니다. 결과 해석에는 `_summary.csv` 의 `slope_dyn` 컬럼과 `_joule_per_op_bar.png` 가 핵심입니다.
+A100 만 있거나 H100 만 있을 때는 Step 3 을 건너뛰고 Step 1–2 로 종료합니다. 결과 해석에는 `_summary.csv` 의 `slope_dyn` 컬럼과 `_01_powermodel_coefficient_bar.png` 가 핵심입니다.
 
 #### 9.5.5 전체 디렉토리 구조 (참조)
 
@@ -786,8 +793,14 @@ reports/
 ├── gpu_power_bench_h100_sxm_20260421_140000_h100_samples.csv
 ├── a100/                                                        # Step 2 output (A100)
 │   ├── <stem>_summary.csv
-│   ├── <stem>_linearity_elementwise.png
-│   └── … (다른 6 종 PNG)
+│   ├── <stem>_summary_by_regime.csv
+│   ├── <stem>_01_powermodel_linearity_elementwise.png
+│   ├── <stem>_01_powermodel_linearity_matmul.png
+│   ├── <stem>_01_powermodel_coefficient_bar.png
+│   ├── <stem>_02_cache_regime.png
+│   ├── <stem>_03_baseline_static_power.png
+│   ├── <stem>_04_thermal_diagnostics.png
+│   └── <stem>_05_trace_timeline.png
 ├── h100/                                                        # Step 2 output (H100)
 │   └── … (동일 7 종)
 └── compare/                                                     # Step 3 output

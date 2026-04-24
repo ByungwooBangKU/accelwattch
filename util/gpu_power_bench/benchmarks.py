@@ -244,27 +244,33 @@ def get_l2_bytes(device: int = 0) -> int:
 
 
 def classify_cache_regime(working_set_bytes: int, l2_bytes: int) -> str:
-    """Return a coarse cache-locality regime for a given working set.
+    """Return a 5-bucket cache-locality regime for a given working set.
 
-    Boundaries are set so each regime has a clear interpretation:
-      * working set ≤ L2/2              → fits with margin → ~100% L2 hit after
-                                          the first iteration (data stays resident
-                                          across subsequent kernel launches).
-      * L2/2 < working set ≤ 2·L2       → thrashing / partial hit (~50% as a
-                                          ballpark; actual depends on access
-                                          pattern and L2 replacement policy).
-      * working set > 2·L2              → every kernel streams from DRAM;
-                                          effective L2 hit rate near 0%.
-    These thresholds are deliberately conservative — the inner boundaries
-    aren't sharp, but they place each sweep point unambiguously in one bucket.
+    The buckets are log-symmetric around the L2 size: L2/4, L2/2, 2·L2, 4·L2.
+    That gives a steady progression from "easily fits" to "grossly exceeds",
+    which makes the five per-regime k_op coefficients read as a trend rather
+    than the 3-bucket step function the earlier version produced.
+
+      ws ≤ L2/4              → l2_hit_100 : comfortably L2-resident, ~100% hit
+      L2/4 < ws ≤ L2/2       → l2_hit_75  : just inside L2, still mostly hit
+      L2/2 < ws ≤ 2·L2       → l2_hit_50  : right at / around L2, thrashing
+      2·L2 < ws ≤ 4·L2       → l2_hit_25  : clearly larger than L2, spillover
+      ws > 4·L2              → l2_hit_0   : DRAM streaming, ~0% L2 hit
+
+    Labels embed the approximate L2 hit rate so plot legends and CSV
+    columns read directly as "experiments at ~75% cache hit".
     """
     if l2_bytes <= 0:
         return "unknown"
+    if working_set_bytes <= l2_bytes / 4:
+        return "l2_hit_100"
     if working_set_bytes <= l2_bytes / 2:
-        return "l2_resident"
+        return "l2_hit_75"
     if working_set_bytes <= 2 * l2_bytes:
-        return "l2_partial"
-    return "dram_stream"
+        return "l2_hit_50"
+    if working_set_bytes <= 4 * l2_bytes:
+        return "l2_hit_25"
+    return "l2_hit_0"
 
 
 def _elementwise_working_set(op: str, n_elements: int, bytes_per_elem: int) -> int:
@@ -285,20 +291,30 @@ def _elementwise_working_set(op: str, n_elements: int, bytes_per_elem: int) -> i
 
 
 def cache_sweep_points(op: str, dtype_label: str, l2_bytes: int) -> list[int]:
-    """Return 3 N values that land cleanly in the 3 regimes for this op/dtype.
+    """Return 5 N values that each land in the centre of one cache regime.
 
-    Target working-set ratios vs L2:
-      l2_resident : L2/8    (solid 100% hit)
-      l2_partial  : L2      (right at threshold → ~50%)
-      dram_stream : 8·L2    (clear DRAM streaming)
+    Targets are the geometric centre of each bucket on a log scale, so each
+    point is unambiguously inside its regime after rounding:
+
+      bucket        ws target           approx L2 hit
+      l2_hit_100    L2/8                ~100 %
+      l2_hit_75     L2·√(1/4 · 1/2) ≈ L2·0.35 (≈ L2/3)   ~75 %
+      l2_hit_50     L2                  ~50 %
+      l2_hit_25     L2·√(2 · 4) ≈ 2.83·L2 (≈ 3·L2)       ~25 %
+      l2_hit_0      8·L2                ~0 %
     """
     if l2_bytes <= 0:
-        # Fall back to 3 spread-out defaults — same as before this feature.
-        return [1 << 19, 1 << 23, 1 << 27]
+        # Fall back to 5 spread-out defaults when L2 size is unknown.
+        return [1 << 19, 1 << 21, 1 << 23, 1 << 25, 1 << 27]
     b = _dtype_bytes(dtype_label)
     rw = 3 if op in ("mul", "add") else 2
     def n_for(ws): return max(1 << 14, int(ws) // (rw * b))
-    return [n_for(l2_bytes / 8), n_for(l2_bytes), n_for(8 * l2_bytes)]
+    targets = [l2_bytes / 8,
+               l2_bytes / 3,
+               l2_bytes,
+               3 * l2_bytes,
+               8 * l2_bytes]
+    return [n_for(t) for t in targets]
 
 
 def build(op: str, dtype_label: str, n_elements: int,
@@ -375,8 +391,8 @@ def all_specs(n_elements: int, device="cuda") -> list[BenchSpec]:
 #   * fp8 TE is the unique H100 capability we want to price vs A100 FP16 TC.
 #
 # Load axis: matrix side length K (M = N = K).  FLOPs per call = 2·K³.
-# Memory:    3 × K² elements (A, B, out).  K=8192 fp32 ≈ 768 MiB — fits on
-# both A100 40GB and H100.
+# Memory:    3 × K² elements (A, B, out).  K=12288 fp32 ≈ 1.7 GB — fits on
+# both 80 GB A100 (HBM2E) and 80 GB H100 with large margin.
 # ============================================================================
 
 # (dtype_label, compute_mode) — compute_mode ∈ {"simt", "tc", "te"}
