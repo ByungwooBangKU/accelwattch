@@ -40,11 +40,44 @@ class PreflightResult:
 REQUIRED_PKGS = ("torch", "numpy", "pynvml", "nvtx", "matplotlib", "pandas")
 
 
+# Distribution names differ from import names for some required packages
+# (most notably `pynvml` ships in the `nvidia-ml-py` distribution, and
+# older NVTX wheels expose no `__version__` attribute on the module).
+# Map import-name → list of plausible distribution names so we can
+# fall back to importlib.metadata when the module-level attribute is
+# missing.
+_DIST_NAME_FALLBACKS = {
+    "pynvml": ["nvidia-ml-py", "nvidia-ml-py3", "pynvml"],
+    "nvtx":   ["nvtx", "nvtx-plugins"],
+}
+
+
+def _pkg_version(name: str, mod) -> str:
+    """Best-effort version string. Tries module __version__ first, then
+    importlib.metadata.version() against several distribution-name
+    candidates. Returns "?" only when every probe fails."""
+    v = getattr(mod, "__version__", None)
+    if v:
+        return str(v)
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+    except ImportError:
+        return "?"
+    for dist in _DIST_NAME_FALLBACKS.get(name, [name]):
+        try:
+            return version(dist)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            continue
+    return "?"
+
+
 def _check_pkgs(r: PreflightResult) -> None:
     for name in REQUIRED_PKGS:
         try:
             mod = importlib.import_module(name)
-            r.info[f"{name}_version"] = getattr(mod, "__version__", "?")
+            r.info[f"{name}_version"] = _pkg_version(name, mod)
         except ImportError as e:
             r.fail(f"missing python package: {name} ({e}) — pip install -r requirements.txt")
 
@@ -91,12 +124,17 @@ def _check_cuda_and_fp8(r: PreflightResult) -> None:
         r.warn(f"compute capability {cc[0]}.{cc[1]} is older than A100 — FP16 tensor cores may be slow or absent")
 
     # Tensor Core support matrix — informational, useful in the report.
+    # Use tuple comparison (cc >= (M, m)) for the version checks: the old
+    # `cc[0] >= 7 and cc[1] >= 2` form falsely returned False on Ampere
+    # (cc=8.0) and Hopper (cc=9.0) for int8_tc because minor=0 fails the
+    # minor-version test, even though those generations clearly inherit
+    # Turing's INT8 tensor cores.
     tc = {
-        "fp16_tc":  cc[0] >= 7,                 # Volta+
-        "bf16_tc":  cc[0] >= 8,                 # Ampere+
-        "tf32_tc":  cc[0] >= 8,                 # Ampere+
-        "int8_tc":  cc[0] >= 7 and cc[1] >= 2,  # Turing+
-        "fp8_tc":   cc[0] >= 9,                 # Hopper+
+        "fp16_tc":  cc >= (7, 0),    # Volta+
+        "bf16_tc":  cc >= (8, 0),    # Ampere+
+        "tf32_tc":  cc >= (8, 0),    # Ampere+
+        "int8_tc":  cc >= (7, 5),    # Turing+
+        "fp8_tc":   cc >= (9, 0),    # Hopper+
     }
     r.info["tensor_core_support"] = ", ".join(f"{k}={v}" for k, v in tc.items())
 
