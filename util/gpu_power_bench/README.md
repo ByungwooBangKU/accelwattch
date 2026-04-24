@@ -198,7 +198,53 @@ matmul 은 **compute dominated** 커널이며, 같은 문제를 다른 compute u
 
 **Transformer Engine 경로** : `fp8_te` 는 `te.fp8_autocast(enabled=True, fp8_recipe=DelayedScaling(...))` context 안에서 `te.Linear` 를 호출한다. 이는 내부적으로 `cublasLtMatmul` 의 FP8 경로를 호출하며, H100 Hopper 의 FP8 Tensor Core 를 직접 사용한다. A100 에서는 미지원이므로 preflight 에서 스킵 처리.
 
-**Matmul size sweep** : `N ∈ {512, 1024, 1536, 2048, 3072, 4096, 6144, 8192}` 를 sweep. FLOP = `2 · N³`. 메모리 footprint 는 `3 · N² · sizeof(dtype)`, N=8192 FP32 는 768 MB — 80 GB HBM 안에 충분히 들어감.
+**Matmul size sweep** : `N ∈ {512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288}` 를 sweep. FLOP = `2 · N³`. 메모리 footprint 는 `3 · N² · sizeof(dtype)`, N=12288 FP32 는 ~1.7 GB — 80 GB HBM 안에 충분히 들어감.
+
+### 3.2.1 LLM-shape matmul sweep (`--llm-shapes`, opt-in)
+
+§3.2 의 square GEMM 은 **R² / 선형성 검증용 베이스라인** 입니다. 실제 LLM 은 대부분 **skinny 또는 fat GEMM** 이라서 square 수치 만으로는 "이 모델 한 스텝에 몇 J 쓰나?" 에 답할 수 없어요. gpt-oss-120B 를 대표 모델로 삼아 다음 8 개 layer shape 를 `bm.LLM_SHAPES` 에 하드코딩하고, token 수 T (= M dim) 을 따로 sweep 합니다:
+
+| preset | K | N | 역할 | 특징 |
+|---|---|---|---|---|
+| `qkv`     | 2880 | 5120   | Merged QKV projection     | K<N, 약 1.8× fat |
+| `q_only`  | 2880 | 4096   | Q-only projection         | K<N, 1.4× fat |
+| `kv`      | 2880 |  512   | K/V projection (GQA)      | **K≫N, 5.6× skinny** |
+| `attn_o`  | 4096 | 2880   | Attention output          | square-ish |
+| `router`  | 2880 |  128   | MoE gate                  | **K≫N, 22× skinny** |
+| `mlp1`    | 2880 | 5760   | MoE expert up-projection  | K<N, 2× fat |
+| `mlp2`    | 2880 | 2880   | MoE expert down-projection| square |
+| `lm_head` | 2880 | 201088 | LM unembedding            | **K≪N, 70× fat** |
+
+**T sweep** (= M dim, batch × seq): `[1, 256, 2048, 8192, 32768]` — decode step / small prefill / standard prefill / long context / very long.
+
+**Dtype**: 기본 `bf16:tc` (현대 LLM 의 de-facto). `--llm-dtypes fp8:te bf16:tc` 같은 식으로 복수 지정 가능.
+
+**셀 수**: 8 presets × 5 T = **40 cells / dtype**. `bf16` 만 돌리면 ~25 분.
+
+**메모리 가드**: `llm_matmul_footprint_bytes(preset, T, dtype)` 로 A+B+C 크기를 계산하고, 25% HBM budget 을 초과하는 cell (예: 80 GB HBM 미만 GPU 에서 `lm_head @ T=32768`) 은 sweep 시작 전에 자동 drop 되고 로그됩니다:
+```
+[memcheck] dropped 2 LLM-shape cells that would exceed the 25% HBM budget:
+[memcheck]    lm_head @ T=32768  bf16  ≈ 14.20 GB
+[memcheck]    lm_head @ T=8192   fp32  ≈ 7.00 GB
+```
+
+**사용**:
+```bash
+# bf16 기본, 8 preset × 5 T
+python3 gpu_power_bench.py --device 0 --llm-shapes --tag h100_llm
+
+# 다른 모델 매핑하려면 LLM_SHAPES 를 수정하거나 subset 선택
+python3 gpu_power_bench.py --llm-shapes \
+    --llm-presets qkv kv mlp1 lm_head \
+    --llm-ts 1 8192 32768 \
+    --llm-dtypes bf16:tc fp8:te
+```
+
+**분석**: `_01_powermodel_llm_matmul.png` 가 생성돼요. 2 panel:
+- **Panel A** — preset 별 **J/FLOP vs T** (log-log). 수평선이면 BW-bound (skinny 의 전형), 기울어지면 compute-bound 이 지배. K≫N 인 `kv` / `router` 는 T 가 작을 때 BW 병목이 커서 J/FLOP 이 평탄하게 높게 나오는 게 정상.
+- **Panel B** — preset 별 **layer 한 번 call 당 에너지 (mJ)** vs T. 포인트마다 `T=..., {mJ} mJ` 라벨. 이 숫자가 **LLM inference cost model 의 per-layer 입력값** 이에요.
+
+Square sweep 과 LLM sweep 은 CSV 안에서 `category == "matmul"` vs `"matmul_llm"` 으로 구분됩니다. `summary_by_regime` 도 LLM preset 별로 따로 행이 나오게 grouping 됩니다 (`variant = llm_{preset}_{dtype}_{mode}`).
 
 ### 3.3 Load sweep 설계 원칙
 

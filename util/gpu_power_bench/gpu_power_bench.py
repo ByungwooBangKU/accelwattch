@@ -285,6 +285,22 @@ def main() -> int:
     ap.add_argument("--matmul-variants", nargs="+", default=None,
                     help='matmul variants "dtype:mode" (default: all 5). '
                          'choices: fp32:simt tf32:tc fp16:tc bf16:tc fp8:te')
+    # --- LLM-shape matmul sweep (real inference layer shapes) ---
+    ap.add_argument("--llm-shapes", action="store_true",
+                    help="enable the LLM-shape matmul sweep (real inference "
+                         "shapes for a representative 120B-class model: "
+                         "QKV / KV / MLP1 / MLP2 / router / LM-head, with "
+                         "the token-count M dim swept separately from the "
+                         "fixed K / N dims). Disabled by default because it "
+                         "adds ~40 cells; the square sweep stays enabled.")
+    ap.add_argument("--llm-presets", nargs="+", default=None,
+                    help="subset of LLM_SHAPES keys to benchmark. Default: all 8.")
+    ap.add_argument("--llm-ts", type=int, nargs="+", default=None,
+                    help="token-count (M dim) sweep for --llm-shapes; "
+                         "default: 1 256 2048 8192 32768")
+    ap.add_argument("--llm-dtypes", nargs="+", default=None,
+                    help='LLM-shape dtype:mode list (default: bf16:tc). '
+                         'choices: fp32:simt tf32:tc fp16:tc bf16:tc fp8:te')
     args = ap.parse_args()
 
     if args.no_elementwise and args.no_matmul:
@@ -407,10 +423,58 @@ def main() -> int:
                     "build": (lambda K=K, d=dtype_label, m=mode:
                               bm.build_matmul(K, d, m, device="cuda")),
                 })
+    # LLM-shape sweep — opt-in via --llm-shapes. We pre-filter (preset, T)
+    # combos by HBM budget using llm_matmul_footprint_bytes(), so the fat
+    # lm_head @ T=32768 cell doesn't blow memory on smaller GPUs.
+    if args.llm_shapes:
+        presets = args.llm_presets or list(bm.LLM_SHAPES.keys())
+        unknown = [p for p in presets if p not in bm.LLM_SHAPES]
+        if unknown:
+            print(f"[error] unknown llm preset(s): {unknown}. "
+                  f"choices: {sorted(bm.LLM_SHAPES)}")
+            return 1
+        llm_ts = args.llm_ts or list(bm.DEFAULT_LLM_TS)
+        if args.llm_dtypes is None:
+            llm_dtypes = [("bf16", "tc")]
+        else:
+            llm_dtypes = []
+            for v in args.llm_dtypes:
+                parts = v.split(":")
+                if len(parts) != 2:
+                    print(f"bad --llm-dtypes entry {v!r} (expected dtype:mode)")
+                    return 1
+                llm_dtypes.append(tuple(parts))
+        budget = int(hbm_bytes * _MEM_SAFETY_FRACTION) if hbm_bytes > 0 else 0
+        dropped_llm: list[tuple[str, int, str, int]] = []
+        for dtype_label, mode in llm_dtypes:
+            for preset in presets:
+                for T in llm_ts:
+                    fp = bm.llm_matmul_footprint_bytes(preset, T, dtype_label)
+                    if budget > 0 and fp > budget:
+                        dropped_llm.append((preset, T, dtype_label, fp))
+                        continue
+                    plans.append({
+                        "category": "matmul_llm",
+                        "mode": mode,
+                        "op": "matmul", "dtype": dtype_label,
+                        "load_name": "T",
+                        "load_value": T,
+                        "llm_preset": preset,
+                        "build": (lambda p=preset, t=T, d=dtype_label, m=mode:
+                                  bm.build_llm_matmul(p, t, d, m, device="cuda")),
+                    })
+        if dropped_llm:
+            print(f"[memcheck] dropped {len(dropped_llm)} LLM-shape cells "
+                  f"that would exceed the {int(_MEM_SAFETY_FRACTION*100)}% "
+                  f"HBM budget:")
+            for preset, T, dt, fp in dropped_llm:
+                print(f"[memcheck]   {preset:>8s} @ T={T:<6d} {dt:>4s}  "
+                      f"≈ {fp/(1<<30):.2f} GB")
     total_cells = len(plans)
     print(f"[info] scheduling {total_cells} cells "
           f"(elementwise={sum(1 for p in plans if p['category']=='elementwise')}, "
-          f"matmul={sum(1 for p in plans if p['category']=='matmul')})")
+          f"matmul={sum(1 for p in plans if p['category']=='matmul')}, "
+          f"matmul_llm={sum(1 for p in plans if p['category']=='matmul_llm')})")
 
     rows: list[dict] = []
     try:
@@ -471,6 +535,10 @@ def main() -> int:
                 "dtype": plan["dtype"],
                 "mode": plan["mode"],
                 "variant": spec.name,
+                # Empty except for matmul_llm — identifies which LLM layer
+                # shape (qkv / mlp1 / lm_head / …) this row came from. Lets
+                # analyze group the sweep by layer role.
+                "llm_preset": plan.get("llm_preset", ""),
                 # HW path the op actually runs on — see benchmarks.BenchSpec.
                 # "CUDA core" | "Tensor Core" | "Tensor Core (FP16 fallback)"
                 "compute_unit": spec.compute_unit,

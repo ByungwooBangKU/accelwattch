@@ -581,3 +581,170 @@ def matmul_all_specs(K_size: int, device="cuda") -> list[BenchSpec]:
         except Exception:
             continue
     return out
+
+
+# ============================================================================
+# LLM-shape matmul sweep — same builders as build_matmul() but with real
+# layer shapes from a representative large model (gpt-oss-120B), and M
+# (= token count T) swept explicitly rather than coupled to K. The square
+# sweep above is kept because square R² is the cleanest signal for linearity;
+# this one is for "what does one inference step of layer X actually cost?".
+# ============================================================================
+#
+# Hidden dim d = 2880. K and N hardcoded per role below. Every preset is
+# a plain linear layer (Y = X @ W) with bias=False so the measurement is
+# pure GEMM — no epilogue bias-add to muddle the FLOP count.
+#
+# Override shapes with LLM_SHAPES["my_layer"] = (K, N) from python.
+# ============================================================================
+
+LLM_SHAPES: dict[str, tuple[int, int]] = {
+    # name      : (K  = reduction dim,  N = output dim)
+    "qkv":      (2880, 5120),    # merged QKV projection
+    "q_only":   (2880, 4096),    # Q head projection
+    "kv":       (2880,  512),    # K/V head projection (GQA — K ≫ N, skinny)
+    "attn_o":   (4096, 2880),    # attention output projection
+    "router":   (2880,  128),    # MoE gate (very skinny output)
+    "mlp1":     (2880, 5760),    # MoE expert up-projection
+    "mlp2":     (2880, 2880),    # MoE expert down-projection
+    "lm_head":  (2880, 201088),  # unembedding to vocab (extremely fat)
+}
+
+# Default token-count (= M dim) sweep spanning decode → long-context prefill.
+DEFAULT_LLM_TS: tuple[int, ...] = (1, 256, 2048, 8192, 32768)
+
+
+def _make_llm_matmul(M: int, K: int, N: int, dtype: torch.dtype,
+                     device) -> Callable[[], None]:
+    """Non-TE linear-layer GEMM: Y = X @ W.  For fp16/bf16/tf32/fp32."""
+    x = torch.randn(M, K, dtype=dtype, device=device)
+    w = torch.randn(K, N, dtype=dtype, device=device)
+    def f():
+        torch.matmul(x, w)
+    return f
+
+
+def _make_llm_matmul_fp32_simt(M: int, K: int, N: int, device) -> Callable[[], None]:
+    x = torch.randn(M, K, dtype=torch.float32, device=device)
+    w = torch.randn(K, N, dtype=torch.float32, device=device)
+    def f():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.matmul(x, w)
+    return f
+
+
+def _make_llm_matmul_tf32_tc(M: int, K: int, N: int, device) -> Callable[[], None]:
+    x = torch.randn(M, K, dtype=torch.float32, device=device)
+    w = torch.randn(K, N, dtype=torch.float32, device=device)
+    def f():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.matmul(x, w)
+    return f
+
+
+def _make_llm_matmul_fp8_te(M: int, K: int, N: int, device) -> Callable[[], None]:
+    """FP8 via Transformer Engine te.Linear — same wrapper as build_matmul's
+    fp8 path but M/K/N are arbitrary (not forced square)."""
+    try:
+        import transformer_engine.pytorch as te
+        from transformer_engine.common import recipe as te_recipe
+    except (ImportError, OSError, RuntimeError) as e:
+        raise RuntimeError(
+            f"transformer_engine not usable ({type(e).__name__}: {e}); "
+            f"run ./install_transformer_engine.sh"
+        ) from e
+    x = torch.randn(M, K, dtype=torch.float16, device=device)
+    linear = te.Linear(K, N, bias=False, params_dtype=torch.float16).to(device)
+    fp8_recipe = te_recipe.DelayedScaling(
+        fp8_format=te_recipe.Format.E4M3,
+        amax_history_len=16,
+        amax_compute_algo="max",
+    )
+    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+        linear(x)   # warmup to force .so load
+    def f():
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            linear(x)
+    return f
+
+
+def build_llm_matmul(preset: str, T: int, dtype_label: str, mode: str,
+                     device: str | torch.device = "cuda",
+                     shapes: dict[str, tuple[int, int]] | None = None) -> BenchSpec:
+    """Build one LLM-shape matmul BenchSpec.
+
+    Args:
+      preset: key into LLM_SHAPES (or `shapes` if given) — picks (K, N).
+      T: token count = M dim.  Sweep this axis to see J/FLOP as a function
+         of batch/sequence length.
+      dtype_label / mode: same as build_matmul (fp32/simt, tf32/tc,
+         fp16/tc, bf16/tc, fp8/te).
+      shapes: optional override dict — useful when the caller wants to
+         sweep a model different from gpt-oss-120B.
+    """
+    table = shapes if shapes is not None else LLM_SHAPES
+    if preset not in table:
+        raise ValueError(f"unknown llm preset {preset!r}; "
+                         f"choices: {sorted(table)}")
+    K, N = table[preset]
+    M = T
+    cc = torch.cuda.get_device_capability()
+    compute_unit = "Tensor Core"
+    emulated = False
+    notes = ""
+
+    if (dtype_label, mode) == ("fp32", "simt"):
+        fn = _make_llm_matmul_fp32_simt(M, K, N, device)
+        compute_unit = "CUDA core"
+    elif (dtype_label, mode) == ("tf32", "tc"):
+        if cc[0] < 8:
+            raise RuntimeError(f"TF32 requires Ampere (sm_80) or newer (this GPU is sm_{cc[0]}{cc[1]})")
+        fn = _make_llm_matmul_tf32_tc(M, K, N, device)
+    elif (dtype_label, mode) == ("fp16", "tc"):
+        fn = _make_llm_matmul(M, K, N, torch.float16, device)
+    elif (dtype_label, mode) == ("bf16", "tc"):
+        if cc[0] < 8:
+            raise RuntimeError("BF16 requires Ampere (sm_80) or newer")
+        fn = _make_llm_matmul(M, K, N, torch.bfloat16, device)
+    elif (dtype_label, mode) == ("fp8", "te"):
+        fn = _make_llm_matmul_fp8_te(M, K, N, device)
+        if cc[0] < 9:
+            compute_unit = "Tensor Core (FP16 fallback)"
+            emulated = True
+            notes = "fp8_te on pre-Hopper falls back to FP16 Tensor Core"
+    else:
+        raise ValueError(f"unknown matmul variant ({dtype_label!r}, {mode!r})")
+
+    flops = 2 * M * N * K
+    n_out = M * N
+    name = f"llm_{preset}_{dtype_label}_{mode}"
+    ws_bytes = (M * K + K * N + M * N) * _dtype_bytes(dtype_label)
+    dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
+    regime = classify_cache_regime(ws_bytes, get_l2_bytes(dev_idx))
+    notes = (notes + f" | llm_preset={preset} shape=({M}x{K})@({K}x{N})").strip(" |")
+    return BenchSpec(
+        name=name, op="matmul_llm", dtype_label=dtype_label,
+        shape=(M, K, N), n_elements=n_out,
+        flops_per_call=flops, run=fn,
+        compute_unit=compute_unit, emulated=emulated,
+        cache_regime=regime, notes=notes,
+    )
+
+
+def llm_matmul_footprint_bytes(preset: str, T: int, dtype_label: str,
+                               shapes: dict[str, tuple[int, int]] | None = None) -> int:
+    """Worst-case HBM footprint (A + B + C) for pre-flight memory budgeting.
+
+    This is exposed as a module-level function so gpu_power_bench.py can
+    drop (preset, T) combinations that would exceed the per-cell HBM
+    budget BEFORE it tries to allocate them.
+    """
+    table = shapes if shapes is not None else LLM_SHAPES
+    K, N = table[preset]
+    b = _dtype_bytes(dtype_label)
+    # Three tensors (X, W, Y); fp8_te additionally keeps an fp16 weight
+    # shadow for the amax history, so inflate by 1.5× in the fp8 case.
+    base = (T * K + K * N + T * N) * b
+    if dtype_label == "fp8":
+        base = int(base * 1.5) + K * N * 2
+    return base
