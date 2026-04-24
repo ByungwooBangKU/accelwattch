@@ -96,6 +96,73 @@ def _check_nvidia_smi(r: PreflightResult) -> None:
         r.fail(f"nvidia-smi failed: {e}")
 
 
+def _parse_cuda_version(s: str) -> tuple[int, int] | None:
+    """Parse '12.1' or '12.8.1' or '11.6' → (major, minor).  Returns None
+    if the string doesn't look like a CUDA version."""
+    if not s:
+        return None
+    parts = s.strip().split(".")
+    try:
+        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    except (ValueError, IndexError):
+        return None
+
+
+def _check_nvcc_toolkit(r: PreflightResult) -> None:
+    """Parse `nvcc --version` and compare it to torch.version.cuda.
+
+    Why: Transformer Engine compiles from source against the SYSTEM CUDA
+    toolkit (nvcc), not torch's bundled CUDA runtime. When a server has
+    a pip-installed torch 2.x+cu128 but a stale system nvcc (e.g. CUDA
+    11.x from `/usr/local/cuda`), TE's setup.py refuses with:
+        RuntimeError: Transformer Engine requires CUDA 12.0 or newer
+    even though torch.version.cuda reads 12.8. Surface this up-front so
+    the user knows BEFORE starting the 10-minute compile.
+    """
+    nvcc_path = shutil.which("nvcc")
+    if not nvcc_path:
+        r.info["nvcc"] = "NOT FOUND (no nvcc on PATH)"
+        return
+    try:
+        out = subprocess.check_output(["nvcc", "--version"], text=True, timeout=10)
+    except subprocess.SubprocessError as e:
+        r.info["nvcc"] = f"error invoking nvcc: {e}"
+        return
+    # nvcc --version emits e.g. "Cuda compilation tools, release 12.1, V12.1.105"
+    nvcc_ver_str = ""
+    for line in out.splitlines():
+        if "release" in line:
+            after = line.split("release", 1)[1]
+            nvcc_ver_str = after.split(",", 1)[0].strip()
+            break
+    r.info["nvcc"] = f"{nvcc_path}  (release {nvcc_ver_str or '?'})"
+
+    nvcc_ver = _parse_cuda_version(nvcc_ver_str)
+    try:
+        import torch
+        torch_cuda = _parse_cuda_version(torch.version.cuda)
+    except ImportError:
+        torch_cuda = None
+
+    # TE minimum CUDA for the current 2.x line is 12.0.
+    if nvcc_ver is not None and nvcc_ver < (12, 0):
+        msg = (f"system CUDA toolkit is {nvcc_ver[0]}.{nvcc_ver[1]} — "
+               f"Transformer Engine requires ≥ 12.0 to build from source")
+        if torch_cuda and torch_cuda >= (12, 0):
+            msg += (f" (your torch reports {torch_cuda[0]}.{torch_cuda[1]} "
+                    f"because the wheel bundles its own runtime — TE ignores that "
+                    f"and uses nvcc)")
+        msg += (". Either install a newer toolkit (conda install -c nvidia "
+                "cuda-toolkit=12.1) or use the prebuilt wheel path — "
+                "./install_transformer_engine.sh now tries pypi.nvidia.com first")
+        r.warn(msg)
+    elif (nvcc_ver is not None and torch_cuda is not None
+            and nvcc_ver[0] != torch_cuda[0]):
+        r.warn(f"system nvcc major ({nvcc_ver[0]}.{nvcc_ver[1]}) differs from "
+               f"torch.version.cuda ({torch_cuda[0]}.{torch_cuda[1]}); "
+               "TE binaries may build but fail to load at runtime.")
+
+
 def _check_cuda_and_fp8(r: PreflightResult) -> None:
     try:
         import torch
@@ -230,6 +297,7 @@ def check() -> PreflightResult:
     r = PreflightResult()
     _check_pkgs(r)
     _check_nvidia_smi(r)
+    _check_nvcc_toolkit(r)
     _check_cuda_and_fp8(r)
     _check_pynvml(r)
     return r

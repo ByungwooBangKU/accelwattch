@@ -534,6 +534,68 @@ pip install --force-reinstall --no-build-isolation 'transformer-engine[pytorch]'
 
 재설치 후 `preflight.py` 를 다시 돌려 "transformer_engine" 항목이 **버전 문자열** 만 표시하는지 확인한다 (`torch-backend BROKEN (...)` 이 뜨면 아직 문제 있는 것). 문제가 해결될 때까지 H100 FP8 native TC 수치는 수집되지 않고, CSV 에는 `matmul_fp16_tc` 와 기타 variants 만 남는다.
 
+#### 8.3.2 Troubleshooting: `Transformer Engine requires CUDA 12.0 or newer` (에서 torch 는 12.8 인데?)
+
+설치 중 pip 가 **소스 tarball** (`transformer_engine_torch-2.x.tar.gz`) 을 받아서 `setup.py` 를 돌릴 때 다음 에러가 나오는 경우:
+
+```
+File "build_tools/pytorch.py", line 68, in setup_pytorch_extension
+    raise RuntimeError("Transformer Engine requires CUDA 12.0 or newer")
+```
+
+`torch.version.cuda = 12.8` 로 보여도 이 에러가 뜨는 이유:
+
+- **`torch.version.cuda`** 는 torch wheel 이 **번들한** CUDA runtime 버전. pip 로 설치된 torch 안에만 존재.
+- TE 의 `setup.py` 는 torch 의 bundle 이 아니라 **시스템의 `nvcc` 가 가리키는 toolkit 을 보고** 컴파일한다. 따라서 시스템 `/usr/local/cuda` 가 구형 (예: CUDA 11.x) 을 가리키면 TE 는 그 버전으로 판단해 에러를 낸다.
+
+진단:
+
+```bash
+which nvcc
+nvcc --version | grep release          # 12.0 이상이어야 함
+ls -la /usr/local/cuda                 # 실제 어디로 링크?
+echo $CUDA_HOME
+```
+
+해결 — 두 가지 경로:
+
+**(a) [권장, 간단] NVIDIA 의 prebuilt wheel 사용** — nvcc 필요 없음:
+
+```bash
+pip install --no-build-isolation \
+    --extra-index-url https://pypi.nvidia.com \
+    'transformer-engine[pytorch]'
+```
+
+`install_transformer_engine.sh` 는 이제 이 경로를 **먼저 자동으로 시도**합니다. torch / Python / CUDA 조합이 prebuilt 에 맞으면 nvcc 없이 즉시 설치 완료.
+
+**(b) [복잡] system CUDA toolkit 업그레이드** — prebuilt 가 안 맞을 때:
+
+```bash
+# conda 환경이면
+conda install -c nvidia cuda-toolkit=12.1
+
+# 또는 시스템 패키지 (sudo 권한 필요)
+sudo apt install cuda-toolkit-12-1
+
+# 설치 후 환경변수 확인
+export CUDA_HOME=/usr/local/cuda-12.1
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+```
+
+그 뒤 `./install_transformer_engine.sh` 재실행.
+
+**preflight 에서 사전 감지**: `preflight.py` 는 이제 `nvcc` 버전을 파싱해서 `torch.version.cuda` 와 비교합니다. 공용 서버에서 잘 발생하는 "pip torch 는 신 CUDA, 시스템 nvcc 는 구 CUDA" 함정이 사전에 경고로 표시됩니다:
+
+```
+[warnings]
+  - system CUDA toolkit is 11.6 — Transformer Engine requires ≥ 12.0 to build from source
+    (your torch reports 12.8 because the wheel bundles its own runtime — TE ignores that and uses nvcc).
+    Either install a newer toolkit (conda install -c nvidia cuda-toolkit=12.1) or use the prebuilt wheel path —
+    ./install_transformer_engine.sh now tries pypi.nvidia.com first
+```
+
 ### 8.4 환경 권장 사항
 
 - `sudo nvidia-smi -pm 1` : persistence mode.
