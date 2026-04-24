@@ -197,6 +197,15 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
             lambda c: "Tensor Core" if c == "matmul" else "CUDA core")
     if "emulated" not in df.columns:
         df["emulated"] = 0
+    # Back-compat: older CSVs used the 3-bucket vocabulary — fold those
+    # onto the 5-bucket equivalents so the summary rows stay consistent
+    # regardless of which version produced the data.
+    df = df.copy()
+    df["cache_regime"] = df["cache_regime"].replace({
+        "l2_resident": "l2_hit_100",
+        "l2_partial":  "l2_hit_50",
+        "dram_stream": "l2_hit_0",
+    })
     for (cat, op, dt, mode, regime), g in df.groupby(group_keys):
         if regime == "unknown":
             continue
@@ -814,10 +823,25 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
     if "cache_regime" not in df.columns:
         return
     plt = _get_mpl()
-    regime_order = ["l2_resident", "l2_partial", "dram_stream"]
-    regime_hit_rate = {"l2_resident": "~100%", "l2_partial": "~50%",
-                       "dram_stream": "~0%"}
+    # 5-bucket cache-locality vocabulary (new). Legacy 3-bucket CSVs are
+    # still readable below — `_keep_row` filters strictly against whatever
+    # is present in the data, and the legacy column values
+    # (l2_resident / l2_partial / dram_stream) are mapped onto the new
+    # labels for plotting so old and new data can analyse the same way.
+    regime_order = ["l2_hit_100", "l2_hit_75", "l2_hit_50",
+                    "l2_hit_25", "l2_hit_0"]
+    regime_hit_rate = {"l2_hit_100": "~100%", "l2_hit_75": "~75%",
+                       "l2_hit_50": "~50%",  "l2_hit_25": "~25%",
+                       "l2_hit_0":  "~0%"}
+    _legacy_to_new = {"l2_resident": "l2_hit_100",
+                      "l2_partial":  "l2_hit_50",
+                      "dram_stream": "l2_hit_0"}
     regime_x = {r: i for i, r in enumerate(regime_order)}
+
+    # Map legacy labels onto the new 5-bucket vocabulary up-front so the
+    # rest of the function can stay single-vocabulary. No-op on new data.
+    df = df.copy()
+    df["cache_regime"] = df["cache_regime"].replace(_legacy_to_new)
 
     ew = df[df["category"] == "elementwise"].copy()
     ew = ew[ew["cache_regime"].isin(regime_order)]
@@ -1192,7 +1216,10 @@ def main() -> int:
                       "n_points", "slope_dyn", "R2_dyn",
                       "median_j_per_unit", "mean_dyn_power_w"]
             # Sort so mul/add/… stay grouped and regimes cycle in order.
-            regime_rank = {"l2_resident": 0, "l2_partial": 1, "dram_stream": 2}
+            regime_rank = {"l2_hit_100": 0, "l2_hit_75": 1, "l2_hit_50": 2,
+                           "l2_hit_25": 3, "l2_hit_0":  4,
+                           # legacy fallback
+                           "l2_resident": 0, "l2_partial": 2, "dram_stream": 4}
             show = by_regime.assign(
                 _rk=by_regime["cache_regime"].map(regime_rank).fillna(99)
             ).sort_values(["variant", "_rk"]).drop(columns="_rk")
@@ -1230,9 +1257,19 @@ def main() -> int:
                   f"elementwise fp8 too. Full data: {summary_path.name}.")
 
     # --- plots ---
-    plot_linearity_elementwise(plot_df, out_dir / f"{stem}_linearity_elementwise.png", gpu)
-    plot_linearity_matmul(plot_df, out_dir / f"{stem}_linearity_matmul.png", gpu)
-    plot_joule_per_op_bar(plot_summary, out_dir / f"{stem}_joule_per_op_bar.png", gpu)
+    # File-naming convention: every plot file is prefixed with a 2-digit
+    # group number so `ls` puts them in the order a reader should consume.
+    #   01_powermodel_*   → linearity + coefficient bar
+    #   02_cache_*        → cache-regime breakdown
+    #   03_baseline_*     → static power diagnostics
+    #   04_thermal_*      → thermal diagnostics
+    #   05_trace_*        → raw NVML timeline
+    plot_linearity_elementwise(plot_df,
+        out_dir / f"{stem}_01_powermodel_linearity_elementwise.png", gpu)
+    plot_linearity_matmul(plot_df,
+        out_dir / f"{stem}_01_powermodel_linearity_matmul.png", gpu)
+    plot_joule_per_op_bar(plot_summary,
+        out_dir / f"{stem}_01_powermodel_coefficient_bar.png", gpu)
     # Filter the by-regime summary in the same way (elementwise fp8 hidden
     # by default) so annotations on the plot stay consistent with the
     # other plots. Matmul rows are kept either way.
@@ -1243,7 +1280,7 @@ def main() -> int:
             | (by_regime["category"] == "matmul")
         ].copy()
     plot_cache_regime(plot_df, plot_by_regime,
-                      out_dir / f"{stem}_cache_regime.png", gpu)
+                      out_dir / f"{stem}_02_cache_regime.png", gpu)
 
     # Static-power diagnostics (auto-discover the baseline sidecar).
     if args.baseline is None:
@@ -1251,9 +1288,9 @@ def main() -> int:
         if cand.exists():
             args.baseline = cand
     plot_static_power(plot_df, args.baseline,
-                      out_dir / f"{stem}_static_power.png", gpu)
+                      out_dir / f"{stem}_03_baseline_static_power.png", gpu)
     plot_temperature(plot_df, plot_summary,
-                     out_dir / f"{stem}_temperature.png", gpu)
+                     out_dir / f"{stem}_04_thermal_diagnostics.png", gpu)
 
     # Timeline (auto-discover samples file if not given).
     if args.samples is None:
@@ -1261,7 +1298,7 @@ def main() -> int:
         if cand.exists():
             args.samples = cand
     if args.samples and args.samples.exists():
-        plot_timeline(args.samples, out_dir / f"{stem}_timeline.png", gpu)
+        plot_timeline(args.samples, out_dir / f"{stem}_05_trace_timeline.png", gpu)
 
     print("\nHow to read the summary CSV:")
     print("  slope_dyn  — Joules per element (elementwise) / per FLOP (matmul).")

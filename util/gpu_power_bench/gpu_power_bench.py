@@ -61,14 +61,14 @@ import preflight
 #     128M (1<<27)     768 MB       dram_stream                 dram_stream
 #     256M (1<<28)     1.5 GB       dram_stream                 dram_stream
 #     512M (1<<29)     3.0 GB       dram_stream                 dram_stream
-#     1G   (1<<30)     6.0 GB       dram_stream (~15% of A100)  dram_stream
+#     1G   (1<<30)     6.0 GB       l2_hit_0 (~8% of 80GB A100)   l2_hit_0
 #
-# Memory safety: the largest point (1G mul fp16 ≈ 6 GB) fits on A100 40GB
-# with margin; fp8 emulation adds fp16 intermediates (~3× the footprint),
-# so for tight A100 environments the memory-aware cap in _filter_loads()
-# below drops cells that would exceed 25 % of HBM. That keeps the default
-# sweep identical across A100/H100 unless an op runs in a pathological
-# emulation path.
+# Memory safety: the largest point (1G mul fp16 ≈ 6 GB) fits on 80 GB
+# A100 HBM2E with huge margin (~8%). fp8 emulation adds fp16
+# intermediates (~3× the footprint), so for smaller-memory GPUs the
+# memory-aware cap in _filter_loads() below drops cells that would
+# exceed 25 % of HBM. That keeps the default sweep identical across
+# A100 80GB / H100 80GB unless a smaller GPU is targeted.
 DEFAULT_LOADS = [
     1 << 17,   # 128K  — launch-overhead regime (every op is l2_resident here)
     1 << 20,   # 1M
@@ -80,7 +80,7 @@ DEFAULT_LOADS = [
     1 << 27,   # 128M
     1 << 28,   # 256M  — one realistic-size transformer activation
     1 << 29,   # 512M  — deep dram_stream, catches BW-saturation plateau
-    1 << 30,   # 1G    — near the largest safe load on 40 GB A100
+    1 << 30,   # 1G    — ~8% of 80 GB A100 HBM2E; headroom for fp8 emulation
 ]
 QUICK_LOADS = [1 << 20, 1 << 22, 1 << 24]
 
@@ -94,8 +94,9 @@ QUICK_MATMUL_SIZES = [1024, 2048, 4096]
 
 
 # Fraction of the device's total HBM that one elementwise cell may consume.
-# At 0.25, a 40 GB A100 caps at 10 GB per-cell footprint — enough for 1B
-# fp16 elements (6 GB) plus fp8 cast-compute-cast intermediates.
+# At 0.25, an 80 GB A100 (HBM2E) caps at 20 GB per-cell; 80 GB H100
+# caps at 20 GB; 40 GB cards (older A100 / V100) cap at 10 GB — still
+# enough for 1B fp16 mul (6 GB) but will drop the 1G fp8 cell (9 GB).
 _MEM_SAFETY_FRACTION = 0.25
 
 
