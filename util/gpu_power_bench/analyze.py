@@ -123,21 +123,25 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     emulated cases (fp8 elementwise, fp8_te on pre-Hopper).
     """
     out = []
-    group_keys = ["category", "op", "dtype", "mode"]
-    # Some older CSVs may lack "category"/"mode" columns — fall back gracefully.
+    # Include llm_preset in the group key so each (layer-role × dtype) in the
+    # matmul_llm sweep gets its own regression. For non-LLM rows llm_preset
+    # is empty string (or missing) and doesn't change the grouping.
+    group_keys = ["category", "op", "dtype", "mode", "llm_preset"]
+    # Some older CSVs may lack "category"/"mode"/"llm_preset" columns — fall
+    # back gracefully.
     for col in group_keys:
         if col not in df.columns:
-            df[col] = "elementwise" if col in ("category", "mode") else df.get(col, "")
+            df[col] = "elementwise" if col in ("category", "mode") else ""
     # Back-compat: older CSVs won't have compute_unit / emulated columns.
     if "compute_unit" not in df.columns:
         df["compute_unit"] = df["category"].map(
-            lambda c: "Tensor Core" if c == "matmul" else "CUDA core")
+            lambda c: "Tensor Core" if c in ("matmul", "matmul_llm") else "CUDA core")
     if "emulated" not in df.columns:
         df["emulated"] = 0
-    for (cat, op, dt, mode), g in df.groupby(group_keys):
+    for (cat, op, dt, mode, preset), g in df.groupby(group_keys):
         g = g.sort_values("total_elements")
         # Axis choice: FLOPs for matmul (K³ scaling), elements otherwise.
-        if cat == "matmul":
+        if cat in ("matmul", "matmul_llm"):
             x = g["total_flops"].to_numpy(dtype=float)
             unit = "J/FLOP"
         else:
@@ -150,9 +154,18 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         # compute_unit / emulated are constant within a group — take the first.
         compute_unit = str(g["compute_unit"].iloc[0])
         emulated = int(bool(g["emulated"].iloc[0]))
+        # Variant name — encodes preset when this is an LLM-shape row so
+        # analyze / compare plots can tell qkv / mlp1 / lm_head apart.
+        if cat == "matmul_llm":
+            variant = f"llm_{preset}_{dt}_{mode}"
+        elif cat == "matmul":
+            variant = f"{op}_{dt}_{mode}"
+        else:
+            variant = f"{dt}_{op}"
         out.append({
             "category": cat, "op": op, "dtype": dt, "mode": mode,
-            "variant": f"{op}_{dt}_{mode}" if cat == "matmul" else f"{dt}_{op}",
+            "llm_preset": preset,
+            "variant": variant,
             "compute_unit": compute_unit,
             "emulated":     emulated,
             "n_points": len(g),
@@ -188,13 +201,13 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
     if "cache_regime" not in df.columns:
         return pd.DataFrame()
     out = []
-    group_keys = ["category", "op", "dtype", "mode", "cache_regime"]
-    for col in ("category", "op", "dtype", "mode", "cache_regime"):
+    group_keys = ["category", "op", "dtype", "mode", "llm_preset", "cache_regime"]
+    for col in ("category", "op", "dtype", "mode", "llm_preset", "cache_regime"):
         if col not in df.columns:
-            df[col] = "unknown"
+            df[col] = "unknown" if col == "cache_regime" else ""
     if "compute_unit" not in df.columns:
         df["compute_unit"] = df["category"].map(
-            lambda c: "Tensor Core" if c == "matmul" else "CUDA core")
+            lambda c: "Tensor Core" if c in ("matmul", "matmul_llm") else "CUDA core")
     if "emulated" not in df.columns:
         df["emulated"] = 0
     # Back-compat: older CSVs used the 3-bucket vocabulary — fold those
@@ -206,11 +219,11 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
         "l2_partial":  "l2_hit_50",
         "dram_stream": "l2_hit_0",
     })
-    for (cat, op, dt, mode, regime), g in df.groupby(group_keys):
+    for (cat, op, dt, mode, preset, regime), g in df.groupby(group_keys):
         if regime == "unknown":
             continue
         g = g.sort_values("total_elements")
-        if cat == "matmul":
+        if cat in ("matmul", "matmul_llm"):
             x = g["total_flops"].to_numpy(dtype=float)
             y_per = g["j_per_flop_dyn"].astype(float)
             unit = "J/FLOP"
@@ -227,10 +240,17 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
             slope_dyn, r2_dyn = float(y_per.iloc[0]), float("nan")
         compute_unit = str(g["compute_unit"].iloc[0])
         emulated = int(bool(g["emulated"].iloc[0]))
+        if cat == "matmul_llm":
+            variant = f"llm_{preset}_{dt}_{mode}"
+        elif cat == "matmul":
+            variant = f"{op}_{dt}_{mode}"
+        else:
+            variant = f"{dt}_{op}"
         out.append({
             "category": cat, "op": op, "dtype": dt, "mode": mode,
+            "llm_preset": preset,
             "cache_regime": regime,
-            "variant": f"{op}_{dt}_{mode}" if cat == "matmul" else f"{dt}_{op}",
+            "variant": variant,
             "compute_unit": compute_unit,
             "emulated":     emulated,
             "n_points":     len(g),
@@ -609,6 +629,9 @@ def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
         cat = r.get("category", "elementwise")
         if cat == "matmul":
             return (1, r.get("variant", ""), int(r["load_value"]))
+        if cat == "matmul_llm":
+            return (2, r.get("llm_preset", ""), r.get("dtype", ""),
+                    int(r["load_value"]))
         return (0, r["op"], r["dtype"], int(r["load_value"]))
 
     rows = df.to_dict("records")
@@ -724,6 +747,9 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
         cat = r.get("category", "elementwise")
         if cat == "matmul":
             return (1, r.get("variant", ""), int(r["load_value"]))
+        if cat == "matmul_llm":
+            return (2, r.get("llm_preset", ""), r.get("dtype", ""),
+                    int(r["load_value"]))
         return (0, r["op"], r["dtype"], int(r["load_value"]))
 
     rows = df.to_dict("records")
@@ -797,6 +823,8 @@ def _short_label(r: dict) -> str:
     """Compact cell label used as x-tick in the static-power bar chart."""
     if r.get("category") == "matmul":
         return f"{r.get('variant','matmul')}·K{int(r['load_value'])}"
+    if r.get("category") == "matmul_llm":
+        return f"llm·{r.get('llm_preset','?')}·{r.get('dtype','?')}·T{int(r['load_value'])}"
     return f"{r['dtype']}·{r['op']}·N{int(r['load_value'])}"
 
 
@@ -1043,6 +1071,91 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
     print(f"[save] {out_png}")
 
 
+def plot_llm_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
+    """LLM-shape matmul energy per preset as a function of token count T (= M).
+
+    Two panels:
+      A : J/FLOP (dyn) vs T, one line per preset. Horizontal-ish = BW
+          cost dominates over compute cost (skinny GEMM territory);
+          upward slope = compute cost dominates.
+      B : dynamic energy per single forward pass of that layer at each
+          T, on log-log axes. The slope of each line is the per-flop
+          coefficient; the y-intercept is the fixed launch overhead.
+    """
+    llm = df[df["category"] == "matmul_llm"].copy()
+    if llm.empty:
+        return
+    plt = _get_mpl()
+    presets = sorted(llm["llm_preset"].unique())
+    # Fixed palette so layers in the same role always get the same colour
+    # across runs / GPUs.
+    palette = {
+        "qkv":     "#1f77b4",   "q_only": "#17becf",
+        "kv":      "#aec7e8",   "attn_o": "#2ca02c",
+        "router":  "#9467bd",   "mlp1":   "#ff7f0e",
+        "mlp2":    "#d62728",   "lm_head": "#555555",
+    }
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(18, 7))
+    for preset in presets:
+        g = llm[llm["llm_preset"] == preset].sort_values("load_value")
+        if g.empty:
+            continue
+        T = g["load_value"].to_numpy(float)
+        jpf = pd.to_numeric(g["j_per_flop_dyn"], errors="coerce").to_numpy(float)
+        dyn = pd.to_numeric(g["dyn_energy_j"], errors="coerce").to_numpy(float)
+        iters = pd.to_numeric(g.get("iters", pd.Series(dtype=float)),
+                              errors="coerce").to_numpy(float)
+        # Energy PER forward pass of the layer (not per-iter batch) = dyn / iters.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            e_per_forward = np.where(iters > 0, dyn / iters, dyn)
+        colour = palette.get(preset, None)
+        # Only show points with positive ys for log axes.
+        mJ = jpf > 0
+        mE = e_per_forward > 0
+        if mJ.any():
+            ax_a.plot(T[mJ], jpf[mJ], marker="o", color=colour, label=preset)
+            for t, y in zip(T[mJ], jpf[mJ]):
+                ax_a.annotate(f"T={int(t)}", (t, y),
+                              textcoords="offset points", xytext=(5, 5),
+                              fontsize=7, color=colour, alpha=0.85)
+        if mE.any():
+            ax_b.plot(T[mE], e_per_forward[mE], marker="o", color=colour,
+                      label=preset)
+            for t, y in zip(T[mE], e_per_forward[mE]):
+                ax_b.annotate(f"T={int(t)}\n{y*1e3:.2f} mJ", (t, y),
+                              textcoords="offset points", xytext=(5, 5),
+                              fontsize=6.5, color=colour, alpha=0.85)
+    for ax in (ax_a, ax_b):
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("token count T  (= M dim)")
+        ax.legend(fontsize=8, ncol=2, loc="best")
+    ax_a.set_ylabel("J / FLOP  (dynamic)")
+    ax_a.set_title("A. Per-FLOP energy vs token count — flat = BW-bound, "
+                   "rising = compute-bound")
+    ax_b.set_ylabel("J per forward pass of this layer")
+    ax_b.set_title("B. Per-call energy vs T  (annotated in mJ)")
+    # Pick headroom manually to leave space for the K/N legend entries.
+    for ax in (ax_a, ax_b):
+        lo, hi = ax.get_ylim()
+        if np.isfinite(lo) and np.isfinite(hi) and lo > 0:
+            ax.set_ylim(lo, hi * 4)
+
+    # Title records which preset shapes were in play so the PNG is
+    # self-documenting (important for multi-model comparisons).
+    shape_lines = []
+    for preset in presets:
+        g = llm[llm["llm_preset"] == preset]
+        if g.empty:
+            continue
+        shape = str(g["shape"].iloc[0])
+        shape_lines.append(f"{preset}:{shape}")
+    fig.suptitle(f"LLM-shape matmul — {gpu}   "
+                 f"({', '.join(shape_lines)})", y=1.00, fontsize=9)
+    fig.tight_layout(); fig.savefig(out_png, dpi=160, pad_inches=0.3)
+    print(f"[save] {out_png}")
+
+
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
     plt = _get_mpl()
     s = pd.read_csv(samples_csv)
@@ -1281,6 +1394,9 @@ def main() -> int:
         ].copy()
     plot_cache_regime(plot_df, plot_by_regime,
                       out_dir / f"{stem}_02_cache_regime.png", gpu)
+    # LLM-shape matmul plot (only generates if matmul_llm rows present).
+    plot_llm_matmul(plot_df,
+                    out_dir / f"{stem}_01_powermodel_llm_matmul.png", gpu)
 
     # Static-power diagnostics (auto-discover the baseline sidecar).
     if args.baseline is None:
