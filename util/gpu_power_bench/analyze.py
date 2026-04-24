@@ -128,10 +128,19 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     # is empty string (or missing) and doesn't change the grouping.
     group_keys = ["category", "op", "dtype", "mode", "llm_preset"]
     # Some older CSVs may lack "category"/"mode"/"llm_preset" columns — fall
-    # back gracefully.
+    # back gracefully.  IMPORTANT: pandas read_csv turns blank cells into
+    # NaN by default, and DataFrame.groupby drops rows whose group keys are
+    # NaN — which would silently empty out the summary when the CSV has an
+    # llm_preset column that's empty on every non-LLM row. We coerce to
+    # empty string before the groupby so every row is retained.
+    df = df.copy()
     for col in group_keys:
         if col not in df.columns:
             df[col] = "elementwise" if col in ("category", "mode") else ""
+        else:
+            # Existing column: fill any NaN / None with "" so groupby keeps
+            # those rows. `fillna("")` is cheap even when no NaNs exist.
+            df[col] = df[col].fillna("").astype(str)
     # Back-compat: older CSVs won't have compute_unit / emulated columns.
     if "compute_unit" not in df.columns:
         df["compute_unit"] = df["category"].map(
@@ -202,9 +211,17 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = []
     group_keys = ["category", "op", "dtype", "mode", "llm_preset", "cache_regime"]
-    for col in ("category", "op", "dtype", "mode", "llm_preset", "cache_regime"):
+    # Same NaN-in-group-keys gotcha as summarize() — read_csv produces NaN
+    # for blank cells and groupby silently drops those rows. cache_regime
+    # NaNs become "unknown" (which is then filtered below); everything else
+    # becomes the empty string so non-LLM rows still participate.
+    df = df.copy()
+    for col in group_keys:
+        default = "unknown" if col == "cache_regime" else ""
         if col not in df.columns:
-            df[col] = "unknown" if col == "cache_regime" else ""
+            df[col] = default
+        else:
+            df[col] = df[col].fillna(default).astype(str)
     if "compute_unit" not in df.columns:
         df["compute_unit"] = df["category"].map(
             lambda c: "Tensor Core" if c in ("matmul", "matmul_llm") else "CUDA core")
