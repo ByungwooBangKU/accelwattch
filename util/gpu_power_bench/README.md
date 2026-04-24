@@ -974,6 +974,70 @@ cell 단위로 `slope_dyn`, `slope_tot`, `intercept_dyn`, `intercept_tot`, `r2_d
 5. `compare_gpus.py` 로 cross-GPU 비교.
 6. `summary.csv` 를 AccelWattch coefficient table 업데이트에 사용.
 
+### 11.1 Multi-GPU variance analysis (같은 모델 카드 여러 장)
+
+같은 노드에 동일 GPU 가 여러 장 있을 때 (예: 8× H100 SXM5), 카드 간 variance — **cooling asymmetry**, **silicon binning**, **stuck clock**, **bad TIM** 등 — 을 측정하려면 병렬 sweep + 전용 분석기를 씁니다.
+
+**Step 1 — 병렬 sweep** (`run_bench.sh`):
+
+```bash
+# 8 장 GPU 에 동시에 full sweep
+./run_bench.sh --num-gpus 8 --tag h100
+
+# 일부 GPU 만 (0, 2, 4, 6)
+./run_bench.sh --devices "0,2,4,6" --tag h100
+
+# 열 부담 최소화 — 한 번에 한 장씩 (느림, 8× 시간)
+./run_bench.sh --num-gpus 8 --sequential --tag h100
+
+# 기존 옵션 그대로 forward
+./run_bench.sh --num-gpus 4 --llm-shapes --tag h100_llm
+```
+
+각 GPU 는 고유 tag 접미사 `_gpu<N>` 을 받고 (`h100_gpu0`, `h100_gpu1`, …), 로그는 `reports/logs/<tag>.log` 로 분리됩니다. 병렬 모드는 node 의 쿨링 예산을 공유하니 **cross-GPU variance 에는 cooling asymmetry 가 섞여 들어갑니다** — 순수 silicon 차이만 보고 싶다면 `--sequential`.
+
+아무 플래그도 안 주면 기존대로 `--device 0` 하나만 실행.
+
+**Step 2 — 분석** (`multi_gpu_analysis.py`):
+
+```bash
+python3 multi_gpu_analysis.py reports/ 8 --tag h100
+```
+
+출력 (`reports/multi_gpu_h100/`):
+
+| 파일 | 내용 |
+|---|---|
+| `multi_gpu_<tag>_<stamp>_per_gpu_summary.csv` | per-GPU × variant 당 한 행 (analyze.summarize 결과 concat + `gpu_index` 컬럼) |
+| `multi_gpu_<tag>_<stamp>_variance.csv` | variant 당 한 행 — `mean`, `std`, `cv_percent`, `min`, `max`, `outlier_gpus_2sigma` |
+| `multi_gpu_<tag>_<stamp>_per_gpu_scalars.csv` | GPU 당 한 행 — `static_power_w`, `mean_dyn_power_w`, `mean_temp_c`, `peak_temp_c` |
+| `multi_gpu_<tag>_<stamp>_01_coefficient_variance.png` | k_op bar (mean ± σ, CV% 라벨, CV ≥ 10 % 면 ⚠) |
+| `multi_gpu_<tag>_<stamp>_02_deviation_heatmap.png` | (variant × GPU) 행렬, cell 값 = 해당 GPU 가 cross-GPU 평균 대비 몇 % 벗어났는지 (빨강=비쌈 / 파랑=쌈) |
+| `multi_gpu_<tag>_<stamp>_03_per_gpu_health.png` | GPU 당 3 개 bar (idle power, mean dyn power, mean/peak temp) — per-card health card |
+
+**어떻게 읽나**:
+- `coefficient_variance.png` 에서 어떤 variant 든 **CV ≥ 10 %** 가 찍히면 (⚠ 표시), 그 variant 의 regression 이 한두 GPU 때문에 오염된 것. `variance.csv` 의 `outlier_gpus_2sigma` 에서 정확히 어떤 card 가 2σ 밖인지 확인.
+- `deviation_heatmap.png` 에서 **특정 row 전체가 빨강/파랑** 이면 그 variant 의 kernel 이 환경 민감한 것 (드물음); **특정 column 전체가 빨강** 이면 그 card 가 전 workload 에서 더 비싼 — **cooling / silicon 문제 GPU** 로 retirement 후보.
+- `per_gpu_health.png` 에서 한 card 의 idle 이 mean 보다 3-5 W 이상 높으면 stuck clock / bad binning 의심; peak temp 가 다른 card 대비 10 °C 이상 높으면 TIM / 공기 흐름 이슈.
+
+**실 예시 (합성 데이터, gpu2 를 outlier 로 설정한 시나리오)**:
+
+```
+== cross-GPU variance on k_op (slope_dyn) ==
+ variant    category  n_gpus      mean       std  cv_percent       min       max  outlier_gpus_2sigma
+fp16_add elementwise       4 9.778e-13 1.555e-13    15.90       9.001e-13 1.211e-12
+fp16_mul elementwise       4 9.778e-13 1.555e-13    15.90       9.001e-13 1.211e-12
+
+⚠  2 variant(s) with CV ≥ 10% — likely a per-GPU outlier on those variants
+
+== per-GPU health card ==
+ gpu_index       gpu_name  static_power_w  mean_dyn_power_w  mean_temp_c  peak_temp_c
+         0 H100 SXM5 80GB           65.10            102.20        51.00        56.00
+         1 H100 SXM5 80GB           65.70            102.40        51.00        56.00
+         2 H100 SXM5 80GB           73.00            115.00        68.00        73.00   ← outlier
+         3 H100 SXM5 80GB           65.30            102.20        50.00        55.00
+```
+
 ## 12. 유효성 체크리스트
 
 측정 결과를 신뢰하려면 **모두** 충족해야 한다:
@@ -991,7 +1055,7 @@ cell 단위로 `slope_dyn`, `slope_tot`, `intercept_dyn`, `intercept_tot`, `r2_d
 1. **Board-level NVML** : GPU core 와 HBM 이 구별되지 않음. 원한다면 별도로 NVIDIA Nsight 의 per-unit counter 필요.
 2. **20 Hz sensor rate** : 초단기 power spike 는 smooth 처리됨. 평균값은 보존되므로 `k_op` 에는 영향 없음.
 3. **FP8 elementwise cast overhead** : 순수 FP8 HW path 측정은 matmul 만 가능. elementwise 는 "cast + compute" 의 composite.
-4. **Single-GPU focus** : multi-GPU NCCL 등은 대상이 아님.
+4. **Intra-GPU single-process focus** : 같은 노드 여러 GPU 의 **variance / outlier 분석**은 §11.1 `multi_gpu_analysis.py` 로 가능하지만, **GPU 간 NCCL / P2P 통신 에너지**는 여전히 대상이 아님 (각 카드는 독립 sweep 으로 측정됨).
 5. **훈련 중 workload 와 차이** : microbenchmark 는 순수 kernel 을 무한 반복하므로, 실제 훈련의 scheduling gap / memory fragment 는 재현 못함.
 
 ## 14. 확장 아이디어
