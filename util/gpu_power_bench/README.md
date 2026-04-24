@@ -202,10 +202,25 @@ matmul 은 **compute dominated** 커널이며, 같은 문제를 다른 compute u
 
 ### 3.3 Load sweep 설계 원칙
 
-- **최소 load** (`1<<17` = 128 K elem) : launch overhead 가 커질 정도로 작지 않으면서 모니터 window 안에 여러 iteration 이 들어갈 만큼 작음.
-- **최대 load** (`(1<<28)+(1<<27)` = 384 M elem) : 80 GB HBM 의 1.5% 수준 — OOM 피하면서 충분히 큼.
-- **9 points, 2배씩 2배 증가 + 끝점 1.5x** : log-linear 커버리지. R² 평가를 왜곡하는 dense cluster 피함.
-- **`iters` 자동계산** : `target_ms / per-iter-us`. 최소 window (`--window-ms 3000`) 를 채우도록 반복 횟수 결정.
+**최소 load** (`1<<17` = 128 K elem)
+  : launch overhead 가 커질 정도로 작지 않으면서 모니터 window 안에 여러 iteration 이 들어갈 만큼 작음. 모든 op 가 확실히 `l2_resident` regime 에 들어가는 anchor point.
+
+**최대 load** (`1<<30` = 1 G elem)
+  : 40 GB A100 HBM 의 ~15 % 수준. `mul` fp16 기준 working set 6 GB, fp8 (cast-compute-cast intermediate 포함) 기준 ~9 GB. 실제 HBM 의 몇 % 까지 쓰는지가 아니라 **"단일 cell 이 HBM 의 25 % 를 초과하지 않을 것"** 이 기준 (아래 참조). 이 상한 덕에 LLM inference 의 큰 activation tensor (예: batch × seq × hidden = 32 × 2048 × 4096 = 256 M, 또는 8k seq 에서 4× 큰 것) 까지 sweep 이 직접 커버.
+
+**11 points, 2× 로그 스케일 (중간에 `1<<24` = 16 M 추가)**
+  : 4 개의 `l2_resident` / 2 개의 `l2_partial` / 5 개의 `dram_stream` point 를 모든 regime 에 2 개 이상 배치해서 **§3.4 per-regime regression** 이 single-point fallback 으로 떨어지지 않도록. 이전 9-point 설계에서 `l2_partial` 이 1 point 뿐이었던 맹점을 해소.
+
+**메모리 안전장치 (`_MEM_SAFETY_FRACTION = 0.25`)**
+  : sweep 시작 전에 `torch.cuda.get_device_properties(device).total_memory` 로 HBM 용량을 확인하고, 각 (op, dtype, N) 조합의 **worst-case 메모리 footprint** (fp8 는 fp16 intermediate 포함 3× 계수) 가 HBM × 25 % 를 넘으면 그 N 을 자동 drop 합니다. 로그:
+```
+[info] HBM total: 40.0 GB (per-cell budget: 25% = 10.0 GB)
+[memcheck] dropped N=1,073,741,824 (worst case softmax/fp8 ≈ 9.00 GB)
+```
+A100 40 GB + fp8 sweep 에서 최상위 point 1 개가 drop 될 수 있지만 나머지는 그대로 진행 — 측정이 통째로 중단되지 않음.
+
+**`iters` 자동계산**
+  : `target_ms / per-iter-us`. 최소 window (`--window-ms 3000`) 를 채우도록 반복 횟수 결정. load 가 커져 per-iter 시간이 길어지면 iter 수가 자동으로 줄어들어 **wall time 은 cell 당 일정**.
 
 ### 3.4 Cache locality regime — L2 hit rate 와 에너지
 
