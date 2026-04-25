@@ -110,6 +110,65 @@ def linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
 # summary: one regression per (category, op, dtype, mode).
 # ---------------------------------------------------------------------------
 
+# bytes_per_call lookup for pJ/bit derivation. Mirrors benchmarks._RW_PER_CALL
+# but kept here so analyze.py can be run standalone on a CSV without importing
+# the full benchmarks module (which pulls in torch).
+_RW_PER_CALL_ANALYZE = {
+    "mul": 3, "add": 3,
+    "gelu": 2, "softmax": 2, "layernorm": 2,
+    "stream_copy": 2, "stream_scale": 2, "stream_triad": 3,
+}
+_DTYPE_BYTES_ANALYZE = {"fp16": 2, "fp8": 2, "bf16": 2, "fp32": 4, "tf32": 4}
+
+
+def add_traffic_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Augment a per-cell df with three derived columns:
+
+      bytes_traffic       — working-set bytes touched per call × iters.
+                            For l2_hit_0 cells this is the DRAM traffic;
+                            for l2_hit_100 cells it overstates DRAM and
+                            instead reflects L2 traffic. The interpretation
+                            depends on the cache_regime, so analyze always
+                            slices by regime before reporting.
+      pj_per_bit_traffic  — dyn_energy_J × 1e12 / (bytes_traffic × 8).
+                            At l2_hit_0 this maps to "pJ to move one bit
+                            through HBM + PHY + L2 path"; literature
+                            HBM2 ≈ 7, HBM2E ≈ 5, HBM3 ≈ 3.9 (full stack).
+      achieved_bw_gbps    — bytes_traffic / wall_s / 1e9. Useful for
+                            sanity-checking against the GPU's HBM peak;
+                            >50% of peak ⇒ truly BW-bound.
+
+    Matmul rows are skipped (their working set has K-fold reuse so the
+    naive bytes-per-call ≠ DRAM bytes).
+    """
+    df = df.copy()
+    if "iters" not in df.columns or "n_elements" not in df.columns:
+        return df
+
+    def _bytes_per_call(r) -> float:
+        if r.get("category") not in (None, "elementwise"):
+            return float("nan")
+        rw = _RW_PER_CALL_ANALYZE.get(r.get("op", ""))
+        if rw is None:
+            return float("nan")
+        bpe = _DTYPE_BYTES_ANALYZE.get(r.get("dtype"), 2)
+        try:
+            n = int(r.get("n_elements", 0))
+        except (TypeError, ValueError):
+            return float("nan")
+        return float(rw * n * bpe)
+
+    bpc = df.apply(_bytes_per_call, axis=1)
+    iters = pd.to_numeric(df.get("iters"), errors="coerce")
+    df["bytes_traffic"] = bpc * iters
+    dyn = pd.to_numeric(df.get("dyn_energy_j"), errors="coerce")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        df["pj_per_bit_traffic"] = (dyn * 1e12) / (df["bytes_traffic"] * 8.0)
+        wall = pd.to_numeric(df.get("wall_s"), errors="coerce")
+        df["achieved_bw_gbps"] = df["bytes_traffic"] / wall / 1e9
+    return df
+
+
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     """Power-modeling summary.
 
@@ -1173,6 +1232,127 @@ def plot_llm_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     print(f"[save] {out_png}")
 
 
+# Literature reference points for DRAM pJ/bit, drawn as horizontal guide
+# lines so the user can eyeball where their measurement lands. Numbers are
+# "full stack" (DRAM cells + PHY + controller); see README §3.5 for sources.
+_DRAM_REFERENCE_PJBIT = {
+    "HBM2 (V100)":     7.0,
+    "HBM2E (A100)":    5.0,
+    "HBM3 (H100)":     3.9,
+    "DDR4":            7.0,
+    "Horowitz '14 (DRAM core)": 2.5,
+}
+
+
+def plot_dram_energy(df: pd.DataFrame, out_png: Path, gpu: str,
+                     hbm_peak_gbps: float | None = None) -> None:
+    """pJ/bit + achieved BW per cell, sliced by cache_regime.
+
+    Two panels:
+      A : pJ/bit per cell, x = cache_regime (l2_hit_100 → l2_hit_0).
+          Each marker is one cell, colored by op. l2_hit_0 cluster is
+          the "DRAM cost" — the interesting number. l2_hit_100 cluster
+          is the "L2 cost" — it should be ~5–10× lower.
+          Horizontal dashed lines mark literature HBM reference points.
+      B : achieved sustained BW (GB/s) at l2_hit_0, by op + dtype.
+          Reveals whether each kernel is truly BW-bound (close to HBM
+          peak) or compute-bound (well below peak). HBM peak (if known)
+          drawn as a dashed line.
+    """
+    if "pj_per_bit_traffic" not in df.columns:
+        return
+    ew = df[(df.get("category") == "elementwise")].copy()
+    if ew.empty or ew["pj_per_bit_traffic"].notna().sum() == 0:
+        return
+    plt = _get_mpl()
+    regime_order = ["l2_hit_100", "l2_hit_75", "l2_hit_50",
+                    "l2_hit_25", "l2_hit_0"]
+    legacy_to_new = {"l2_resident": "l2_hit_100", "l2_partial": "l2_hit_50",
+                     "dram_stream": "l2_hit_0"}
+    ew["cache_regime"] = ew["cache_regime"].replace(legacy_to_new)
+    ew = ew[ew["cache_regime"].isin(regime_order)]
+    if ew.empty:
+        return
+    ew["pj_per_bit_traffic"] = pd.to_numeric(ew["pj_per_bit_traffic"], errors="coerce")
+    ew["achieved_bw_gbps"]   = pd.to_numeric(ew["achieved_bw_gbps"], errors="coerce")
+    ew = ew[ew["pj_per_bit_traffic"] > 0]
+    if ew.empty:
+        return
+
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(18, 7),
+                                     gridspec_kw={"width_ratios": [3, 2]})
+    palette_cmap = plt.get_cmap("tab10")
+    ops = sorted(ew["op"].unique())
+    op_color = {op: palette_cmap(i % 10) for i, op in enumerate(ops)}
+    regime_x = {r: i for i, r in enumerate(regime_order)}
+
+    # --- Panel A : pJ/bit strip, regime on x ---
+    for op in ops:
+        for dt, marker in (("fp16", "o"), ("fp8", "s"),
+                           ("bf16", "^"), ("fp32", "D"), ("tf32", "v")):
+            g = ew[(ew["op"] == op) & (ew["dtype"] == dt)]
+            if g.empty:
+                continue
+            xs = g["cache_regime"].map(regime_x).astype(float) \
+                + (0.04 * (hash(op + dt) % 7 - 3))
+            ys = g["pj_per_bit_traffic"]
+            ax_a.scatter(xs, ys, s=44, color=op_color[op], marker=marker,
+                         alpha=0.85, edgecolors="white", label=f"{op} {dt}")
+    # Reference lines (only meaningful in the DRAM-streaming regime — but
+    # we draw them across the whole panel for context).
+    ref_colors = ["#888888", "#666666", "#444444", "#aa5555", "#55aaaa"]
+    for (label, val), c in zip(_DRAM_REFERENCE_PJBIT.items(), ref_colors):
+        ax_a.axhline(val, color=c, ls="--", lw=1, alpha=0.7)
+        ax_a.text(len(regime_order) - 1 + 0.05, val, f" {label} ≈ {val} pJ/bit",
+                  fontsize=7, color=c, va="center", ha="left")
+    ax_a.set_xticks(list(regime_x.values()))
+    hit_pct = {"l2_hit_100": "100%", "l2_hit_75": "75%",
+               "l2_hit_50": "50%",  "l2_hit_25": "25%", "l2_hit_0": "0%"}
+    ax_a.set_xticklabels([f"{r}\n(~{hit_pct[r]} L2 hit)" for r in regime_order])
+    ax_a.set_yscale("log")
+    ax_a.set_ylabel("pJ / bit  (working-set traffic)")
+    ax_a.set_title("A. Per-cell pJ/bit by cache regime — l2_hit_0 ≈ DRAM cost,\n"
+                   "    dashed lines: literature reference (full HBM/DRAM stack)")
+    ax_a.grid(True, axis="y", alpha=0.3)
+    ax_a.legend(fontsize=7, ncol=1, loc="upper left", bbox_to_anchor=(1.18, 1.0))
+
+    # --- Panel B : achieved BW at l2_hit_0 ---
+    drm = ew[ew["cache_regime"] == "l2_hit_0"]
+    if drm.empty:
+        ax_b.set_visible(False)
+    else:
+        # Aggregate per (op, dtype) — take the median BW (sustained value).
+        agg = drm.groupby(["op", "dtype"]).agg(
+            bw_med=("achieved_bw_gbps", "median"),
+            n=("achieved_bw_gbps", "size"),
+        ).reset_index()
+        agg = agg.sort_values(["op", "dtype"]).reset_index(drop=True)
+        xs = np.arange(len(agg))
+        bars = ax_b.bar(xs, agg["bw_med"], color=[op_color[o] for o in agg["op"]],
+                        alpha=0.85, edgecolor="white")
+        for rect, v in zip(bars, agg["bw_med"]):
+            if not np.isnan(v):
+                ax_b.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                          f"{v:.0f}", ha="center", va="bottom", fontsize=8)
+        ax_b.set_xticks(xs)
+        ax_b.set_xticklabels([f"{r['op']}\n{r['dtype']}" for _, r in agg.iterrows()],
+                             rotation=0, fontsize=8)
+        ax_b.set_ylabel("achieved sustained BW  (GB/s)")
+        ax_b.set_title("B. l2_hit_0 sustained BW per kernel "
+                       "(median across N values)")
+        ax_b.grid(True, axis="y", alpha=0.3)
+        if hbm_peak_gbps:
+            ax_b.axhline(hbm_peak_gbps, color="#d62728", ls="--", lw=1.2,
+                         label=f"HBM peak ≈ {hbm_peak_gbps:.0f} GB/s")
+            ax_b.legend(fontsize=8)
+
+    fig.suptitle(f"DRAM bandwidth energy — {gpu}  "
+                 "(l2_hit_0 = DRAM-streaming regime; literature lines for context)",
+                 y=1.00, fontsize=10)
+    fig.tight_layout(); fig.savefig(out_png, dpi=160, pad_inches=0.3)
+    print(f"[save] {out_png}")
+
+
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
     plt = _get_mpl()
     s = pd.read_csv(samples_csv)
@@ -1298,6 +1478,9 @@ def main() -> int:
     df = pd.read_csv(args.csv)
     if df.empty:
         print("empty CSV"); return 1
+    # Augment with derived DRAM-energy metrics (cheap; later filters reuse
+    # the same df). For non-elementwise rows the new columns stay NaN.
+    df = add_traffic_metrics(df)
     # Output directory resolution:
     #   1. --out-dir explicitly given  → use it
     #   2. --reports-dir + --tag given → <reports-dir>/<tag>/  (so A100 and
@@ -1411,9 +1594,35 @@ def main() -> int:
         ].copy()
     plot_cache_regime(plot_df, plot_by_regime,
                       out_dir / f"{stem}_02_cache_regime.png", gpu)
+    # DRAM bandwidth energy plot (auto-skipped if no traffic metrics yet).
+    plot_dram_energy(plot_df,
+                     out_dir / f"{stem}_02_dram_energy.png", gpu)
     # LLM-shape matmul plot (only generates if matmul_llm rows present).
     plot_llm_matmul(plot_df,
                     out_dir / f"{stem}_01_powermodel_llm_matmul.png", gpu)
+
+    # --- console summary: pJ/bit at l2_hit_0 (DRAM streaming) -------------
+    if "pj_per_bit_traffic" in df.columns:
+        dram = df[(df.get("category") == "elementwise")
+                  & (df["cache_regime"].replace({
+                      "l2_resident":"l2_hit_100","l2_partial":"l2_hit_50",
+                      "dram_stream":"l2_hit_0"}) == "l2_hit_0")]
+        if not dram.empty and dram["pj_per_bit_traffic"].notna().any():
+            print("\n== DRAM-streaming energy (l2_hit_0 cells) ==")
+            print("    Per-kernel pJ/bit (board-level — includes HBM cells, "
+                  "PHY, controller, on-chip routing):")
+            with pd.option_context("display.width", 160,
+                                   "display.float_format", lambda v: f"{v:.2f}"):
+                tbl = (dram.groupby(["op", "dtype"])
+                          .agg(n=("pj_per_bit_traffic", "size"),
+                               pj_per_bit_med=("pj_per_bit_traffic", "median"),
+                               bw_gbps_med=("achieved_bw_gbps", "median"))
+                          .reset_index())
+                print(tbl.to_string(index=False))
+            print("    Reference (full stack): HBM2 ≈ 7, HBM2E ≈ 5, HBM3 ≈ 3.9 "
+                  "pJ/bit. Our boundary is wider (also captures L2 → HBM "
+                  "transit + idle controller overhead) so values 1.5–3× "
+                  "above the reference are normal.")
 
     # Static-power diagnostics (auto-discover the baseline sidecar).
     if args.baseline is None:

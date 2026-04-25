@@ -301,6 +301,19 @@ def main() -> int:
     ap.add_argument("--llm-dtypes", nargs="+", default=None,
                     help='LLM-shape dtype:mode list (default: bf16:tc). '
                          'choices: fp32:simt tf32:tc fp16:tc bf16:tc fp8:te')
+    # --- DRAM bandwidth probe (STREAM-style copy/scale/triad) ---
+    ap.add_argument("--dram-bw-test", action="store_true",
+                    help="add STREAM-style probes (stream_copy / stream_scale "
+                         "/ stream_triad) at large working sets so analyze.py "
+                         "can derive pJ/bit of DRAM traffic. Each probe is "
+                         "compute-light, so the dynamic energy is dominated "
+                         "by HBM ↔ DRAM movement. See README §3.5 for the "
+                         "literature comparison points (HBM2 ≈ 7 pJ/bit, "
+                         "HBM3 ≈ 4 pJ/bit) and what our board-level "
+                         "measurement boundary actually includes.")
+    ap.add_argument("--dram-bw-loads", type=int, nargs="+", default=None,
+                    help="working-set-target N values for --dram-bw-test "
+                         "(default: 4 sizes deep into the l2_hit_0 regime)")
     args = ap.parse_args()
 
     if args.no_elementwise and args.no_matmul:
@@ -423,6 +436,37 @@ def main() -> int:
                     "build": (lambda K=K, d=dtype_label, m=mode:
                               bm.build_matmul(K, d, m, device="cuda")),
                 })
+    # DRAM bandwidth probes — opt-in. Pure-streaming kernels at large N
+    # so the dyn energy is dominated by HBM traffic. analyze.py converts
+    # these into pJ/bit. We pick load sizes deep in the l2_hit_0 regime
+    # (working set ≥ 8·L2) so cache reuse is essentially zero.
+    if args.dram_bw_test:
+        if args.dram_bw_loads is not None:
+            stream_loads = args.dram_bw_loads
+        elif l2_bytes > 0:
+            # Targets ws ∈ {8, 16, 32, 64} × L2 — solidly l2_hit_0.
+            # Use rw=2 / 2-byte dtype for sizing (the probe whose ws/N is
+            # smallest, so the others are even more deeply DRAM-bound).
+            base = max(1 << 14, int(l2_bytes / (2 * 2)))
+            stream_loads = [8 * base, 16 * base, 32 * base, 64 * base]
+        else:
+            stream_loads = [1 << 27, 1 << 28, 1 << 29, 1 << 30]
+        # Apply the same memory budget filter used for the elementwise sweep.
+        stream_loads = _filter_loads(stream_loads,
+                                     ["stream_copy", "stream_scale", "stream_triad"],
+                                     list(args.dtypes), hbm_bytes)
+        print(f"[dram-bw] {len(stream_loads)} working-set sizes: {stream_loads}")
+        for dtype in args.dtypes:
+            for op in ("stream_copy", "stream_scale", "stream_triad"):
+                for N in stream_loads:
+                    plans.append({
+                        "category": "elementwise",
+                        "mode": "elementwise",
+                        "op": op, "dtype": dtype,
+                        "load_name": "n_elements", "load_value": N,
+                        "build": (lambda op=op, dtype=dtype, N=N:
+                                  bm.build(op, dtype, N, device="cuda")),
+                    })
     # LLM-shape sweep — opt-in via --llm-shapes. We pre-filter (preset, T)
     # combos by HBM budget using llm_matmul_footprint_bytes(), so the fat
     # lm_head @ T=32768 cell doesn't blow memory on smaller GPUs.

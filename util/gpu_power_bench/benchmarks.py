@@ -35,6 +35,11 @@ FLOPS_PER_ELEMENT = {
     "softmax":   5,   # max, sub, exp, sum, div
     "gelu":      8,   # tanh-approx: x, x^3, mul, add, tanh, add, mul, mul
     "layernorm": 8,   # mean, var, sub, div, mul, add (amortized across dim)
+    # STREAM-style probes are intentionally compute-light so all of the
+    # measured energy attributes to memory traffic.
+    "stream_copy":  0,   # no compute, pure data movement
+    "stream_scale": 1,   # one mul per element
+    "stream_triad": 2,   # one mul + one add per element
 }
 
 
@@ -191,6 +196,87 @@ _BUILDERS = {
 }
 
 
+# ---------- STREAM-style DRAM-bandwidth probes -------------------------------
+# Pure-streaming kernels modeled after McCalpin's classic STREAM benchmark.
+# Used for deriving pJ/bit of DRAM traffic at large working sets:
+#   copy   : y = x                 (1 read  + 1 write = 2N bytes/call)
+#   scale  : y = α · x             (1 read  + 1 write = 2N bytes/call)
+#   triad  : y = α · x + z         (2 reads + 1 write = 3N bytes/call)
+# These have minimal compute (one fused MAD at most) so the dynamic energy
+# we measure is dominated by HBM traffic — the measurement boundary is
+# board-level so it includes the L2 → HBM PHY → DRAM cell path. Compare
+# the resulting pJ/bit at the l2_hit_0 cache regime to literature values
+# (see README §3.5).
+def _make_copy(shape, dtype_label, device):
+    dt, ct = _resolve_dtype(dtype_label)
+    a = _alloc_like(shape, dt, device, ct)
+    out = _alloc_like(shape, dt, device, ct)   # pre-allocated to avoid alloc traffic
+    def f():
+        out.copy_(a)
+    return f
+
+
+def _make_scale(shape, dtype_label, device):
+    dt, ct = _resolve_dtype(dtype_label)
+    a = _alloc_like(shape, dt, device, ct)
+    if ct is None:
+        alpha = torch.tensor(1.5, dtype=dt, device=device)
+        def f():
+            torch.mul(a, alpha)
+        return f
+    # fp8 path — promote, scale, demote (still BW-bound at large N)
+    alpha = torch.tensor(1.5, dtype=ct, device=device)
+    def f():
+        a16 = a.to(ct)
+        out = torch.mul(a16, alpha)
+        out.to(dt)
+    return f
+
+
+def _make_triad(shape, dtype_label, device):
+    dt, ct = _resolve_dtype(dtype_label)
+    a = _alloc_like(shape, dt, device, ct)
+    z = _alloc_like(shape, dt, device, ct)
+    if ct is None:
+        alpha = torch.tensor(1.5, dtype=dt, device=device)
+        def f():
+            torch.add(z, a, alpha=1.5)   # y = z + α·a  (PyTorch fused)
+        return f
+    alpha = torch.tensor(1.5, dtype=ct, device=device)
+    def f():
+        a16 = a.to(ct); z16 = z.to(ct)
+        out = torch.add(z16, a16, alpha=1.5)
+        out.to(dt)
+    return f
+
+
+_STREAM_BUILDERS = {
+    "stream_copy":  _make_copy,
+    "stream_scale": _make_scale,
+    "stream_triad": _make_triad,
+}
+
+# Bytes touched per call for each op (read+write counts × N × bytes_per_elem).
+# Used by analyze.py to compute pJ/bit. Keys cover both the regular elementwise
+# ops and the STREAM probes.
+_RW_PER_CALL = {
+    "mul": 3, "add": 3,                       # 2 reads + 1 write
+    "gelu": 2, "softmax": 2, "layernorm": 2,  # 1 read  + 1 write
+    "stream_copy": 2, "stream_scale": 2,
+    "stream_triad": 3,
+}
+
+
+def bytes_per_call(op: str, n_elements: int, dtype_label: str) -> int:
+    """Bytes that an op-kernel touches in a single call. For DRAM-bound
+    workloads (l2_hit_0) this equals DRAM bytes/call; for L2-resident
+    workloads it equals L2 traffic (with most of it staying on-chip)."""
+    rw = _RW_PER_CALL.get(op)
+    if rw is None:
+        return 0
+    return rw * n_elements * _dtype_bytes(dtype_label)
+
+
 # ---------- shape helpers ---------------------------------------------------
 
 def _shape_for(op: str, n_elements: int) -> tuple[int, ...]:
@@ -200,7 +286,8 @@ def _shape_for(op: str, n_elements: int) -> tuple[int, ...]:
     → 2-D with a fixed "feature" dim so the reduction cost per row stays
     realistic (matches a transformer's hidden size).
     """
-    if op in ("mul", "add", "gelu"):
+    if op in ("mul", "add", "gelu",
+              "stream_copy", "stream_scale", "stream_triad"):
         return (n_elements,)
     # softmax, layernorm: reduction along last dim; fix D = 1024 (transformer-ish)
     D = 1024
@@ -319,13 +406,14 @@ def cache_sweep_points(op: str, dtype_label: str, l2_bytes: int) -> list[int]:
 
 def build(op: str, dtype_label: str, n_elements: int,
           device: str | torch.device = "cuda") -> BenchSpec:
-    if op not in _BUILDERS:
-        raise ValueError(f"unknown op {op!r} (choices: {list(_BUILDERS)})")
+    builders = {**_BUILDERS, **_STREAM_BUILDERS}
+    if op not in builders:
+        raise ValueError(f"unknown op {op!r} (choices: {list(builders)})")
     if dtype_label not in ("fp16", "fp8"):
         raise ValueError(f"unknown dtype {dtype_label!r}")
     shape = _shape_for(op, n_elements)
     actual_n = math.prod(shape)
-    fn = _BUILDERS[op](shape, dtype_label, device)
+    fn = builders[op](shape, dtype_label, device)
     flops = actual_n * FLOPS_PER_ELEMENT[op]
     name = f"{dtype_label}_{op}"
     # Elementwise ops never hit Tensor Cores — TC is matmul-only silicon.
