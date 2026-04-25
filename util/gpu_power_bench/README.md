@@ -240,7 +240,7 @@ python3 gpu_power_bench.py --llm-shapes \
     --llm-dtypes bf16:tc fp8:te
 ```
 
-**분석**: `_01_powermodel_llm_matmul.png` 가 생성돼요. 2 panel:
+**분석**: `_01_powermodel_llm_jperflop.png` (J/FLOP vs T) 와 `_01_powermodel_llm_per_call.png` (per-call mJ vs T) 두 개로 나눠 저장됩니다:
 - **Panel A** — preset 별 **J/FLOP vs T** (log-log). 수평선이면 BW-bound (skinny 의 전형), 기울어지면 compute-bound 이 지배. K≫N 인 `kv` / `router` 는 T 가 작을 때 BW 병목이 커서 J/FLOP 이 평탄하게 높게 나오는 게 정상.
 - **Panel B** — preset 별 **layer 한 번 call 당 에너지 (mJ)** vs T. 포인트마다 `T=..., {mJ} mJ` 라벨. 이 숫자가 **LLM inference cost model 의 per-layer 입력값** 이에요.
 
@@ -296,7 +296,7 @@ Working-set 정의:
 python3 gpu_power_bench.py --device 0 --cache-sweep --tag h100_cache --out-dir reports/
 ```
 
-출력은 평소처럼 CSV 에 쌓이고, `analyze.py` 는 `_02_cache_regime.png` 플롯을 새로 그립니다 (§6.4.1 참조).
+출력은 평소처럼 CSV 에 쌓이고, `analyze.py` 는 `_02_cache_regime_*.png` 6 개 (elementwise 3 + matmul 3) plot 을 새로 그립니다 (§6.4.1 참조).
 
 ### 3.5 DRAM bandwidth energy — `pJ/bit` 측정
 
@@ -335,7 +335,7 @@ python3 analyze.py --reports-dir reports/ --tag h100_dram
 
 해당 커널들 (`stream_copy`, `stream_scale`, `stream_triad`) 은 **연산이 거의 없어서** 동적 에너지가 거의 전부 메모리 트래픽. 따라서 derive 된 pJ/bit 가 mul/add 의 그것보다 noise 가 더 작음.
 
-**`_02_dram_energy.png` 분석** (§6.4.2 참조): 2 panel.
+**`_02_dram_energy_*.png` 분석** (§6.4.2 참조): 2 개 별도 PNG.
 - **Panel A**: cell 별 pJ/bit 을 cache_regime x축으로 strip. 우측에 HBM2/HBM2E/HBM3/DDR4/Horowitz reference 가 dashed line 으로 그려져 있어서 측정치가 어디 위치하는지 즉시 비교 가능.
 - **Panel B**: l2_hit_0 cell 의 sustained BW (GB/s). HBM peak 점선과 함께 표시 — peak 의 50% 이상이면 BW-bound 이 정상, 30% 이하면 launch overhead 또는 kernel inefficiency 의심.
 
@@ -467,7 +467,7 @@ E_dyn = k_op · N_op + c
 - `k_op` 단위: elementwise 는 J/element, matmul 은 J/FLOP.
 - J/FLOP 을 얻으려면 matmul 의 N_op 는 `2·M·N·K` 로 계산 (multiply-accumulate = 2 FLOP 관례).
 
-`<stem>_01_powermodel_coefficient_bar.png` 의 bar 위에는 WLS slope + R² 가 라벨링되고, **bootstrap CI 가 error bar 로** 직접 표시됩니다 — bar 위에 작은 whisker 가 보이면 그것이 95% CI.
+`<stem>_01_powermodel_coef_bar_elementwise.png` 와 `<stem>_01_powermodel_coef_bar_matmul.png` 의 bar 위에는 WLS slope + R² 가 라벨링되고, **bootstrap CI 가 error bar 로** 직접 표시됩니다 — bar 위에 작은 whisker 가 보이면 그것이 95% CI.
 
 ### 5.2 Total-energy regression vs dynamic-energy regression
 
@@ -749,27 +749,55 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 ## 9. 실행
 
-### 9.1 기본 실행
+### 9.0 Test suites — `--suite NAME` (권장 진입점)
+
+여러 플래그를 매번 외울 필요 없이 **named test-suite 프리셋** 을 사용합니다. 각 suite 는 적절한 플래그 조합으로 자동 펼쳐지고, 사용자가 추가로 명시한 플래그는 suite 의 default 를 override 합니다.
+
+| Suite | 무엇을 도는가 | 펼쳐진 플래그 | 시간 |
+|---|---|---|---|
+| `smoke` | 5분 산뜻한 sanity check | `--quick --no-matmul` | ~5 분 |
+| `powermodel` | 기존 baseline benchmark — elementwise + matmul, 추가 probe 없음 | (default) | ~30 분 |
+| `cache` | 5-bucket cache regime 에 정확히 1 cell 씩 + matmul | `--cache-sweep` | ~15 분 |
+| `dram` | STREAM-style 만 (pJ/bit 측정 전용) | `--dram-bw-test --no-matmul --no-elementwise` | ~10 분 |
+| `llm` | gpt-oss-120B layer shape 만 | `--llm-shapes --no-elementwise --no-matmul` | ~25 분 |
+| `full` | 전체 + drift correction (publication-quality) | `--llm-shapes --dram-bw-test --rebaseline-every 20` | ~75 분 |
 
 ```bash
-./run_bench.sh
+# 권장: 기본 5분 smoke 후 본 측정 (full)
+./run_bench.sh --suite smoke --tag h100_smoke
+./run_bench.sh --suite full  --tag h100
+
+# Suite + 사용자 override (--no-matmul 으로 matmul 빼기)
+./run_bench.sh --suite full --tag h100 --no-matmul
+
+# 특정 카테고리만 빠르게
+./run_bench.sh --suite cache --tag h100_cache
+./run_bench.sh --suite dram  --tag h100_dram
 ```
 
-GPU 0 에서 full sweep (15 cells × 9 loads = ~30-40 분) 을 돈다.
+### 9.1 기본 실행 (auto-pipeline)
+
+`run_bench.sh` 는 sweep 끝나면 **자동으로 `analyze.py` 를 호출**해서 plot 까지 생성합니다 (single-GPU). multi-GPU 모드는 자동으로 `multi_gpu_analysis.py` 를 호출.
+
+```bash
+./run_bench.sh                      # GPU 0 sweep + analyze 자동
+./run_bench.sh --no-auto-analyze    # CSV 만 만들고 종료
+```
 
 ### 9.2 다중 GPU / 태깅
 
 ```bash
-./run_bench.sh --device 0 --tag a100
-./run_bench.sh --device 1 --tag h100
+./run_bench.sh --device 0 --tag a100        # 단일 GPU + auto-analyze
+./run_bench.sh --num-gpus 8  --tag h100     # 8 장 병렬 + multi_gpu_analysis 자동
+./run_bench.sh --devices "0,2,4" --tag h100 --suite full
 ```
 
-`--tag` 는 출력 파일 이름과 메타데이터에 붙는다.
-
-### 9.3 Quick 모드
+### 9.3 Quick 모드 (별칭: `--suite smoke`)
 
 ```bash
-./run_bench.sh --quick
+./run_bench.sh --suite smoke
+# 또는 동등하게:
+./run_bench.sh --quick --no-matmul
 ```
 
 `--quick` 은 n_points=5, window=1500ms 로 짧게. 완전 검증용이 아니라 pipeline smoke test 용.
@@ -913,9 +941,18 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_summary_by_regime.csv` | `(op, dtype, mode, cache_regime)` 당 1 행 — regime 별 `slope_dyn` (= `k_op`), `R2_dyn`, `median_j_per_unit`, `mean_dyn_power_w` |
 | `<stem>_01_powermodel_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
 | `<stem>_01_powermodel_linearity_matmul.png`      | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
-| `<stem>_01_powermodel_coefficient_bar.png`       | bar chart — 좌 elementwise, 우 matmul. 각 bar 에 pJ/elem (또는 pJ/FLOP) + R² 값 라벨 |
-| `<stem>_02_cache_regime.png`                     | 5-bucket L2 hit rate 별 J/element / J/FLOP (strip + k_op bar + steady-state dyn power) |
-| `<stem>_02_dram_energy.png`                      | DRAM 트래픽 pJ/bit + sustained BW (HBM2/HBM3 reference 라인 포함) |
+| `<stem>_01_powermodel_coef_bar_elementwise.png` | elementwise k_op bar (pJ/elem + R² + bootstrap CI whisker) — full-width 단독 패널 |
+| `<stem>_01_powermodel_coef_bar_matmul.png`      | matmul k_op bar (pJ/FLOP + R² + bootstrap CI whisker) — full-width 단독 패널 |
+| `<stem>_01_powermodel_llm_jperflop.png`          | LLM-shape: J/FLOP vs token count T (preset 별 line + T 라벨) |
+| `<stem>_01_powermodel_llm_per_call.png`          | LLM-shape: per-call mJ vs T |
+| `<stem>_02_cache_regime_elementwise_strip.png`   | elementwise: per-cell J/elem strip per regime (5 bucket) |
+| `<stem>_02_cache_regime_elementwise_kop.png`     | elementwise: regime 별 k_op bar (pJ/elem + R²) |
+| `<stem>_02_cache_regime_elementwise_dynpower.png` | elementwise: regime 별 평균 dyn power (W) |
+| `<stem>_02_cache_regime_matmul_strip.png`        | matmul: 동일 strip plot |
+| `<stem>_02_cache_regime_matmul_kop.png`          | matmul: regime 별 k_op (pJ/FLOP) |
+| `<stem>_02_cache_regime_matmul_dynpower.png`     | matmul: regime 별 dyn power |
+| `<stem>_02_dram_energy_pjbit.png`                | pJ/bit strip — HBM2/HBM3 reference 라인 포함 |
+| `<stem>_02_dram_energy_bw.png`                   | l2_hit_0 sustained BW per kernel (HBM peak 비교) |
 | `<stem>_03_baseline_static_power.png`            | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
 | `<stem>_04_thermal_diagnostics.png`              | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
 | `<stem>_05_trace_timeline.png`                   | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
@@ -940,7 +977,7 @@ matmul     matmul_fp8_te       Tensor Core (FP16 fallback)    1         8       
 | elementwise (fp8_{mul,add,softmax,gelu,layernorm}) | **숨김** | PyTorch 의 native FP8 elementwise 커널 부재로 인한 cast-compute-cast 오버헤드. FP16 bar 와 나란히 그리면 착시 유발. |
 | matmul (`matmul_fp8_te` A100 폴백) | **노출** (hatched + `*EMU` + `[TC·FP16-fallback]` 태그) | fp16_tc 와 같은 값에 수렴해야 정상 — 이 수렴 여부 자체가 TE 폴백이 제대로 동작했다는 sanity check 가 된다. |
 
-즉 A100 에서도 `_01_powermodel_linearity_matmul.png`, `_01_powermodel_coefficient_bar.png` 에 `matmul_fp8_te` bar 가 그려지고, H100 의 native FP8 수치와 시각적으로 직접 비교할 수 있습니다. cross-GPU 플롯 (`compare_gpus.py`) 에서도 `matmul_fp8_te` 가 두 GPU 모두 bar 로 나타나며, A100 쪽은 hatch + `*EMU` 주석으로 폴백임을 명시합니다.
+즉 A100 에서도 `_01_powermodel_linearity_matmul.png`, `_01_powermodel_coef_bar_matmul.png` 에 `matmul_fp8_te` bar 가 그려지고, H100 의 native FP8 수치와 시각적으로 직접 비교할 수 있습니다. cross-GPU 플롯 (`compare_gpus.py`) 에서도 `matmul_fp8_te` 가 두 GPU 모두 bar 로 나타나며, A100 쪽은 hatch + `*EMU` 주석으로 폴백임을 명시합니다.
 
 **Summary CSV 에는 두 카테고리 모두 그대로 남깁니다** (`_summary.csv`). 숨겨진 fp8 elementwise 까지 플롯에 포함하려면:
 
@@ -983,7 +1020,7 @@ python3 compare_gpus.py \
 
 #### 9.5.4 한 GPU 만 있을 때
 
-A100 만 있거나 H100 만 있을 때는 Step 3 을 건너뛰고 Step 1–2 로 종료합니다. 결과 해석에는 `_summary.csv` 의 `slope_dyn` 컬럼과 `_01_powermodel_coefficient_bar.png` 가 핵심입니다.
+A100 만 있거나 H100 만 있을 때는 Step 3 을 건너뛰고 Step 1–2 로 종료합니다. 결과 해석에는 `_summary.csv` 의 `slope_dyn` 컬럼과 `_01_powermodel_coef_bar_*.png` 두 장이 핵심입니다.
 
 #### 9.5.5 전체 디렉토리 구조 (참조)
 
@@ -1004,9 +1041,18 @@ reports/
 │   ├── <stem>_summary_by_regime.csv
 │   ├── <stem>_01_powermodel_linearity_elementwise.png
 │   ├── <stem>_01_powermodel_linearity_matmul.png
-│   ├── <stem>_01_powermodel_coefficient_bar.png
-│   ├── <stem>_02_cache_regime.png
-│   ├── <stem>_02_dram_energy.png
+│   ├── <stem>_01_powermodel_coef_bar_elementwise.png      # split per panel
+│   ├── <stem>_01_powermodel_coef_bar_matmul.png
+│   ├── <stem>_01_powermodel_llm_jperflop.png              # if --suite full / llm
+│   ├── <stem>_01_powermodel_llm_per_call.png
+│   ├── <stem>_02_cache_regime_elementwise_strip.png       # 6 cache panels
+│   ├── <stem>_02_cache_regime_elementwise_kop.png
+│   ├── <stem>_02_cache_regime_elementwise_dynpower.png
+│   ├── <stem>_02_cache_regime_matmul_strip.png
+│   ├── <stem>_02_cache_regime_matmul_kop.png
+│   ├── <stem>_02_cache_regime_matmul_dynpower.png
+│   ├── <stem>_02_dram_energy_pjbit.png                    # split DRAM
+│   ├── <stem>_02_dram_energy_bw.png
 │   ├── <stem>_03_baseline_static_power.png
 │   ├── <stem>_04_thermal_diagnostics.png
 │   └── <stem>_05_trace_timeline.png

@@ -58,6 +58,8 @@ SEQUENTIAL=0
 BASE_TAG=""
 FORWARD=()
 
+AUTO_ANALYZE=1   # default ON for single-GPU; multi-GPU paths disable it below.
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --num-gpus)         NUM_GPUS="$2"; shift 2 ;;
@@ -65,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --devices)          DEVICES="$2"; shift 2 ;;
         --devices=*)        DEVICES="${1#*=}"; shift ;;
         --sequential)       SEQUENTIAL=1; shift ;;
+        --no-auto-analyze)  AUTO_ANALYZE=0; shift ;;
         --tag)              BASE_TAG="$2"; FORWARD+=("--tag" "$2"); shift 2 ;;
         --tag=*)            BASE_TAG="${1#*=}"; FORWARD+=("$1"); shift ;;
         # --device is a single-GPU flag we leave as-is when no multi-GPU
@@ -131,9 +134,36 @@ run_one() {
         >> "$log" 2>&1
 }
 
-# Fallback: no multi-GPU flag given → original single-GPU behaviour.
+# Fallback: no multi-GPU flag given → single-GPU sweep, then optionally
+# chain analyze.py automatically. Use --no-auto-analyze to keep just the
+# raw CSV (e.g. when the analyse step will be done elsewhere).
 if [[ ${#DEVS[@]} -eq 0 ]]; then
-    exec "$PYTHON" gpu_power_bench.py ${FORWARD[@]+"${FORWARD[@]}"}
+    sweep_log=$(mktemp -t bench_sweep.XXXXXX.log)
+    "$PYTHON" gpu_power_bench.py ${FORWARD[@]+"${FORWARD[@]}"} 2>&1 | tee "$sweep_log"
+    sweep_rc=${PIPESTATUS[0]}
+    if (( sweep_rc != 0 )); then
+        echo "[error] gpu_power_bench.py exited with code $sweep_rc" >&2
+        rm -f "$sweep_log"; exit $sweep_rc
+    fi
+    if (( AUTO_ANALYZE == 1 )); then
+        # gpu_power_bench.py writes a "[OUTPUT_CSV] <path>" line at the end
+        # — pluck it out so we don't have to glob.
+        csv_line=$(grep -E '^\[OUTPUT_CSV\] ' "$sweep_log" | tail -n 1)
+        rm -f "$sweep_log"
+        if [[ -z "$csv_line" ]]; then
+            echo "[warn] sweep finished but no [OUTPUT_CSV] marker found — skip auto-analyze" >&2
+            exit 0
+        fi
+        csv_path="${csv_line#\[OUTPUT_CSV\] }"
+        echo
+        echo "[auto-analyze] running analyze.py on $csv_path"
+        echo "                (skip with --no-auto-analyze; or run later: python3 analyze.py <csv>)"
+        echo
+        "$PYTHON" analyze.py "$csv_path"
+        exit $?
+    fi
+    rm -f "$sweep_log"
+    exit 0
 fi
 
 echo "[info] multi-GPU run: devices=${DEVS[*]}  mode=$([[ $SEQUENTIAL == 1 ]] && echo sequential || echo parallel)"
@@ -224,7 +254,18 @@ if (( rc != 0 )); then
         echo "       To retry only the failing cards, use --devices '<csv>'." >&2
     fi
 else
-    echo "[done] per-GPU CSVs written under reports/. Next:"
-    echo "  python3 multi_gpu_analysis.py reports/ ${#DEVS[@]}${BASE_TAG:+ --tag $BASE_TAG}"
+    echo "[done] per-GPU CSVs written under reports/."
+    if (( AUTO_ANALYZE == 1 )); then
+        echo "[auto-analyze] running multi_gpu_analysis.py on the new CSVs"
+        echo "                (skip with --no-auto-analyze)"
+        echo
+        if [[ -n "$BASE_TAG" ]]; then
+            "$PYTHON" multi_gpu_analysis.py reports/ "${#DEVS[@]}" --tag "$BASE_TAG" || rc=$?
+        else
+            "$PYTHON" multi_gpu_analysis.py reports/ "${#DEVS[@]}" || rc=$?
+        fi
+    else
+        echo "  next: python3 multi_gpu_analysis.py reports/ ${#DEVS[@]}${BASE_TAG:+ --tag $BASE_TAG}"
+    fi
 fi
 exit $rc
