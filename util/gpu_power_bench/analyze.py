@@ -95,7 +95,14 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
-    """Return (slope, intercept, R²).  Slope is the primary power-model coeff."""
+    """Return (slope, intercept, R²).  Slope is the primary power-model coeff.
+
+    OLS — minimises Σ(y − a·x − b)². Equal weight on every point, which
+    over-weights large-N samples whose absolute variance is also larger
+    (energy variance ≈ proportional to mean energy). For the heteroscedasticity-
+    aware version that's appropriate when reporting `k_op` headlines, see
+    `linear_fit_wls()` below.
+    """
     if len(x) < 2:
         return float("nan"), float("nan"), float("nan")
     a, b = np.polyfit(x, y, 1)
@@ -104,6 +111,83 @@ def linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
     ss_tot = np.sum((y - y.mean()) ** 2)
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
     return float(a), float(b), float(r2)
+
+
+def linear_fit_wls(x: np.ndarray, y: np.ndarray,
+                   weights: np.ndarray | None = None) -> tuple[float, float, float]:
+    """Weighted least squares.  Returns (slope, intercept, R²).
+
+    Default weights = 1 / max(y, ε)² — this matches the empirical
+    observation that for our power measurements σ(y) is approximately
+    proportional to y itself (constant *relative* error). Each point
+    therefore contributes equally in log-space, which is exactly what
+    the analyst eyes when looking at the log-log linearity plots.
+
+    With explicit weights, this is the same fit a `numpy.polyfit(x, y, 1, w)`
+    would produce — but we also return the weighted R², which is what
+    the headline `R²` in the summary CSV should reflect.
+    """
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if len(x) < 2:
+        return float("nan"), float("nan"), float("nan")
+    if weights is None:
+        eps = max(1e-12, float(np.nanmax(np.abs(y))) * 1e-6)
+        weights = 1.0 / np.maximum(np.abs(y), eps) ** 2
+    w = np.asarray(weights, dtype=float)
+    # numpy.polyfit interprets `w` as 1/sigma weights (sqrt(weights) under the
+    # hood), so to apply a true 1/var weighting we pass sqrt(weights).
+    a, b = np.polyfit(x, y, 1, w=np.sqrt(w))
+    y_pred = a * x + b
+    sw = np.sum(w)
+    if sw <= 0:
+        return float(a), float(b), float("nan")
+    y_mean_w = np.sum(w * y) / sw
+    ss_res = np.sum(w * (y - y_pred) ** 2)
+    ss_tot = np.sum(w * (y - y_mean_w) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return float(a), float(b), float(r2)
+
+
+def bootstrap_slope_ci(x: np.ndarray, y: np.ndarray,
+                       n_resample: int = 1000,
+                       confidence: float = 0.95,
+                       weighted: bool = True,
+                       rng_seed: int = 0) -> tuple[float, float, float]:
+    """Percentile-bootstrap confidence interval for the regression slope.
+
+    Resamples (x, y) PAIRS with replacement, refits the slope each time,
+    and returns (slope_med, ci_lo, ci_hi). With <2 unique x-values returns
+    NaNs. With weighted=True uses linear_fit_wls (matches the headline
+    fit method); set False for OLS.
+
+    For our N=9-11 sweep points, percentile bootstrap with 1000 resamples
+    is sensible — the resampling distribution is well-resolved at the 2.5%
+    and 97.5% quantiles, and the cost is negligible (well under 100 ms
+    per variant).
+    """
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    n = len(x)
+    if n < 2 or len(np.unique(x)) < 2:
+        return float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(rng_seed)
+    fit = linear_fit_wls if weighted else linear_fit
+    slopes = np.empty(n_resample, dtype=float)
+    for i in range(n_resample):
+        idx = rng.integers(0, n, size=n)
+        # Avoid degenerate resamples that picked all-same x.
+        if len(np.unique(x[idx])) < 2:
+            slopes[i] = np.nan
+            continue
+        s, _, _ = fit(x[idx], y[idx])
+        slopes[i] = s
+    slopes = slopes[np.isfinite(slopes)]
+    if slopes.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    alpha = (1.0 - confidence) / 2.0
+    lo = float(np.quantile(slopes, alpha))
+    hi = float(np.quantile(slopes, 1.0 - alpha))
+    med = float(np.median(slopes))
+    return med, lo, hi
 
 
 # ---------------------------------------------------------------------------
@@ -217,13 +301,33 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
             unit = "J/element"
         y_dyn = g["dyn_energy_j"].to_numpy(dtype=float)
         y_tot = g["total_energy_j"].to_numpy(dtype=float)
+        # OLS — kept for backward compatibility and so the user can see how
+        # much the WLS / clip-correction moves the headline.
         slope_dyn, _, r2_dyn = linear_fit(x, y_dyn)
         slope_tot, _, r2_tot = linear_fit(x, y_tot)
-        # compute_unit / emulated are constant within a group — take the first.
+        # WLS — weights = 1/y² so each point contributes proportional to its
+        # *relative* error, which matches what we see in the log-log plot.
+        # This is the slope we recommend reporting as the headline `k_op`.
+        slope_dyn_wls, _, r2_dyn_wls = linear_fit_wls(x, y_dyn)
+        # Bootstrap CI on the WLS slope (1000 resamples; stochastic but
+        # rng_seed=0 keeps the per-cell number reproducible).
+        _, ci_lo, ci_hi = bootstrap_slope_ci(x, y_dyn, n_resample=1000,
+                                             confidence=0.95, weighted=True)
+        # Clip-bias check — if dyn_energy_j_raw is in the CSV, refit on
+        # the unclipped residual so the user can see how much the
+        # max(0, …) clipping moved the slope. Reported as
+        # slope_dyn_unclipped + delta_clip_pct.
+        slope_dyn_unclipped = float("nan")
+        delta_clip_pct = float("nan")
+        if "dyn_energy_j_raw" in g.columns:
+            y_raw = pd.to_numeric(g["dyn_energy_j_raw"], errors="coerce").to_numpy(float)
+            if np.all(np.isfinite(y_raw)):
+                s_raw, _, _ = linear_fit_wls(x, y_raw)
+                slope_dyn_unclipped = s_raw
+                if np.isfinite(slope_dyn_wls) and slope_dyn_wls != 0:
+                    delta_clip_pct = (slope_dyn_wls - s_raw) / s_raw * 100.0
         compute_unit = str(g["compute_unit"].iloc[0])
         emulated = int(bool(g["emulated"].iloc[0]))
-        # Variant name — encodes preset when this is an LLM-shape row so
-        # analyze / compare plots can tell qkv / mlp1 / lm_head apart.
         if cat == "matmul_llm":
             variant = f"llm_{preset}_{dt}_{mode}"
         elif cat == "matmul":
@@ -238,10 +342,16 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
             "emulated":     emulated,
             "n_points": len(g),
             "fit_axis": unit,
-            "slope_dyn":   slope_dyn,   # ← the power-modeling coefficient
-            "slope_total": slope_tot,
-            "R2_dyn":      r2_dyn,
-            "R2_total":    r2_tot,
+            "slope_dyn":          slope_dyn,        # OLS — legacy headline
+            "slope_dyn_wls":      slope_dyn_wls,    # WLS — recommended k_op
+            "slope_dyn_ci_lo":    ci_lo,            # 95% percentile bootstrap
+            "slope_dyn_ci_hi":    ci_hi,
+            "slope_dyn_unclipped": slope_dyn_unclipped,  # WLS on raw (signed) dyn
+            "clip_bias_pct":       delta_clip_pct,       # +ve = clip inflated slope
+            "slope_total":        slope_tot,
+            "R2_dyn":             r2_dyn,
+            "R2_dyn_wls":         r2_dyn_wls,
+            "R2_total":           r2_tot,
             "mean_dyn_power_w":  g["dyn_power_w"].mean(),
             "mean_avg_power_w":  g["avg_power_w"].mean(),
             "mean_temp_c":       g["avg_temp_c"].mean(),
@@ -310,10 +420,16 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
         y_dyn = g["dyn_energy_j"].to_numpy(dtype=float)
         if len(g) >= 2:
             slope_dyn, _, r2_dyn = linear_fit(x, y_dyn)
+            slope_dyn_wls, _, r2_dyn_wls = linear_fit_wls(x, y_dyn)
+            _, ci_lo, ci_hi = bootstrap_slope_ci(x, y_dyn, n_resample=1000,
+                                                 confidence=0.95, weighted=True)
         else:
             # Single-point regime — use the per-point coefficient directly.
             # This is the one case where we degrade the model to median.
             slope_dyn, r2_dyn = float(y_per.iloc[0]), float("nan")
+            slope_dyn_wls = slope_dyn
+            r2_dyn_wls = float("nan")
+            ci_lo = ci_hi = float("nan")
         compute_unit = str(g["compute_unit"].iloc[0])
         emulated = int(bool(g["emulated"].iloc[0]))
         if cat == "matmul_llm":
@@ -331,7 +447,10 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
             "emulated":     emulated,
             "n_points":     len(g),
             "fit_axis":     unit,
-            "slope_dyn":      slope_dyn,          # regime-specific k_op
+            "slope_dyn":      slope_dyn,          # OLS regime k_op
+            "slope_dyn_wls":  slope_dyn_wls,      # WLS regime k_op
+            "slope_dyn_ci_lo": ci_lo,
+            "slope_dyn_ci_hi": ci_hi,
             "R2_dyn":         r2_dyn,
             "median_j_per_unit": float(y_per.median()),
             "mean_dyn_power_w":  g["dyn_power_w"].astype(float).mean(),
@@ -535,38 +654,60 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
         w = 0.8 / max(1, len(dtypes))
         colors = {"fp16": "#1f77b4", "fp8": "#d62728"}
         has_emulated = False
+        # Prefer the WLS slope (with bootstrap CI) when present; fall back to
+        # OLS for back-compat with older summary CSVs that lack the WLS cols.
+        slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
+        r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in ew.columns else "R2_dyn"
         for i, dt in enumerate(dtypes):
-            vals, r2s = [], []
+            vals, r2s, errs_lo, errs_hi = [], [], [], []
             for op in ops:
                 row = ew[(ew.op == op) & (ew.dtype == dt)]
                 if row.empty:
                     vals.append(float("nan")); r2s.append(float("nan"))
+                    errs_lo.append(0.0); errs_hi.append(0.0)
                 else:
-                    vals.append(row["slope_dyn"].iloc[0])
-                    r2s.append(row["R2_dyn"].iloc[0])
+                    v = float(row[slope_col].iloc[0])
+                    vals.append(v)
+                    r2s.append(float(row[r2_col].iloc[0]))
+                    # Bootstrap CI as asymmetric error bars around the WLS slope.
+                    if ("slope_dyn_ci_lo" in row.columns
+                            and pd.notna(row["slope_dyn_ci_lo"].iloc[0])):
+                        ci_lo = float(row["slope_dyn_ci_lo"].iloc[0])
+                        ci_hi = float(row["slope_dyn_ci_hi"].iloc[0])
+                        errs_lo.append(max(0.0, v - ci_lo))
+                        errs_hi.append(max(0.0, ci_hi - v))
+                    else:
+                        errs_lo.append(0.0); errs_hi.append(0.0)
                     if "emulated" in row.columns and int(row["emulated"].iloc[0]):
                         has_emulated = True
-            # fp8 bars are drawn with a diagonal hatch to visually flag them
-            # as the cast-compute-cast emulation path.
             emu_dt = (dt == "fp8")
             label = f"{dt} [CUDA]" + (" *EMU" if emu_dt else "")
+            yerr = [errs_lo, errs_hi] if any(errs_lo) or any(errs_hi) else None
             bars = ax.bar(xpos + (i - (len(dtypes) - 1) / 2) * w, vals, w,
+                          yerr=yerr, capsize=3,
                           label=label, color=colors.get(dt, None), alpha=0.9,
-                          hatch="//" if emu_dt else None, edgecolor="white")
+                          hatch="//" if emu_dt else None, edgecolor="white",
+                          error_kw=dict(ecolor="#444444", lw=0.9))
             for rect, v, r2 in zip(bars, vals, r2s):
                 _annot(rect, v, r2, "pJ/elem")
         ax.set_xticks(xpos); ax.set_xticklabels(ops)
         ax.set_ylabel("J / element (dynamic)  — regression slope")
-        ax.set_yscale("log"); ax.legend(); ax.grid(True, axis="y", alpha=0.3)
+        # Switch to log scale only when at least one bar has a positive
+        # height. With NaN / negative bars (rare — happens when the WLS
+        # slope flips sign on a noisy / poorly-fit variant) matplotlib
+        # picks pathological log bounds and bbox_inches="tight" then
+        # blows the figure up to gigapixel size.
+        positive = [v for v in vals if np.isfinite(v) and v > 0]
+        if positive:
+            ax.set_yscale("log")
+            lo = min(positive); hi = max(positive)
+            ax.set_ylim(lo * 0.3, hi * 4)
+        ax.legend(); ax.grid(True, axis="y", alpha=0.3)
         subtitle = ("Elementwise — per-op energy coefficient (all on CUDA cores). "
                     "Labels: slope (pJ/elem) + R²")
         if has_emulated:
             subtitle += "\nfp8 bars = cast-compute-cast via FP16 (no native FP8 elementwise in PyTorch)"
         ax.set_title(subtitle, fontsize=10)
-        # Bumping the upper ylim by ~1 decade on log scale so the two-line
-        # labels don't clip the title.
-        ymin, ymax = ax.get_ylim()
-        ax.set_ylim(ymin, ymax * 3)
     else:
         ax.set_visible(False)
 
@@ -588,13 +729,31 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
                 return bool(int(val)) if pd.notna(val) else False
             return False
         hatches = ["//" if _emu(v) else None for v in mm2.index]
-        bars = ax.bar(range(len(mm2)), mm2["slope_dyn"].values,
-                      color=colors, alpha=0.9, edgecolor="white")
+        slope_col_mm = "slope_dyn_wls" if "slope_dyn_wls" in mm2.columns else "slope_dyn"
+        r2_col_mm    = "R2_dyn_wls"    if "R2_dyn_wls"    in mm2.columns else "R2_dyn"
+        slope_vals = mm2[slope_col_mm].values
+        # Asymmetric bootstrap-CI error bars when available.
+        if "slope_dyn_ci_lo" in mm2.columns and "slope_dyn_ci_hi" in mm2.columns:
+            errs_lo, errs_hi = [], []
+            for v, lo, hi in zip(slope_vals,
+                                  mm2["slope_dyn_ci_lo"].values,
+                                  mm2["slope_dyn_ci_hi"].values):
+                if pd.notna(v) and pd.notna(lo) and pd.notna(hi):
+                    errs_lo.append(max(0.0, float(v) - float(lo)))
+                    errs_hi.append(max(0.0, float(hi) - float(v)))
+                else:
+                    errs_lo.append(0.0); errs_hi.append(0.0)
+            yerr = [errs_lo, errs_hi]
+        else:
+            yerr = None
+        bars = ax.bar(range(len(mm2)), slope_vals,
+                      yerr=yerr, capsize=3,
+                      color=colors, alpha=0.9, edgecolor="white",
+                      error_kw=dict(ecolor="#444444", lw=0.9))
         for rect, h in zip(bars, hatches):
             if h:
                 rect.set_hatch(h)
-        for rect, v, r2 in zip(bars, mm2["slope_dyn"].values,
-                                mm2["R2_dyn"].values):
+        for rect, v, r2 in zip(bars, slope_vals, mm2[r2_col_mm].values):
             _annot(rect, float(v) if pd.notna(v) else float("nan"),
                    float(r2) if pd.notna(r2) else float("nan"),
                    "pJ/FLOP")
@@ -616,19 +775,28 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> Non
         ax.set_xticklabels([_tick(v) for v in mm2.index],
                            rotation=30, ha="right", fontsize=8)
         ax.set_ylabel("J / FLOP (dynamic)  — regression slope")
-        ax.set_yscale("log"); ax.grid(True, axis="y", alpha=0.3)
+        positive = [v for v in slope_vals if pd.notna(v) and float(v) > 0]
+        if positive:
+            ax.set_yscale("log")
+            lo = float(min(positive)); hi = float(max(positive))
+            ax.set_ylim(lo * 0.3, hi * 4)
+        ax.grid(True, axis="y", alpha=0.3)
         title = ("Matmul — per-variant energy coefficient. "
                  "Labels: slope (pJ/FLOP) + R²")
         if any(hatches):
             title += "\n* hatched bar = emulated (not native for this dtype)"
         ax.set_title(title, fontsize=10)
-        ymin, ymax = ax.get_ylim()
-        ax.set_ylim(ymin, ymax * 3)
     else:
         ax.set_visible(False)
 
     fig.suptitle(f"Power-model coefficients — {gpu}")
-    fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
+    fig.tight_layout()
+    # Fixed padding instead of bbox_inches="tight" — defends against the
+    # gigapixel-PNG bug if the log-axis ever ends up pathological.
+    w_in, h_in = fig.get_size_inches()
+    if w_in > 30 or h_in > 18:
+        fig.set_size_inches(min(w_in, 30), min(h_in, 18))
+    fig.savefig(out_png, dpi=160, pad_inches=0.3)
     print(f"[save] {out_png}")
 
 
@@ -1506,8 +1674,12 @@ def main() -> int:
                            "display.float_format", lambda v: f"{v:.3e}"):
         cols = ["category", "variant", "compute_unit", "emulated",
                 "n_points", "fit_axis",
-                "slope_dyn", "R2_dyn", "mean_dyn_power_w",
-                "mean_temp_c", "peak_temp_c"]
+                "slope_dyn", "slope_dyn_wls",
+                "slope_dyn_ci_lo", "slope_dyn_ci_hi",
+                "R2_dyn_wls", "clip_bias_pct",
+                "mean_dyn_power_w", "mean_temp_c"]
+        # Older summaries may not have the new columns; show what's there.
+        cols = [c for c in cols if c in summary.columns]
         print(summary[cols].to_string(index=False))
 
     # --- per-regime summary (regime-specific k_op) --------------------------
