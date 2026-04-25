@@ -602,202 +602,194 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     print(f"[save] {out_png}")
 
 
-def plot_joule_per_op_bar(summary: pd.DataFrame, out_png: Path, gpu: str) -> None:
-    """One bar per benchmark with the slope (J/element or J/FLOP).
-
-    Two panels side by side:
-      * elementwise — bars grouped by op, color by dtype
-      * matmul      — bars by variant
-    Each bar is annotated with both the numeric coefficient (pJ/element for
-    elementwise, pJ/FLOP for matmul — small-number-friendly units) and the
-    regression R², so the plot alone answers "how much does this op cost
-    on this GPU" without the reader having to open the CSV.
-    """
-    plt = _get_mpl()
-    ew = summary[summary["category"] == "elementwise"]
-    mm = summary[summary["category"] == "matmul"]
-    # Figure height bumped vs before: each bar now carries two lines of text
-    # ("0.31 pJ / R²=0.99"), which needs extra headroom on a log-scale y-axis.
-    fig, axes = plt.subplots(1, 2, figsize=(17, 7),
-                             gridspec_kw={"width_ratios": [3, 2]})
-
-    def _annot(rect, value_j, r2, scale_label):
-        """Write '0.31 pJ\\nR²=0.99' on top of a bar, skipping NaNs."""
-        if value_j is None or np.isnan(value_j):
-            return
-        # Pick human-friendly precision: large values (>=100 pJ) get one
-        # decimal, smaller ones get two, very small (<0.1 pJ) use scientific.
-        v_p = value_j * 1e12   # J → pJ
-        if abs(v_p) >= 100:
-            vtxt = f"{v_p:.0f} {scale_label}"
-        elif abs(v_p) >= 1:
-            vtxt = f"{v_p:.2f} {scale_label}"
-        elif abs(v_p) >= 0.01:
-            vtxt = f"{v_p:.3f} {scale_label}"
-        else:
-            vtxt = f"{v_p:.2e} {scale_label}"
-        if np.isnan(r2):
-            label = vtxt
-        else:
-            label = f"{vtxt}\nR²={r2:.3f}"
-        ax = rect.axes
-        ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
-                label, ha="center", va="bottom", fontsize=7,
-                linespacing=1.1)
-
-    # ---- elementwise panel: grouped bar (op on x, dtype as hue) ----
-    ax = axes[0]
-    if not ew.empty:
-        ops = sorted(ew["op"].unique())
-        dtypes = sorted(ew["dtype"].unique(), reverse=True)
-        xpos = np.arange(len(ops))
-        w = 0.8 / max(1, len(dtypes))
-        colors = {"fp16": "#1f77b4", "fp8": "#d62728"}
-        has_emulated = False
-        # Prefer the WLS slope (with bootstrap CI) when present; fall back to
-        # OLS for back-compat with older summary CSVs that lack the WLS cols.
-        slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
-        r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in ew.columns else "R2_dyn"
-        for i, dt in enumerate(dtypes):
-            vals, r2s, errs_lo, errs_hi = [], [], [], []
-            for op in ops:
-                row = ew[(ew.op == op) & (ew.dtype == dt)]
-                if row.empty:
-                    vals.append(float("nan")); r2s.append(float("nan"))
-                    errs_lo.append(0.0); errs_hi.append(0.0)
-                else:
-                    v = float(row[slope_col].iloc[0])
-                    vals.append(v)
-                    r2s.append(float(row[r2_col].iloc[0]))
-                    # Bootstrap CI as asymmetric error bars around the WLS slope.
-                    if ("slope_dyn_ci_lo" in row.columns
-                            and pd.notna(row["slope_dyn_ci_lo"].iloc[0])):
-                        ci_lo = float(row["slope_dyn_ci_lo"].iloc[0])
-                        ci_hi = float(row["slope_dyn_ci_hi"].iloc[0])
-                        errs_lo.append(max(0.0, v - ci_lo))
-                        errs_hi.append(max(0.0, ci_hi - v))
-                    else:
-                        errs_lo.append(0.0); errs_hi.append(0.0)
-                    if "emulated" in row.columns and int(row["emulated"].iloc[0]):
-                        has_emulated = True
-            emu_dt = (dt == "fp8")
-            label = f"{dt} [CUDA]" + (" *EMU" if emu_dt else "")
-            yerr = [errs_lo, errs_hi] if any(errs_lo) or any(errs_hi) else None
-            bars = ax.bar(xpos + (i - (len(dtypes) - 1) / 2) * w, vals, w,
-                          yerr=yerr, capsize=3,
-                          label=label, color=colors.get(dt, None), alpha=0.9,
-                          hatch="//" if emu_dt else None, edgecolor="white",
-                          error_kw=dict(ecolor="#444444", lw=0.9))
-            for rect, v, r2 in zip(bars, vals, r2s):
-                _annot(rect, v, r2, "pJ/elem")
-        ax.set_xticks(xpos); ax.set_xticklabels(ops)
-        ax.set_ylabel("J / element (dynamic)  — regression slope")
-        # Switch to log scale only when at least one bar has a positive
-        # height. With NaN / negative bars (rare — happens when the WLS
-        # slope flips sign on a noisy / poorly-fit variant) matplotlib
-        # picks pathological log bounds and bbox_inches="tight" then
-        # blows the figure up to gigapixel size.
-        positive = [v for v in vals if np.isfinite(v) and v > 0]
-        if positive:
-            ax.set_yscale("log")
-            lo = min(positive); hi = max(positive)
-            ax.set_ylim(lo * 0.3, hi * 4)
-        ax.legend(); ax.grid(True, axis="y", alpha=0.3)
-        subtitle = ("Elementwise — per-op energy coefficient (all on CUDA cores). "
-                    "Labels: slope (pJ/elem) + R²")
-        if has_emulated:
-            subtitle += "\nfp8 bars = cast-compute-cast via FP16 (no native FP8 elementwise in PyTorch)"
-        ax.set_title(subtitle, fontsize=10)
+def _annot_bar_pj(rect, value_j, r2, scale_label):
+    """Write '0.31 pJ/elem\\nR²=0.99' on top of a bar, skipping NaNs."""
+    if value_j is None or np.isnan(value_j):
+        return
+    v_p = value_j * 1e12   # J → pJ
+    if abs(v_p) >= 100:
+        vtxt = f"{v_p:.0f} {scale_label}"
+    elif abs(v_p) >= 1:
+        vtxt = f"{v_p:.2f} {scale_label}"
+    elif abs(v_p) >= 0.01:
+        vtxt = f"{v_p:.3f} {scale_label}"
     else:
-        ax.set_visible(False)
+        vtxt = f"{v_p:.2e} {scale_label}"
+    label = vtxt if np.isnan(r2) else f"{vtxt}\nR²={r2:.3f}"
+    ax = rect.axes
+    ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+            label, ha="center", va="bottom", fontsize=9, linespacing=1.1)
 
-    # ---- matmul panel: one bar per variant ----
-    ax = axes[1]
-    if not mm.empty:
-        order = ["matmul_fp32_simt", "matmul_tf32_tc", "matmul_fp16_tc",
-                 "matmul_bf16_tc", "matmul_fp8_te"]
-        mm2 = mm.set_index("variant").reindex([v for v in order if v in mm["variant"].values])
-        palette = {"matmul_fp32_simt": "#555555",
-                   "matmul_tf32_tc":   "#ff7f0e",
-                   "matmul_fp16_tc":   "#1f77b4",
-                   "matmul_bf16_tc":   "#2ca02c",
-                   "matmul_fp8_te":    "#d62728"}
-        colors = [palette.get(v, "gray") for v in mm2.index]
-        def _emu(v):
-            if "emulated" in mm2.columns:
-                val = mm2.loc[v, "emulated"]
-                return bool(int(val)) if pd.notna(val) else False
-            return False
-        hatches = ["//" if _emu(v) else None for v in mm2.index]
-        slope_col_mm = "slope_dyn_wls" if "slope_dyn_wls" in mm2.columns else "slope_dyn"
-        r2_col_mm    = "R2_dyn_wls"    if "R2_dyn_wls"    in mm2.columns else "R2_dyn"
-        slope_vals = mm2[slope_col_mm].values
-        # Asymmetric bootstrap-CI error bars when available.
-        if "slope_dyn_ci_lo" in mm2.columns and "slope_dyn_ci_hi" in mm2.columns:
-            errs_lo, errs_hi = [], []
-            for v, lo, hi in zip(slope_vals,
-                                  mm2["slope_dyn_ci_lo"].values,
-                                  mm2["slope_dyn_ci_hi"].values):
-                if pd.notna(v) and pd.notna(lo) and pd.notna(hi):
-                    errs_lo.append(max(0.0, float(v) - float(lo)))
-                    errs_hi.append(max(0.0, float(hi) - float(v)))
-                else:
-                    errs_lo.append(0.0); errs_hi.append(0.0)
-            yerr = [errs_lo, errs_hi]
-        else:
-            yerr = None
-        bars = ax.bar(range(len(mm2)), slope_vals,
-                      yerr=yerr, capsize=3,
-                      color=colors, alpha=0.9, edgecolor="white",
-                      error_kw=dict(ecolor="#444444", lw=0.9))
-        for rect, h in zip(bars, hatches):
-            if h:
-                rect.set_hatch(h)
-        for rect, v, r2 in zip(bars, slope_vals, mm2[r2_col_mm].values):
-            _annot(rect, float(v) if pd.notna(v) else float("nan"),
-                   float(r2) if pd.notna(r2) else float("nan"),
-                   "pJ/FLOP")
-        # Build tick labels that carry the actual compute unit ([CUDA]/[TC])
-        # and a star when the variant was emulated (fp8_te fallback).
-        def _tick(v):
-            cu = str(mm2.loc[v, "compute_unit"]) if "compute_unit" in mm2.columns else ""
-            if cu.startswith("Tensor Core (FP16 fallback)"):
-                tag = "TC·FP16-fallback"
-            elif cu.startswith("Tensor"):
-                tag = "TC"
-            elif cu.startswith("CUDA"):
-                tag = "CUDA"
-            else:
-                tag = "?"
-            star = " *" if _emu(v) else ""
-            return f"{v}\n[{tag}]{star}"
-        ax.set_xticks(range(len(mm2)))
-        ax.set_xticklabels([_tick(v) for v in mm2.index],
-                           rotation=30, ha="right", fontsize=8)
-        ax.set_ylabel("J / FLOP (dynamic)  — regression slope")
-        positive = [v for v in slope_vals if pd.notna(v) and float(v) > 0]
-        if positive:
-            ax.set_yscale("log")
-            lo = float(min(positive)); hi = float(max(positive))
-            ax.set_ylim(lo * 0.3, hi * 4)
-        ax.grid(True, axis="y", alpha=0.3)
-        title = ("Matmul — per-variant energy coefficient. "
-                 "Labels: slope (pJ/FLOP) + R²")
-        if any(hatches):
-            title += "\n* hatched bar = emulated (not native for this dtype)"
-        ax.set_title(title, fontsize=10)
-    else:
-        ax.set_visible(False)
 
-    fig.suptitle(f"Power-model coefficients — {gpu}")
+def _save_fig(fig, out_png: Path, dpi: int = 160) -> None:
+    """Save with a fixed pad and a hard size cap — defends against the
+    gigapixel-PNG bug whenever log axes end up with pathological bounds."""
     fig.tight_layout()
-    # Fixed padding instead of bbox_inches="tight" — defends against the
-    # gigapixel-PNG bug if the log-axis ever ends up pathological.
     w_in, h_in = fig.get_size_inches()
     if w_in > 30 or h_in > 18:
         fig.set_size_inches(min(w_in, 30), min(h_in, 18))
-    fig.savefig(out_png, dpi=160, pad_inches=0.3)
+    fig.savefig(out_png, dpi=dpi, pad_inches=0.3)
     print(f"[save] {out_png}")
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def _coef_bar_elementwise(ew, out_png: Path, gpu: str) -> bool:
+    """Standalone elementwise k_op bar chart — full-width, single panel.
+    Returns True iff a file was written."""
+    if ew.empty:
+        return False
+    plt = _get_mpl()
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ops = sorted(ew["op"].unique())
+    dtypes = sorted(ew["dtype"].unique(), reverse=True)
+    xpos = np.arange(len(ops))
+    w = 0.8 / max(1, len(dtypes))
+    colors = {"fp16": "#1f77b4", "fp8": "#d62728"}
+    has_emulated = False
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
+    r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in ew.columns else "R2_dyn"
+    all_positive: list[float] = []
+    for i, dt in enumerate(dtypes):
+        vals, r2s, errs_lo, errs_hi = [], [], [], []
+        for op in ops:
+            row = ew[(ew.op == op) & (ew.dtype == dt)]
+            if row.empty:
+                vals.append(float("nan")); r2s.append(float("nan"))
+                errs_lo.append(0.0); errs_hi.append(0.0)
+            else:
+                v = float(row[slope_col].iloc[0])
+                vals.append(v); r2s.append(float(row[r2_col].iloc[0]))
+                if ("slope_dyn_ci_lo" in row.columns
+                        and pd.notna(row["slope_dyn_ci_lo"].iloc[0])):
+                    ci_lo = float(row["slope_dyn_ci_lo"].iloc[0])
+                    ci_hi = float(row["slope_dyn_ci_hi"].iloc[0])
+                    errs_lo.append(max(0.0, v - ci_lo))
+                    errs_hi.append(max(0.0, ci_hi - v))
+                else:
+                    errs_lo.append(0.0); errs_hi.append(0.0)
+                if "emulated" in row.columns and int(row["emulated"].iloc[0]):
+                    has_emulated = True
+                if np.isfinite(v) and v > 0:
+                    all_positive.append(v)
+        emu_dt = (dt == "fp8")
+        label = f"{dt} [CUDA]" + (" *EMU" if emu_dt else "")
+        yerr = [errs_lo, errs_hi] if any(errs_lo) or any(errs_hi) else None
+        bars = ax.bar(xpos + (i - (len(dtypes) - 1) / 2) * w, vals, w,
+                      yerr=yerr, capsize=3,
+                      label=label, color=colors.get(dt, None), alpha=0.9,
+                      hatch="//" if emu_dt else None, edgecolor="white",
+                      error_kw=dict(ecolor="#444444", lw=0.9))
+        for rect, v, r2 in zip(bars, vals, r2s):
+            _annot_bar_pj(rect, v, r2, "pJ/elem")
+    ax.set_xticks(xpos); ax.set_xticklabels(ops, fontsize=11)
+    ax.set_ylabel("J / element (dynamic)  — regression slope")
+    if all_positive:
+        ax.set_yscale("log")
+        ax.set_ylim(min(all_positive) * 0.3, max(all_positive) * 4)
+    ax.legend(); ax.grid(True, axis="y", alpha=0.3)
+    title = ("Elementwise — per-op energy coefficient (all on CUDA cores). "
+             "Labels: slope (pJ/elem) + R²")
+    if has_emulated:
+        title += "\nfp8 bars = cast-compute-cast via FP16 (no native FP8 elementwise in PyTorch)"
+    ax.set_title(title, fontsize=11)
+    fig.suptitle(f"Power-model coefficient — elementwise — {gpu}")
+    _save_fig(fig, out_png)
+    return True
+
+
+def _coef_bar_matmul(mm, out_png: Path, gpu: str) -> bool:
+    """Standalone matmul k_op bar chart — full-width, single panel."""
+    if mm.empty:
+        return False
+    plt = _get_mpl()
+    order = ["matmul_fp32_simt", "matmul_tf32_tc", "matmul_fp16_tc",
+             "matmul_bf16_tc", "matmul_fp8_te"]
+    mm2 = mm.set_index("variant").reindex([v for v in order if v in mm["variant"].values])
+    if mm2.empty:
+        return False
+    palette = {"matmul_fp32_simt": "#555555", "matmul_tf32_tc": "#ff7f0e",
+               "matmul_fp16_tc":   "#1f77b4", "matmul_bf16_tc": "#2ca02c",
+               "matmul_fp8_te":    "#d62728"}
+    colors_b = [palette.get(v, "gray") for v in mm2.index]
+    def _emu(v):
+        if "emulated" in mm2.columns:
+            val = mm2.loc[v, "emulated"]
+            return bool(int(val)) if pd.notna(val) else False
+        return False
+    hatches = ["//" if _emu(v) else None for v in mm2.index]
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm2.columns else "slope_dyn"
+    r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in mm2.columns else "R2_dyn"
+    slope_vals = mm2[slope_col].values
+    if "slope_dyn_ci_lo" in mm2.columns and "slope_dyn_ci_hi" in mm2.columns:
+        errs_lo, errs_hi = [], []
+        for v, lo, hi in zip(slope_vals,
+                              mm2["slope_dyn_ci_lo"].values,
+                              mm2["slope_dyn_ci_hi"].values):
+            if pd.notna(v) and pd.notna(lo) and pd.notna(hi):
+                errs_lo.append(max(0.0, float(v) - float(lo)))
+                errs_hi.append(max(0.0, float(hi) - float(v)))
+            else:
+                errs_lo.append(0.0); errs_hi.append(0.0)
+        yerr = [errs_lo, errs_hi]
+    else:
+        yerr = None
+    fig, ax = plt.subplots(figsize=(12, 7))
+    bars = ax.bar(range(len(mm2)), slope_vals, yerr=yerr, capsize=3,
+                  color=colors_b, alpha=0.9, edgecolor="white",
+                  error_kw=dict(ecolor="#444444", lw=0.9))
+    for rect, h in zip(bars, hatches):
+        if h:
+            rect.set_hatch(h)
+    for rect, v, r2 in zip(bars, slope_vals, mm2[r2_col].values):
+        _annot_bar_pj(rect, float(v) if pd.notna(v) else float("nan"),
+                      float(r2) if pd.notna(r2) else float("nan"),
+                      "pJ/FLOP")
+    def _tick(v):
+        cu = str(mm2.loc[v, "compute_unit"]) if "compute_unit" in mm2.columns else ""
+        if cu.startswith("Tensor Core (FP16 fallback)"):
+            tag = "TC·FP16-fallback"
+        elif cu.startswith("Tensor"):
+            tag = "TC"
+        elif cu.startswith("CUDA"):
+            tag = "CUDA"
+        else:
+            tag = "?"
+        star = " *" if _emu(v) else ""
+        return f"{v}\n[{tag}]{star}"
+    ax.set_xticks(range(len(mm2)))
+    ax.set_xticklabels([_tick(v) for v in mm2.index],
+                       rotation=20, ha="right", fontsize=10)
+    ax.set_ylabel("J / FLOP (dynamic)  — regression slope")
+    positive = [float(v) for v in slope_vals if pd.notna(v) and float(v) > 0]
+    if positive:
+        ax.set_yscale("log")
+        ax.set_ylim(min(positive) * 0.3, max(positive) * 4)
+    ax.grid(True, axis="y", alpha=0.3)
+    title = ("Matmul — per-variant energy coefficient. "
+             "Labels: slope (pJ/FLOP) + R²")
+    if any(hatches):
+        title += "\n* hatched bar = emulated (not native for this dtype)"
+    ax.set_title(title, fontsize=11)
+    fig.suptitle(f"Power-model coefficient — matmul — {gpu}")
+    _save_fig(fig, out_png)
+    return True
+
+
+def plot_joule_per_op_bar(summary: pd.DataFrame, out_dir: Path, stem: str,
+                          gpu: str) -> None:
+    """Save the elementwise and matmul k_op bar charts as TWO SEPARATE
+    full-width PNGs — one per panel — so the x-axis labels never get
+    cramped. Filenames:
+        <stem>_01_powermodel_coef_bar_elementwise.png
+        <stem>_01_powermodel_coef_bar_matmul.png
+    """
+    ew = summary[summary["category"] == "elementwise"]
+    mm = summary[summary["category"] == "matmul"]
+    _coef_bar_elementwise(ew,
+        out_dir / f"{stem}_01_powermodel_coef_bar_elementwise.png", gpu)
+    _coef_bar_matmul(mm,
+        out_dir / f"{stem}_01_powermodel_coef_bar_matmul.png", gpu)
 
 
 def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
@@ -1073,19 +1065,23 @@ def _short_label(r: dict) -> str:
 
 
 def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
-                      out_png: Path, gpu: str) -> None:
-    """Energy-per-operation grouped by cache locality regime, for both
-    elementwise and matmul categories.
+                      out_dir: Path, stem: str, gpu: str) -> None:
+    """Energy-per-operation grouped by cache locality regime — one PNG
+    per panel for clean x-axes.
 
-    Layout is a 2 × 3 grid:
-      Row 1 — elementwise (ops: mul / add / softmax / gelu / layernorm)
-      Row 2 — matmul      (5 variants: fp32_simt / tf32_tc / fp16_tc / bf16_tc / fp8_te)
-    Columns (shared between rows):
-      A : per-cell strip of the per-op unit (J/elem or J/FLOP) vs regime.
-      B : regime-specific slope_dyn (k_op) from summarize_by_regime, with
-          numeric value annotated on each bar.
-      C : mean dynamic power (W) per regime — DRAM streaming raises
-          steady-state power, not just energy per op.
+    Six output files (when both categories have data):
+        <stem>_02_cache_regime_elementwise_strip.png      Panel A elementwise
+        <stem>_02_cache_regime_elementwise_kop.png        Panel B elementwise
+        <stem>_02_cache_regime_elementwise_dynpower.png   Panel C elementwise
+        <stem>_02_cache_regime_matmul_strip.png           Panel A matmul
+        <stem>_02_cache_regime_matmul_kop.png             Panel B matmul
+        <stem>_02_cache_regime_matmul_dynpower.png        Panel C matmul
+
+    Panel A : per-cell strip of the per-op unit (J/elem or J/FLOP) vs regime.
+    Panel B : regime-specific slope_dyn (k_op) from summarize_by_regime,
+              annotated with the numeric value on each bar.
+    Panel C : mean dynamic power (W) per regime — DRAM streaming raises
+              steady-state power, not just energy per op.
 
     Matmul note: matmul has intrinsic reuse (O(K) per element), so even
     DRAM-sized GEMMs often stay closer to compute-bound than elementwise
@@ -1128,34 +1124,22 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
         mm["cache_regime"] = pd.Categorical(mm["cache_regime"],
                                             categories=regime_order, ordered=True)
 
-    n_rows = (1 if not ew.empty else 0) + (1 if not mm.empty else 0)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(22, 7 * n_rows),
-                             gridspec_kw={"width_ratios": [3, 3, 2]},
-                             squeeze=False)
-
-    def _draw_row(row_ax, cat_df, cat_sum, cat_name, keys_key, key_palette,
-                  unit_col, unit_label, annot_scale, annot_suffix, title_prefix):
-        """Populate one (cat) row across the 3 shared-semantics columns."""
-        ax_a, ax_b, ax_c = row_ax
+    def _resolve_keys(cat_df, keys_key, key_palette):
         keys = [k for k in key_palette.keys() if k in cat_df[keys_key].unique()]
-        # Fallback: if the palette doesn't cover all keys (user added ops),
-        # append remaining keys in deterministic order.
         extras = sorted(k for k in cat_df[keys_key].unique() if k not in keys)
         keys = keys + extras
         extra_cmap = plt.get_cmap("tab20")
         colors = dict(key_palette)
         for i, k in enumerate(extras):
             colors[k] = extra_cmap(i % 20)
+        return keys, colors
 
-        # --- Panel A: per-cell strip ---------------------------------------
-        # Strip plot on a log scale — filter non-positive values. When a
-        # column has zero legitimate points after the filter (e.g. every
-        # matmul cell reported j_per_flop_dyn=0 because of a bad fit), the
-        # panel stays empty but we don't crash and don't let matplotlib
-        # auto-scale to absurd bounds.
-        any_a_pts = False
+    def _panel_strip(cat_df, keys_col, keys, colors, unit_col, unit_label,
+                     title, out_png):
+        fig, ax = plt.subplots(figsize=(14, 7))
+        any_pts = False
         for key in keys:
-            g = cat_df[cat_df[keys_key] == key]
+            g = cat_df[cat_df[keys_col] == key]
             if g.empty:
                 continue
             ys_raw = pd.to_numeric(g[unit_col], errors="coerce")
@@ -1164,90 +1148,78 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
                 continue
             xs = g["cache_regime"].map(regime_x).astype(float) \
                 + (0.05 * (hash(str(key)) % 7 - 3))
-            ax_a.scatter(xs[mask.values], ys_raw[mask].values,
-                         s=42, color=colors[key], marker="o",
-                         alpha=0.8, edgecolors="white", label=str(key))
-            any_a_pts = True
-        ax_a.set_xticks(list(regime_x.values()))
-        ax_a.set_xticklabels([f"{r}\n({regime_hit_rate[r]} L2 hit)"
-                              for r in regime_order])
-        ax_a.set_ylabel(f"{unit_label} (per cell, dynamic)")
-        if any_a_pts:
-            ax_a.set_yscale("log")
-        ax_a.grid(True, axis="y", alpha=0.3)
-        ax_a.set_title(f"{title_prefix}A. Raw spread — every cell")
-        ax_a.legend(fontsize=8, ncol=1, loc="upper left",
-                    bbox_to_anchor=(1.0, 1.0))
+            ax.scatter(xs[mask.values], ys_raw[mask].values,
+                       s=58, color=colors[key], marker="o", alpha=0.85,
+                       edgecolors="white", linewidths=0.6,
+                       label=str(key))
+            any_pts = True
+        ax.set_xticks(list(regime_x.values()))
+        ax.set_xticklabels([f"{r}\n({regime_hit_rate[r]} L2 hit)" for r in regime_order],
+                           fontsize=11)
+        ax.set_ylabel(f"{unit_label} (per cell, dynamic)")
+        if any_pts:
+            ax.set_yscale("log")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_title(title)
+        if any_pts:
+            ax.legend(fontsize=9, ncol=1, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+        _save_fig(fig, out_png)
 
-        # --- Panel B: k_op bars with numeric annotation --------------------
+    def _panel_kop(cat_sum, keys, colors, keys_key, unit_label,
+                   annot_scale, annot_suffix, title, out_png):
         if cat_sum is None or cat_sum.empty:
-            ax_b.set_visible(False)
-        else:
-            width = 0.8 / max(1, len(keys))
-            xpos = np.arange(len(regime_order))
-            positive_vals: list[float] = []   # used for safe log-scale ylim
-            for i, key in enumerate(keys):
-                vals, r2s = [], []
-                for r in regime_order:
-                    row = cat_sum[(cat_sum[keys_key] == key)
-                                  & (cat_sum["cache_regime"] == r)]
-                    if row.empty:
-                        vals.append(np.nan); r2s.append(np.nan)
-                    else:
-                        sl = float(row["slope_dyn"].iloc[0])
-                        if not np.isfinite(sl) or sl <= 0:
-                            # Fall back to the median of per-cell J/unit when
-                            # the regression slope is non-physical (NaN, ≤ 0
-                            # happens for single-point regimes with intercept
-                            # noise). Median is always a real positive J/unit
-                            # value if ANY cell had one.
-                            med = float(row["median_j_per_unit"].iloc[0])
-                            sl = med if np.isfinite(med) and med > 0 else np.nan
-                        vals.append(sl)
-                        r2s.append(float(row["R2_dyn"].iloc[0]))
-                bars = ax_b.bar(xpos + (i - (len(keys)-1)/2) * width, vals, width,
-                                label=str(key), color=colors[key], alpha=0.9,
-                                edgecolor="white")
-                for rect, v, r2 in zip(bars, vals, r2s):
-                    if not np.isfinite(v) or v <= 0:
-                        continue
-                    positive_vals.append(v)
-                    v_p = v * annot_scale
-                    if abs(v_p) >= 1:
-                        vtxt = f"{v_p:.2f}"
-                    elif abs(v_p) >= 0.01:
-                        vtxt = f"{v_p:.3f}"
-                    else:
-                        vtxt = f"{v_p:.2e}"
-                    txt = f"{vtxt} {annot_suffix}"
-                    if np.isfinite(r2):
-                        txt += f"\nR²={r2:.2f}"
-                    ax_b.text(rect.get_x() + rect.get_width()/2,
-                              rect.get_height(), txt,
-                              ha="center", va="bottom", fontsize=7,
-                              linespacing=1.1)
-            ax_b.set_xticks(xpos)
-            ax_b.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
-            ax_b.set_ylabel(f"k_op = slope_dyn  ({unit_label})")
-            # Only switch to log scale when we actually have ≥ 1 positive bar
-            # — otherwise matplotlib can't pick finite log bounds and the
-            # figure expands unboundedly when bbox_inches="tight" is applied.
-            if positive_vals:
-                ax_b.set_yscale("log")
-                lo = min(positive_vals)
-                hi = max(positive_vals)
-                # Anchor the limits explicitly — don't ask matplotlib to
-                # auto-scale. 0.3× below lowest bar, 5× above highest. This
-                # guarantees the figure stays finite even when some bars are
-                # NaN / 0 and others are tiny (mixes of both produced the
-                # ~1.3 Gpx image earlier).
-                ax_b.set_ylim(lo * 0.3, hi * 5)
-            ax_b.grid(True, axis="y", alpha=0.3)
-            ax_b.set_title(f"{title_prefix}B. k_op per regime "
-                           f"(annotated in {annot_suffix})")
-            ax_b.legend(fontsize=8, ncol=min(len(keys), 3), loc="upper left")
+            return
+        fig, ax = plt.subplots(figsize=(14, 7))
+        width = 0.8 / max(1, len(keys))
+        xpos = np.arange(len(regime_order))
+        positive_vals: list[float] = []
+        for i, key in enumerate(keys):
+            vals, r2s = [], []
+            for r in regime_order:
+                row = cat_sum[(cat_sum[keys_key] == key)
+                              & (cat_sum["cache_regime"] == r)]
+                if row.empty:
+                    vals.append(np.nan); r2s.append(np.nan)
+                else:
+                    sl = float(row["slope_dyn"].iloc[0])
+                    if not np.isfinite(sl) or sl <= 0:
+                        med = float(row["median_j_per_unit"].iloc[0])
+                        sl = med if np.isfinite(med) and med > 0 else np.nan
+                    vals.append(sl)
+                    r2s.append(float(row["R2_dyn"].iloc[0]))
+            bars = ax.bar(xpos + (i - (len(keys)-1)/2) * width, vals, width,
+                          label=str(key), color=colors[key], alpha=0.9,
+                          edgecolor="white")
+            for rect, v, r2 in zip(bars, vals, r2s):
+                if not np.isfinite(v) or v <= 0:
+                    continue
+                positive_vals.append(v)
+                v_p = v * annot_scale
+                if abs(v_p) >= 1:
+                    vtxt = f"{v_p:.2f}"
+                elif abs(v_p) >= 0.01:
+                    vtxt = f"{v_p:.3f}"
+                else:
+                    vtxt = f"{v_p:.2e}"
+                txt = f"{vtxt} {annot_suffix}"
+                if np.isfinite(r2):
+                    txt += f"\nR²={r2:.2f}"
+                ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                        txt, ha="center", va="bottom", fontsize=8, linespacing=1.1)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order],
+                           fontsize=11)
+        ax.set_ylabel(f"k_op = slope_dyn  ({unit_label})")
+        if positive_vals:
+            ax.set_yscale("log")
+            ax.set_ylim(min(positive_vals) * 0.3, max(positive_vals) * 5)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_title(title)
+        ax.legend(fontsize=9, ncol=min(len(keys), 5), loc="upper left")
+        _save_fig(fig, out_png)
 
-        # --- Panel C: mean dyn_power_w per regime --------------------------
+    def _panel_dynpower(cat_df, title, out_png):
+        fig, ax = plt.subplots(figsize=(11, 7))
         mean_p = {}
         for r in regime_order:
             g = cat_df[cat_df["cache_regime"] == r]
@@ -1256,20 +1228,22 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
             mean_p[r] = float(vals.mean()) if len(vals) else float("nan")
         x_regime = list(range(len(regime_order)))
         y_power  = [mean_p[r] for r in regime_order]
-        bar_colors = ["#2ca02c", "#ff7f0e", "#d62728"]
-        bars_c = ax_c.bar(x_regime, y_power, color=bar_colors, alpha=0.85)
-        for rect, v in zip(bars_c, y_power):
+        bar_colors = ["#2ca02c", "#7fc97f", "#ff7f0e", "#fb9a99", "#d62728"]
+        bars = ax.bar(x_regime, y_power, color=bar_colors, alpha=0.9, edgecolor="white")
+        for rect, v in zip(bars, y_power):
             if not np.isnan(v):
-                ax_c.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
-                          f"{v:.0f} W", ha="center", va="bottom", fontsize=10)
-        ax_c.set_xticks(x_regime)
-        ax_c.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order])
-        ax_c.set_ylabel("mean dyn power  (W)")
-        ax_c.set_title(f"{title_prefix}C. Steady-state dyn power per regime")
-        ax_c.grid(True, axis="y", alpha=0.3)
+                ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                        f"{v:.0f} W", ha="center", va="bottom", fontsize=11)
+        ax.set_xticks(x_regime)
+        ax.set_xticklabels([f"{r}\n({regime_hit_rate[r]})" for r in regime_order],
+                           fontsize=11)
+        ax.set_ylabel("mean dyn power  (W)")
+        ax.set_title(title)
+        ax.grid(True, axis="y", alpha=0.3)
         if y_power and not all(np.isnan(v) for v in y_power):
-            ymin, ymax = ax_c.get_ylim()
-            ax_c.set_ylim(ymin, ymax * 1.2)
+            ymin, ymax = ax.get_ylim()
+            ax.set_ylim(ymin, ymax * 1.2)
+        _save_fig(fig, out_png)
 
     ew_palette = {"mul": "#1f77b4", "add": "#2ca02c", "softmax": "#d62728",
                   "gelu": "#9467bd", "layernorm": "#ff7f0e"}
@@ -1282,40 +1256,35 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
     mm_sum = (by_regime[by_regime["category"] == "matmul"]
               if by_regime is not None and not by_regime.empty else pd.DataFrame())
 
-    r = 0
     if not ew.empty:
-        _draw_row(axes[r], ew, ew_sum, "elementwise",
-                  keys_key="op", key_palette=ew_palette,
-                  unit_col="j_per_element_dyn", unit_label="J / element",
-                  annot_scale=1e12, annot_suffix="pJ/elem",
-                  title_prefix="[Elementwise]  ")
-        r += 1
+        keys_key = "op"
+        keys, colors = _resolve_keys(ew, keys_key, ew_palette)
+        _panel_strip(ew, keys_key, keys, colors, "j_per_element_dyn", "J / element",
+                     f"Elementwise raw spread per cell — {gpu}",
+                     out_dir / f"{stem}_02_cache_regime_elementwise_strip.png")
+        _panel_kop(ew_sum, keys, colors, keys_key, "J / element",
+                   1e12, "pJ/elem",
+                   f"Elementwise k_op per cache regime — {gpu}  (annotated in pJ/elem)",
+                   out_dir / f"{stem}_02_cache_regime_elementwise_kop.png")
+        _panel_dynpower(ew,
+                        f"Elementwise — steady-state dyn power per cache regime — {gpu}",
+                        out_dir / f"{stem}_02_cache_regime_elementwise_dynpower.png")
     if not mm.empty:
-        _draw_row(axes[r], mm, mm_sum, "matmul",
-                  keys_key="variant", key_palette=mm_palette,
-                  unit_col="j_per_flop_dyn", unit_label="J / FLOP",
-                  annot_scale=1e12, annot_suffix="pJ/FLOP",
-                  title_prefix="[Matmul]  ")
-
-    fig.suptitle(f"Cache-regime breakdown — {gpu}  "
-                 "(B. columns show the k_op value the energy model uses)",
-                 y=1.00)
-    fig.tight_layout()
-    # Belt-and-braces: even with the log-scale / positive-value guards above,
-    # clamp the final figure size so a single pathological artist can never
-    # balloon the PNG into a gigapixel decompression-bomb. 24 inches tall ≈
-    # 3840 px at 160 dpi, which is still generous for two stacked rows.
-    w_in, h_in = fig.get_size_inches()
-    if w_in > 40 or h_in > 24:
-        fig.set_size_inches(min(w_in, 40), min(h_in, 24))
-    # Fixed pad_inches instead of bbox_inches="tight" — the "tight" mode
-    # expands the crop to fit any overflowing artist, which is what let the
-    # figure grow to ~2500 in when a log-scale limit went infinite.
-    fig.savefig(out_png, dpi=160, pad_inches=0.3)
-    print(f"[save] {out_png}")
+        keys_key = "variant"
+        keys, colors = _resolve_keys(mm, keys_key, mm_palette)
+        _panel_strip(mm, keys_key, keys, colors, "j_per_flop_dyn", "J / FLOP",
+                     f"Matmul raw spread per cell — {gpu}",
+                     out_dir / f"{stem}_02_cache_regime_matmul_strip.png")
+        _panel_kop(mm_sum, keys, colors, keys_key, "J / FLOP",
+                   1e12, "pJ/FLOP",
+                   f"Matmul k_op per cache regime — {gpu}  (annotated in pJ/FLOP)",
+                   out_dir / f"{stem}_02_cache_regime_matmul_kop.png")
+        _panel_dynpower(mm,
+                        f"Matmul — steady-state dyn power per cache regime — {gpu}",
+                        out_dir / f"{stem}_02_cache_regime_matmul_dynpower.png")
 
 
-def plot_llm_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
+def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
     """LLM-shape matmul energy per preset as a function of token count T (= M).
 
     Two panels:
@@ -1339,7 +1308,8 @@ def plot_llm_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
         "router":  "#9467bd",   "mlp1":   "#ff7f0e",
         "mlp2":    "#d62728",   "lm_head": "#555555",
     }
-    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(18, 7))
+    # Pre-compute per-preset arrays once, then re-use across both panels.
+    preset_data: dict[str, dict] = {}
     for preset in presets:
         g = llm[llm["llm_preset"] == preset].sort_values("load_value")
         if g.empty:
@@ -1349,55 +1319,62 @@ def plot_llm_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
         dyn = pd.to_numeric(g["dyn_energy_j"], errors="coerce").to_numpy(float)
         iters = pd.to_numeric(g.get("iters", pd.Series(dtype=float)),
                               errors="coerce").to_numpy(float)
-        # Energy PER forward pass of the layer (not per-iter batch) = dyn / iters.
         with np.errstate(divide="ignore", invalid="ignore"):
             e_per_forward = np.where(iters > 0, dyn / iters, dyn)
+        preset_data[preset] = dict(T=T, jpf=jpf, e_per_forward=e_per_forward,
+                                   shape=str(g["shape"].iloc[0]))
+
+    shape_lines = [f"{p}:{d['shape']}" for p, d in preset_data.items()]
+    suptitle_shapes = ", ".join(shape_lines)
+
+    # --- Panel A : J/FLOP vs T ---
+    fig_a, ax_a = plt.subplots(figsize=(15, 7))
+    for preset, d in preset_data.items():
         colour = palette.get(preset, None)
-        # Only show points with positive ys for log axes.
-        mJ = jpf > 0
-        mE = e_per_forward > 0
+        mJ = d["jpf"] > 0
         if mJ.any():
-            ax_a.plot(T[mJ], jpf[mJ], marker="o", color=colour, label=preset)
-            for t, y in zip(T[mJ], jpf[mJ]):
+            ax_a.plot(d["T"][mJ], d["jpf"][mJ], marker="o", color=colour, label=preset)
+            for t, y in zip(d["T"][mJ], d["jpf"][mJ]):
                 ax_a.annotate(f"T={int(t)}", (t, y),
                               textcoords="offset points", xytext=(5, 5),
-                              fontsize=7, color=colour, alpha=0.85)
+                              fontsize=8, color=colour, alpha=0.9)
+    ax_a.set_xscale("log"); ax_a.set_yscale("log")
+    ax_a.grid(True, alpha=0.3)
+    ax_a.set_xlabel("token count T  (= M dim)")
+    ax_a.set_ylabel("J / FLOP  (dynamic)")
+    ax_a.legend(fontsize=9, ncol=2, loc="best")
+    ax_a.set_title(f"LLM-shape matmul — Per-FLOP energy vs T — {gpu}\n"
+                   f"flat = BW-bound, rising = compute-bound. Shapes: {suptitle_shapes}",
+                   fontsize=10)
+    lo, hi = ax_a.get_ylim()
+    if np.isfinite(lo) and np.isfinite(hi) and lo > 0:
+        ax_a.set_ylim(lo, hi * 4)
+    _save_fig(fig_a, out_dir / f"{stem}_01_powermodel_llm_jperflop.png")
+
+    # --- Panel B : per-call energy (mJ) vs T ---
+    fig_b, ax_b = plt.subplots(figsize=(15, 7))
+    for preset, d in preset_data.items():
+        colour = palette.get(preset, None)
+        mE = d["e_per_forward"] > 0
         if mE.any():
-            ax_b.plot(T[mE], e_per_forward[mE], marker="o", color=colour,
-                      label=preset)
-            for t, y in zip(T[mE], e_per_forward[mE]):
+            ax_b.plot(d["T"][mE], d["e_per_forward"][mE], marker="o",
+                      color=colour, label=preset)
+            for t, y in zip(d["T"][mE], d["e_per_forward"][mE]):
                 ax_b.annotate(f"T={int(t)}\n{y*1e3:.2f} mJ", (t, y),
                               textcoords="offset points", xytext=(5, 5),
-                              fontsize=6.5, color=colour, alpha=0.85)
-    for ax in (ax_a, ax_b):
-        ax.set_xscale("log"); ax.set_yscale("log")
-        ax.grid(True, alpha=0.3)
-        ax.set_xlabel("token count T  (= M dim)")
-        ax.legend(fontsize=8, ncol=2, loc="best")
-    ax_a.set_ylabel("J / FLOP  (dynamic)")
-    ax_a.set_title("A. Per-FLOP energy vs token count — flat = BW-bound, "
-                   "rising = compute-bound")
+                              fontsize=7, color=colour, alpha=0.9)
+    ax_b.set_xscale("log"); ax_b.set_yscale("log")
+    ax_b.grid(True, alpha=0.3)
+    ax_b.set_xlabel("token count T  (= M dim)")
     ax_b.set_ylabel("J per forward pass of this layer")
-    ax_b.set_title("B. Per-call energy vs T  (annotated in mJ)")
-    # Pick headroom manually to leave space for the K/N legend entries.
-    for ax in (ax_a, ax_b):
-        lo, hi = ax.get_ylim()
-        if np.isfinite(lo) and np.isfinite(hi) and lo > 0:
-            ax.set_ylim(lo, hi * 4)
-
-    # Title records which preset shapes were in play so the PNG is
-    # self-documenting (important for multi-model comparisons).
-    shape_lines = []
-    for preset in presets:
-        g = llm[llm["llm_preset"] == preset]
-        if g.empty:
-            continue
-        shape = str(g["shape"].iloc[0])
-        shape_lines.append(f"{preset}:{shape}")
-    fig.suptitle(f"LLM-shape matmul — {gpu}   "
-                 f"({', '.join(shape_lines)})", y=1.00, fontsize=9)
-    fig.tight_layout(); fig.savefig(out_png, dpi=160, pad_inches=0.3)
-    print(f"[save] {out_png}")
+    ax_b.legend(fontsize=9, ncol=2, loc="best")
+    ax_b.set_title(f"LLM-shape matmul — per-call energy vs T — {gpu}\n"
+                   f"(annotated in mJ). Shapes: {suptitle_shapes}",
+                   fontsize=10)
+    lo, hi = ax_b.get_ylim()
+    if np.isfinite(lo) and np.isfinite(hi) and lo > 0:
+        ax_b.set_ylim(lo, hi * 4)
+    _save_fig(fig_b, out_dir / f"{stem}_01_powermodel_llm_per_call.png")
 
 
 # Literature reference points for DRAM pJ/bit, drawn as horizontal guide
@@ -1412,7 +1389,7 @@ _DRAM_REFERENCE_PJBIT = {
 }
 
 
-def plot_dram_energy(df: pd.DataFrame, out_png: Path, gpu: str,
+def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
                      hbm_peak_gbps: float | None = None) -> None:
     """pJ/bit + achieved BW per cell, sliced by cache_regime.
 
@@ -1447,14 +1424,13 @@ def plot_dram_energy(df: pd.DataFrame, out_png: Path, gpu: str,
     if ew.empty:
         return
 
-    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(18, 7),
-                                     gridspec_kw={"width_ratios": [3, 2]})
     palette_cmap = plt.get_cmap("tab10")
     ops = sorted(ew["op"].unique())
     op_color = {op: palette_cmap(i % 10) for i, op in enumerate(ops)}
     regime_x = {r: i for i, r in enumerate(regime_order)}
 
     # --- Panel A : pJ/bit strip, regime on x ---
+    fig_a, ax_a = plt.subplots(figsize=(15, 7))
     for op in ops:
         for dt, marker in (("fp16", "o"), ("fp8", "s"),
                            ("bf16", "^"), ("fp32", "D"), ("tf32", "v")):
@@ -1476,49 +1452,45 @@ def plot_dram_energy(df: pd.DataFrame, out_png: Path, gpu: str,
     ax_a.set_xticks(list(regime_x.values()))
     hit_pct = {"l2_hit_100": "100%", "l2_hit_75": "75%",
                "l2_hit_50": "50%",  "l2_hit_25": "25%", "l2_hit_0": "0%"}
-    ax_a.set_xticklabels([f"{r}\n(~{hit_pct[r]} L2 hit)" for r in regime_order])
+    ax_a.set_xticklabels([f"{r}\n(~{hit_pct[r]} L2 hit)" for r in regime_order],
+                         fontsize=11)
     ax_a.set_yscale("log")
     ax_a.set_ylabel("pJ / bit  (working-set traffic)")
-    ax_a.set_title("A. Per-cell pJ/bit by cache regime — l2_hit_0 ≈ DRAM cost,\n"
-                   "    dashed lines: literature reference (full HBM/DRAM stack)")
+    ax_a.set_title(f"DRAM energy — per-cell pJ/bit by cache regime — {gpu}\n"
+                   "l2_hit_0 ≈ DRAM cost; dashed = literature reference (full stack)")
     ax_a.grid(True, axis="y", alpha=0.3)
-    ax_a.legend(fontsize=7, ncol=1, loc="upper left", bbox_to_anchor=(1.18, 1.0))
+    ax_a.legend(fontsize=8, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    _save_fig(fig_a, out_dir / f"{stem}_02_dram_energy_pjbit.png")
 
     # --- Panel B : achieved BW at l2_hit_0 ---
     drm = ew[ew["cache_regime"] == "l2_hit_0"]
     if drm.empty:
-        ax_b.set_visible(False)
-    else:
-        # Aggregate per (op, dtype) — take the median BW (sustained value).
-        agg = drm.groupby(["op", "dtype"]).agg(
-            bw_med=("achieved_bw_gbps", "median"),
-            n=("achieved_bw_gbps", "size"),
-        ).reset_index()
-        agg = agg.sort_values(["op", "dtype"]).reset_index(drop=True)
-        xs = np.arange(len(agg))
-        bars = ax_b.bar(xs, agg["bw_med"], color=[op_color[o] for o in agg["op"]],
-                        alpha=0.85, edgecolor="white")
-        for rect, v in zip(bars, agg["bw_med"]):
-            if not np.isnan(v):
-                ax_b.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
-                          f"{v:.0f}", ha="center", va="bottom", fontsize=8)
-        ax_b.set_xticks(xs)
-        ax_b.set_xticklabels([f"{r['op']}\n{r['dtype']}" for _, r in agg.iterrows()],
-                             rotation=0, fontsize=8)
-        ax_b.set_ylabel("achieved sustained BW  (GB/s)")
-        ax_b.set_title("B. l2_hit_0 sustained BW per kernel "
-                       "(median across N values)")
-        ax_b.grid(True, axis="y", alpha=0.3)
-        if hbm_peak_gbps:
-            ax_b.axhline(hbm_peak_gbps, color="#d62728", ls="--", lw=1.2,
-                         label=f"HBM peak ≈ {hbm_peak_gbps:.0f} GB/s")
-            ax_b.legend(fontsize=8)
-
-    fig.suptitle(f"DRAM bandwidth energy — {gpu}  "
-                 "(l2_hit_0 = DRAM-streaming regime; literature lines for context)",
-                 y=1.00, fontsize=10)
-    fig.tight_layout(); fig.savefig(out_png, dpi=160, pad_inches=0.3)
-    print(f"[save] {out_png}")
+        return
+    agg = drm.groupby(["op", "dtype"]).agg(
+        bw_med=("achieved_bw_gbps", "median"),
+        n=("achieved_bw_gbps", "size"),
+    ).reset_index()
+    agg = agg.sort_values(["op", "dtype"]).reset_index(drop=True)
+    fig_b, ax_b = plt.subplots(figsize=(12, 7))
+    xs = np.arange(len(agg))
+    bars = ax_b.bar(xs, agg["bw_med"], color=[op_color[o] for o in agg["op"]],
+                    alpha=0.9, edgecolor="white")
+    for rect, v in zip(bars, agg["bw_med"]):
+        if not np.isnan(v):
+            ax_b.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                      f"{v:.0f}", ha="center", va="bottom", fontsize=10)
+    ax_b.set_xticks(xs)
+    ax_b.set_xticklabels([f"{r['op']}\n{r['dtype']}" for _, r in agg.iterrows()],
+                         rotation=0, fontsize=10)
+    ax_b.set_ylabel("achieved sustained BW  (GB/s)")
+    ax_b.set_title(f"DRAM-streaming sustained BW per kernel — {gpu}  "
+                   "(median across N at l2_hit_0)")
+    ax_b.grid(True, axis="y", alpha=0.3)
+    if hbm_peak_gbps:
+        ax_b.axhline(hbm_peak_gbps, color="#d62728", ls="--", lw=1.2,
+                     label=f"HBM peak ≈ {hbm_peak_gbps:.0f} GB/s")
+        ax_b.legend(fontsize=9)
+    _save_fig(fig_b, out_dir / f"{stem}_02_dram_energy_bw.png")
 
 
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
@@ -1753,8 +1725,9 @@ def main() -> int:
         out_dir / f"{stem}_01_powermodel_linearity_elementwise.png", gpu)
     plot_linearity_matmul(plot_df,
         out_dir / f"{stem}_01_powermodel_linearity_matmul.png", gpu)
-    plot_joule_per_op_bar(plot_summary,
-        out_dir / f"{stem}_01_powermodel_coefficient_bar.png", gpu)
+    # Coefficient bar — split into two full-width PNGs (elementwise / matmul)
+    # so neither x-axis is cramped against the other panel.
+    plot_joule_per_op_bar(plot_summary, out_dir, stem, gpu)
     # Filter the by-regime summary in the same way (elementwise fp8 hidden
     # by default) so annotations on the plot stay consistent with the
     # other plots. Matmul rows are kept either way.
@@ -1764,14 +1737,13 @@ def main() -> int:
             (by_regime["emulated"].astype(int) == 0)
             | (by_regime["category"] == "matmul")
         ].copy()
-    plot_cache_regime(plot_df, plot_by_regime,
-                      out_dir / f"{stem}_02_cache_regime.png", gpu)
-    # DRAM bandwidth energy plot (auto-skipped if no traffic metrics yet).
-    plot_dram_energy(plot_df,
-                     out_dir / f"{stem}_02_dram_energy.png", gpu)
-    # LLM-shape matmul plot (only generates if matmul_llm rows present).
-    plot_llm_matmul(plot_df,
-                    out_dir / f"{stem}_01_powermodel_llm_matmul.png", gpu)
+    # Cache-regime — 6 separate per-panel PNGs (per-cell strip / k_op bar /
+    # mean dyn power × elementwise / matmul) so x-axis stays readable.
+    plot_cache_regime(plot_df, plot_by_regime, out_dir, stem, gpu)
+    # DRAM-bandwidth energy — 2 separate PNGs (pJ/bit strip + sustained BW).
+    plot_dram_energy(plot_df, out_dir, stem, gpu)
+    # LLM-shape matmul — 2 separate PNGs (J/FLOP-vs-T + per-call energy).
+    plot_llm_matmul(plot_df, out_dir, stem, gpu)
 
     # --- console summary: pJ/bit at l2_hit_0 (DRAM streaming) -------------
     if "pj_per_bit_traffic" in df.columns:

@@ -100,6 +100,82 @@ QUICK_MATMUL_SIZES = [1024, 2048, 4096]
 _MEM_SAFETY_FRACTION = 0.25
 
 
+# ---- test-suite presets ----------------------------------------------------
+# Each suite is a dict of argparse-style attribute overrides applied to the
+# parser's defaults BEFORE the user's argv is parsed. So the user can still
+# override any individual flag explicitly. Suites compose the canonical
+# benchmark categories (elementwise, matmul, cache, dram, llm) into named
+# bundles so a user doesn't have to memorise 8 flags to run a focused test.
+#
+# Usage:
+#   ./run_bench.sh --suite smoke              # 5-min sanity check
+#   ./run_bench.sh --suite cache --tag h100   # pure cache regime sweep
+#   ./run_bench.sh --suite full --tag h100    # everything + drift correction
+#
+# A user may override any field, e.g.:
+#   ./run_bench.sh --suite full --no-matmul   # skip matmul portion of full
+SUITES: dict[str, dict] = {
+    "smoke": {
+        # Minimum-effort sanity check — quick mode (3 small load points)
+        # plus matmul off. ~5 minutes. Good for verifying the pipeline
+        # before spending 30 min on the real sweep.
+        "_doc":   "5-min sanity check (--quick + matmul off)",
+        "quick":      True,
+        "no_matmul":  True,
+    },
+    "powermodel": {
+        # Original baseline benchmark — elementwise + matmul, no extras.
+        # Produces the canonical k_op coefficient table.
+        "_doc": "elementwise + matmul, no extra probes (default behaviour)",
+    },
+    "cache": {
+        # Focused 5-point cache-regime sweep (--cache-sweep). Drops the
+        # default load list in favour of L2/8, L2/3, L2, 3·L2, 8·L2
+        # working-set targets so each (op, dtype) gets exactly one cell
+        # per regime bucket. Matmul kept on — its per-K size sweep already
+        # spans regimes naturally.
+        "_doc":         "focused 5-point per-regime cache sweep + matmul",
+        "cache_sweep":  True,
+    },
+    "dram": {
+        # STREAM-style copy/scale/triad probes only. No elementwise, no
+        # matmul — purest signal for pJ/bit derivation.
+        "_doc":           "STREAM-style DRAM bandwidth probes only (pJ/bit)",
+        "dram_bw_test":   True,
+        "no_matmul":      True,
+        "no_elementwise": True,
+    },
+    "llm": {
+        # Real LLM layer shapes (gpt-oss-120B presets) at 5 token counts.
+        # Skips the synthetic elementwise / square-matmul sweeps.
+        "_doc":           "gpt-oss-120B layer shapes only (qkv / mlp / lm_head etc.)",
+        "llm_shapes":     True,
+        "no_elementwise": True,
+        "no_matmul":      True,
+    },
+    "full": {
+        # Most thorough — everything on, plus drift correction. ~75 min.
+        # The recommended suite for a publication-quality measurement.
+        "_doc":             "everything + periodic re-baseline (~75 min)",
+        "llm_shapes":       True,
+        "dram_bw_test":     True,
+        "rebaseline_every": 20,
+    },
+}
+
+
+def _apply_suite_to_parser(parser, suite_name: str) -> None:
+    """Push a suite's overrides into the parser's default values so the
+    user's explicit argv still wins."""
+    if suite_name not in SUITES:
+        raise SystemExit(
+            f"unknown --suite {suite_name!r}. choices: {sorted(SUITES)}")
+    overrides = {k: v for k, v in SUITES[suite_name].items()
+                 if not k.startswith("_")}
+    if overrides:
+        parser.set_defaults(**overrides)
+
+
 def _cell_memory_bytes(op: str, dtype_label: str, n_elements: int) -> int:
     """Conservative upper bound on DRAM footprint of a single elementwise cell.
 
@@ -233,7 +309,16 @@ def run_measurement(spec: bm.BenchSpec, sampler: PowerSampler,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+        epilog=("Test-suite presets (--suite NAME):\n"
+                + "\n".join(f"  {k:11s} {v.get('_doc','')}"
+                            for k, v in SUITES.items())))
+    ap.add_argument("--suite", choices=list(SUITES), default=None,
+                    help="apply a predefined bundle of flags. See epilog "
+                         "above. Individual flags after --suite still "
+                         "override the suite's defaults.")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--ops", nargs="+",
                     default=list(bm.OPS),
@@ -326,6 +411,16 @@ def main() -> int:
                     help="working-set-target N values for --dram-bw-test "
                          "(default: 4 sizes deep into the l2_hit_0 regime)")
     args = ap.parse_args()
+
+    # If a suite was named, re-parse so its overrides become defaults but
+    # explicit user flags still take precedence. Also print the resolved
+    # config so the user can see what the suite expanded into.
+    if args.suite:
+        _apply_suite_to_parser(ap, args.suite)
+        args = ap.parse_args()
+        sd = SUITES[args.suite]
+        flags = ", ".join(f"{k}={v}" for k, v in sd.items() if not k.startswith("_"))
+        print(f"[suite] '{args.suite}' → {flags or '(no overrides — legacy default)'}")
 
     if args.no_elementwise and args.no_matmul:
         print("[error] --no-elementwise and --no-matmul together select zero cells")
@@ -821,6 +916,9 @@ def main() -> int:
     print(f"[save] {raw_path}  ({len(sampler.samples)} NVML samples)")
 
     print("\nnext: python3 analyze.py {}  # generate linearity plots".format(csv_path))
+    # Machine-readable last line — run_bench.sh greps this to chain
+    # `analyze.py <csv>` automatically. Keep the prefix exact.
+    print(f"[OUTPUT_CSV] {csv_path}")
     return 0
 
 
