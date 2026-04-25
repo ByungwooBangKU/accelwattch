@@ -258,6 +258,17 @@ def main() -> int:
     ap.add_argument("--cooldown-timeout", type=float, default=180.0)
     ap.add_argument("--no-cooldown", action="store_true",
                     help="skip thermal cool-down between cells")
+    ap.add_argument("--rebaseline-every", type=int, default=0,
+                    help="re-measure idle / static power every N cells "
+                         "(0 = once at start, no drift correction). 20 is a "
+                         "good default for a 130-cell sweep — adds about "
+                         "1–2 minutes of wall time but tracks the 1–3 W of "
+                         "P_static drift that builds up over a 30-minute run.")
+    ap.add_argument("--rebaseline-seconds", type=float, default=4.0,
+                    help="duration of each re-baseline measurement (s). "
+                         "Shorter than --static-seconds because we already "
+                         "have a thermal context and only need a quick "
+                         "re-anchor. Default 4 s.")
     ap.add_argument("--out-dir", type=str, default="reports")
     ap.add_argument("--tag", type=str, default="",
                     help="suffix for output filenames (separate runs / configs)")
@@ -521,8 +532,57 @@ def main() -> int:
           f"matmul_llm={sum(1 for p in plans if p['category']=='matmul_llm')})")
 
     rows: list[dict] = []
+    # Re-baseline drift bookkeeping. p_static_ts records the wall clock
+    # at which the active idle-power estimate was taken, so each row can
+    # report `baseline_age_s` — how stale the P_static was when used.
+    p_static_ts = time.perf_counter()
+    rebaseline_history: list[dict] = [{
+        "after_cell": 0,
+        "p_static_w": p_static,
+        "p_static_w_std": baseline.get("power_w_std", float("nan")),
+        "duration_s": baseline.get("duration_s", args.static_seconds),
+        "wall_ts": p_static_ts,
+        "kind": "initial",
+    }]
+    # Counters for the post-sweep clip-bias report.
+    n_clip_power = 0
+    n_clip_energy = 0
     try:
         for i, plan in enumerate(plans, 1):
+            # Periodic re-baseline. Done BEFORE the per-cell cooldown so
+            # the fresh idle measurement also serves as a thermal
+            # stabilisation window. Skipped on cell #1 (we already have a
+            # fresh baseline from program start) and when the user opts
+            # out by passing --rebaseline-every 0.
+            if (args.rebaseline_every > 0 and i > 1
+                    and (i - 1) % args.rebaseline_every == 0):
+                # The active sampler is logging this idle period — tag it
+                # so analyse can find/exclude these intervals.
+                sampler.set_phase(f"rebaseline_after_{i-1}")
+                # Drain any pending GPU work before measuring idle.
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                rb = measure_static_power(handle,
+                                          seconds=args.rebaseline_seconds,
+                                          hz=args.poll_hz)
+                new_p = rb["power_w_mean"]
+                drift = new_p - p_static
+                print(f"\n[rebaseline @ cell {i-1}/{total_cells}] "
+                      f"P_static {p_static:.2f} W → {new_p:.2f} W "
+                      f"(Δ {drift:+.2f} W, σ {rb.get('power_w_std', 0):.2f} W, "
+                      f"{rb.get('temp_c_mean', -1):.1f}°C)")
+                p_static = new_p
+                p_static_ts = time.perf_counter()
+                rebaseline_history.append({
+                    "after_cell": i - 1,
+                    "p_static_w": p_static,
+                    "p_static_w_std": rb.get("power_w_std", float("nan")),
+                    "duration_s": rb.get("duration_s", args.rebaseline_seconds),
+                    "wall_ts": p_static_ts,
+                    "kind": "periodic",
+                })
+                sampler.set_phase("gap")
+
             label = f"{plan['op']}_{plan['dtype']}_{plan['mode']}"
             print(f"\n[{i}/{total_cells}] {label}  {plan['load_name']}={plan['load_value']}")
 
@@ -562,11 +622,22 @@ def main() -> int:
                 continue
 
             # Energy decomposition: we subtract the baseline / static power
-            # (measured idle at program start) from the measured average
-            # power to get the dynamic (workload-attributable) component.
-            dyn_power = max(0.0, meas["avg_power_w"] - p_static)
+            # from the measured average power to get the dynamic
+            # (workload-attributable) component. The clip-to-zero is the
+            # standard convention because negative dyn is non-physical, but
+            # at very low load NVML noise + P_static drift CAN push the raw
+            # difference slightly below zero — clipping then biases the
+            # low-load mean upward, which flattens the log-log regression
+            # slope. We therefore record BOTH the raw (signed) value and
+            # the clipped one so analyse can quantify the bias and warn.
+            dyn_power_raw = meas["avg_power_w"] - p_static
+            dyn_power = max(0.0, dyn_power_raw)
             static_energy = p_static * meas["wall_s"]
-            dyn_energy = max(0.0, meas["total_energy_j"] - static_energy)
+            dyn_energy_raw = meas["total_energy_j"] - static_energy
+            dyn_energy = max(0.0, dyn_energy_raw)
+            if dyn_power_raw < 0: n_clip_power += 1
+            if dyn_energy_raw < 0: n_clip_energy += 1
+            baseline_age_s = time.perf_counter() - p_static_ts
 
             total_elements = spec.n_elements * meas["iters"]
             total_flops = spec.flops_per_call * meas["iters"]
@@ -603,11 +674,20 @@ def main() -> int:
                 "total_flops": total_flops,
                 "total_elements": total_elements,
                 "static_power_w": f"{p_static:.3f}",
+                # baseline_age_s — how stale (s) the active P_static was
+                # when this cell ran. 0 if --rebaseline-every is on and we
+                # just refreshed; up to ~30 min if not.
+                "baseline_age_s": f"{baseline_age_s:.1f}",
                 "avg_power_w":    f"{meas['avg_power_w']:.3f}",
                 "dyn_power_w":    f"{dyn_power:.3f}",
+                # Pre-clip dynamic — sometimes negative when noise + drift
+                # nudge a low-load measurement below P_static. Lets analyse
+                # see exactly how much clipping inflated the low end.
+                "dyn_power_w_raw":  f"{dyn_power_raw:.3f}",
                 "total_energy_j":  f"{meas['total_energy_j']:.4f}",
                 "static_energy_j": f"{static_energy:.4f}",
                 "dyn_energy_j":    f"{dyn_energy:.4f}",
+                "dyn_energy_j_raw":f"{dyn_energy_raw:.4f}",
                 "j_per_element_total": f"{meas['total_energy_j']/total_elements:.3e}",
                 "j_per_element_dyn":   f"{dyn_energy/total_elements:.3e}",
                 "j_per_flop_total":    f"{meas['total_energy_j']/total_flops:.3e}",
@@ -656,6 +736,48 @@ def main() -> int:
     else:
         print("\n[warn] no rows collected — nothing saved")
         return 2
+
+    # ---- clip-bias report ------------------------------------------------
+    # Tells the user how often the dyn = max(0, raw) clip fired. Frequent
+    # clipping at low load is a sign that P_static was too high (drift),
+    # not necessarily that the kernel is genuinely above idle.
+    n_total = len(rows)
+    if n_total > 0:
+        pct_p = 100.0 * n_clip_power  / n_total
+        pct_e = 100.0 * n_clip_energy / n_total
+        if n_clip_power > 0 or n_clip_energy > 0:
+            print(f"\n[clip] dyn_power_w  clipped to 0 on {n_clip_power}/{n_total} cells ({pct_p:.1f}%)")
+            print(f"[clip] dyn_energy_j clipped to 0 on {n_clip_energy}/{n_total} cells ({pct_e:.1f}%)")
+            print(f"[clip] inspect dyn_power_w_raw / dyn_energy_j_raw columns to see "
+                  f"the unclipped residual; large clip rate (≥ 20%) at small N means "
+                  f"P_static drifted above the true idle — consider --rebaseline-every 20.")
+        else:
+            print(f"\n[clip] no cells required clipping — dyn_raw stayed positive on all "
+                  f"{n_total} cells.")
+
+    # ---- re-baseline history sidecar -------------------------------------
+    # One row per baseline measurement (initial + each periodic refresh).
+    # analyse can plot P_static(time) to verify whether drift is monotone
+    # (rack warming up) vs random (background noise).
+    rebaseline_path = out_dir / f"gpu_power_bench_{gpu_slug}_{stamp}{suffix}_rebaseline.csv"
+    with open(rebaseline_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["after_cell", "kind", "p_static_w", "p_static_w_std",
+                    "duration_s", "wall_ts"])
+        for r in rebaseline_history:
+            w.writerow([r["after_cell"], r["kind"],
+                        f"{r['p_static_w']:.3f}",
+                        f"{r['p_static_w_std']:.3f}",
+                        f"{r['duration_s']:.2f}",
+                        f"{r['wall_ts']:.2f}"])
+    if len(rebaseline_history) > 1:
+        # Quick drift summary
+        ps_vals = [r["p_static_w"] for r in rebaseline_history]
+        drift_total = ps_vals[-1] - ps_vals[0]
+        drift_max = max(ps_vals) - min(ps_vals)
+        print(f"[rebaseline] {len(rebaseline_history)} P_static measurements over the sweep; "
+              f"net drift {drift_total:+.2f} W, range {drift_max:.2f} W")
+    print(f"[save] {rebaseline_path}")
 
     # Dump the idle / static-power baseline as a sidecar so analyze.py can
     # draw a P_static(t) plot (flat line = idle was clean; sawtooth = bad).
