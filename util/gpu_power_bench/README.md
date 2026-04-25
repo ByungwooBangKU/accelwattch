@@ -298,6 +298,49 @@ python3 gpu_power_bench.py --device 0 --cache-sweep --tag h100_cache --out-dir r
 
 출력은 평소처럼 CSV 에 쌓이고, `analyze.py` 는 `_02_cache_regime.png` 플롯을 새로 그립니다 (§6.4.1 참조).
 
+### 3.5 DRAM bandwidth energy — `pJ/bit` 측정
+
+**목표**: HBM ↔ GPU 간 한 비트를 옮기는 데 드는 동적 에너지를 실측해서 선행 연구의 전형값과 비교. 즉 측정값이 "GPU 가 DRAM 트래픽으로 쓰는 pJ/bit" 인지 검증.
+
+**측정 원리**: cache regime `l2_hit_0` (working set ≥ 4·L2) 의 elementwise cell 은 매 iter 마다 데이터를 DRAM 에서 streaming 으로 가져와요. 이 영역에서:
+
+```
+bytes_traffic   = (read+write 횟수) × N × bytes_per_elem × iters
+pJ_per_bit      = dyn_energy_J × 1e12 / (bytes_traffic × 8)
+achieved_BW     = bytes_traffic / wall_s
+```
+
+`analyze.py` 가 모든 elementwise row 에 대해 자동으로 `bytes_traffic`, `pj_per_bit_traffic`, `achieved_bw_gbps` 컬럼을 derive 합니다 (per-cell CSV 에 추가). l2_hit_0 cell 의 median 이 곧 DRAM 전송 에너지.
+
+**선행 연구 참조 표** (full stack: DRAM cells + PHY + controller — 우리 측정 boundary 와 가장 가까움):
+
+| 메모리 | 보고 pJ/bit | 출처 / 비고 |
+|---|---|---|
+| **HBM2** (V100) | **~7.0** | NVIDIA / industry consensus |
+| **HBM2E** (A100) | **~5.0** | A100 white-paper 추정 |
+| **HBM3** (H100) | **~3.9** | Hopper white-paper, "up to 50% energy reduction vs HBM2" 로부터 derive |
+| DDR4 | ~7.0 | O'Connor et al., MICRO 2017 — "Fine-Grained DRAM" |
+| DRAM core only | ~2.5 | Horowitz, ISSCC 2014, "Computing's Energy Problem" — 256-bit access ≈ 640 pJ, controller 제외 |
+
+**측정 boundary 와의 차이**: 우리는 board-level NVML 을 적분하므로 **HBM PHY + L2 → HBM 라우팅 + idle controller overhead 까지 포함**. 따라서 실측치는 위 reference 보다 **1.5–3× 높게** 나오는 게 정상 (HBM3 H100 에서 6–10 pJ/bit 가 일반적). reference 와 정확히 일치하지 않더라도, **L2-resident 와 DRAM-stream 간의 비율** (보통 5–10×) 이 cache 의 에너지적 가치를 보여줍니다.
+
+**옵션 1 — 기존 sweep 만으로**: `mul`, `add` 의 l2_hit_0 cell 이 사실상 STREAM-style 프로브와 동일. 별도 플래그 없이 `analyze.py` 만 돌리면 됩니다.
+
+**옵션 2 — Dedicated STREAM 프로브 (`--dram-bw-test`)**: 더 깔끔한 측정을 원하면 STREAM-style copy/scale/triad 3 종을 큰 working set 4 점에서 추가:
+
+```bash
+python3 gpu_power_bench.py --device 0 --dram-bw-test --tag h100_dram
+python3 analyze.py --reports-dir reports/ --tag h100_dram
+```
+
+해당 커널들 (`stream_copy`, `stream_scale`, `stream_triad`) 은 **연산이 거의 없어서** 동적 에너지가 거의 전부 메모리 트래픽. 따라서 derive 된 pJ/bit 가 mul/add 의 그것보다 noise 가 더 작음.
+
+**`_02_dram_energy.png` 분석** (§6.4.2 참조): 2 panel.
+- **Panel A**: cell 별 pJ/bit 을 cache_regime x축으로 strip. 우측에 HBM2/HBM2E/HBM3/DDR4/Horowitz reference 가 dashed line 으로 그려져 있어서 측정치가 어디 위치하는지 즉시 비교 가능.
+- **Panel B**: l2_hit_0 cell 의 sustained BW (GB/s). HBM peak 점선과 함께 표시 — peak 의 50% 이상이면 BW-bound 이 정상, 30% 이하면 launch overhead 또는 kernel inefficiency 의심.
+
+**Static vs dynamic 분리**: `dyn_energy_j = total_energy_j − static_power_w × wall_s`. static 은 §3.4 의 baseline 측정 (12 초 idle) 에서 mean ± std 가 5% 이내일 때만 신뢰 가능. baseline plot (`_03_baseline_static_power.png`) 에서 idle trace 가 평탄한지 먼저 확인 후 pJ/bit 해석.
+
 ## 4. 측정 방법론
 
 ### 4.1 NVML power telemetry
@@ -472,6 +515,18 @@ k_op per cache regime (J/element for elementwise, J/FLOP for matmul):
  fp16_mul    CUDA core     dram_stream   3          4.08e-12      0.985    5.03e-12            200.0
  ...
 ```
+
+### 6.4.2 `dram_energy.png` — DRAM 트래픽의 pJ/bit + sustained BW
+
+**무엇을 보여주나** : 가로 2 panel (§3.5 자세한 배경).
+
+- **Panel A** : 각 cell 의 `pj_per_bit_traffic` 을 strip plot 으로 cache_regime x축에 표시. l2_hit_0 cluster 가 곧 DRAM 비용. HBM2/HBM2E/HBM3/DDR4/Horowitz '14 의 reference 값이 panel 우측에 dashed 가로선 + 라벨로 그려져 즉시 비교 가능.
+- **Panel B** : l2_hit_0 cell 의 op×dtype 별 median sustained BW (GB/s). HBM peak 가 알려져 있으면 빨간 dashed line 으로 표시 — 50% 이상이면 BW-bound 이 정상, 30% 이하면 launch overhead / 비효율 의심.
+
+**어떻게 읽나** :
+- l2_hit_0 strip 의 median 이 HBM3 reference (3.9 pJ/bit) 의 1.5–3 배 안이면 측정 정상 (board-level boundary 보정 후). 5 배 이상이면 baseline static power 가 잘못 잡혔거나 thermal throttle 가능성.
+- l2_hit_100 cluster 가 l2_hit_0 보다 **1 order 정도 낮으면** (예: 0.5 vs 5 pJ/bit), L2 가 잘 동작하고 있다는 강한 증거.
+- Panel B 에서 fp8 / fp16 / fp32 가 같은 op 에 대해 비슷한 sustained BW 면 BW-bound; fp16 보다 fp32 가 절반이면 BW 가 fp16 에서 saturate 안 함 → launch overhead 가 아직 존재.
 
 ### 6.5 `temperature.png` — 열 특성
 
@@ -816,6 +871,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_01_powermodel_linearity_matmul.png`      | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
 | `<stem>_01_powermodel_coefficient_bar.png`       | bar chart — 좌 elementwise, 우 matmul. 각 bar 에 pJ/elem (또는 pJ/FLOP) + R² 값 라벨 |
 | `<stem>_02_cache_regime.png`                     | 5-bucket L2 hit rate 별 J/element / J/FLOP (strip + k_op bar + steady-state dyn power) |
+| `<stem>_02_dram_energy.png`                      | DRAM 트래픽 pJ/bit + sustained BW (HBM2/HBM3 reference 라인 포함) |
 | `<stem>_03_baseline_static_power.png`            | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
 | `<stem>_04_thermal_diagnostics.png`              | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
 | `<stem>_05_trace_timeline.png`                   | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
@@ -906,6 +962,7 @@ reports/
 │   ├── <stem>_01_powermodel_linearity_matmul.png
 │   ├── <stem>_01_powermodel_coefficient_bar.png
 │   ├── <stem>_02_cache_regime.png
+│   ├── <stem>_02_dram_energy.png
 │   ├── <stem>_03_baseline_static_power.png
 │   ├── <stem>_04_thermal_diagnostics.png
 │   └── <stem>_05_trace_timeline.png
@@ -943,6 +1000,9 @@ reports/
 | `temp_rise_c` | °C | `peak − start` |
 | `cooldown_elapsed_s` | s | 이 cell 직전 cooldown 대기 시간 |
 | `cooldown_reached` | bool | target_c 도달 여부 |
+| `bytes_traffic` | B | (analyze.py 가 derive) elementwise `(reads+writes) × N × bytes/elem × iters` — l2_hit_0 에서 DRAM 트래픽, l2_hit_100 에서 L2 트래픽 (§3.5) |
+| `pj_per_bit_traffic` | pJ/bit | (analyze.py derive) `dyn_energy_J × 1e12 / (bytes_traffic × 8)` — l2_hit_0 cell 에서 DRAM 비용 (HBM3 ≈ 3.9 pJ/bit reference) |
+| `achieved_bw_gbps` | GB/s | (analyze.py derive) `bytes_traffic / wall_s` — sustained BW; HBM peak 대비 50%+ 면 BW-bound |
 | `error` | str | 예외 발생 시 사유 |
 
 ### 10.2 집계 CSV : `<tag>_summary.csv`
