@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import sys
 import time
@@ -454,13 +455,43 @@ def main() -> int:
             return 1
 
     # ---- NVML + device -----------------------------------------------------
+    # Two ways the user can pin the run to a specific GPU:
+    #   (a) `--device N`                          — the canonical path
+    #   (b) `CUDA_VISIBLE_DEVICES=N` env var      — common shell habit
+    #
+    # CUDA_VISIBLE_DEVICES is a CUDA-side filter: torch only sees the listed
+    # GPUs and re-numbers them starting at 0. NVML, however, ignores this
+    # env var and ALWAYS addresses GPUs by their physical index. So the
+    # naive `nvmlDeviceGetHandleByIndex(args.device)` reads the WRONG card
+    # whenever CUDA_VISIBLE_DEVICES restricts visibility — silently. The
+    # fix below pins NVML to torch's actual GPU via PCI bus ID, which is
+    # the same identifier on both sides and is unaffected by remapping.
     pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
     torch.cuda.set_device(args.device)
     gpu_name = torch.cuda.get_device_name(args.device)
     cc = torch.cuda.get_device_capability(args.device)
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        # PyTorch returns the bus id like "0000:81:00.0"; pynvml expects the
+        # same domain:bus:device.function string (case-insensitive).
+        pci_id = torch.cuda.get_device_properties(args.device).pci_bus_id
+        handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
+        nvml_resolution = f"by PCI bus id {pci_id}"
+    except Exception as e:
+        # Older torch builds may lack pci_bus_id; fall back to index but
+        # warn loudly when CUDA_VISIBLE_DEVICES is in play (the case where
+        # the index-based call would silently read the wrong card).
+        handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
+        nvml_resolution = f"by index {args.device}  (pci_bus_id lookup failed: {e})"
+        if cvd:
+            print(f"[warn] CUDA_VISIBLE_DEVICES={cvd!r} is set but we couldn't "
+                  f"resolve the GPU by PCI bus id — NVML reads may target the "
+                  f"WRONG physical GPU. Prefer `--device {args.device}` without "
+                  f"CUDA_VISIBLE_DEVICES, or upgrade torch.")
     gpu_slug = _slugify(gpu_name)
     print(f"\n[info] GPU={gpu_name}  cc={cc[0]}.{cc[1]}  slug={gpu_slug}")
+    print(f"[info] NVML handle resolved {nvml_resolution}"
+          + (f"  (CUDA_VISIBLE_DEVICES={cvd})" if cvd else ""))
     print(f"[info] ops={args.ops}  dtypes={args.dtypes}  loads={loads}")
 
     # ---- static / baseline power ------------------------------------------

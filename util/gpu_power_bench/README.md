@@ -833,6 +833,27 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ./run_bench.sh --devices "0,2,4" --tag h100 --suite full
 ```
 
+### 9.2.1 `--device N` vs `CUDA_VISIBLE_DEVICES=N`
+
+두 방식은 **이상적으로** 같은 GPU 를 측정하지만 NVML 의 동작 차이 때문에 **결과가 달라질 수 있는 sneaky 한 함정**이 있습니다. 권장은 항상 `--device`.
+
+| 방식 | torch | NVML (power 측정) | 결과 |
+|---|---|---|---|
+| `./run_bench.sh --device 3` | 물리 GPU 3 | 물리 GPU 3 | ✅ 일관 |
+| `CUDA_VISIBLE_DEVICES=3 ./run_bench.sh` | 물리 GPU 3 (logical 0) | (옛 코드) **물리 GPU 0** ✗ |
+| `CUDA_VISIBLE_DEVICES=3 ./run_bench.sh` | 물리 GPU 3 (logical 0) | (현재 코드) 물리 GPU 3 (PCI bus id resolved) ✅ |
+
+**이유**: `CUDA_VISIBLE_DEVICES` 는 CUDA-side 필터라 그 프로세스 안에서 보이는 GPU 만 logical index 0..N-1 로 다시 번호 매김. 그러나 **NVML 은 이 환경변수를 무시**하고 항상 물리 인덱스로 동작 → `nvmlDeviceGetHandleByIndex(0)` 가 보이는 logical 0 (= 물리 3) 이 아니라 **진짜 물리 GPU 0** 을 가리킴 → 워크로드는 GPU 3 에서 도는데 power 는 GPU 0 의 idle 값이 measured → dyn_energy 가 silently 잘못된 값으로 계산되는 무서운 시나리오.
+
+**현재 코드 (PR #29 이후)**: `torch.cuda.get_device_properties(args.device).pci_bus_id` 로 GPU 의 PCI bus 주소를 받아 `pynvml.nvmlDeviceGetHandleByPciBusId()` 로 NVML handle 을 잡습니다. PCI bus id 는 양쪽 다 같은 식별자라서 `CUDA_VISIBLE_DEVICES` 가 어떻게 매핑하든 항상 같은 카드를 가리킴. 시작 시 다음과 같은 로그가 찍혀 어느 카드를 측정 중인지 확인 가능:
+
+```
+[info] GPU=NVIDIA H100 80GB HBM3  cc=9.0  slug=h100_sxm
+[info] NVML handle resolved by PCI bus id 0000:81:00.0  (CUDA_VISIBLE_DEVICES=3)
+```
+
+**그래도 권장**: `--device 3 --tag blackwell_gpu0` 가 의도가 더 명확하고, multi-GPU launcher 와 결합하기도 쉬워요. `CUDA_VISIBLE_DEVICES` 는 cluster scheduler 가 자동으로 끼워주는 환경에서 자연스럽게 작동하도록 보호 차원으로 깔아둔 것.
+
 ### 9.3 Quick 모드 (별칭: `--suite smoke`)
 
 ```bash
