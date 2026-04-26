@@ -90,8 +90,83 @@ import numpy as np
 import pandas as pd
 
 
+# ===========================================================================
+# Section 1 — Module-level constants
+# ===========================================================================
+# Everything that several functions need to share lives here so adding a
+# new op / regime / dtype / colour only touches one place.
 # ---------------------------------------------------------------------------
-# utility: R² for the linear fit y ≈ a·x + b, and the slope itself.
+
+# 5-bucket cache-locality vocabulary. classify_cache_regime() in
+# benchmarks.py emits these labels; analyse uses them to slice and order
+# results. Older CSVs (pre-PR #17) used a 3-bucket vocabulary which we
+# fold onto these via LEGACY_REGIME_MAP.
+REGIME_ORDER = ("l2_hit_100", "l2_hit_75", "l2_hit_50",
+                "l2_hit_25",  "l2_hit_0")
+REGIME_HIT_PCT = {"l2_hit_100": "~100%", "l2_hit_75": "~75%",
+                  "l2_hit_50": "~50%",  "l2_hit_25": "~25%",
+                  "l2_hit_0":  "~0%"}
+LEGACY_REGIME_MAP = {"l2_resident": "l2_hit_100",
+                     "l2_partial":  "l2_hit_50",
+                     "dram_stream": "l2_hit_0"}
+
+# Op/variant colour palettes. We keep elementwise + matmul + LLM in
+# separate dicts so unrelated benchmarks can't accidentally share a
+# colour. Any keys NOT in the palette get tab20 colours assigned in
+# whatever order they appear in the data.
+PALETTE_ELEMENTWISE_OPS = {
+    "mul":       "#1f77b4",
+    "add":       "#2ca02c",
+    "softmax":   "#d62728",
+    "gelu":      "#9467bd",
+    "layernorm": "#ff7f0e",
+}
+PALETTE_MATMUL_VARIANTS = {
+    "matmul_fp32_simt": "#555555",
+    "matmul_tf32_tc":   "#ff7f0e",
+    "matmul_fp16_tc":   "#1f77b4",
+    "matmul_bf16_tc":   "#2ca02c",
+    "matmul_fp8_te":    "#d62728",
+}
+PALETTE_LLM_PRESETS = {
+    "qkv":     "#1f77b4",   "q_only": "#17becf",
+    "kv":      "#aec7e8",   "attn_o": "#2ca02c",
+    "router":  "#9467bd",   "mlp1":   "#ff7f0e",
+    "mlp2":    "#d62728",   "lm_head": "#555555",
+}
+
+# Bytes per element for the dtypes we can encounter in a CSV. Mirrors
+# benchmarks._dtype_bytes() but kept here because analyze.py mustn't
+# import torch (we want analyze to run on a laptop).
+DTYPE_BYTES = {"fp16": 2, "fp8": 2, "bf16": 2, "fp32": 4, "tf32": 4}
+
+# How many tensor reads + writes happen per kernel call, used by
+# add_traffic_metrics() to derive bytes_traffic from N + iters.
+RW_PER_CALL = {
+    "mul": 3, "add": 3,
+    "gelu": 2, "softmax": 2, "layernorm": 2,
+    "stream_copy": 2, "stream_scale": 2, "stream_triad": 3,
+}
+
+# Literature reference points for DRAM pJ/bit, drawn as horizontal guide
+# lines on the dram-energy plot. Numbers are "full stack" (DRAM cells +
+# PHY + controller); see README §3.5 for sources.
+DRAM_REFERENCES_PJBIT = {
+    "HBM2 (V100)":     7.0,
+    "HBM2E (A100)":    5.0,
+    "HBM3 (H100)":     3.9,
+    "DDR4":            7.0,
+    "Horowitz '14 (DRAM core)": 2.5,
+}
+
+
+# ===========================================================================
+# Section 2 — Regression helpers
+# ===========================================================================
+# `linear_fit` is plain OLS, kept for back-compat. `linear_fit_wls` is
+# the one we recommend for headline k_op (each point's *relative* error
+# weighted equally — matches the log-log linearity plot view).
+# `bootstrap_slope_ci` returns a 95% percentile CI on top of either fit.
 # ---------------------------------------------------------------------------
 
 def linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
@@ -190,20 +265,16 @@ def bootstrap_slope_ci(x: np.ndarray, y: np.ndarray,
     return med, lo, hi
 
 
+# ===========================================================================
+# Section 3 — DataFrame normalisation + traffic-metric derivations
+# ===========================================================================
+# `add_traffic_metrics(df)` derives bytes_traffic / pj_per_bit_traffic /
+# achieved_bw_gbps for the elementwise rows. `_normalize_for_summary(df)`
+# fills the column defaults that summarize() / summarize_by_regime() /
+# the plot functions all need (cache_regime back-compat, llm_preset
+# fillna so groupby doesn't drop rows, etc.). Both helpers always
+# return a *copy* so callers don't have to remember.
 # ---------------------------------------------------------------------------
-# summary: one regression per (category, op, dtype, mode).
-# ---------------------------------------------------------------------------
-
-# bytes_per_call lookup for pJ/bit derivation. Mirrors benchmarks._RW_PER_CALL
-# but kept here so analyze.py can be run standalone on a CSV without importing
-# the full benchmarks module (which pulls in torch).
-_RW_PER_CALL_ANALYZE = {
-    "mul": 3, "add": 3,
-    "gelu": 2, "softmax": 2, "layernorm": 2,
-    "stream_copy": 2, "stream_scale": 2, "stream_triad": 3,
-}
-_DTYPE_BYTES_ANALYZE = {"fp16": 2, "fp8": 2, "bf16": 2, "fp32": 4, "tf32": 4}
-
 
 def add_traffic_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Augment a per-cell df with three derived columns:
@@ -232,10 +303,10 @@ def add_traffic_metrics(df: pd.DataFrame) -> pd.DataFrame:
     def _bytes_per_call(r) -> float:
         if r.get("category") not in (None, "elementwise"):
             return float("nan")
-        rw = _RW_PER_CALL_ANALYZE.get(r.get("op", ""))
+        rw = RW_PER_CALL.get(r.get("op", ""))
         if rw is None:
             return float("nan")
-        bpe = _DTYPE_BYTES_ANALYZE.get(r.get("dtype"), 2)
+        bpe = DTYPE_BYTES.get(r.get("dtype"), 2)
         try:
             n = int(r.get("n_elements", 0))
         except (TypeError, ValueError):
@@ -253,105 +324,157 @@ def add_traffic_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def summarize(df: pd.DataFrame) -> pd.DataFrame:
-    """Power-modeling summary.
+def _normalize_for_summary(df: pd.DataFrame, *,
+                           include_cache_regime: bool = False) -> pd.DataFrame:
+    """Return a *copy* of df with the columns / values summarize() needs.
 
-    For elementwise rows the regression is E_dyn vs total_elements → slope is
-    *J per element*.  For matmul rows we regress against total_FLOPs → slope
-    is *J per FLOP* (which is the right axis since FLOPs scale as K³ while
-    element count scales as K²).
+    Solves three back-compat / silent-data-loss gotchas in one place so
+    summarize() and summarize_by_regime() don't each repeat the boilerplate:
 
-    Columns `compute_unit` and `emulated` are propagated so downstream tables
-    and plots can distinguish "CUDA core" vs "Tensor Core" paths, and flag
-    emulated cases (fp8 elementwise, fp8_te on pre-Hopper).
+      1. Older CSVs may lack `category` / `mode` / `llm_preset` columns —
+         we add safe defaults.
+      2. `pandas.read_csv` turns blank cells into NaN, and groupby silently
+         DROPS rows whose group keys are NaN (this once silently emptied
+         the entire summary on real H100 data — see PR #21). We fillna +
+         astype(str) every group-key column.
+      3. Pre-PR-#17 CSVs used the 3-bucket cache vocabulary; fold those
+         onto the new 5-bucket labels so analysis is unified.
+
+    Pass include_cache_regime=True for summarize_by_regime() / plot
+    callers; default False for the basic summarize() that doesn't need
+    it.
     """
-    out = []
-    # Include llm_preset in the group key so each (layer-role × dtype) in the
-    # matmul_llm sweep gets its own regression. For non-LLM rows llm_preset
-    # is empty string (or missing) and doesn't change the grouping.
-    group_keys = ["category", "op", "dtype", "mode", "llm_preset"]
-    # Some older CSVs may lack "category"/"mode"/"llm_preset" columns — fall
-    # back gracefully.  IMPORTANT: pandas read_csv turns blank cells into
-    # NaN by default, and DataFrame.groupby drops rows whose group keys are
-    # NaN — which would silently empty out the summary when the CSV has an
-    # llm_preset column that's empty on every non-LLM row. We coerce to
-    # empty string before the groupby so every row is retained.
     df = df.copy()
+    group_keys = ["category", "op", "dtype", "mode", "llm_preset"]
+    if include_cache_regime:
+        group_keys = group_keys + ["cache_regime"]
     for col in group_keys:
+        default = ("elementwise" if col in ("category", "mode")
+                   else "unknown" if col == "cache_regime" else "")
         if col not in df.columns:
-            df[col] = "elementwise" if col in ("category", "mode") else ""
+            df[col] = default
         else:
-            # Existing column: fill any NaN / None with "" so groupby keeps
-            # those rows. `fillna("")` is cheap even when no NaNs exist.
-            df[col] = df[col].fillna("").astype(str)
-    # Back-compat: older CSVs won't have compute_unit / emulated columns.
+            df[col] = df[col].fillna(default).astype(str)
     if "compute_unit" not in df.columns:
         df["compute_unit"] = df["category"].map(
             lambda c: "Tensor Core" if c in ("matmul", "matmul_llm") else "CUDA core")
     if "emulated" not in df.columns:
         df["emulated"] = 0
+    if include_cache_regime:
+        df["cache_regime"] = df["cache_regime"].replace(LEGACY_REGIME_MAP)
+    return df
+
+
+def _variant_name(cat: str, op: str, dt: str, mode: str, preset: str) -> str:
+    """Stable variant string used as the row identifier in summary CSVs."""
+    if cat == "matmul_llm":
+        return f"llm_{preset}_{dt}_{mode}"
+    if cat == "matmul":
+        return f"{op}_{dt}_{mode}"
+    return f"{dt}_{op}"
+
+
+def _fit_one_group(g: pd.DataFrame, x_col: str,
+                   *, want_ci: bool = True) -> dict:
+    """Run all regressions on one (groupby) cell. Returns a dict that can
+    be merged straight into a summary row.
+
+    Computes:
+      - OLS slope + R²        (legacy headline; back-compat)
+      - WLS slope + R²        (recommended k_op; weights = 1/y²)
+      - Bootstrap 95% CI on the WLS slope (1000 resamples)
+      - Total-energy OLS slope + R² (no clip, includes static)
+      - Unclipped WLS slope + clip_bias_pct from dyn_energy_j_raw
+        (PR A; absent on pre-PR-A CSVs → reported as NaN)
+
+    Single-point groups can't fit a slope; we fall back to median y for
+    a coarse k_op and emit NaN R² / CI.
+    """
+    x = g[x_col].to_numpy(dtype=float)
+    y_dyn = g["dyn_energy_j"].to_numpy(dtype=float)
+    y_tot = g["total_energy_j"].to_numpy(dtype=float)
+    n = len(g)
+    if n >= 2:
+        slope_dyn,    _, r2_dyn     = linear_fit(x, y_dyn)
+        slope_total,  _, r2_total   = linear_fit(x, y_tot)
+        slope_dyn_wls, _, r2_dyn_wls = linear_fit_wls(x, y_dyn)
+        if want_ci:
+            _, ci_lo, ci_hi = bootstrap_slope_ci(
+                x, y_dyn, n_resample=1000, confidence=0.95, weighted=True)
+        else:
+            ci_lo = ci_hi = float("nan")
+    else:
+        # Degenerate group — common for single-point cache regimes.
+        # Use the (only) per-point coefficient as a coarse k_op.
+        per_point = y_dyn[0] / x[0] if (x[0] != 0 and n == 1) else float("nan")
+        slope_dyn    = slope_dyn_wls = per_point
+        slope_total  = float("nan")
+        r2_dyn       = r2_dyn_wls = r2_total = float("nan")
+        ci_lo = ci_hi = float("nan")
+    # Clip-bias check (PR A added dyn_energy_j_raw — pre-clip residual).
+    slope_dyn_unclipped = float("nan")
+    clip_bias_pct = float("nan")
+    if "dyn_energy_j_raw" in g.columns:
+        y_raw = pd.to_numeric(g["dyn_energy_j_raw"], errors="coerce").to_numpy(float)
+        if np.all(np.isfinite(y_raw)) and n >= 2:
+            s_raw, _, _ = linear_fit_wls(x, y_raw)
+            slope_dyn_unclipped = s_raw
+            if np.isfinite(slope_dyn_wls) and slope_dyn_wls != 0:
+                clip_bias_pct = (slope_dyn_wls - s_raw) / s_raw * 100.0
+    return dict(
+        n_points=n,
+        slope_dyn=slope_dyn,
+        slope_dyn_wls=slope_dyn_wls,
+        slope_dyn_ci_lo=ci_lo,
+        slope_dyn_ci_hi=ci_hi,
+        slope_dyn_unclipped=slope_dyn_unclipped,
+        clip_bias_pct=clip_bias_pct,
+        slope_total=slope_total,
+        R2_dyn=r2_dyn,
+        R2_dyn_wls=r2_dyn_wls,
+        R2_total=r2_total,
+    )
+
+
+# ===========================================================================
+# Section 4 — Summary builders
+# ===========================================================================
+# `summarize()` produces one row per (category, op, dtype, mode, llm_preset).
+# `summarize_by_regime()` adds cache_regime to the group key so each
+# locality bucket gets its own k_op (the regime-specific k_op is what
+# the power model should consume when the caller knows the workload's
+# working-set size).
+# ---------------------------------------------------------------------------
+
+def summarize(df: pd.DataFrame) -> pd.DataFrame:
+    """Power-modeling summary — one regression per
+    (category, op, dtype, mode, llm_preset).
+
+    For elementwise rows the regression is E_dyn vs total_elements → slope is
+    *J per element*.  For matmul rows we regress against total_FLOPs → slope
+    is *J per FLOP* (right axis since FLOPs scale as K³ while element count
+    scales as K²). Columns `compute_unit` and `emulated` are propagated so
+    downstream tables and plots can distinguish "CUDA core" vs "Tensor Core"
+    paths and flag emulated cases (fp8 elementwise, fp8_te on pre-Hopper).
+    """
+    df = _normalize_for_summary(df, include_cache_regime=False)
+    group_keys = ["category", "op", "dtype", "mode", "llm_preset"]
+    out: list[dict] = []
     for (cat, op, dt, mode, preset), g in df.groupby(group_keys):
         g = g.sort_values("total_elements")
-        # Axis choice: FLOPs for matmul (K³ scaling), elements otherwise.
         if cat in ("matmul", "matmul_llm"):
-            x = g["total_flops"].to_numpy(dtype=float)
-            unit = "J/FLOP"
+            x_col, unit = "total_flops",    "J/FLOP"
         else:
-            x = g["total_elements"].to_numpy(dtype=float)
-            unit = "J/element"
-        y_dyn = g["dyn_energy_j"].to_numpy(dtype=float)
-        y_tot = g["total_energy_j"].to_numpy(dtype=float)
-        # OLS — kept for backward compatibility and so the user can see how
-        # much the WLS / clip-correction moves the headline.
-        slope_dyn, _, r2_dyn = linear_fit(x, y_dyn)
-        slope_tot, _, r2_tot = linear_fit(x, y_tot)
-        # WLS — weights = 1/y² so each point contributes proportional to its
-        # *relative* error, which matches what we see in the log-log plot.
-        # This is the slope we recommend reporting as the headline `k_op`.
-        slope_dyn_wls, _, r2_dyn_wls = linear_fit_wls(x, y_dyn)
-        # Bootstrap CI on the WLS slope (1000 resamples; stochastic but
-        # rng_seed=0 keeps the per-cell number reproducible).
-        _, ci_lo, ci_hi = bootstrap_slope_ci(x, y_dyn, n_resample=1000,
-                                             confidence=0.95, weighted=True)
-        # Clip-bias check — if dyn_energy_j_raw is in the CSV, refit on
-        # the unclipped residual so the user can see how much the
-        # max(0, …) clipping moved the slope. Reported as
-        # slope_dyn_unclipped + delta_clip_pct.
-        slope_dyn_unclipped = float("nan")
-        delta_clip_pct = float("nan")
-        if "dyn_energy_j_raw" in g.columns:
-            y_raw = pd.to_numeric(g["dyn_energy_j_raw"], errors="coerce").to_numpy(float)
-            if np.all(np.isfinite(y_raw)):
-                s_raw, _, _ = linear_fit_wls(x, y_raw)
-                slope_dyn_unclipped = s_raw
-                if np.isfinite(slope_dyn_wls) and slope_dyn_wls != 0:
-                    delta_clip_pct = (slope_dyn_wls - s_raw) / s_raw * 100.0
-        compute_unit = str(g["compute_unit"].iloc[0])
-        emulated = int(bool(g["emulated"].iloc[0]))
-        if cat == "matmul_llm":
-            variant = f"llm_{preset}_{dt}_{mode}"
-        elif cat == "matmul":
-            variant = f"{op}_{dt}_{mode}"
-        else:
-            variant = f"{dt}_{op}"
+            x_col, unit = "total_elements", "J/element"
+        fit = _fit_one_group(g, x_col, want_ci=True)
         out.append({
             "category": cat, "op": op, "dtype": dt, "mode": mode,
             "llm_preset": preset,
-            "variant": variant,
-            "compute_unit": compute_unit,
-            "emulated":     emulated,
-            "n_points": len(g),
-            "fit_axis": unit,
-            "slope_dyn":          slope_dyn,        # OLS — legacy headline
-            "slope_dyn_wls":      slope_dyn_wls,    # WLS — recommended k_op
-            "slope_dyn_ci_lo":    ci_lo,            # 95% percentile bootstrap
-            "slope_dyn_ci_hi":    ci_hi,
-            "slope_dyn_unclipped": slope_dyn_unclipped,  # WLS on raw (signed) dyn
-            "clip_bias_pct":       delta_clip_pct,       # +ve = clip inflated slope
-            "slope_total":        slope_tot,
-            "R2_dyn":             r2_dyn,
-            "R2_dyn_wls":         r2_dyn_wls,
-            "R2_total":           r2_tot,
+            "variant": _variant_name(cat, op, dt, mode, preset),
+            "compute_unit": str(g["compute_unit"].iloc[0]),
+            "emulated":     int(bool(g["emulated"].iloc[0])),
+            "fit_axis":     unit,
+            **fit,
             "mean_dyn_power_w":  g["dyn_power_w"].mean(),
             "mean_avg_power_w":  g["avg_power_w"].mean(),
             "mean_temp_c":       g["avg_temp_c"].mean(),
@@ -378,89 +501,47 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
     """
     if "cache_regime" not in df.columns:
         return pd.DataFrame()
-    out = []
+    df = _normalize_for_summary(df, include_cache_regime=True)
     group_keys = ["category", "op", "dtype", "mode", "llm_preset", "cache_regime"]
-    # Same NaN-in-group-keys gotcha as summarize() — read_csv produces NaN
-    # for blank cells and groupby silently drops those rows. cache_regime
-    # NaNs become "unknown" (which is then filtered below); everything else
-    # becomes the empty string so non-LLM rows still participate.
-    df = df.copy()
-    for col in group_keys:
-        default = "unknown" if col == "cache_regime" else ""
-        if col not in df.columns:
-            df[col] = default
-        else:
-            df[col] = df[col].fillna(default).astype(str)
-    if "compute_unit" not in df.columns:
-        df["compute_unit"] = df["category"].map(
-            lambda c: "Tensor Core" if c in ("matmul", "matmul_llm") else "CUDA core")
-    if "emulated" not in df.columns:
-        df["emulated"] = 0
-    # Back-compat: older CSVs used the 3-bucket vocabulary — fold those
-    # onto the 5-bucket equivalents so the summary rows stay consistent
-    # regardless of which version produced the data.
-    df = df.copy()
-    df["cache_regime"] = df["cache_regime"].replace({
-        "l2_resident": "l2_hit_100",
-        "l2_partial":  "l2_hit_50",
-        "dram_stream": "l2_hit_0",
-    })
+    out = []
     for (cat, op, dt, mode, preset, regime), g in df.groupby(group_keys):
         if regime == "unknown":
             continue
         g = g.sort_values("total_elements")
         if cat in ("matmul", "matmul_llm"):
-            x = g["total_flops"].to_numpy(dtype=float)
-            y_per = g["j_per_flop_dyn"].astype(float)
-            unit = "J/FLOP"
+            x_col, unit, y_per_col = "total_flops",    "J/FLOP",    "j_per_flop_dyn"
         else:
-            x = g["total_elements"].to_numpy(dtype=float)
-            y_per = g["j_per_element_dyn"].astype(float)
-            unit = "J/element"
-        y_dyn = g["dyn_energy_j"].to_numpy(dtype=float)
-        if len(g) >= 2:
-            slope_dyn, _, r2_dyn = linear_fit(x, y_dyn)
-            slope_dyn_wls, _, r2_dyn_wls = linear_fit_wls(x, y_dyn)
-            _, ci_lo, ci_hi = bootstrap_slope_ci(x, y_dyn, n_resample=1000,
-                                                 confidence=0.95, weighted=True)
-        else:
-            # Single-point regime — use the per-point coefficient directly.
-            # This is the one case where we degrade the model to median.
-            slope_dyn, r2_dyn = float(y_per.iloc[0]), float("nan")
-            slope_dyn_wls = slope_dyn
-            r2_dyn_wls = float("nan")
-            ci_lo = ci_hi = float("nan")
-        compute_unit = str(g["compute_unit"].iloc[0])
-        emulated = int(bool(g["emulated"].iloc[0]))
-        if cat == "matmul_llm":
-            variant = f"llm_{preset}_{dt}_{mode}"
-        elif cat == "matmul":
-            variant = f"{op}_{dt}_{mode}"
-        else:
-            variant = f"{dt}_{op}"
+            x_col, unit, y_per_col = "total_elements", "J/element", "j_per_element_dyn"
+        fit = _fit_one_group(g, x_col, want_ci=True)
+        median_j = float(pd.to_numeric(g[y_per_col], errors="coerce").median())
         out.append({
             "category": cat, "op": op, "dtype": dt, "mode": mode,
             "llm_preset": preset,
             "cache_regime": regime,
-            "variant": variant,
-            "compute_unit": compute_unit,
-            "emulated":     emulated,
-            "n_points":     len(g),
+            "variant": _variant_name(cat, op, dt, mode, preset),
+            "compute_unit": str(g["compute_unit"].iloc[0]),
+            "emulated":     int(bool(g["emulated"].iloc[0])),
             "fit_axis":     unit,
-            "slope_dyn":      slope_dyn,          # OLS regime k_op
-            "slope_dyn_wls":  slope_dyn_wls,      # WLS regime k_op
-            "slope_dyn_ci_lo": ci_lo,
-            "slope_dyn_ci_hi": ci_hi,
-            "R2_dyn":         r2_dyn,
-            "median_j_per_unit": float(y_per.median()),
-            "mean_dyn_power_w":  g["dyn_power_w"].astype(float).mean(),
-            "mean_temp_c":       g["avg_temp_c"].astype(float).mean(),
+            "n_points":          fit["n_points"],
+            "slope_dyn":         fit["slope_dyn"],
+            "slope_dyn_wls":     fit["slope_dyn_wls"],
+            "slope_dyn_ci_lo":   fit["slope_dyn_ci_lo"],
+            "slope_dyn_ci_hi":   fit["slope_dyn_ci_hi"],
+            "R2_dyn":            fit["R2_dyn"],
+            "median_j_per_unit": median_j,
+            "mean_dyn_power_w":  pd.to_numeric(g["dyn_power_w"], errors="coerce").mean(),
+            "mean_temp_c":       pd.to_numeric(g["avg_temp_c"], errors="coerce").mean(),
         })
     return pd.DataFrame(out)
 
 
-# ---------------------------------------------------------------------------
-# plots
+# ===========================================================================
+# Section 5 — Plot helpers
+# ===========================================================================
+# `_get_mpl()` lazy-imports matplotlib (analyse can run on a CSV viewer
+# host without it). `_save_fig()` is the canonical save path — fixed
+# pad_inches + a 30×18-in figsize cap. `_annot_bar_pj()` writes the
+# "0.31 pJ/elem  R²=0.99" two-line annotation on top of any bar.
 # ---------------------------------------------------------------------------
 
 def _get_mpl():
@@ -469,6 +550,19 @@ def _get_mpl():
     import matplotlib.pyplot as plt
     return plt
 
+
+# ===========================================================================
+# Section 6 — Plot functions
+# ===========================================================================
+# Each visible plot is one or more PNGs under `<stem>_<group>_<panel>.png`.
+# Groups (lexicographic order = reading order):
+#   01_powermodel_*  linearity + coefficient + LLM
+#   02_cache_regime_*  per-regime strip / k_op / dyn-power
+#   02_dram_energy_*   pJ/bit + sustained BW
+#   03_baseline_*      P_static diagnostics
+#   04_thermal_*       per-cell temp + cool-down + J vs T
+#   05_trace_*         raw NVML timeline (samples sidecar)
+# ---------------------------------------------------------------------------
 
 def plot_linearity_elementwise(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     """3 × 5 grid : one column per op, rows = E_dyn, wall, J/elem.
@@ -534,11 +628,7 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     ax_e.set_title("matmul — E_dyn vs FLOPs (slope = J/FLOP)")
     ax_t.set_title("matmul — wall time vs FLOPs")
     ax_j.set_title("matmul — J/FLOP (dyn)  [annotated with the swept K]")
-    palette = {"matmul_fp32_simt": "#555555",
-               "matmul_tf32_tc":   "#ff7f0e",
-               "matmul_fp16_tc":   "#1f77b4",
-               "matmul_bf16_tc":   "#2ca02c",
-               "matmul_fp8_te":    "#d62728"}
+    palette = PALETTE_MATMUL_VARIANTS
     for v in variants:
         g = mm[mm["variant"] == v].sort_values("total_flops")
         if g.empty:
@@ -708,10 +798,7 @@ def _coef_bar_matmul(mm, out_png: Path, gpu: str) -> bool:
     mm2 = mm.set_index("variant").reindex([v for v in order if v in mm["variant"].values])
     if mm2.empty:
         return False
-    palette = {"matmul_fp32_simt": "#555555", "matmul_tf32_tc": "#ff7f0e",
-               "matmul_fp16_tc":   "#1f77b4", "matmul_bf16_tc": "#2ca02c",
-               "matmul_fp8_te":    "#d62728"}
-    colors_b = [palette.get(v, "gray") for v in mm2.index]
+    colors_b = [PALETTE_MATMUL_VARIANTS.get(v, "gray") for v in mm2.index]
     def _emu(v):
         if "emulated" in mm2.columns:
             val = mm2.loc[v, "emulated"]
@@ -1092,24 +1179,17 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
         return
     plt = _get_mpl()
     # 5-bucket cache-locality vocabulary (new). Legacy 3-bucket CSVs are
-    # still readable below — `_keep_row` filters strictly against whatever
-    # is present in the data, and the legacy column values
+    # still readable below — the legacy column values
     # (l2_resident / l2_partial / dram_stream) are mapped onto the new
     # labels for plotting so old and new data can analyse the same way.
-    regime_order = ["l2_hit_100", "l2_hit_75", "l2_hit_50",
-                    "l2_hit_25", "l2_hit_0"]
-    regime_hit_rate = {"l2_hit_100": "~100%", "l2_hit_75": "~75%",
-                       "l2_hit_50": "~50%",  "l2_hit_25": "~25%",
-                       "l2_hit_0":  "~0%"}
-    _legacy_to_new = {"l2_resident": "l2_hit_100",
-                      "l2_partial":  "l2_hit_50",
-                      "dram_stream": "l2_hit_0"}
+    regime_order = list(REGIME_ORDER)
+    regime_hit_rate = REGIME_HIT_PCT
     regime_x = {r: i for i, r in enumerate(regime_order)}
 
     # Map legacy labels onto the new 5-bucket vocabulary up-front so the
     # rest of the function can stay single-vocabulary. No-op on new data.
     df = df.copy()
-    df["cache_regime"] = df["cache_regime"].replace(_legacy_to_new)
+    df["cache_regime"] = df["cache_regime"].replace(LEGACY_REGIME_MAP)
 
     ew = df[df["category"] == "elementwise"].copy()
     ew = ew[ew["cache_regime"].isin(regime_order)]
@@ -1245,11 +1325,8 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
             ax.set_ylim(ymin, ymax * 1.2)
         _save_fig(fig, out_png)
 
-    ew_palette = {"mul": "#1f77b4", "add": "#2ca02c", "softmax": "#d62728",
-                  "gelu": "#9467bd", "layernorm": "#ff7f0e"}
-    mm_palette = {"matmul_fp32_simt": "#555555", "matmul_tf32_tc": "#ff7f0e",
-                  "matmul_fp16_tc":   "#1f77b4", "matmul_bf16_tc": "#2ca02c",
-                  "matmul_fp8_te":    "#d62728"}
+    ew_palette = PALETTE_ELEMENTWISE_OPS
+    mm_palette = PALETTE_MATMUL_VARIANTS
 
     ew_sum = (by_regime[by_regime["category"] == "elementwise"]
               if by_regime is not None and not by_regime.empty else pd.DataFrame())
@@ -1300,14 +1377,7 @@ def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> Non
         return
     plt = _get_mpl()
     presets = sorted(llm["llm_preset"].unique())
-    # Fixed palette so layers in the same role always get the same colour
-    # across runs / GPUs.
-    palette = {
-        "qkv":     "#1f77b4",   "q_only": "#17becf",
-        "kv":      "#aec7e8",   "attn_o": "#2ca02c",
-        "router":  "#9467bd",   "mlp1":   "#ff7f0e",
-        "mlp2":    "#d62728",   "lm_head": "#555555",
-    }
+    palette = PALETTE_LLM_PRESETS
     # Pre-compute per-preset arrays once, then re-use across both panels.
     preset_data: dict[str, dict] = {}
     for preset in presets:
@@ -1377,18 +1447,6 @@ def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> Non
     _save_fig(fig_b, out_dir / f"{stem}_01_powermodel_llm_per_call.png")
 
 
-# Literature reference points for DRAM pJ/bit, drawn as horizontal guide
-# lines so the user can eyeball where their measurement lands. Numbers are
-# "full stack" (DRAM cells + PHY + controller); see README §3.5 for sources.
-_DRAM_REFERENCE_PJBIT = {
-    "HBM2 (V100)":     7.0,
-    "HBM2E (A100)":    5.0,
-    "HBM3 (H100)":     3.9,
-    "DDR4":            7.0,
-    "Horowitz '14 (DRAM core)": 2.5,
-}
-
-
 def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
                      hbm_peak_gbps: float | None = None) -> None:
     """pJ/bit + achieved BW per cell, sliced by cache_regime.
@@ -1410,11 +1468,8 @@ def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
     if ew.empty or ew["pj_per_bit_traffic"].notna().sum() == 0:
         return
     plt = _get_mpl()
-    regime_order = ["l2_hit_100", "l2_hit_75", "l2_hit_50",
-                    "l2_hit_25", "l2_hit_0"]
-    legacy_to_new = {"l2_resident": "l2_hit_100", "l2_partial": "l2_hit_50",
-                     "dram_stream": "l2_hit_0"}
-    ew["cache_regime"] = ew["cache_regime"].replace(legacy_to_new)
+    regime_order = list(REGIME_ORDER)
+    ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
     ew = ew[ew["cache_regime"].isin(regime_order)]
     if ew.empty:
         return
@@ -1445,14 +1500,12 @@ def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
     # Reference lines (only meaningful in the DRAM-streaming regime — but
     # we draw them across the whole panel for context).
     ref_colors = ["#888888", "#666666", "#444444", "#aa5555", "#55aaaa"]
-    for (label, val), c in zip(_DRAM_REFERENCE_PJBIT.items(), ref_colors):
+    for (label, val), c in zip(DRAM_REFERENCES_PJBIT.items(), ref_colors):
         ax_a.axhline(val, color=c, ls="--", lw=1, alpha=0.7)
         ax_a.text(len(regime_order) - 1 + 0.05, val, f" {label} ≈ {val} pJ/bit",
                   fontsize=7, color=c, va="center", ha="left")
     ax_a.set_xticks(list(regime_x.values()))
-    hit_pct = {"l2_hit_100": "100%", "l2_hit_75": "75%",
-               "l2_hit_50": "50%",  "l2_hit_25": "25%", "l2_hit_0": "0%"}
-    ax_a.set_xticklabels([f"{r}\n(~{hit_pct[r]} L2 hit)" for r in regime_order],
+    ax_a.set_xticklabels([f"{r}\n({REGIME_HIT_PCT[r]} L2 hit)" for r in regime_order],
                          fontsize=11)
     ax_a.set_yscale("log")
     ax_a.set_ylabel("pJ / bit  (working-set traffic)")
@@ -1523,6 +1576,13 @@ def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
     print(f"[save] {out_png}")
 
 
+# ===========================================================================
+# Section 7 — CLI / main
+# ===========================================================================
+# `_resolve_csv()` accepts either a positional CSV path or a
+# `--reports-dir` + `--tag` pair (auto-discovers the latest matching
+# `gpu_power_bench_*_<tag>.csv`). `main()` orchestrates: load → augment
+# (traffic metrics) → summarise (per-cell + per-regime) → plot all.
 # ---------------------------------------------------------------------------
 
 def _resolve_csv(args) -> Path | None:
