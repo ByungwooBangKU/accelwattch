@@ -743,7 +743,37 @@ def main() -> int:
             try:
                 spec = plan["build"]()
             except Exception as e:
-                print(f"  ! build failed: {e}  — skipped")
+                err_msg = str(e)
+                # Same fatal-marker / broken_variants logic as the
+                # run_measurement except below. A build() failure on Blackwell
+                # fp8_te typically means the prior cell's measurement loop
+                # poisoned the CUDA context, and the *first* CUDA call this
+                # cell makes (the warmup inside the build helper) is what
+                # surfaces it. Without this, we'd "skip" each remaining cell
+                # of the broken variant with a fresh build attempt — burning
+                # time on a deterministic, unrecoverable fault.
+                fatal_markers = (
+                    "illegal memory access",
+                    "CUDA error",
+                    "an asynchronous CUDA error",
+                    "device-side assert",
+                    "CUDA call failed",
+                )
+                fatal = any(m in err_msg for m in fatal_markers)
+                variant_key = (plan.get("op"), plan.get("dtype"),
+                               plan.get("mode"), plan.get("llm_preset", ""))
+                broken_variants.add(variant_key)
+                if fatal:
+                    print(f"  !! FATAL CUDA error during build at {label} "
+                          f"{plan['load_name']}={plan['load_value']}: {err_msg}")
+                    print(f"  !! CUDA context is now unrecoverable — "
+                          f"flushing {len(rows)} completed cells to CSV "
+                          f"and exiting early. Re-run without the offending "
+                          f"variant (e.g. --matmul-variants without fp8:te, "
+                          f"or skip --llm-shapes).")
+                    fatal_error = err_msg
+                    break
+                print(f"  ! build failed: {err_msg}  — skipped")
                 continue
             tag = spec.compute_unit + ("  [EMULATED]" if spec.emulated else "")
             print(f"  compute_unit: {tag}")
@@ -908,13 +938,36 @@ def main() -> int:
 
             # Free before the next cell to keep peak memory bounded.
             del spec
+            # Force any pending async CUDA errors to surface NOW — TE's
+            # amax-buffer fault on Blackwell often stays queued until the
+            # next CUDA call, which is the *next cell's* build(). Synching
+            # here means we attribute the fault to the cell that caused
+            # it, mark that variant broken, and exit cleanly.
             try:
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            except Exception:
-                # Context already poisoned — bail out, the post-loop save
-                # below will still flush whatever rows were collected.
-                fatal_error = "cuda context poisoned during empty_cache"
-                break
+            except Exception as e:
+                err_msg = str(e)
+                variant_key = (plan.get("op"), plan.get("dtype"),
+                               plan.get("mode"), plan.get("llm_preset", ""))
+                broken_variants.add(variant_key)
+                fatal_markers = (
+                    "illegal memory access",
+                    "CUDA error",
+                    "an asynchronous CUDA error",
+                    "device-side assert",
+                    "CUDA call failed",
+                )
+                if any(m in err_msg for m in fatal_markers):
+                    print(f"  !! deferred CUDA error surfaced after {label} "
+                          f"{plan['load_name']}={plan['load_value']}: {err_msg}")
+                    print(f"  !! CUDA context is poisoned — flushing "
+                          f"{len(rows)} completed cells and exiting.")
+                    fatal_error = err_msg
+                    break
+                # Non-fatal: just skip this variant going forward.
+                print(f"  ! post-cell cleanup failed: {err_msg}  "
+                      f"— marking {variant_key[0]}_{variant_key[1]}_{variant_key[2]} broken")
     finally:
         try:
             sampler.stop()
