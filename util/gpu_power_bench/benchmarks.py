@@ -620,11 +620,18 @@ def _make_matmul_fp8_te(M, N, K, device):
             amax_history_len=16,
             amax_compute_algo="max",
         )
-        # Warmup call — also forces the torch backend .so load path so
-        # a broken install fails during build() rather than inside the
-        # power-sampled loop.
-        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-            linear(x)
+        # Warmup — 5 iterations + sync. Two reasons:
+        #   (a) forces lazy load of libtransformer_engine_torch.so so a
+        #       missing / ABI-mismatched build fails during build() not
+        #       inside the power-sampled loop;
+        #   (b) catches Blackwell + small-M edge cases where TE's amax
+        #       buffer maintenance corrupts CUDA state on the second or
+        #       third call (single-warmup wasn't enough — see README
+        #       §8.3.3). Once we sync 5 calls cleanly, the cell is safe.
+        for _ in range(5):
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                linear(x)
+        torch.cuda.synchronize()
     except (OSError, RuntimeError) as e:
         msg = str(e)
         if ("shared object" in msg.lower()
@@ -788,8 +795,26 @@ def _make_llm_matmul_fp8_te(M: int, K: int, N: int, device) -> Callable[[], None
         amax_history_len=16,
         amax_compute_algo="max",
     )
-    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-        linear(x)   # warmup to force .so load
+    # Warmup 5×: same Blackwell + small-M (T=1 decode) safeguard as the
+    # square-matmul builder. If TE's amax-buffer dance is going to trip
+    # the CUDA context, it shows up here, where build() can re-raise as
+    # a clean RuntimeError that's caught at plan-build time and skips
+    # the cell instead of poisoning the whole sweep.
+    try:
+        for _ in range(5):
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                linear(x)
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        if "illegal memory access" in str(e) or "CUDA error" in str(e):
+            raise RuntimeError(
+                f"transformer_engine fp8_autocast failed during warmup "
+                f"on shape (M={M}, K={K}, N={N}) — likely Blackwell + "
+                f"small-M (decode-size) issue. CUDA context is now "
+                f"unrecoverable in this process. README §8.3.3 has the "
+                f"workarounds. Original: {e}"
+            ) from e
+        raise
     def f():
         with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
             linear(x)
