@@ -326,20 +326,55 @@ achieved_BW     = bytes_traffic / wall_s
 
 **옵션 1 — 기존 sweep 만으로**: `mul`, `add` 의 l2_hit_0 cell 이 사실상 STREAM-style 프로브와 동일. 별도 플래그 없이 `analyze.py` 만 돌리면 됩니다.
 
-**옵션 2 — Dedicated STREAM 프로브 (`--dram-bw-test`)**: 더 깔끔한 측정을 원하면 STREAM-style copy/scale/triad 3 종을 큰 working set 4 점에서 추가:
+**옵션 2 — Dedicated STREAM 프로브 (`--dram-bw-test`)**: 더 깔끔한 측정을 원하면 5 종 STREAM-style 커널을 큰 working set 4 점에서 추가:
+
+| 커널 | 의미 | 트래픽 (per call) | pJ/bit 해석 |
+|---|---|---|---|
+| `stream_read`  | `y = x.sum()` | 1·N·bpe | **DRAM read** 단독 |
+| `stream_write` | `y.fill_(c)` | 1·N·bpe | **DRAM write** 단독 |
+| `stream_copy`  | `out.copy_(x)` | 2·N·bpe | mixed 50/50 — read/write 평균 cross-check |
+| `stream_scale` | `y = α·x` | 2·N·bpe | mixed 50/50 |
+| `stream_triad` | `y = α·x + z` | 3·N·bpe | mixed 67/33 |
 
 ```bash
 python3 gpu_power_bench.py --device 0 --dram-bw-test --tag h100_dram
 python3 analyze.py --reports-dir reports/ --tag h100_dram
 ```
 
-해당 커널들 (`stream_copy`, `stream_scale`, `stream_triad`) 은 **연산이 거의 없어서** 동적 에너지가 거의 전부 메모리 트래픽. 따라서 derive 된 pJ/bit 가 mul/add 의 그것보다 noise 가 더 작음.
+해당 커널들은 **연산이 거의 없어서** 동적 에너지가 거의 전부 메모리 트래픽. 따라서 derive 된 pJ/bit 가 mul/add 의 그것보다 noise 가 더 작음.
 
-**`_02_dram_energy_*.png` 분석** (§6.4.2 참조): 2 개 별도 PNG.
-- **Panel A**: cell 별 pJ/bit 을 cache_regime x축으로 strip. 우측에 HBM2/HBM2E/HBM3/DDR4/Horowitz reference 가 dashed line 으로 그려져 있어서 측정치가 어디 위치하는지 즉시 비교 가능.
-- **Panel B**: l2_hit_0 cell 의 sustained BW (GB/s). HBM peak 점선과 함께 표시 — peak 의 50% 이상이면 BW-bound 이 정상, 30% 이하면 launch overhead 또는 kernel inefficiency 의심.
+`stream_read` / `stream_write` 는 단방향 트래픽이라 **read 와 write 의 pJ/bit 을 따로 분리** 할 수 있고, mixed 3종은 같은 dtype 의 (R + W) / 2 와 자기들이 측정한 평균이 일치하는지 cross-check 합니다 (오차 < 5% 면 측정 quality 양호).
 
-**Static vs dynamic 분리**: `dyn_energy_j = total_energy_j − static_power_w × wall_s`. static 은 §3.4 의 baseline 측정 (12 초 idle) 에서 mean ± std 가 5% 이내일 때만 신뢰 가능. baseline plot (`_03_baseline_static_power.png`) 에서 idle trace 가 평탄한지 먼저 확인 후 pJ/bit 해석.
+### 3.5.1 출력 파일 4 종
+
+| 파일 | 내용 |
+|---|---|
+| `_02_dram_energy_pjbit.png` | 모든 cell 의 pJ/bit strip — l2_hit_100 → l2_hit_0 progression + HBM2/HBM3/DDR4 reference 라인 |
+| `_02_dram_energy_bw.png` | l2_hit_0 sustained BW (GB/s) per kernel + HBM peak 비교 |
+| `_02_dram_energy_rw_split.png` | **read vs write 분리 bar** (stream_read/stream_write 만 활성). 회색 hatched bar 는 mixed kernel 의 측정 vs 이론치 (impl) 비교 |
+| `_02_dram_energy_marginal.png` | **direct (l2_hit_0)** vs **marginal (l2_hit_0 − l2_hit_100)** 두 해석. marginal 이 SM compute + L2 transit baseline 을 cancel 해서 literature DRAM-stack 정의에 더 가까움. marginal 이 음수면 P_static 문제 |
+
+### 3.5.2 콘솔 자동 출력 예시
+
+```
+== DRAM read vs write energy (l2_hit_0, pJ/bit) ==
+ dtype           op   role  r_per_call  w_per_call  n_cells  pj_per_bit_med  pj_per_bit_implied  implied_error_pct
+  fp16  stream_read   READ           1           0        4           2.844                 NaN                NaN
+  fp16 stream_write  WRITE           0           1        4           4.640                 NaN                NaN
+  fp16  stream_copy  MIXED           1           1        4           3.621               3.742            -3.227
+  fp16 stream_scale  MIXED           1           1        4           3.727               3.742            -0.402
+  fp16 stream_triad  MIXED           2           1        4           3.558               3.443             3.349
+
+== DRAM marginal cost (direct vs marginal pJ/bit) ==
+          op  dtype   direct_dram_pJ_per_bit   marginal_pJ_per_bit
+ stream_copy   fp16                    3.621                 3.214
+ stream_read   fp16                    2.844                 2.439
+stream_write   fp16                    4.640                 4.240
+```
+
+read 와 write 가 분리돼서 나오고, mixed 의 implied (= (r·R+w·W)/(r+w)) 와 측정값의 오차도 표시. marginal 컬럼은 direct 에서 ~0.4 pJ/bit 빠진 값 (l2_hit_100 baseline 이 SM/L2 비용으로 빠짐) — HBM3 literature 3.9 와 더 가깝게 정렬.
+
+**Static vs dynamic 분리**: `dyn_energy_j = total_energy_j − static_power_w × wall_s`. static 은 §3.4 의 baseline 측정 (12 초 idle) 에서 mean ± std 가 5% 이내일 때만 신뢰 가능. baseline plot (`_03_baseline_static_power.png`) 에서 idle trace 가 평탄한지 먼저 확인 후 pJ/bit 해석. **Marginal plot 의 음수 bar 는 P_static 이 너무 높게 잡혀서 l2_hit_100 의 dyn_energy 가 인플레됐다는 신호** — 이 경우 `--rebaseline-every 20` 으로 재측정 권장.
 
 ## 4. 측정 방법론
 
@@ -1015,6 +1050,10 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_02_cache_regime_matmul_dynpower.png`     | matmul: regime 별 dyn power |
 | `<stem>_02_dram_energy_pjbit.png`                | pJ/bit strip — HBM2/HBM3 reference 라인 포함 |
 | `<stem>_02_dram_energy_bw.png`                   | l2_hit_0 sustained BW per kernel (HBM peak 비교) |
+| `<stem>_02_dram_energy_rw_split.png`             | (--dram-bw-test 시) read vs write 분리 bar + mixed cross-check |
+| `<stem>_02_dram_energy_marginal.png`             | direct vs marginal pJ/bit (l2_hit_0 − l2_hit_100) — DRAM-stack 만 |
+| `<stem>_dram_rw_split.csv`                       | (--dram-bw-test 시) per (dtype, op) read/write/mixed pJ/bit 표 |
+| `<stem>_dram_marginal.csv`                       | per (op, dtype) direct vs marginal pJ/bit 표 |
 | `<stem>_03_baseline_static_power.png`            | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
 | `<stem>_04_thermal_diagnostics.png`              | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
 | `<stem>_05_trace_timeline.png`                   | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
@@ -1115,6 +1154,8 @@ reports/
 │   ├── <stem>_02_cache_regime_matmul_dynpower.png
 │   ├── <stem>_02_dram_energy_pjbit.png                    # split DRAM
 │   ├── <stem>_02_dram_energy_bw.png
+│   ├── <stem>_02_dram_energy_rw_split.png                 # if --dram-bw-test
+│   ├── <stem>_02_dram_energy_marginal.png                 # if both regimes present
 │   ├── <stem>_03_baseline_static_power.png
 │   ├── <stem>_04_thermal_diagnostics.png
 │   └── <stem>_05_trace_timeline.png
