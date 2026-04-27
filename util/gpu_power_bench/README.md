@@ -830,11 +830,11 @@ RuntimeError: CUDA error: an illegal memory access was encountered
 
 **증상의 무서운 점**: 한 번 illegal memory access 가 나면 그 프로세스의 **CUDA context 가 완전히 망가져서** 이후 모든 CUDA 호출이 같은 에러로 죽음. 옛 코드에선 sweep 전체가 crash 하면서 이미 측정한 cell 들도 CSV 로 못 남아 소실.
 
-**현재 코드 (PR #31 이후)**:
+**현재 코드 (PR #32 이후)**:
 
 1. **build() 단계의 5× warmup** : `_make_matmul_fp8_te` / `_make_llm_matmul_fp8_te` 가 단일 forward 가 아니라 5 회 + sync 로 검증. amax buffer state 가 안정될 때까지. 이 경계에서 fail 하면 cell 만 skip 되고 sweep 은 살아남음.
 
-2. **fatal-CUDA-error 자동 감지 + 부분 CSV 저장** : 측정 중 `illegal memory access` / `CUDA error` / `device-side assert` 등이 보이면 `gpu_power_bench.py` 가 더 이상 CUDA 호출 시도하지 않고 그 시점까지 모은 row 를 즉시 CSV 로 dump 한 뒤 cleanly 종료:
+2. **fatal-CUDA-error 자동 감지 + 부분 CSV 저장** : 측정 *및 build* 중 `illegal memory access` / `CUDA error` / `device-side assert` 등이 보이면 `gpu_power_bench.py` 가 더 이상 CUDA 호출 시도하지 않고 그 시점까지 모은 row 를 즉시 CSV 로 dump 한 뒤 cleanly 종료. **build 단계도 같은 보호** : 이전 cell 의 비동기 CUDA 에러가 다음 cell 의 `build()` 첫 호출에서 surface 되는 케이스도 fatal markers 로 잡아 즉시 partial-CSV save + exit.
    ```
    !! FATAL CUDA error at matmul_fp8_te K_size=1024: CUDA error: an illegal memory access...
    !! CUDA context is now unrecoverable — flushing 130 completed cells to CSV and exiting early.
@@ -843,7 +843,9 @@ RuntimeError: CUDA error: an illegal memory access was encountered
              that crashed (e.g. --matmul-variants without fp8:te, or skip --llm-shapes).
    ```
 
-3. **Variant-level skip** : 한 cell 이 (FATAL 외) 에러로 죽으면 같은 (op, dtype, mode, llm_preset) 의 나머지 cell 도 retry 안 하고 skip — CUDA context 가 살아있어도 동일 fault 가 deterministic 하게 반복되니 시간 낭비 방지.
+3. **Variant-level skip (build / run 양쪽)** : 한 cell 이 build 또는 run 에서 죽으면 같은 (op, dtype, mode, llm_preset) 의 나머지 cell 도 retry 안 하고 skip — CUDA context 가 살아있어도 동일 fault 가 deterministic 하게 반복되니 시간 낭비 방지. (이전엔 build 실패 시에만 broken_variants 추적이 빠져 있어서, fp8_te 의 K-sweep 9 셀이 전부 다시 시도하다 죽었음 — 이 갭이 이번 PR 의 핵심 수정.)
+
+4. **Post-cell `torch.cuda.synchronize()`** : 매 cell 의 cleanup 단계에서 sync 를 강제해 비동기 CUDA 에러가 그 cell 에 귀속되도록 함. 옛 코드에선 cell N 의 fault 가 cell N+1 의 build() 에서 비로소 보였고, "build failed" 메시지가 사실은 N 의 amax-buffer 사고를 나타내고 있었음. 이제 sync 시점에서 잡아 fatal-marker 로 분류하고 `broken_variants` 에 추가.
 
 **해결 / 우회**:
 
