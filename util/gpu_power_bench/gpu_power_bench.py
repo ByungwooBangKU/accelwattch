@@ -687,8 +687,22 @@ def main() -> int:
     # Counters for the post-sweep clip-bias report.
     n_clip_power = 0
     n_clip_energy = 0
+    # Variants (op, dtype, mode, llm_preset) that have already crashed once.
+    # Any later cell sharing the same key gets skipped without retry — the
+    # CUDA fault repeats deterministically and we'd just waste time.
+    broken_variants: set[tuple[str, str, str, str]] = set()
+    fatal_error: str | None = None
     try:
         for i, plan in enumerate(plans, 1):
+            # Skip cells from variants we've already proven broken in this run.
+            variant_key = (plan.get("op"), plan.get("dtype"),
+                           plan.get("mode"), plan.get("llm_preset", ""))
+            if variant_key in broken_variants:
+                print(f"\n[{i}/{total_cells}] {plan['op']}_{plan['dtype']}_{plan['mode']}"
+                      + (f"·{plan['llm_preset']}" if plan.get("llm_preset") else "")
+                      + f"  {plan['load_name']}={plan['load_value']}  — SKIPPED "
+                      f"(this variant crashed earlier)")
+                continue
             # Periodic re-baseline. Done BEFORE the per-cell cooldown so
             # the fresh idle measurement also serves as a thermal
             # stabilisation window. Skipped on cell #1 (we already have a
@@ -753,12 +767,50 @@ def main() -> int:
             except torch.cuda.OutOfMemoryError as e:
                 print(f"  ! OOM at load={plan['load_value']}: {e}")
                 del spec
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
                 continue
             except Exception as e:
-                print(f"  ! run failed: {e}")
+                err_msg = str(e)
+                # Some errors poison the CUDA context for the entire process
+                # — every subsequent CUDA call (including empty_cache and the
+                # next cell's tensor allocation) will re-raise the SAME error.
+                # In that case continuing is pointless: we'd just produce
+                # garbage. Detect those, dump the rows we already have, and
+                # exit cleanly so the user keeps everything completed so far.
+                fatal_markers = (
+                    "illegal memory access",
+                    "CUDA error",
+                    "an asynchronous CUDA error",
+                    "device-side assert",
+                    "CUDA call failed",
+                )
+                fatal = any(m in err_msg for m in fatal_markers)
+                # Track that THIS variant is broken so subsequent cells of the
+                # same (op, dtype, mode, llm_preset) get skipped without trying
+                # — the CUDA context is the same, the fault repeats.
+                variant_key = (plan.get("op"), plan.get("dtype"),
+                               plan.get("mode"), plan.get("llm_preset", ""))
+                broken_variants.add(variant_key)
+                if fatal:
+                    print(f"  !! FATAL CUDA error at {label} "
+                          f"{plan['load_name']}={plan['load_value']}: {err_msg}")
+                    print(f"  !! CUDA context is now unrecoverable — "
+                          f"flushing {len(rows)} completed cells to CSV "
+                          f"and exiting early. Re-run without the offending "
+                          f"variant (e.g. --no-matmul / drop --llm-shapes / "
+                          f"--matmul-variants without fp8:te).")
+                    fatal_error = err_msg
+                    break  # exit the for-loop; the finally: + post-loop save
+                           # still write whatever we accumulated.
+                print(f"  ! run failed: {err_msg}")
                 del spec
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
                 continue
 
             # Energy decomposition: we subtract the baseline / static power
@@ -856,10 +908,22 @@ def main() -> int:
 
             # Free before the next cell to keep peak memory bounded.
             del spec
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                # Context already poisoned — bail out, the post-loop save
+                # below will still flush whatever rows were collected.
+                fatal_error = "cuda context poisoned during empty_cache"
+                break
     finally:
-        sampler.stop()
-        pynvml.nvmlShutdown()
+        try:
+            sampler.stop()
+        except Exception:
+            pass
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
     # ---- write CSV ---------------------------------------------------------
     out_dir = Path(args.out_dir)
@@ -872,7 +936,15 @@ def main() -> int:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader()
             w.writerows(rows)
-        print(f"\n[save] {csv_path}  ({len(rows)} rows)")
+        if fatal_error:
+            print(f"\n[save] {csv_path}  ({len(rows)} rows — partial; "
+                  f"sweep aborted by '{fatal_error}')")
+            print(f"[recover] all completed cells are saved. To finish "
+                  f"the sweep, re-run dropping the variant that crashed "
+                  f"(e.g. --matmul-variants without fp8:te, or skip "
+                  f"--llm-shapes).")
+        else:
+            print(f"\n[save] {csv_path}  ({len(rows)} rows)")
     else:
         print("\n[warn] no rows collected — nothing saved")
         return 2

@@ -816,6 +816,56 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
     ./install_transformer_engine.sh now tries pypi.nvidia.com first
 ```
 
+#### 8.3.3 Troubleshooting: `CUDA error: an illegal memory access` in `torch.cat(amax_buffer)` (Blackwell + fp8_te)
+
+`matmul_fp8_te` 또는 `--llm-shapes` 가 **Blackwell (sm_120)** GPU 에서 다음과 같이 죽는 경우:
+
+```
+File ".../transformer_engine/pytorch/fp8.py", line 340, in reduce_and_update_fp8_tensors
+    contiguous_amax = torch.cat(amax_buffer)
+RuntimeError: CUDA error: an illegal memory access was encountered
+```
+
+**원인**: TE 의 amax history buffer 관리 코드가 **Blackwell 의 새로운 FP8 tile 경로 + 작은 M dim** (예: T=1 decode-size matmul) 조합에서 amax 텐서를 잘못 다룸. TE 가 Hopper sm_90 에 맞춰 튜닝되어 있어서 sm_120 의 새 패스가 amax 와 race 를 일으킴. NVIDIA TE 1.x 에서 알려진 이슈.
+
+**증상의 무서운 점**: 한 번 illegal memory access 가 나면 그 프로세스의 **CUDA context 가 완전히 망가져서** 이후 모든 CUDA 호출이 같은 에러로 죽음. 옛 코드에선 sweep 전체가 crash 하면서 이미 측정한 cell 들도 CSV 로 못 남아 소실.
+
+**현재 코드 (PR #31 이후)**:
+
+1. **build() 단계의 5× warmup** : `_make_matmul_fp8_te` / `_make_llm_matmul_fp8_te` 가 단일 forward 가 아니라 5 회 + sync 로 검증. amax buffer state 가 안정될 때까지. 이 경계에서 fail 하면 cell 만 skip 되고 sweep 은 살아남음.
+
+2. **fatal-CUDA-error 자동 감지 + 부분 CSV 저장** : 측정 중 `illegal memory access` / `CUDA error` / `device-side assert` 등이 보이면 `gpu_power_bench.py` 가 더 이상 CUDA 호출 시도하지 않고 그 시점까지 모은 row 를 즉시 CSV 로 dump 한 뒤 cleanly 종료:
+   ```
+   !! FATAL CUDA error at matmul_fp8_te K_size=1024: CUDA error: an illegal memory access...
+   !! CUDA context is now unrecoverable — flushing 130 completed cells to CSV and exiting early.
+   [save] reports/gpu_power_bench_*_blackwell.csv  (130 rows — partial; sweep aborted by '...')
+   [recover] all completed cells are saved. To finish the sweep, re-run dropping the variant
+             that crashed (e.g. --matmul-variants without fp8:te, or skip --llm-shapes).
+   ```
+
+3. **Variant-level skip** : 한 cell 이 (FATAL 외) 에러로 죽으면 같은 (op, dtype, mode, llm_preset) 의 나머지 cell 도 retry 안 하고 skip — CUDA context 가 살아있어도 동일 fault 가 deterministic 하게 반복되니 시간 낭비 방지.
+
+**해결 / 우회**:
+
+- **fp8_te 빼고 sweep 다시** :
+  ```bash
+  ./run_bench.sh --device 3 --suite full --tag blackwell \
+      --matmul-variants fp32:simt tf32:tc fp16:tc bf16:tc   # fp8:te 제거
+  ```
+  또는 LLM sweep 안 켜기:
+  ```bash
+  ./run_bench.sh --device 3 --suite powermodel --tag blackwell   # llm 안 들어감
+  ```
+
+- **Square matmul 만은 보통 OK** : Hopper 처럼 T 가 충분히 크면 (M ≥ 128) Blackwell 에서도 `matmul_fp8_te` 가 통과합니다. `--llm-shapes` 의 `T=1` (decode), `T=256` (small prefill) 정도가 자주 fail. fp8_te + LLM 만 빼고 fp16/bf16 LLM 으로:
+  ```bash
+  ./run_bench.sh --suite llm --llm-dtypes bf16:tc fp16:tc   # fp8:te 제외
+  ```
+
+- **TE 업그레이드** : 최신 TE (≥ 2.x) 에서는 sm_120 amax 처리가 일부 개선됨. 테스트 환경 허용되면 `pip install --upgrade transformer-engine[pytorch]`.
+
+- **Recovery 후 분석**: 부분 CSV 도 `analyze.py` 가 정상 처리합니다. fp8_te / llm 행이 없을 뿐 elementwise + 다른 matmul variants 의 k_op / cache_regime / DRAM-energy 분석은 모두 동작.
+
 ### 8.4 환경 권장 사항
 
 - `sudo nvidia-smi -pm 1` : persistence mode.
