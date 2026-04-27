@@ -180,14 +180,20 @@ def _apply_suite_to_parser(parser, suite_name: str) -> None:
 def _cell_memory_bytes(op: str, dtype_label: str, n_elements: int) -> int:
     """Conservative upper bound on DRAM footprint of a single elementwise cell.
 
-    mul/add           : 3 tensors (a, b, out)
-    gelu              : 2 tensors (in, out)
-    softmax/layernorm : 2 tensors (in, out) — reduction in fp32 done in-register
-    fp8 path          : each of those tensors may also materialise a full fp16
-                        intermediate (cast-compute-cast), so multiply by 3.
+    mul/add                       : 3 tensors (a, b, out)
+    gelu                          : 2 tensors (in, out)
+    softmax/layernorm             : 2 tensors (in, out) — reduction in fp32 done in-register
+    stream_copy / stream_scale    : 2 tensors (in, out)
+    stream_triad                  : 3 tensors (a, z, out)
+    stream_read                   : 1 tensor  (in only — output is a scalar)
+    stream_write                  : 1 tensor  (out only)
+    fp8 path                      : each tensor may also materialise a full fp16
+                                    intermediate (cast-compute-cast), so ×1.5.
     """
-    if op in ("mul", "add"):
+    if op in ("mul", "add", "stream_triad"):
         tensors = 3
+    elif op in ("stream_read", "stream_write"):
+        tensors = 1
     else:
         tensors = 2
     bytes_per_elem = {"fp16": 2, "fp8": 1}.get(dtype_label, 2)
@@ -590,11 +596,19 @@ def main() -> int:
             stream_loads = [1 << 27, 1 << 28, 1 << 29, 1 << 30]
         # Apply the same memory budget filter used for the elementwise sweep.
         stream_loads = _filter_loads(stream_loads,
-                                     ["stream_copy", "stream_scale", "stream_triad"],
+                                     ["stream_copy", "stream_scale", "stream_triad",
+                                      "stream_read", "stream_write"],
                                      list(args.dtypes), hbm_bytes)
         print(f"[dram-bw] {len(stream_loads)} working-set sizes: {stream_loads}")
         for dtype in args.dtypes:
-            for op in ("stream_copy", "stream_scale", "stream_triad"):
+            # 5 STREAM-style probes:
+            #   stream_read   pure read  (sum reduction)         → DRAM read pJ/bit
+            #   stream_write  pure write (fill_)                  → DRAM write pJ/bit
+            #   stream_copy   1R + 1W    (out.copy_ from x)       → cross-check (R+W)/2
+            #   stream_scale  1R + 1W    (y = α·x)
+            #   stream_triad  2R + 1W    (y = α·x + z)
+            for op in ("stream_read",  "stream_write",
+                       "stream_copy",  "stream_scale", "stream_triad"):
                 for N in stream_loads:
                     plans.append({
                         "category": "elementwise",

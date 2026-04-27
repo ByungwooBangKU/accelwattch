@@ -146,6 +146,18 @@ RW_PER_CALL = {
     "mul": 3, "add": 3,
     "gelu": 2, "softmax": 2, "layernorm": 2,
     "stream_copy": 2, "stream_scale": 2, "stream_triad": 3,
+    "stream_read":  1,    # bytes_traffic = N·bpe (read only)
+    "stream_write": 1,    # bytes_traffic = N·bpe (write only)
+}
+
+# Single-direction stream probes — used by compute_dram_rw_split() to
+# isolate read vs write energy. The "ratio" is the (reads, writes) per call.
+STREAM_RW_RATIO: dict[str, tuple[int, int]] = {
+    "stream_read":  (1, 0),   # pure read
+    "stream_write": (0, 1),   # pure write
+    "stream_copy":  (1, 1),   # 50/50 — cross-check
+    "stream_scale": (1, 1),   # 50/50 — cross-check
+    "stream_triad": (2, 1),   # 67/33 — cross-check
 }
 
 # Literature reference points for DRAM pJ/bit, drawn as horizontal guide
@@ -1546,6 +1558,242 @@ def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
     _save_fig(fig_b, out_dir / f"{stem}_02_dram_energy_bw.png")
 
 
+# ---------------------------------------------------------------------------
+# DRAM read/write split + marginal cost (added in PR #30)
+# ---------------------------------------------------------------------------
+
+def compute_dram_rw_split(df: pd.DataFrame) -> pd.DataFrame:
+    """For each dtype at l2_hit_0, derive **separate** read and write
+    pJ/bit from the stream_read / stream_write probes, plus the mixed
+    measurements (stream_copy / stream_scale / stream_triad) as cross-
+    check.
+
+    Returns one row per (dtype, op) carrying:
+      pj_per_bit_med    — median over the swept N values
+      n_cells           — how many cells contributed
+      r_per_call        — number of reads per kernel call
+      w_per_call        — number of writes per kernel call
+      role              — "READ", "WRITE", "MIXED" — for plot grouping
+
+    Also computes the "implied" pJ/bit for each MIXED kernel as
+    `(r·R + w·W)/(r+w)` and returns it as `pj_per_bit_implied` so the
+    user can eyeball the read/write decomposition's self-consistency.
+    """
+    if "pj_per_bit_traffic" not in df.columns:
+        return pd.DataFrame()
+    drm = df[(df.get("category") == "elementwise") &
+             (df["op"].isin(STREAM_RW_RATIO))].copy()
+    if drm.empty:
+        return pd.DataFrame()
+    drm["cache_regime"] = drm["cache_regime"].replace(LEGACY_REGIME_MAP)
+    drm = drm[drm["cache_regime"] == "l2_hit_0"]
+    drm["pj_per_bit_traffic"] = pd.to_numeric(drm["pj_per_bit_traffic"],
+                                              errors="coerce")
+    drm = drm[drm["pj_per_bit_traffic"] > 0]
+    if drm.empty:
+        return pd.DataFrame()
+    rows: list[dict] = []
+    # Separate cache for read / write per dtype so we can compute the
+    # MIXED-kernel implied number from the same dtype's measurements.
+    pure: dict[tuple[str, str], float] = {}   # (dtype, "read"|"write") → pJ/bit
+    for (dt, op), g in drm.groupby(["dtype", "op"]):
+        med = float(g["pj_per_bit_traffic"].median())
+        r, w = STREAM_RW_RATIO[op]
+        if (r, w) == (1, 0):
+            role = "READ";  pure[(dt, "read")]  = med
+        elif (r, w) == (0, 1):
+            role = "WRITE"; pure[(dt, "write")] = med
+        else:
+            role = "MIXED"
+        rows.append(dict(dtype=dt, op=op, role=role,
+                         r_per_call=r, w_per_call=w,
+                         pj_per_bit_med=med, n_cells=len(g)))
+    out = pd.DataFrame(rows)
+    # Add implied pJ/bit for MIXED rows.
+    def _implied(row):
+        if row["role"] != "MIXED":
+            return float("nan")
+        R = pure.get((row["dtype"], "read"))
+        W = pure.get((row["dtype"], "write"))
+        if R is None or W is None:
+            return float("nan")
+        r, w = row["r_per_call"], row["w_per_call"]
+        return (r * R + w * W) / (r + w)
+    out["pj_per_bit_implied"] = out.apply(_implied, axis=1)
+    out["implied_error_pct"] = (out["pj_per_bit_med"] - out["pj_per_bit_implied"]) \
+                                / out["pj_per_bit_implied"] * 100.0
+    return out.sort_values(["dtype", "role", "op"]).reset_index(drop=True)
+
+
+def compute_dram_marginal(df: pd.DataFrame) -> pd.DataFrame:
+    """Marginal DRAM cost — the extra pJ/bit a kernel pays when its
+    working set spills out of L2 into HBM. For each (op, dtype) that has
+    cells in BOTH the l2_hit_100 and l2_hit_0 regimes we report:
+
+        J_per_byte(l2_hit_100)        # baseline: SM compute + L2 traffic
+        J_per_byte(l2_hit_0)          # SM compute + L2 transit + HBM stream
+        marginal_pJ_per_bit = (J_dram - J_l2) × 1e12 / 8
+
+    The marginal number is closer to the *literature* "DRAM-only"
+    energy because the on-chip components (SM compute, L2 lookup, NoC
+    routing) cancel between the two regimes. README §3.5.
+
+    Cells where dyn_energy_j was clipped to 0 (P_static drift) are
+    excluded — they'd silently set the L2 baseline to 0 and inflate
+    the marginal.
+    """
+    if ("pj_per_bit_traffic" not in df.columns
+            or "bytes_traffic" not in df.columns):
+        return pd.DataFrame()
+    ew = df[df.get("category") == "elementwise"].copy()
+    if ew.empty:
+        return pd.DataFrame()
+    ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
+    ew["dyn_energy_j"] = pd.to_numeric(ew["dyn_energy_j"], errors="coerce")
+    ew["bytes_traffic"] = pd.to_numeric(ew["bytes_traffic"], errors="coerce")
+    ew = ew[(ew["dyn_energy_j"] > 0) & (ew["bytes_traffic"] > 0)]
+    if ew.empty:
+        return pd.DataFrame()
+    ew["j_per_byte"] = ew["dyn_energy_j"] / ew["bytes_traffic"]
+
+    rows: list[dict] = []
+    for (op, dt), g in ew.groupby(["op", "dtype"]):
+        l2 = g[g["cache_regime"] == "l2_hit_100"]["j_per_byte"]
+        dr = g[g["cache_regime"] == "l2_hit_0"]["j_per_byte"]
+        if l2.empty or dr.empty:
+            continue
+        l2_med = float(l2.median()); dr_med = float(dr.median())
+        delta = dr_med - l2_med
+        rows.append(dict(
+            op=op, dtype=dt,
+            l2_J_per_byte=l2_med,
+            dram_J_per_byte=dr_med,
+            marginal_pJ_per_bit=delta * 1e12 / 8.0,
+            direct_dram_pJ_per_bit=dr_med * 1e12 / 8.0,
+            n_l2_cells=len(l2),
+            n_dram_cells=len(dr),
+        ))
+    return pd.DataFrame(rows).sort_values(["op", "dtype"]).reset_index(drop=True)
+
+
+def plot_dram_rw_split(rw_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
+    """Bar chart: read vs write vs mixed pJ/bit per dtype (l2_hit_0).
+
+    Reference dashed lines: the literature HBM3 numbers (read ~3.0,
+    write ~4.5 pJ/bit). Mixed bars show their measured value next to
+    the "implied" value derived from the read/write decomposition —
+    the % error tells the user how well the linear-model assumption
+    (mixed = (r·R + w·W)/(r+w)) holds on this card.
+    """
+    if rw_df.empty:
+        return
+    plt = _get_mpl()
+    dtypes = sorted(rw_df["dtype"].unique())
+    op_order = ["stream_read", "stream_write",
+                "stream_copy", "stream_scale", "stream_triad"]
+    role_color = {"READ": "#1f77b4", "WRITE": "#d62728", "MIXED": "#7f7f7f"}
+
+    fig, ax = plt.subplots(figsize=(15, 7))
+    bar_w = 0.8 / max(1, len(dtypes))
+    xs = np.arange(len(op_order))
+    for i, dt in enumerate(dtypes):
+        sub = rw_df[rw_df["dtype"] == dt].set_index("op")
+        vals = [float(sub.loc[op, "pj_per_bit_med"]) if op in sub.index else float("nan")
+                for op in op_order]
+        roles = [str(sub.loc[op, "role"]) if op in sub.index else "" for op in op_order]
+        offset = (i - (len(dtypes) - 1) / 2) * bar_w
+        bars = ax.bar(xs + offset, vals, bar_w,
+                      color=[role_color.get(r, "#999") for r in roles],
+                      edgecolor="white", alpha=0.9, label=dt,
+                      hatch=["", "", "//", "//", "//"])
+        for rect, v, op in zip(bars, vals, op_order):
+            if not np.isfinite(v):
+                continue
+            row = sub.loc[op] if op in sub.index else None
+            txt = f"{v:.2f}"
+            if row is not None and pd.notna(row.get("pj_per_bit_implied")):
+                imp = row["pj_per_bit_implied"]; err = row["implied_error_pct"]
+                txt += f"\n(impl {imp:.2f}, Δ{err:+.0f}%)"
+            ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                    txt, ha="center", va="bottom", fontsize=8, linespacing=1.05)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"{op}\n({STREAM_RW_RATIO[op][0]}R+{STREAM_RW_RATIO[op][1]}W)"
+                        for op in op_order], fontsize=10)
+    ax.set_ylabel("pJ / bit  (l2_hit_0, board-level)")
+    ax.set_yscale("log")
+    ax.grid(True, axis="y", alpha=0.3)
+    # Reference lines.
+    ax.axhline(3.0, color="#1f77b4", ls="--", lw=1, alpha=0.6)
+    ax.text(len(op_order) - 0.5, 3.0, " HBM3 read ≈ 3.0", fontsize=8,
+            color="#1f77b4", va="center")
+    ax.axhline(4.5, color="#d62728", ls="--", lw=1, alpha=0.6)
+    ax.text(len(op_order) - 0.5, 4.5, " HBM3 write ≈ 4.5", fontsize=8,
+            color="#d62728", va="center")
+    ax.axhline(3.9, color="#444444", ls=":", lw=1, alpha=0.6)
+    ax.text(len(op_order) - 0.5, 3.9, " HBM3 avg ≈ 3.9", fontsize=8,
+            color="#444444", va="center")
+    ax.set_title(f"DRAM read vs write energy — {gpu}\n"
+                 "Blue=read-only / Red=write-only / Grey=mixed "
+                 "(implied = (r·R+w·W)/(r+w))", fontsize=11)
+    ax.legend(title="dtype", fontsize=9, loc="upper left")
+    _save_fig(fig, out_png)
+
+
+def plot_dram_marginal(marg_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
+    """Bar chart contrasting two DRAM-cost interpretations:
+
+      direct  = pJ/bit at l2_hit_0 (= board-level full-stack)
+      marginal = (J_dram − J_l2) per byte → cancels SM-compute and L2
+                  routing; closer to "DRAM cells + PHY + controller"
+                  literature definition
+
+    Marginal is usually 1–2 pJ/bit *lower* than direct because the SM
+    compute and L2 transit baseline are subtracted. If marginal is
+    *negative* on some op, P_static is wrong (the l2_hit_100 measurement
+    is artificially high, pushing direct-l2 above direct-dram).
+    """
+    if marg_df.empty:
+        return
+    plt = _get_mpl()
+    fig, ax = plt.subplots(figsize=(15, 7))
+    keys = [f"{r['op']}·{r['dtype']}" for _, r in marg_df.iterrows()]
+    xs = np.arange(len(keys))
+    w = 0.4
+    bars_d = ax.bar(xs - w/2, marg_df["direct_dram_pJ_per_bit"], w,
+                    color="#999999", alpha=0.85, edgecolor="white",
+                    label="direct (full stack at l2_hit_0)")
+    bars_m = ax.bar(xs + w/2, marg_df["marginal_pJ_per_bit"], w,
+                    color="#1f77b4", alpha=0.9, edgecolor="white",
+                    label="marginal (DRAM-only ≈ direct − l2_hit_100)")
+    for rect, v in zip(bars_d, marg_df["direct_dram_pJ_per_bit"]):
+        if pd.notna(v):
+            ax.text(rect.get_x()+rect.get_width()/2, rect.get_height(),
+                    f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+    for rect, v in zip(bars_m, marg_df["marginal_pJ_per_bit"]):
+        if pd.notna(v):
+            colour = "#d62728" if v < 0 else "black"
+            ax.text(rect.get_x()+rect.get_width()/2, rect.get_height(),
+                    f"{v:.2f}", ha="center", va="bottom", fontsize=8,
+                    color=colour, fontweight="bold" if v < 0 else "normal")
+    ax.set_xticks(xs)
+    ax.set_xticklabels(keys, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("pJ / bit")
+    # Reference lines for the marginal interpretation.
+    ax.axhline(3.9, color="#444444", ls="--", lw=1, alpha=0.7)
+    ax.text(len(keys) - 0.5, 3.9, " HBM3 ≈ 3.9", fontsize=8, color="#444444", va="center")
+    ax.axhline(2.5, color="#888888", ls=":", lw=1, alpha=0.7)
+    ax.text(len(keys) - 0.5, 2.5, " Horowitz '14 DRAM core ≈ 2.5", fontsize=8,
+            color="#888888", va="center")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_title(f"DRAM energy: direct vs marginal — {gpu}\n"
+                 "marginal cancels SM/L2 baseline → closer to literature DRAM-stack value\n"
+                 "(red, bold values: marginal < 0 — likely P_static drift problem)",
+                 fontsize=11)
+    ax.legend(loc="upper left")
+    _save_fig(fig, out_png)
+
+
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
     plt = _get_mpl()
     s = pd.read_csv(samples_csv)
@@ -1802,6 +2050,45 @@ def main() -> int:
     plot_cache_regime(plot_df, plot_by_regime, out_dir, stem, gpu)
     # DRAM-bandwidth energy — 2 separate PNGs (pJ/bit strip + sustained BW).
     plot_dram_energy(plot_df, out_dir, stem, gpu)
+    # DRAM read/write split (only fires when stream_read / stream_write
+    # probes are present — i.e. user ran --dram-bw-test).
+    rw_df = compute_dram_rw_split(plot_df)
+    if not rw_df.empty:
+        rw_path = out_dir / f"{stem}_dram_rw_split.csv"
+        rw_df.to_csv(rw_path, index=False)
+        print(f"[save] {rw_path}")
+        plot_dram_rw_split(rw_df,
+            out_dir / f"{stem}_02_dram_energy_rw_split.png", gpu)
+        # Also print a tidy summary so the user sees R / W numbers without
+        # opening the CSV.
+        print("\n== DRAM read vs write energy (l2_hit_0, pJ/bit) ==")
+        with pd.option_context("display.width", 160,
+                               "display.float_format", lambda v: f"{v:.3f}"):
+            cols = ["dtype", "op", "role", "r_per_call", "w_per_call",
+                    "n_cells", "pj_per_bit_med", "pj_per_bit_implied",
+                    "implied_error_pct"]
+            print(rw_df[cols].to_string(index=False))
+    # DRAM marginal cost (l2_hit_0 minus l2_hit_100) — works on any sweep
+    # that has cells in both regimes (no extra probe needed).
+    marg_df = compute_dram_marginal(plot_df)
+    if not marg_df.empty:
+        marg_path = out_dir / f"{stem}_dram_marginal.csv"
+        marg_df.to_csv(marg_path, index=False)
+        print(f"[save] {marg_path}")
+        plot_dram_marginal(marg_df,
+            out_dir / f"{stem}_02_dram_energy_marginal.png", gpu)
+        print("\n== DRAM marginal cost (direct vs marginal pJ/bit) ==")
+        with pd.option_context("display.width", 160,
+                               "display.float_format", lambda v: f"{v:.3f}"):
+            cols = ["op", "dtype", "n_l2_cells", "n_dram_cells",
+                    "direct_dram_pJ_per_bit", "marginal_pJ_per_bit"]
+            print(marg_df[cols].to_string(index=False))
+        neg = marg_df[marg_df["marginal_pJ_per_bit"] < 0]
+        if not neg.empty:
+            print(f"\n[warn] {len(neg)} kernel(s) have NEGATIVE marginal — "
+                  f"P_static is probably wrong (l2_hit_100 measurement "
+                  f"sits above l2_hit_0 in raw J). Re-run with "
+                  f"--rebaseline-every 20.")
     # LLM-shape matmul — 2 separate PNGs (J/FLOP-vs-T + per-call energy).
     plot_llm_matmul(plot_df, out_dir, stem, gpu)
 

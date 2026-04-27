@@ -250,10 +250,44 @@ def _make_triad(shape, dtype_label, device):
     return f
 
 
+def _make_read_only(shape, dtype_label, device):
+    """Pure-read probe: y = sum(x).
+    Reads N elements from HBM; writes a single scalar — output traffic is
+    negligible (~0 of N bytes). Used to isolate the **DRAM read** energy
+    when sampled at the l2_hit_0 cache regime."""
+    dt, _ = _resolve_dtype(dtype_label)
+    a = _alloc_like(shape, dt, device)
+    if dtype_label == "fp8":
+        # FP8 has no native sum kernel — promote in-register to fp16 for
+        # the reduction. The cost we measure is still dominated by the
+        # fp8 LOAD from HBM (1 byte/elem), which is what we want.
+        def f():
+            torch.sum(a.to(torch.float16))
+        return f
+    def f():
+        torch.sum(a)
+    return f
+
+
+def _make_write_only(shape, dtype_label, device):
+    """Pure-write probe: y.fill_(constant).
+    Writes N elements to HBM; reads ~0 of x (the fill value is broadcast
+    per warp). Used to isolate the **DRAM write** energy at l2_hit_0."""
+    dt, _ = _resolve_dtype(dtype_label)
+    out = _alloc_like(shape, dt, device)
+    def f():
+        out.fill_(1.5)
+    return f
+
+
 _STREAM_BUILDERS = {
     "stream_copy":  _make_copy,
     "stream_scale": _make_scale,
     "stream_triad": _make_triad,
+    # Single-direction probes — let analyze split the average pJ/bit into
+    # separate read and write components.
+    "stream_read":  _make_read_only,
+    "stream_write": _make_write_only,
 }
 
 # Bytes touched per call for each op (read+write counts × N × bytes_per_elem).
@@ -264,6 +298,11 @@ _RW_PER_CALL = {
     "gelu": 2, "softmax": 2, "layernorm": 2,  # 1 read  + 1 write
     "stream_copy": 2, "stream_scale": 2,
     "stream_triad": 3,
+    # Pure single-direction kernels — bytes_traffic = 1 × N × bpe in each
+    # case, but the SEMANTICS differ: stream_read's pJ/bit is purely DRAM
+    # read cost, stream_write's purely DRAM write cost.
+    "stream_read":  1,
+    "stream_write": 1,
 }
 
 
@@ -287,7 +326,8 @@ def _shape_for(op: str, n_elements: int) -> tuple[int, ...]:
     realistic (matches a transformer's hidden size).
     """
     if op in ("mul", "add", "gelu",
-              "stream_copy", "stream_scale", "stream_triad"):
+              "stream_copy", "stream_scale", "stream_triad",
+              "stream_read", "stream_write"):
         return (n_elements,)
     # softmax, layernorm: reduction along last dim; fix D = 1024 (transformer-ish)
     D = 1024
