@@ -1220,7 +1220,53 @@ reports/
     └── gpu_compare_20260421_150000_v1_static.png
 ```
 
-## 10. 산출 파일 레퍼런스
+### 9.6 SoC power envelope — `soc_power_bench.py` / `run_soc_bench.sh`
+
+`gpu_power_bench.py` 의 sweep 과는 **별개 실험**으로, GPU 의 **static / max / leakage** 3 점을 짧게 측정하는 단독 도구. AccelWattch 의 power-model 파라미터 (`P_static` / `P_max` / leakage 의 온도 의존성) 를 cross-check 하거나 데이터 시트의 TGP 와 실제 saturation 을 비교할 때 유용.
+
+#### 9.6.1 측정 대상 3 phase
+
+| phase | 동작 | 측정값 |
+|---|---|---|
+| **static** | 60 s 유휴 (gating 된 idle). | mean / peak idle power, idle temp. `gpu_power_bench.py` 의 `static_power_w` 와 일치해야 함. |
+| **max** | 60 s 동안 큰 GEMM (`K=16384`, fp16/TC 기본) 을 연속 launch. | peak / mean power (≈ TGP), 평균·peak 온도, P(t)·T(t) 곡선 (saturation 시간 관찰). |
+| **leakage** | `{20 s GEMM 스트레스 → 30 s 유휴 decay}` 5 사이클. 스트레스 직후 1 s 의 평균 power 가 **hot leakage**. silicon 이 따끈할수록 누설전류가 커지므로 `P_hot - P_static_cold` 가 온도 의존 leakage component. | per-cycle hot-leak power & temp, 5 사이클 평균, `P_hot − P_static` Δ. |
+
+#### 9.6.2 실행
+
+```bash
+cd util/gpu_power_bench
+./run_soc_bench.sh --device 0 --tag h100      # 기본 (≈ 10 분)
+./run_soc_bench.sh --device 3 --dtype bf16    # bf16/TC 로 max 부하
+./run_soc_bench.sh --no-leakage               # static + max 만 (≈ 2 분)
+./run_soc_bench.sh --static-seconds 30 --max-seconds 30 --leakage-cycles 3   # 단축 모드
+```
+
+주요 flag:
+- `--matmul-K` (기본 `16384`) : square GEMM 크기. 클수록 SM 사용률 ↑ → TGP 근접. fp32 면 OOM 위험 있음.
+- `--dtype {fp32,tf32,fp16,bf16,fp8}` `--mode {simt,tc,te}` : 컴퓨트 path. 기본 `fp16/tc` 가 대부분 GPU 에서 가장 무거움.
+- `--leak-window-s` (기본 `1.0`) : 스트레스 직후 hot-leak 평균을 잡을 윈도우. NVML 이 ~20 Hz 라 1 s 면 ~20 샘플 들어옴.
+- `--leakage-cycles` / `--leakage-stress-s` / `--leakage-decay-s` : leakage phase 모양 조절.
+- `--cooldown-c` (기본 `45`) : 각 phase 시작 전 식히는 목표 온도. 0 이면 비활성.
+
+#### 9.6.3 산출물
+
+`reports/soc_power_<gpu_slug>_<stamp>[_<tag>]_*` :
+
+| 파일 | 내용 |
+|---|---|
+| `_summary.csv` | 한 줄 요약 + 5 cycle 별 leakage detail (peak temp / hot power / Δ vs static) |
+| `_timeseries.csv` | 100 Hz raw (`t`, `power_w`, `temp_c`, `sm_mhz`, `mem_mhz`, `gpu_util`, `phase`) |
+| `_phases.png` | 전체 P(t) + T(t), phase 별 음영, static/max/hot-leak 의 평균 가이드라인 |
+| `_leakage.png` | 5 cycle 의 decay 곡선을 t=0(스트레스 종료) 기준으로 overlay — 누설 감쇠 가시화 |
+| `_summary.png` | static / max-mean / max-peak / hot-leak 막대그래프 + Δ 주석 |
+
+#### 9.6.4 해석 팁
+
+- **max < TGP** : 데이터시트 TGP 근처까지 안 가면 (a) cooling 이 thermal throttle 걸리거나 (b) GEMM 크기/dtype 이 SM 을 못 채운 것. P(t) 의 saturation 곡선과 sm_clk 추이로 구분.
+- **hot leakage − static** 이 두자리수 W 면 silicon 이 충분히 가열된 상태. 작은 GPU·짧은 stress 에선 한자리수까지 떨어질 수 있음.
+- **decay 곡선 모양** : 지수 감쇠에 가까우면 leakage 가 thermal RC 시정수 따라 식는 정상 거동. 평탄하면 fan/cooling 이 약해 silicon 이 잘 안 식는 중.
+- **5 cycle 평균** 을 쓰는 이유 : 단일 cycle 은 NVML 샘플 노이즈 + bcoolant 변동에 흔들리지만 5 회 평균이면 ±1 W 수준으로 안정.
 
 ### 10.1 Per-cell CSV : `<tag>_<cell_id>.csv`
 
@@ -1389,6 +1435,8 @@ util/gpu_power_bench/
 ├── preflight.py                 의존성/GPU 체크
 ├── analyze.py                   per-GPU plot
 ├── compare_gpus.py              cross-GPU plot
+├── soc_power_bench.py           SoC envelope (static / max / leakage)
+├── run_soc_bench.sh             SoC envelope 런처
 ├── install_transformer_engine.sh  TE 설치 헬퍼
 └── reports/                     출력 디렉토리
 ```
