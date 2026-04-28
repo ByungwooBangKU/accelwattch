@@ -29,6 +29,18 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
 
 PYTHON="${PYTHON:-python3}"
+# Force line-buffered Python stdout. Without this, the `tee` pipe below
+# flips Python from line-buffered (terminal) to block-buffered (~8 KB)
+# so the first ~30s of "import torch / nvmlInit / preflight / first cell"
+# prints land in the buffer and only flush en-bloc when the first cell's
+# E_total/P_avg lines push them past the threshold. Looks exactly like
+# a hang. Setting PYTHONUNBUFFERED here makes every print() show up
+# immediately under tee. Override RUN_BENCH_UNBUFFERED=0 if you have a
+# specific reason to want buffered output (e.g. perf-sensitive CSV
+# generation that you're piping through grep).
+if [[ "${RUN_BENCH_UNBUFFERED:-1}" == "1" ]]; then
+    export PYTHONUNBUFFERED=1
+fi
 # Seconds to wait between parallel launches. Staggering avoids a thundering
 # herd on nvmlInit / torch.cuda.set_device that has been observed to drop
 # 7/8 processes simultaneously on some driver versions. Override with

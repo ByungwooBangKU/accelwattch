@@ -17,6 +17,14 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
 
 PYTHON="${PYTHON:-python3}"
+# Force line-buffered Python stdout so phase-progress prints flush
+# immediately even when this script is run under tee / nohup / a CI log
+# capture. Same rationale as run_bench.sh — without it, a 5-min run
+# can look like a 5-min hang for the first ~30s. Override with
+# RUN_BENCH_UNBUFFERED=0 if needed.
+if [[ "${RUN_BENCH_UNBUFFERED:-1}" == "1" ]]; then
+    export PYTHONUNBUFFERED=1
+fi
 
 if ! command -v "$PYTHON" >/dev/null; then
     echo "error: $PYTHON not found" >&2
