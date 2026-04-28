@@ -635,8 +635,17 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     variants = sorted(mm["variant"].unique())
     if not variants:
         return
-    fig, axes = plt.subplots(3, 1, figsize=(14, 17), squeeze=False)
-    ax_e, ax_t, ax_j = axes[0][0], axes[1][0], axes[2][0]
+    # Layout : 1 row × 3 cols, each panel ~9×9 → roughly square so the
+    # log-log slope is read at a 1:1 aspect (slope-of-1 line really looks
+    # 45°). Per-panel ~9×9 with title/label margin gives fig (30, 10).
+    # User feedback: the old 3-row stacked layout (figsize=(14, 17),
+    # i.e. 14×5.7 per panel) made the panels visibly wider than tall,
+    # distorting log-log slope perception.
+    fig, axes = plt.subplots(1, 3, figsize=(30, 10), squeeze=False)
+    ax_e, ax_t, ax_j = axes[0][0], axes[0][1], axes[0][2]
+    # Force aspect=1 in DATA units after axis limits are set (call below).
+    for ax in (ax_e, ax_t, ax_j):
+        ax.set_box_aspect(1)
     ax_e.set_title("matmul — E_dyn vs FLOPs (slope = J/FLOP)")
     ax_t.set_title("matmul — wall time vs FLOPs")
     ax_j.set_title("matmul — J/FLOP (dyn)  [annotated with the swept K]")
@@ -1802,9 +1811,17 @@ def plot_dram_marginal(marg_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     ax.set_xticks(xs)
     ax.set_xticklabels(keys, rotation=30, ha="right", fontsize=9)
     ax.set_ylabel("pJ / bit")
-    # Reference lines for the marginal interpretation.
+    # Reference lines for the marginal interpretation. The full literature
+    # set spans HBM2 (~7) → HBM2E (~5) → HBM3 (~3.9) → DRAM core (~2.5).
+    # Show the band that brackets typical Hopper/Ampere measurements so a
+    # reader can immediately see whether their marginal lands in the
+    # expected window for THEIR HBM generation.
+    ax.axhline(5.0, color="#aa5555", ls="--", lw=1, alpha=0.7)
+    ax.text(len(keys) - 0.5, 5.0, " HBM2E (A100) ≈ 5.0", fontsize=8,
+            color="#aa5555", va="center")
     ax.axhline(3.9, color="#444444", ls="--", lw=1, alpha=0.7)
-    ax.text(len(keys) - 0.5, 3.9, " HBM3 ≈ 3.9", fontsize=8, color="#444444", va="center")
+    ax.text(len(keys) - 0.5, 3.9, " HBM3 (H100) ≈ 3.9", fontsize=8,
+            color="#444444", va="center")
     ax.axhline(2.5, color="#888888", ls=":", lw=1, alpha=0.7)
     ax.text(len(keys) - 0.5, 2.5, " Horowitz '14 DRAM core ≈ 2.5", fontsize=8,
             color="#888888", va="center")
