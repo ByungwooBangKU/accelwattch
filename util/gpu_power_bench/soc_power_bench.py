@@ -445,6 +445,13 @@ def main() -> int:
     ap.add_argument("--tag", type=str, default="")
     ap.add_argument("--out-dir", type=str, default="reports")
     ap.add_argument("--sample-hz", type=int, default=100)
+    ap.add_argument("--power-source", choices=["legacy", "instant", "average"],
+                    default="legacy",
+                    help="NVML power source. 'legacy' (default) matches "
+                         "nvidia-smi. 'instant' captures sub-ms transients "
+                         "(useful for the leakage decay) but reads higher "
+                         "than nvidia-smi during static phase. 'average' "
+                         "is a smoother running mean.")
 
     # Defaults shrunk vs. the original (60/60/5×(20+30) ≈ 10 min):
     # - static 20s gives ~400 samples at 20Hz NVML — plenty for a tight
@@ -517,7 +524,8 @@ def main() -> int:
 
     # Single sampler for the whole run so the timeseries is contiguous and
     # we can slice phases out of it for stats / plotting.
-    sampler = PowerSampler(handle, hz=args.sample_hz)
+    sampler = PowerSampler(handle, hz=args.sample_hz,
+                           power_source=args.power_source)
     print(f"[info] power source: {sampler.power_source}")
     sampler.start()
     sampler.set_phase("startup")

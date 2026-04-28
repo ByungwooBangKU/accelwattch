@@ -53,78 +53,105 @@ def _nvml_or(fn, *args, default=-1):
 # ---------------------------------------------------------------------------
 # Power-reader resolution
 #
-# `nvmlDeviceGetPowerUsage` returns the *board* power averaged over the last
-# ~50ms by the firmware. On Hopper (sm_90, H100) and newer, NVIDIA exposes a
-# higher-resolution per-IC reading via NVML_FI_DEV_POWER_INSTANT (~1ms
-# cadence, lower latency, slightly different scope: includes faster transients
-# the legacy averaged number smooths out). Field IDs only landed in CUDA 12.x
-# pynvml; older bindings won't have the constant. We probe both: prefer
-# instant when supported, fall back to legacy otherwise.
+# Three power sources NVML exposes :
 #
-# Why bother: for short-duration phases (leakage hot-window of 1s, max-power
-# clock-ramp visible in P(t)), the 50ms averaging is too coarse — we'd see
-# blurred transients. The instant path also matches what nvidia-smi dmon
-# reports under `pwr` on H100.
+#   "legacy"  — nvmlDeviceGetPowerUsage. ~50 ms internal averaging.
+#               THIS IS WHAT nvidia-smi REPORTS. Use this if you want
+#               readings to match what the user sees in nvidia-smi /
+#               dmon. Default since the Hopper-default-instant change
+#               in PR #36 led to ~+40 W reported idle vs nvidia-smi.
+#
+#   "average" — NVML_FI_DEV_POWER_AVERAGE field. Running average over a
+#               longer window than legacy. Slightly smoother for steady-
+#               state measurements but biases peak captures downward.
+#
+#   "instant" — NVML_FI_DEV_POWER_INSTANT field. ~1 ms cadence reading
+#               from the on-chip power IC. Captures fast transients
+#               (clock ramps, leakage decay tails) that the averaged
+#               sources smooth away — but on idle / lightly-loaded
+#               GPUs this picks up real instantaneous spikes (DMA,
+#               telemetry, NVLink heartbeats) that DON'T appear in the
+#               averaged reading, so the *mean* of instant samples can
+#               run noticeably HIGHER than nvidia-smi's idle number.
+#               Useful for SoC-bench leakage transients; misleading
+#               for static-power baselining vs nvidia-smi.
+#
+# Default `prefer="legacy"` restores nvidia-smi-matching semantics
+# everywhere. SoC bench / future transient analyses can opt in via
+# `--power-source instant`. Field IDs only landed in CUDA 12.x pynvml;
+# missing constants fall back to numeric IDs from the NVML headers.
 # ---------------------------------------------------------------------------
 try:
     _POWER_INSTANT_FIELD = pynvml.NVML_FI_DEV_POWER_INSTANT
 except AttributeError:
-    # Fallback: numeric ID from NVML headers (CUDA 12.x). Same value across
-    # driver versions; pynvml just hadn't exposed the constant yet.
     _POWER_INSTANT_FIELD = 186
+try:
+    _POWER_AVERAGE_FIELD = pynvml.NVML_FI_DEV_POWER_AVERAGE
+except AttributeError:
+    _POWER_AVERAGE_FIELD = 187
 
 
-def _make_power_reader(handle):
-    """Return (reader_fn, label). reader_fn() → power in mW (or -1 on error).
-
-    Tries the high-frequency NVML_FI_DEV_POWER_INSTANT path first and falls
-    back to the universal nvmlDeviceGetPowerUsage if the field isn't
-    supported (older driver / pre-Hopper GPU / older pynvml).
-    """
-    # Probe: a single call. If it fails OR returns 0/<0, we use the legacy
-    # path. We don't trust a SUCCESS+0 reading either — some drivers return
-    # 0 instead of UNSUPPORTED for "field exists but not on this GPU".
-    try:
-        # Build a single c_nvmlFieldValue_t and submit it. pynvml's
-        # high-level helper varies across versions; the low-level signature
-        # below is stable.
-        fv = pynvml.c_nvmlFieldValue_t()
-        fv.fieldId = _POWER_INSTANT_FIELD
-        fv.scopeId = 0
-        pynvml.nvmlDeviceGetFieldValues(handle, [fv])
-        if fv.nvmlReturn == pynvml.NVML_SUCCESS and fv.value.uiVal > 0:
-            # Success — wire up the fast-path reader. Reuse the same buffer
-            # across polls to avoid per-sample allocation overhead.
-            buf = pynvml.c_nvmlFieldValue_t()
-            buf.fieldId = _POWER_INSTANT_FIELD
-            buf.scopeId = 0
-
-            def read_instant() -> int:
-                try:
-                    pynvml.nvmlDeviceGetFieldValues(handle, [buf])
-                    if buf.nvmlReturn == pynvml.NVML_SUCCESS:
-                        return int(buf.value.uiVal)
-                    return -1
-                except Exception:
-                    return -1
-
-            return read_instant, "NVML_FI_DEV_POWER_INSTANT"
-    except (AttributeError, pynvml.NVMLError, Exception):
-        # AttributeError: pynvml lacks c_nvmlFieldValue_t / the function.
-        # NVMLError: driver doesn't support this field.
-        # Generic Exception: paranoid catch — driver/libnvml versions vary.
-        pass
-
+def _legacy_reader(handle):
     def read_legacy() -> int:
         return _nvml_or(pynvml.nvmlDeviceGetPowerUsage, handle, default=-1)
+    return read_legacy, "nvmlDeviceGetPowerUsage (legacy, matches nvidia-smi)"
 
-    return read_legacy, "nvmlDeviceGetPowerUsage (legacy ~50ms-averaged)"
+
+def _field_reader(handle, field_id: int, label: str):
+    """Build a reader that polls one NVML field-values entry. Returns
+    (reader, label) or None if the field isn't supported on this GPU.
+    """
+    try:
+        fv = pynvml.c_nvmlFieldValue_t()
+        fv.fieldId = field_id
+        fv.scopeId = 0
+        pynvml.nvmlDeviceGetFieldValues(handle, [fv])
+        if fv.nvmlReturn != pynvml.NVML_SUCCESS or fv.value.uiVal <= 0:
+            return None
+        buf = pynvml.c_nvmlFieldValue_t()
+        buf.fieldId = field_id
+        buf.scopeId = 0
+
+        def read() -> int:
+            try:
+                pynvml.nvmlDeviceGetFieldValues(handle, [buf])
+                if buf.nvmlReturn == pynvml.NVML_SUCCESS:
+                    return int(buf.value.uiVal)
+                return -1
+            except Exception:
+                return -1
+        return read, label
+    except (AttributeError, pynvml.NVMLError, Exception):
+        return None
+
+
+def _make_power_reader(handle, prefer: str = "legacy"):
+    """Return (reader_fn, label). reader_fn() → power in mW (or -1 on error).
+
+    `prefer` ∈ {"legacy", "instant", "average"}. Falls back to legacy
+    nvmlDeviceGetPowerUsage if the requested field-values path isn't
+    available on this GPU / driver / pynvml combination.
+    """
+    if prefer == "instant":
+        r = _field_reader(handle, _POWER_INSTANT_FIELD,
+                          "NVML_FI_DEV_POWER_INSTANT (~1ms, transient-aware)")
+        if r is not None:
+            return r
+    elif prefer == "average":
+        r = _field_reader(handle, _POWER_AVERAGE_FIELD,
+                          "NVML_FI_DEV_POWER_AVERAGE (running average)")
+        if r is not None:
+            return r
+    elif prefer != "legacy":
+        # Unknown prefer value — log and fall through.
+        pass
+    return _legacy_reader(handle)
 
 
 class PowerSampler(threading.Thread):
     """Background NVML poller. Call start(), then set_phase(...) around work."""
 
-    def __init__(self, handle, hz: int = 100):
+    def __init__(self, handle, hz: int = 100, power_source: str = "legacy"):
         super().__init__(daemon=True)
         self.h = handle
         self.interval = 1.0 / hz
@@ -132,11 +159,12 @@ class PowerSampler(threading.Thread):
         self._phase = ""
         self.t0 = 0.0
         self.samples: list[PowerSample] = []
-        # Resolve the power source ONCE — `_make_power_reader()` probes the
-        # high-frequency POWER_INSTANT field and falls back to the legacy
-        # averaged path on older HW / driver. `power_source` is exposed for
-        # logging by the driver.
-        self._read_power_mw, self.power_source = _make_power_reader(handle)
+        # `power_source` ∈ {"legacy", "instant", "average"}. Default
+        # "legacy" matches nvidia-smi (nvmlDeviceGetPowerUsage). Opt in
+        # to "instant" only when you actually want sub-50ms transients
+        # — see _make_power_reader docstring for the trade-offs.
+        self._read_power_mw, self.power_source = _make_power_reader(
+            handle, prefer=power_source)
 
     def set_phase(self, name: str) -> None:
         self._phase = name
@@ -212,19 +240,24 @@ class PowerSampler(threading.Thread):
 
 # -------------------------------- utilities ----------------------------------
 
-def measure_static_power(handle, seconds: float = 5.0, hz: int = 100) -> dict:
+def measure_static_power(handle, seconds: float = 5.0, hz: int = 100,
+                          power_source: str = "legacy") -> dict:
     """Sit idle for `seconds` and report mean/stdev/min/max of power & temp.
 
     The returned mean power is the "static" (idle) power that we subtract
     from measurements to isolate the *dynamic* energy of the workload.
     Caller should drop any GPU allocations and synchronize before calling.
 
+    `power_source` matches PowerSampler — default "legacy" matches
+    nvidia-smi. Use "instant" only when you accept the +5..40 W noise
+    floor that comes with sub-ms sampling on idle GPUs.
+
     The raw per-sample trace is returned under the "samples" key so that
     `gpu_power_bench.py` can persist it as a sidecar CSV — the idle trace
     is what lets `analyze.py` draw a P_static(t) plot and verify that the
     baseline was actually flat (no background kernel, no clock ramp).
     """
-    sampler = PowerSampler(handle, hz=hz)
+    sampler = PowerSampler(handle, hz=hz, power_source=power_source)
     sampler.start()
     sampler.set_phase("idle_baseline")
     time.sleep(seconds)

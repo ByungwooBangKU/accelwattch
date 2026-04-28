@@ -139,6 +139,23 @@ def plot_bar(all_summary: pd.DataFrame, out_png: Path) -> None:
         ax.set_xticklabels(variants, rotation=30, ha="right")
         ax.set_ylabel(f"slope_dyn ({metric_unit})")
         ax.set_yscale("log")
+        # Bound the log y-axis explicitly. Without this, a row with
+        # slope_dyn ≤ 0 (clipped-to-zero on noise-floor cells, or NaN
+        # from stream_copy with FLOP=0 → J/FLOP undefined) makes
+        # matplotlib try to render log(0) → ymin = -inf, which then
+        # asks tight_layout for a 400 000-pixel canvas and bails out
+        # with "Tight layout not applied". Pull the finite positive
+        # values, derive a reasonable [ymin, ymax], and clamp.
+        all_vals = pd.to_numeric(sub["slope_dyn"], errors="coerce")
+        pos_vals = all_vals[(all_vals.notna()) & (all_vals > 0)]
+        if not pos_vals.empty:
+            lo, hi = pos_vals.min(), pos_vals.max()
+            # 1.5 decades of headroom each side, clamped to absolute
+            # sane bounds so a single insane outlier doesn't blow up
+            # the panel either.
+            ymin = max(1e-15, lo / 30.0)
+            ymax = min(1e+5,  hi * 30.0)
+            ax.set_ylim(ymin, ymax)
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend()
 
