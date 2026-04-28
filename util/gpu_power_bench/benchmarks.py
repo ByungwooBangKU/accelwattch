@@ -40,6 +40,13 @@ FLOPS_PER_ELEMENT = {
     "stream_copy":  0,   # no compute, pure data movement
     "stream_scale": 1,   # one mul per element
     "stream_triad": 2,   # one mul + one add per element
+    # stream_read / stream_write — single-direction memory probes for
+    # the R/W decomposition. Treated as compute-light (FLOP=0) for the
+    # same reason as stream_copy: we want pJ/bit to capture memory cost
+    # only, not a tiny incidental sum-reduction. Without these entries,
+    # build() raises KeyError when --dram-bw-test enables them.
+    "stream_read":  0,
+    "stream_write": 0,
 }
 
 
@@ -454,7 +461,14 @@ def build(op: str, dtype_label: str, n_elements: int,
     shape = _shape_for(op, n_elements)
     actual_n = math.prod(shape)
     fn = builders[op](shape, dtype_label, device)
-    flops = actual_n * FLOPS_PER_ELEMENT[op]
+    # `.get(..., 0)` defends against the historic foot-gun of registering
+    # a new op in _BUILDERS / _STREAM_BUILDERS but forgetting the matching
+    # FLOPS_PER_ELEMENT entry — the cell will still run, just with
+    # FLOPs=0 (treated as compute-light, J/FLOP comes out NaN per
+    # gpu_power_bench.py's zero-divisor guard). Without this, you'd see
+    # "build failed: '<op>'" with KeyError, exactly the symptom the
+    # stream_read / stream_write addition triggered.
+    flops = actual_n * FLOPS_PER_ELEMENT.get(op, 0)
     name = f"{dtype_label}_{op}"
     # Elementwise ops never hit Tensor Cores — TC is matmul-only silicon.
     compute_unit = "CUDA core"
