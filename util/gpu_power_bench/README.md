@@ -1266,6 +1266,7 @@ cd util/gpu_power_bench
 | `_timeseries.csv` | 100 Hz raw (`t`, `power_w`, `temp_c`, `sm_mhz`, `mem_mhz`, `gpu_util`, `phase`) |
 | `_phases.png` | 전체 P(t) + T(t), phase 별 음영, static/max/hot-leak 의 평균 가이드라인 |
 | `_leakage.png` | 5 cycle 의 decay 곡선을 t=0(스트레스 종료) 기준으로 overlay — 누설 감쇠 가시화 |
+| `_leakage_enlarged.png` | 위 plot 의 **첫 3 s × 0–150 W 줌-인**. hot-window (0~`--leak-window-s`) 와 첫 1 초의 급격한 drop 이 압축돼 안 보이는 경우를 위해 동일 데이터 더 촘촘한 ticks 로 (1 s major / 0.25 s minor, 25 W major / 5 W minor) |
 | `_summary.png` | static / max-mean / max-peak / hot-leak 막대그래프 + Δ 주석 |
 
 #### 9.6.4 해석 팁

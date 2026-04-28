@@ -27,11 +27,12 @@ Three phases:
 
 Outputs (under --out-dir, default ./reports):
 
-  soc_power_<gpu>_<stamp>[_<tag>]_summary.csv      one-row stats
-  soc_power_<gpu>_<stamp>[_<tag>]_timeseries.csv   raw 100Hz samples
-  soc_power_<gpu>_<stamp>[_<tag>]_phases.png       full-run P(t) + T(t)
-  soc_power_<gpu>_<stamp>[_<tag>]_leakage.png      5 overlaid decay curves
-  soc_power_<gpu>_<stamp>[_<tag>]_summary.png      static/max/leakage bars
+  soc_power_<gpu>_<stamp>[_<tag>]_summary.csv           one-row stats
+  soc_power_<gpu>_<stamp>[_<tag>]_timeseries.csv        raw 100Hz samples
+  soc_power_<gpu>_<stamp>[_<tag>]_phases.png            full-run P(t) + T(t)
+  soc_power_<gpu>_<stamp>[_<tag>]_leakage.png           5 overlaid decay curves
+  soc_power_<gpu>_<stamp>[_<tag>]_leakage_enlarged.png  zoom: first 3s, 0..150W
+  soc_power_<gpu>_<stamp>[_<tag>]_summary.png           static/max/leakage bars
 """
 
 from __future__ import annotations
@@ -286,23 +287,19 @@ def plot_phase_timeline(samples, summary, out_path: Path) -> None:
     plt.close(fig)
 
 
-def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
-    """Overlay the decay curves with t=0 at the moment stress stopped.
-
-    Bigger figure (12x7) so each cycle's curve and its hot-window
-    spike at t=0 are visible. Minor x ticks every 1s, y ticks every
-    5W, with a marker at the hot-window boundary so the reader can
-    see exactly which samples feed `leakage_power_w_mean`.
-    """
-    if not cycles:
-        return
-    fig, ax = plt.subplots(figsize=(12, 7))
-    # `static_power_w_mean` may be missing if the run aborted before the
-    # static phase completed. Fall back to 0 so we still produce SOME plot.
+def _draw_leakage_decay(ax, samples, cycles, summary,
+                        x_lim: tuple[float, float] | None,
+                        y_lim: tuple[float, float] | None,
+                        x_major: float, x_minor: float,
+                        y_major: float, y_minor: float) -> None:
+    """Shared body for the full and zoomed leakage-decay plots."""
     static_w = summary.get("static_power_w_mean", 0.0) or 0.0
     leak_window = summary.get("leakage_window_s", 1.0)
     for c in cycles:
-        # Slice the decay window and re-zero its time axis.
+        # Slice the decay window and re-zero its time axis. When zoomed,
+        # we still pull the full slice — matplotlib's xlim handles the
+        # crop, and we want the legend / static reference to look the
+        # same on both plots.
         sl = [(s.t - c["decay_t0"], s.power_w, s.temp_c)
               for s in samples
               if c["decay_t0"] <= s.t <= c["decay_t1"] and s.power_w >= 0]
@@ -315,8 +312,27 @@ def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
                label=f"static {static_w:.1f} W")
     ax.axvspan(0, leak_window, color=(0.95, 0.95, 0.30, 0.20),
                label=f"hot-window ({leak_window}s)")
+    if x_lim is not None:
+        ax.set_xlim(*x_lim)
+    if y_lim is not None:
+        ax.set_ylim(*y_lim)
     ax.set_xlabel("t since stress stop (s)", fontsize=11)
     ax.set_ylabel("Power (W)", fontsize=11)
+    _add_axis_detail(ax, x_major=x_major, x_minor=x_minor,
+                     y_major=y_major, y_minor=y_minor)
+    ax.legend(loc="upper right", fontsize=10)
+
+
+def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
+    """Overlay the decay curves with t=0 at the moment stress stopped.
+
+    Full window (the entire `--leakage-decay-s` per cycle). Minor x ticks
+    every 1s, y ticks every 5W, with the hot-window shaded so the reader
+    can see which samples feed `leakage_power_w_mean`.
+    """
+    if not cycles:
+        return
+    fig, ax = plt.subplots(figsize=(12, 7))
     src = summary.get("power_source", "")
     title = f"Leakage decay (kernel idle, hot silicon) — {summary['gpu_name']}"
     if src:
@@ -324,9 +340,40 @@ def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
     ax.set_title(title, fontsize=12)
     # Decay windows are ~15s in the new defaults — minor every 1s, major
     # every 5s gives readable detail without crowding.
-    _add_axis_detail(ax, x_major=5.0, x_minor=1.0,
-                     y_major=20.0, y_minor=5.0)
-    ax.legend(loc="upper right", fontsize=10)
+    _draw_leakage_decay(ax, samples, cycles, summary,
+                        x_lim=None, y_lim=None,
+                        x_major=5.0, x_minor=1.0,
+                        y_major=20.0, y_minor=5.0)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+
+
+def plot_leakage_decay_zoomed(samples, cycles, summary, out_path: Path,
+                              x_max: float = 3.0,
+                              y_min: float = 0.0,
+                              y_max: float = 150.0) -> None:
+    """Zoomed view of the first 3s and 0..150W — the region where the
+    hot-leakage signal lives.
+
+    Same data as `plot_leakage_decay` but with tighter axis limits and
+    finer ticks (0.25s minor / 1s major on x, 5W minor / 25W major on y)
+    so the cycle-to-cycle hot-window spread and the rapid drop in the
+    first second are easy to read off the plot.
+    """
+    if not cycles:
+        return
+    fig, ax = plt.subplots(figsize=(12, 7))
+    src = summary.get("power_source", "")
+    title = (f"Leakage decay — first {x_max:.0f}s zoom "
+             f"(0–{y_max:.0f} W) — {summary['gpu_name']}")
+    if src:
+        title += f"   ({src})"
+    ax.set_title(title, fontsize=12)
+    _draw_leakage_decay(ax, samples, cycles, summary,
+                        x_lim=(0.0, x_max), y_lim=(y_min, y_max),
+                        x_major=1.0, x_minor=0.25,
+                        y_major=25.0, y_minor=5.0)
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
@@ -640,12 +687,19 @@ def main() -> int:
                         s.temp_c, s.sm_mhz, s.mem_mhz, s.gpu_util, s.phase])
 
     # Plots
-    phase_png   = base.parent / f"{base.name}_phases.png"
-    leakage_png = base.parent / f"{base.name}_leakage.png"
-    summary_png = base.parent / f"{base.name}_summary.png"
+    phase_png            = base.parent / f"{base.name}_phases.png"
+    leakage_png          = base.parent / f"{base.name}_leakage.png"
+    leakage_enlarged_png = base.parent / f"{base.name}_leakage_enlarged.png"
+    summary_png          = base.parent / f"{base.name}_summary.png"
     plot_phase_timeline(samples, summary, phase_png)
     if cycles_meta:
         plot_leakage_decay(samples, cycles_meta, summary, leakage_png)
+        # Zoomed companion: first 3s, 0..150W. Catches the cycle-to-cycle
+        # hot-window spread and the rapid first-second drop that the full
+        # ~15s view compresses into a few pixels.
+        plot_leakage_decay_zoomed(samples, cycles_meta, summary,
+                                  leakage_enlarged_png,
+                                  x_max=3.0, y_min=0.0, y_max=150.0)
     plot_summary_bars(summary, summary_png)
 
     # ---- console report ---------------------------------------------------
@@ -673,6 +727,7 @@ def main() -> int:
     print(f"[save] {phase_png}")
     if cycles_meta:
         print(f"[save] {leakage_png}")
+        print(f"[save] {leakage_enlarged_png}")
     print(f"[save] {summary_png}")
     return 0
 
