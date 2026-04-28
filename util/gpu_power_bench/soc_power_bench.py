@@ -100,12 +100,31 @@ def _run_gemm_for(spec, seconds: float, batch: int = 32) -> None:
     starve the GPU between launches — at large K each call already takes
     enough ms that GPU stays saturated, but smaller GEMMs would otherwise
     leave gaps that drop us out of the max-power envelope.
+
+    A fatal CUDA fault here (Blackwell amax race for fp8_te, OOM, etc.)
+    poisons the whole process — same hazard as gpu_power_bench.py covers
+    in README §8.3.3. We re-raise as RuntimeError so the caller can save
+    whatever telemetry has already been collected before bailing.
     """
     end = time.perf_counter() + seconds
-    while time.perf_counter() < end:
-        for _ in range(batch):
-            spec.run()
-    torch.cuda.synchronize()
+    try:
+        while time.perf_counter() < end:
+            for _ in range(batch):
+                spec.run()
+        torch.cuda.synchronize()
+    except Exception as e:
+        msg = str(e)
+        fatal_markers = ("illegal memory access", "CUDA error",
+                         "device-side assert", "CUDA call failed",
+                         "out of memory")
+        if any(m in msg for m in fatal_markers):
+            raise RuntimeError(
+                f"CUDA fault during stress GEMM after {time.perf_counter()-end+seconds:.1f}s "
+                f"of {seconds:.0f}s: {msg}. Process CUDA context is likely "
+                f"poisoned; partial telemetry will still be saved. See "
+                f"README §8.3.3 for Blackwell+fp8_te workarounds."
+            ) from e
+        raise
 
 
 def phase_max(sampler: PowerSampler, spec, seconds: float) -> tuple[float, float]:
@@ -176,14 +195,20 @@ def plot_phase_timeline(samples, summary, out_path: Path) -> None:
     axP.set_ylabel("Power (W)")
     axP.set_title(f"SoC power envelope — {summary['gpu_name']}")
     axP.grid(alpha=0.3)
-    # Annotate static / max / mean-leakage as horizontal guides.
-    axP.axhline(summary["static_power_w_mean"], color="C2", lw=1, ls="--",
-                label=f"static {summary['static_power_w_mean']:.1f} W")
-    axP.axhline(summary["max_power_w_mean"], color="C3", lw=1, ls="--",
-                label=f"max-mean {summary['max_power_w_mean']:.1f} W")
-    if summary.get("leakage_power_w_mean", -1) > 0:
-        axP.axhline(summary["leakage_power_w_mean"], color="C1", lw=1, ls="--",
-                    label=f"hot-leak {summary['leakage_power_w_mean']:.1f} W")
+    # Horizontal guides — only drawn for phases that actually completed.
+    # An aborted run may leave any of these missing from `summary`.
+    s_w = summary.get("static_power_w_mean")
+    if s_w is not None and s_w > 0:
+        axP.axhline(s_w, color="C2", lw=1, ls="--",
+                    label=f"static {s_w:.1f} W")
+    m_w = summary.get("max_power_w_mean")
+    if m_w is not None and m_w > 0:
+        axP.axhline(m_w, color="C3", lw=1, ls="--",
+                    label=f"max-mean {m_w:.1f} W")
+    l_w = summary.get("leakage_power_w_mean")
+    if l_w is not None and l_w > 0:
+        axP.axhline(l_w, color="C1", lw=1, ls="--",
+                    label=f"hot-leak {l_w:.1f} W")
     axP.legend(loc="upper right", fontsize=8)
 
     axT.plot(Tts, Ts, lw=0.8, color="C3")
@@ -221,11 +246,13 @@ def plot_phase_timeline(samples, summary, out_path: Path) -> None:
 
 
 def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
-    """Overlay the 5 decay curves with t=0 at the moment stress stopped."""
+    """Overlay the decay curves with t=0 at the moment stress stopped."""
     if not cycles:
         return
     fig, ax = plt.subplots(figsize=(8.5, 5.0))
-    static_w = summary["static_power_w_mean"]
+    # `static_power_w_mean` may be missing if the run aborted before the
+    # static phase completed. Fall back to 0 so we still produce SOME plot.
+    static_w = summary.get("static_power_w_mean", 0.0) or 0.0
     for c in cycles:
         # Slice the decay window and re-zero its time axis.
         sl = [(s.t - c["decay_t0"], s.power_w, s.temp_c)
@@ -361,6 +388,7 @@ def main() -> int:
                "dtype": args.dtype, "mode": args.mode}
     cycles_meta: list[dict] = []
     static_t = max_t = None
+    fatal_error: str | None = None
 
     try:
         # --- 1) STATIC ------------------------------------------------------
@@ -372,6 +400,10 @@ def main() -> int:
         static_t = phase_static(sampler, args.static_seconds)
 
         # --- 2) MAX ---------------------------------------------------------
+        # Each compute phase is in its own try/except so that a CUDA fault
+        # in max doesn't kill the leakage data, AND so partial telemetry
+        # always reaches CSV/plots. _run_gemm_for() already classifies
+        # fatal CUDA markers and raises RuntimeError on them.
         if not args.no_max:
             if args.cooldown_c > 0:
                 sampler.set_phase("cooldown_pre_max")
@@ -379,25 +411,37 @@ def main() -> int:
                                   timeout_s=args.cooldown_timeout, verbose=False)
             print(f"\n[phase] max-power GEMM for {args.max_seconds}s "
                   f"(K={args.matmul_K} {args.dtype}/{args.mode})")
-            max_t = phase_max(sampler, spec, args.max_seconds)
+            try:
+                max_t = phase_max(sampler, spec, args.max_seconds)
+            except RuntimeError as e:
+                print(f"[error] max phase failed: {e}")
+                fatal_error = f"max: {e}"
 
         # --- 3) LEAKAGE -----------------------------------------------------
-        if not args.no_leakage:
+        if not args.no_leakage and not fatal_error:
             if args.cooldown_c > 0:
                 sampler.set_phase("cooldown_pre_leakage")
                 wait_for_cooldown(handle, target_c=args.cooldown_c,
                                   timeout_s=args.cooldown_timeout, verbose=False)
             print(f"\n[phase] leakage: {args.leakage_cycles} cycles of "
                   f"{args.leakage_stress_s}s stress + {args.leakage_decay_s}s decay")
-            cycles_meta = phase_leakage(sampler, spec, args.leakage_cycles,
-                                        args.leakage_stress_s,
-                                        args.leakage_decay_s)
+            try:
+                cycles_meta = phase_leakage(sampler, spec, args.leakage_cycles,
+                                            args.leakage_stress_s,
+                                            args.leakage_decay_s)
+            except RuntimeError as e:
+                print(f"[error] leakage phase failed mid-cycle: {e}")
+                print(f"        partial cycles_meta will be reported")
+                fatal_error = f"leakage: {e}"
     finally:
         sampler.stop()
         try:
             pynvml.nvmlShutdown()
         except Exception:
             pass
+
+    if fatal_error:
+        summary["fatal_error"] = fatal_error
 
     # ---- compute summary stats from the in-memory timeseries --------------
     samples = sampler.samples
