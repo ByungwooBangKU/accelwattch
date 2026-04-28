@@ -91,12 +91,28 @@ DEFAULT_LOADS = [
 QUICK_LOADS = [1 << 20, 1 << 22, 1 << 24]
 
 # Matrix side length K (M = N = K). FLOPs per call = 2·K³, memory = 3·K²
-# elements.  Dense around the TC sweet spot (1024–4096) + one tiny (512,
-# launch overhead) + three big (6144, 8192, 12288) to expose BW saturation
-# on FP32 and push matmul into dram_stream cache regime. K=12288 fp32 ≈
-# 1.7 GB — fits on both A100/H100 with margin.
-DEFAULT_MATMUL_SIZES = [512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288]
-QUICK_MATMUL_SIZES = [1024, 2048, 4096]
+# elements.
+#
+# Default set is "GPT-OSS-120B aware" — the hidden / attn / MLP-intermediate
+# K values used by the reference 120B-class model are explicitly included so
+# that square sweep results can be cross-checked against the asymmetric
+# --llm-shapes results (which use the same K's). See README §3.2.
+#
+#     1024, 2048      — TC sweet spot; small enough to avoid BW saturation
+#     2880            — GPT-OSS hidden dim (qkv / q_only / kv / mlp / lm_head)
+#     4096            — GPT-OSS attn_o input (head_dim × heads)
+#     5760            — GPT-OSS MLP intermediate (mlp1 out / mlp2 in)
+#     8192, 12288     — large GEMM regime, BW saturation visible on fp32
+#
+# K=12288 fp32 needs 3·K²·4B ≈ 1.7 GB — fits on 80 GB A100/H100 with margin.
+# K=512..1536 dropped vs old default — H100 fp8_te falls below NVML noise
+# floor at K<2880 (README §8.3.4) and the tiny launch-overhead cell at
+# K=512 was never load-bearing for k_op fits.
+#
+# Override per-run with `--matmul-sizes K1 K2 ...` to e.g. extend to 16384
+# for fp8-only fp8_te runs or to drop large K on small-VRAM cards.
+DEFAULT_MATMUL_SIZES = [1024, 2048, 2880, 4096, 5760, 8192, 12288]
+QUICK_MATMUL_SIZES = [1024, 2880, 4096]
 
 
 # Fraction of the device's total HBM that one elementwise cell may consume.
