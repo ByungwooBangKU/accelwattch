@@ -27,6 +27,8 @@
 - [부록 A. 수치해석 주의사항](#부록-a-수치해석-주의사항)
 - [부록 B. NVML power telemetry semantics](#부록-b-nvml-power-telemetry-semantics)
 
+> 📋 **실험 카탈로그** : 모든 test case 의 *목적 / 동작 / 입력 파라미터 / 산출물* 을 대분류 → 중분류 → 개별 cell 의 3 단계로 정리한 문서는 **[`TestCases.md`](TestCases.md)** 에 별도로 있다. 새 실험 추가 시 그 문서의 §A~§D 에 한 줄 등록하면 자동으로 README 흐름에 합류한다.
+
 ## 0. 용어와 기호
 
 | 기호 | 의미 |
@@ -1438,6 +1440,7 @@ util/gpu_power_bench/
 ├── soc_power_bench.py           SoC envelope (static / max / leakage)
 ├── run_soc_bench.sh             SoC envelope 런처
 ├── install_transformer_engine.sh  TE 설치 헬퍼
+├── TestCases.md                 실험 카탈로그 (대/중분류, 입력/산출물)
 └── reports/                     출력 디렉토리
 ```
 
