@@ -454,7 +454,7 @@ def main() -> int:
 
     # ---- preflight ---------------------------------------------------------
     if not args.skip_preflight:
-        pf = preflight.check()
+        pf = preflight.check(device=args.device)
         preflight.print_report(pf)
         if not pf.ok:
             print("preflight failed — fix the above or re-run with --skip-preflight")
