@@ -644,6 +644,11 @@ E_dyn = k_op · N_op + c
 
 `<stem>_01_powermodel_coef_bar_elementwise.png` 와 `<stem>_01_powermodel_coef_bar_matmul.png` 의 bar 위에는 WLS slope + R² 가 라벨링되고, **bootstrap CI 가 error bar 로** 직접 표시됩니다 — bar 위에 작은 whisker 가 보이면 그것이 95% CI.
 
+**Noise-floor 자동 제외** : `dyn_energy_j ≤ 0` (즉 NVML noise 아래로 떨어져 clip-to-zero 된 cell, README §8.3.4) 은 `_fit_one_group()` 의 dyn 회귀에서 제외됩니다. 이유 : WLS 의 가중치가 `1/y²` 이라 한 row 의 y=0 가 가중치 ≈ ∞ 가 되어 slope 를 0 쪽으로 끌어당김 — H100 의 `matmul_fp8_te` K=1024..2048 같은 작은 K 셀이 전형적 케이스. 결과적으로 :
+- 일부만 clipping → 살아남은 K 점들로 slope 정상 fit
+- 전부 clipping → `slope_dyn_wls = NaN`, bar 가 *invisible* (가짜 0 대신). summary CSV 의 `n_points_dyn_fit` 와 `n_dropped_clipped` 컬럼에 몇 개가 빠졌는지 기록되어 있어 사후 진단 가능
+- Total-energy 회귀는 영향 없음 (`y_tot = total_energy_j > 0` 항상)
+
 ### 5.2 Total-energy regression vs dynamic-energy regression
 
 두 가지 fit 모두 수행한다:

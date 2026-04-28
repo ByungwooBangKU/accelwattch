@@ -406,23 +406,46 @@ def _fit_one_group(g: pd.DataFrame, x_col: str,
     y_dyn = g["dyn_energy_j"].to_numpy(dtype=float)
     y_tot = g["total_energy_j"].to_numpy(dtype=float)
     n = len(g)
-    if n >= 2:
-        slope_dyn,    _, r2_dyn     = linear_fit(x, y_dyn)
-        slope_total,  _, r2_total   = linear_fit(x, y_tot)
-        slope_dyn_wls, _, r2_dyn_wls = linear_fit_wls(x, y_dyn)
+    # Drop clipped-to-zero rows from the DYN regression. The WLS weight
+    # is 1/y² (`linear_fit_wls`), so a single y=0 row gets weight ≈ 1/eps²
+    # which dominates the fit and drags slope_dyn to ~0. This is the
+    # exact symptom on H100 matmul_fp8_te K=1024..2048 — those rows are
+    # under the NVML noise floor (README §8.3.4) and got clipped to 0,
+    # making the bar plot read 0 J/FLOP for the entire variant. Total-
+    # energy regression isn't affected (y_tot never goes to 0; static
+    # power × wall_s is always > 0) so we keep its full-row fit.
+    pos_mask = (y_dyn > 0) & np.isfinite(y_dyn) & np.isfinite(x)
+    n_dropped_clipped = int((~pos_mask).sum())
+    x_dyn = x[pos_mask]
+    y_dyn_pos = y_dyn[pos_mask]
+    n_dyn = len(x_dyn)
+    if n_dyn >= 2:
+        slope_dyn,    _, r2_dyn     = linear_fit(x_dyn, y_dyn_pos)
+        slope_dyn_wls, _, r2_dyn_wls = linear_fit_wls(x_dyn, y_dyn_pos)
         if want_ci:
             _, ci_lo, ci_hi = bootstrap_slope_ci(
-                x, y_dyn, n_resample=1000, confidence=0.95, weighted=True)
+                x_dyn, y_dyn_pos, n_resample=1000, confidence=0.95, weighted=True)
         else:
             ci_lo = ci_hi = float("nan")
-    else:
-        # Degenerate group — common for single-point cache regimes.
-        # Use the (only) per-point coefficient as a coarse k_op.
-        per_point = y_dyn[0] / x[0] if (x[0] != 0 and n == 1) else float("nan")
-        slope_dyn    = slope_dyn_wls = per_point
-        slope_total  = float("nan")
-        r2_dyn       = r2_dyn_wls = r2_total = float("nan")
+    elif n_dyn == 1:
+        # Single non-clipped point — coarse k_op from that point alone.
+        per_point = y_dyn_pos[0] / x_dyn[0] if x_dyn[0] != 0 else float("nan")
+        slope_dyn = slope_dyn_wls = per_point
+        r2_dyn = r2_dyn_wls = float("nan")
         ci_lo = ci_hi = float("nan")
+    else:
+        # ALL points clipped → no meaningful dyn k_op. Emit NaN so the
+        # bar / heatmap plots draw nothing for this variant rather than
+        # showing a misleading 0.
+        slope_dyn = slope_dyn_wls = float("nan")
+        r2_dyn = r2_dyn_wls = float("nan")
+        ci_lo = ci_hi = float("nan")
+    # Total-energy fit — uses full row set (no clipping concern there).
+    if n >= 2:
+        slope_total,  _, r2_total = linear_fit(x, y_tot)
+    else:
+        slope_total = float("nan")
+        r2_total    = float("nan")
     # Clip-bias check (PR A added dyn_energy_j_raw — pre-clip residual).
     slope_dyn_unclipped = float("nan")
     clip_bias_pct = float("nan")
@@ -435,6 +458,13 @@ def _fit_one_group(g: pd.DataFrame, x_col: str,
                 clip_bias_pct = (slope_dyn_wls - s_raw) / s_raw * 100.0
     return dict(
         n_points=n,
+        # n_points_dyn_fit = how many rows actually fed the dyn regression
+        # after clipped-to-zero exclusion. n_dropped_clipped = the rest.
+        # When n_points_dyn_fit < n_points, the headline k_op is fitted
+        # from a subset of the cells the user thinks they ran — surfaced
+        # so a downstream consumer can flag that.
+        n_points_dyn_fit=n_dyn,
+        n_dropped_clipped=n_dropped_clipped,
         slope_dyn=slope_dyn,
         slope_dyn_wls=slope_dyn_wls,
         slope_dyn_ci_lo=ci_lo,
