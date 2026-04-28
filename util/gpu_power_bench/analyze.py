@@ -1876,8 +1876,12 @@ def _resolve_csv(args) -> Path | None:
         return None
     # Prefer tag-suffixed files (those gpu_power_bench.py writes when --tag
     # is used); otherwise match any per-cell CSV. We deliberately exclude
-    # sidecar CSVs (_baseline / _samples / _summary) so the user doesn't
-    # accidentally analyze the wrong file.
+    # sidecar CSVs (_baseline / _samples / _summary / _rebaseline) so the
+    # user doesn't accidentally analyze the wrong file.
+    # `_rebaseline.csv` is the trickiest of these — it's written AFTER
+    # the main CSV at sweep end, so its mtime is newer; without this
+    # filter it wins the "most recent" tiebreak and analyze.py crashes
+    # with KeyError: 'gpu' (rebaseline schema has no gpu column).
     patterns = []
     if args.tag:
         patterns += [f"gpu_power_bench_*_{args.tag}.csv",
@@ -1892,7 +1896,8 @@ def _resolve_csv(args) -> Path | None:
                 continue
             name = p.name
             if any(name.endswith(s) for s in ("_baseline.csv", "_baseline_stats.csv",
-                                              "_samples.csv", "_summary.csv")):
+                                              "_samples.csv", "_summary.csv",
+                                              "_rebaseline.csv")):
                 continue
             seen.add(p)
             candidates.append(p)
@@ -1965,7 +1970,19 @@ def main() -> int:
         out_dir = args.csv.parent
     out_dir.mkdir(exist_ok=True, parents=True)
     print(f"[output] {out_dir}/")
-    gpu = df["gpu"].iloc[0]
+    # Defensive: gpu column is written by current gpu_power_bench.py but
+    # missing in (a) very old CSVs, (b) sidecars that slipped past the
+    # _resolve_csv filter. Fall back to a slug parsed from the filename
+    # so we still produce plots instead of crashing.
+    if "gpu" in df.columns and not df["gpu"].empty:
+        gpu = df["gpu"].iloc[0]
+    else:
+        # Filename pattern: gpu_power_bench_<slug>_<ts>[_<tag>].csv
+        stem_parts = args.csv.stem.split("_")
+        gpu = "_".join(stem_parts[3:5]) if len(stem_parts) >= 5 else args.csv.stem
+        print(f"[warn] CSV has no 'gpu' column — derived from filename: {gpu!r}. "
+              f"Re-run gpu_power_bench.py if you want the proper GPU name "
+              f"(this CSV is likely from an older sweep or a sidecar).")
     stem = args.csv.stem
 
     # --- summary / power-model coefficient extraction ---
