@@ -31,7 +31,7 @@
 set -euo pipefail
 
 PYTHON="${PYTHON:-python3}"
-TE_VERSION="${TE_VERSION:-}"        # empty → latest
+TE_VERSION="${TE_VERSION:-}"        # empty → recommended-or-latest (see below)
 EXTRA="${TE_EXTRA:-pytorch}"        # change to "pytorch,jax" if you need JAX too
 TE_NO_PREBUILT="${TE_NO_PREBUILT:-0}"
 # TE requires CUDA toolkit ≥ 12.0 for TE ≥ 1.x (and ≥ 12.1 for TE 2.x).
@@ -39,6 +39,24 @@ TE_NO_PREBUILT="${TE_NO_PREBUILT:-0}"
 # the toolkit is below what the latest TE series needs.
 TE_MIN_CUDA_MAJOR=12
 TE_MIN_CUDA_MINOR=0
+
+# Known-good / known-bad TE versions per CUDA major. Hand-curated from
+# real failures observed during dev. Update as NVIDIA fixes / breaks new
+# releases — a wrong pin here just shows a noisy warning, not a crash.
+#
+#   cu13 + TE 2.14.x : torch backend .so links against a newer cuBLASLt
+#                      symbol set than what nvidia-cublas-cu13 13.1.x
+#                      ships with as of late 2025 → import fails with
+#                      'undefined symbol: cublasLt*_internal'.
+#                      TE 2.12.0 is the last known-good release for that
+#                      stack.
+declare -A TE_RECOMMENDED=(
+    ["13"]="2.12.0"
+)
+declare -A TE_BAD=(
+    ["13:2.14.0"]="cu13 + nvidia-cublas-cu13 13.1.x → undefined cublasLt*_internal symbol at import (use 2.12.0)"
+    ["13:2.14"]="cu13 + nvidia-cublas-cu13 13.1.x → undefined cublasLt*_internal symbol at import (use 2.12.0)"
+)
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()   { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -281,6 +299,38 @@ if [[ $have_nvcc -eq 1 && -d "$cuda_home_effective" ]]; then
 fi
 
 # ---- 5. install TE ----
+# 5a-prelude : pick a sensible TE version for THIS CUDA stack.
+#
+#   - if user pinned TE_VERSION explicitly, honour it (but warn loudly if
+#     it's in the known-bad list — they may have set it before reading
+#     the new compat matrix and don't realise it's broken)
+#   - otherwise, if TE_RECOMMENDED has an entry for this CUDA major,
+#     use that pin so a fresh user doesn't pull the latest broken release
+#   - otherwise, leave TE_VERSION empty and let pip pick latest
+if [[ -n "$TE_VERSION" ]]; then
+    bad_key="${torch_cuda_major}:${TE_VERSION}"
+    bad_msg="${TE_BAD[$bad_key]:-}"
+    if [[ -n "$bad_msg" ]]; then
+        red ""
+        red "  WARNING : TE_VERSION=$TE_VERSION on CUDA $torch_cuda_major is on the known-bad list :"
+        red "      $bad_msg"
+        red ""
+        if [[ "${TE_ALLOW_BAD:-0}" != "1" ]]; then
+            red "  Aborting. Override with TE_ALLOW_BAD=1 to install anyway."
+            recommended="${TE_RECOMMENDED[$torch_cuda_major]:-}"
+            if [[ -n "$recommended" ]]; then
+                red "  Or unset TE_VERSION to use the recommended pin ($recommended)."
+            fi
+            exit 1
+        fi
+        ylw "  TE_ALLOW_BAD=1 set — proceeding with the broken pin anyway."
+    fi
+elif [[ -n "${TE_RECOMMENDED[$torch_cuda_major]:-}" ]]; then
+    TE_VERSION="${TE_RECOMMENDED[$torch_cuda_major]}"
+    grn "[version] CUDA $torch_cuda_major detected → defaulting to TE $TE_VERSION (known-good)"
+    echo "          override with TE_VERSION=...  to pick a different release"
+fi
+
 if [[ -n "$TE_VERSION" ]]; then
     PKG="transformer-engine[$EXTRA]==$TE_VERSION"
 else
