@@ -1226,28 +1226,33 @@ reports/
 
 `gpu_power_bench.py` 의 sweep 과는 **별개 실험**으로, GPU 의 **static / max / leakage** 3 점을 짧게 측정하는 단독 도구. AccelWattch 의 power-model 파라미터 (`P_static` / `P_max` / leakage 의 온도 의존성) 를 cross-check 하거나 데이터 시트의 TGP 와 실제 saturation 을 비교할 때 유용.
 
+> **Power source** : Hopper (H100, sm_90+) 이상에서는 `nvmlDeviceGetFieldValues(NVML_FI_DEV_POWER_INSTANT)` 로 ~1 ms 갱신 주기의 instant 값을 사용. 그 외 (또는 driver / pynvml 가 field-values 미지원이면) 자동으로 legacy `nvmlDeviceGetPowerUsage` (~50 ms 평균) 로 fallback. 시작 시 `[info] power source: …` 로 어느 path 인지 콘솔에 노출되고 summary CSV 의 `power_source` 컬럼에도 기록됨. instant 경로는 max-power ramp / leakage decay 의 짧은 transient 가 averaging 으로 뭉개지지 않아 H100 분석에 권장.
+
 #### 9.6.1 측정 대상 3 phase
 
-| phase | 동작 | 측정값 |
+| phase | 동작 (기본값) | 측정값 |
 |---|---|---|
-| **static** | 60 s 유휴 (gating 된 idle). | mean / peak idle power, idle temp. `gpu_power_bench.py` 의 `static_power_w` 와 일치해야 함. |
-| **max** | 60 s 동안 큰 GEMM (`K=16384`, fp16/TC 기본) 을 연속 launch. | peak / mean power (≈ TGP), 평균·peak 온도, P(t)·T(t) 곡선 (saturation 시간 관찰). |
-| **leakage** | `{20 s GEMM 스트레스 → 30 s 유휴 decay}` 5 사이클. 스트레스 직후 1 s 의 평균 power 가 **hot leakage**. silicon 이 따끈할수록 누설전류가 커지므로 `P_hot - P_static_cold` 가 온도 의존 leakage component. | per-cycle hot-leak power & temp, 5 사이클 평균, `P_hot − P_static` Δ. |
+| **static** | 20 s 유휴 (gating 된 idle). | mean / peak idle power, idle temp. `gpu_power_bench.py` 의 `static_power_w` 와 일치해야 함. |
+| **max** | 30 s 동안 큰 GEMM (`K=16384`, fp16/TC 기본) 을 연속 launch. | peak / mean power (≈ TGP), 평균·peak 온도, P(t)·T(t) 곡선 (saturation 시간 관찰). |
+| **leakage** | `{10 s GEMM 스트레스 → 15 s 유휴 decay}` 5 사이클. 스트레스 직후 1 s 의 평균 power 가 **hot leakage**. silicon 이 따끈할수록 누설전류가 커지므로 `P_hot - P_static_cold` 가 온도 의존 leakage component. | per-cycle hot-leak power & temp, 5 사이클 평균, `P_hot − P_static` Δ. |
+
+기본값 기준 컴퓨트 합 ≈ 175 s, cooldown 포함 wall ≈ **5 분**. (이전 60/60/5×(20+30) = 약 10 분에서 단축됨.)
 
 #### 9.6.2 실행
 
 ```bash
 cd util/gpu_power_bench
-./run_soc_bench.sh --device 0 --tag h100      # 기본 (≈ 10 분)
-./run_soc_bench.sh --device 3 --dtype bf16    # bf16/TC 로 max 부하
-./run_soc_bench.sh --no-leakage               # static + max 만 (≈ 2 분)
-./run_soc_bench.sh --static-seconds 30 --max-seconds 30 --leakage-cycles 3   # 단축 모드
+./run_soc_bench.sh --device 0 --tag h100              # 기본 ≈ 5 분
+./run_soc_bench.sh --device 3 --dtype bf16            # bf16/TC 로 max 부하
+./run_soc_bench.sh --no-leakage                       # static + max 만 ≈ 1 분
+./run_soc_bench.sh --static-seconds 60 --max-seconds 60 \
+                   --leakage-stress-s 20 --leakage-decay-s 30   # 옛 long-soak 복원
 ```
 
 주요 flag:
 - `--matmul-K` (기본 `16384`) : square GEMM 크기. 클수록 SM 사용률 ↑ → TGP 근접. fp32 면 OOM 위험 있음.
 - `--dtype {fp32,tf32,fp16,bf16,fp8}` `--mode {simt,tc,te}` : 컴퓨트 path. 기본 `fp16/tc` 가 대부분 GPU 에서 가장 무거움.
-- `--leak-window-s` (기본 `1.0`) : 스트레스 직후 hot-leak 평균을 잡을 윈도우. NVML 이 ~20 Hz 라 1 s 면 ~20 샘플 들어옴.
+- `--leak-window-s` (기본 `1.0`) : 스트레스 직후 hot-leak 평균을 잡을 윈도우. NVML legacy 가 ~20 Hz 라 1 s 면 ~20 샘플; H100 instant path 면 ~100 샘플 들어옴.
 - `--leakage-cycles` / `--leakage-stress-s` / `--leakage-decay-s` : leakage phase 모양 조절.
 - `--cooldown-c` (기본 `45`) : 각 phase 시작 전 식히는 목표 온도. 0 이면 비활성.
 

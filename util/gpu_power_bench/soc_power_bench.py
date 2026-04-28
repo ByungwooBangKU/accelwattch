@@ -179,8 +179,35 @@ def phase_leakage(sampler: PowerSampler, spec, n_cycles: int,
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
+def _add_axis_detail(ax, x_major: float, x_minor: float,
+                     y_major: float = None, y_minor: float = None) -> None:
+    """Tighten axis ticks + grid for at-a-glance reading.
+
+    Major ticks every `x_major` seconds with labels; minor ticks every
+    `x_minor` for sub-second resolution. Grid drawn on both. Y is set
+    similarly when y_major/y_minor are given (we leave it auto-scaled
+    when None — the data range varies too much across phases to pick
+    a sane fixed step).
+    """
+    from matplotlib.ticker import MultipleLocator
+    ax.xaxis.set_major_locator(MultipleLocator(x_major))
+    ax.xaxis.set_minor_locator(MultipleLocator(x_minor))
+    if y_major is not None:
+        ax.yaxis.set_major_locator(MultipleLocator(y_major))
+    if y_minor is not None:
+        ax.yaxis.set_minor_locator(MultipleLocator(y_minor))
+    ax.grid(which="major", alpha=0.4)
+    ax.grid(which="minor", alpha=0.15, linestyle=":")
+    ax.tick_params(which="both", labelsize=9)
+
+
 def plot_phase_timeline(samples, summary, out_path: Path) -> None:
-    """Whole-run P(t) and T(t) on one figure with phase shading."""
+    """Whole-run P(t) and T(t) on one figure with phase shading.
+
+    Big figure (16x10 in) so x/y ticks remain readable when the run
+    spans 200+ seconds. Minor x ticks every 5s, major every 30s; minor
+    power-y ticks every 10W, major every 50W.
+    """
     if not samples:
         return
     ts  = [s.t for s in samples]
@@ -189,32 +216,46 @@ def plot_phase_timeline(samples, summary, out_path: Path) -> None:
     Ts  = [s.temp_c for s in samples if s.temp_c >= 0]
     Tts = [s.t for s in samples if s.temp_c >= 0]
 
-    fig, (axP, axT) = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True)
+    fig, (axP, axT) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
 
-    axP.plot(pts, ps, lw=0.8, color="C0")
-    axP.set_ylabel("Power (W)")
-    axP.set_title(f"SoC power envelope — {summary['gpu_name']}")
-    axP.grid(alpha=0.3)
+    axP.plot(pts, ps, lw=1.0, color="C0")
+    axP.set_ylabel("Power (W)", fontsize=11)
+    src = summary.get("power_source", "")
+    title = f"SoC power envelope — {summary['gpu_name']}"
+    if src:
+        title += f"   ({src})"
+    axP.set_title(title, fontsize=12)
     # Horizontal guides — only drawn for phases that actually completed.
     # An aborted run may leave any of these missing from `summary`.
     s_w = summary.get("static_power_w_mean")
     if s_w is not None and s_w > 0:
-        axP.axhline(s_w, color="C2", lw=1, ls="--",
+        axP.axhline(s_w, color="C2", lw=1.2, ls="--",
                     label=f"static {s_w:.1f} W")
     m_w = summary.get("max_power_w_mean")
     if m_w is not None and m_w > 0:
-        axP.axhline(m_w, color="C3", lw=1, ls="--",
+        axP.axhline(m_w, color="C3", lw=1.2, ls="--",
                     label=f"max-mean {m_w:.1f} W")
     l_w = summary.get("leakage_power_w_mean")
     if l_w is not None and l_w > 0:
-        axP.axhline(l_w, color="C1", lw=1, ls="--",
+        axP.axhline(l_w, color="C1", lw=1.2, ls="--",
                     label=f"hot-leak {l_w:.1f} W")
-    axP.legend(loc="upper right", fontsize=8)
+    axP.legend(loc="upper right", fontsize=10)
 
-    axT.plot(Tts, Ts, lw=0.8, color="C3")
-    axT.set_ylabel("Temperature (°C)")
-    axT.set_xlabel("t (s)")
-    axT.grid(alpha=0.3)
+    axT.plot(Tts, Ts, lw=1.0, color="C3")
+    axT.set_ylabel("Temperature (°C)", fontsize=11)
+    axT.set_xlabel("t (s)", fontsize=11)
+
+    # Tick density tuned to the new ~200s default total wall time.
+    # 30s major / 5s minor on x lets you spot a 1-2s feature without
+    # squinting; 50W major / 10W minor on power matches the typical
+    # per-bin resolution we care about.
+    duration = (samples[-1].t - samples[0].t) if samples else 1.0
+    x_major = max(10.0, round(duration / 12 / 5) * 5) or 10.0
+    x_minor = max(1.0, x_major / 6)
+    _add_axis_detail(axP, x_major=x_major, x_minor=x_minor,
+                     y_major=50.0, y_minor=10.0)
+    _add_axis_detail(axT, x_major=x_major, x_minor=x_minor,
+                     y_major=10.0, y_minor=2.0)
 
     # Phase shading from the per-sample phase tag — collapse runs of same
     # tag to (t_start, t_end) intervals and shade alternating tones.
@@ -241,18 +282,25 @@ def plot_phase_timeline(samples, summary, out_path: Path) -> None:
                 ax.axvspan(t0, t1, color=c, lw=0)
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=130)
+    fig.savefig(out_path, dpi=140)
     plt.close(fig)
 
 
 def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
-    """Overlay the decay curves with t=0 at the moment stress stopped."""
+    """Overlay the decay curves with t=0 at the moment stress stopped.
+
+    Bigger figure (12x7) so each cycle's curve and its hot-window
+    spike at t=0 are visible. Minor x ticks every 1s, y ticks every
+    5W, with a marker at the hot-window boundary so the reader can
+    see exactly which samples feed `leakage_power_w_mean`.
+    """
     if not cycles:
         return
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    fig, ax = plt.subplots(figsize=(12, 7))
     # `static_power_w_mean` may be missing if the run aborted before the
     # static phase completed. Fall back to 0 so we still produce SOME plot.
     static_w = summary.get("static_power_w_mean", 0.0) or 0.0
+    leak_window = summary.get("leakage_window_s", 1.0)
     for c in cycles:
         # Slice the decay window and re-zero its time axis.
         sl = [(s.t - c["decay_t0"], s.power_w, s.temp_c)
@@ -262,47 +310,81 @@ def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
             continue
         ts = [r[0] for r in sl]
         ps = [r[1] for r in sl]
-        ax.plot(ts, ps, lw=1.0, label=f"cycle {c['cycle']+1}", alpha=0.85)
-    ax.axhline(static_w, color="k", lw=1, ls=":", label=f"static {static_w:.1f} W")
-    ax.set_xlabel("t since stress stop (s)")
-    ax.set_ylabel("Power (W)")
-    ax.set_title(f"Leakage decay (kernel idle, hot silicon) — {summary['gpu_name']}")
-    ax.grid(alpha=0.3)
-    ax.legend(loc="upper right", fontsize=8)
+        ax.plot(ts, ps, lw=1.3, label=f"cycle {c['cycle']+1}", alpha=0.85)
+    ax.axhline(static_w, color="k", lw=1.2, ls=":",
+               label=f"static {static_w:.1f} W")
+    ax.axvspan(0, leak_window, color=(0.95, 0.95, 0.30, 0.20),
+               label=f"hot-window ({leak_window}s)")
+    ax.set_xlabel("t since stress stop (s)", fontsize=11)
+    ax.set_ylabel("Power (W)", fontsize=11)
+    src = summary.get("power_source", "")
+    title = f"Leakage decay (kernel idle, hot silicon) — {summary['gpu_name']}"
+    if src:
+        title += f"   ({src})"
+    ax.set_title(title, fontsize=12)
+    # Decay windows are ~15s in the new defaults — minor every 1s, major
+    # every 5s gives readable detail without crowding.
+    _add_axis_detail(ax, x_major=5.0, x_minor=1.0,
+                     y_major=20.0, y_minor=5.0)
+    ax.legend(loc="upper right", fontsize=10)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=130)
+    fig.savefig(out_path, dpi=140)
     plt.close(fig)
 
 
 def plot_summary_bars(summary, out_path: Path) -> None:
-    """Bar chart: static / max-mean / max-peak / hot-leak (with delta vs static)."""
-    labels, values = [], []
-    labels.append("static")
-    values.append(summary["static_power_w_mean"])
-    labels.append("max\n(mean)")
-    values.append(summary["max_power_w_mean"])
-    labels.append("max\n(peak)")
-    values.append(summary["max_power_w_peak"])
-    if summary.get("leakage_power_w_mean", -1) > 0:
-        labels.append("hot-leak\n(mean of 5)")
-        values.append(summary["leakage_power_w_mean"])
+    """Bar chart: static / max-mean / max-peak / hot-leak (with delta vs static).
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    Bigger figure (10x6) and y-axis tick density tuned so the W values
+    on each bar are easily read.
+    """
+    labels, values = [], []
+    s_w = summary.get("static_power_w_mean")
+    if s_w is not None and s_w > 0:
+        labels.append("static")
+        values.append(s_w)
+    m_w = summary.get("max_power_w_mean")
+    if m_w is not None and m_w > 0:
+        labels.append("max\n(mean)")
+        values.append(m_w)
+    m_p = summary.get("max_power_w_peak")
+    if m_p is not None and m_p > 0:
+        labels.append("max\n(peak)")
+        values.append(m_p)
+    l_w = summary.get("leakage_power_w_mean")
+    if l_w is not None and l_w > 0:
+        n = summary.get("leakage_cycles", "?")
+        labels.append(f"hot-leak\n(mean of {n})")
+        values.append(l_w)
+
+    if not values:
+        return  # nothing to plot
+
+    fig, ax = plt.subplots(figsize=(10, 6))
     bars = ax.bar(labels, values,
                   color=["C2", "C3", "C3", "C1"][:len(labels)])
-    static_w = summary["static_power_w_mean"]
+    static_w = summary.get("static_power_w_mean", 0.0) or 0.0
     for b, v, lab in zip(bars, values, labels):
         delta = v - static_w
         delta_txt = f"\nΔ={delta:+.1f} W" if "static" not in lab else ""
         ax.text(b.get_x() + b.get_width() / 2, v,
                 f"{v:.1f} W{delta_txt}",
-                ha="center", va="bottom", fontsize=9)
-    ax.set_ylabel("Power (W)")
-    ax.set_ylim(0, max(values) * 1.20)
-    ax.set_title(f"SoC power-envelope summary — {summary['gpu_name']}")
-    ax.grid(axis="y", alpha=0.3)
+                ha="center", va="bottom", fontsize=11)
+    ax.set_ylabel("Power (W)", fontsize=12)
+    ax.set_ylim(0, max(values) * 1.22)
+    src = summary.get("power_source", "")
+    title = f"SoC power-envelope summary — {summary['gpu_name']}"
+    if src:
+        title += f"   ({src})"
+    ax.set_title(title, fontsize=12)
+    ax.grid(axis="y", alpha=0.3, which="major")
+    ax.grid(axis="y", alpha=0.15, which="minor", linestyle=":")
+    from matplotlib.ticker import MultipleLocator
+    ax.yaxis.set_major_locator(MultipleLocator(50))
+    ax.yaxis.set_minor_locator(MultipleLocator(10))
+    ax.tick_params(labelsize=11)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=130)
+    fig.savefig(out_path, dpi=140)
     plt.close(fig)
 
 
@@ -317,15 +399,25 @@ def main() -> int:
     ap.add_argument("--out-dir", type=str, default="reports")
     ap.add_argument("--sample-hz", type=int, default=100)
 
-    ap.add_argument("--static-seconds", type=float, default=60.0,
+    # Defaults shrunk vs. the original (60/60/5×(20+30) ≈ 10 min):
+    # - static 20s gives ~400 samples at 20Hz NVML — plenty for a tight
+    #   idle baseline (std typically <0.5W).
+    # - max 30s lets clocks ramp, cuBLAS pick an algorithm, and the
+    #   thermal-soak curve reach its steady-state plateau (~5-10s ramp,
+    #   then ~20s of saturated reading).
+    # - leakage stress 10s heats the silicon enough that the hot-leak
+    #   delta is well above NVML noise. decay 15s captures the visible
+    #   exponential ramp back toward static; longer just adds wall time.
+    # Total compute ~3 min, total wall (with cooldowns) ~5 min.
+    ap.add_argument("--static-seconds", type=float, default=20.0,
                     help="duration of the idle baseline phase")
-    ap.add_argument("--max-seconds", type=float, default=60.0,
+    ap.add_argument("--max-seconds", type=float, default=30.0,
                     help="duration of the max-power GEMM phase")
     ap.add_argument("--leakage-cycles", type=int, default=5,
                     help="number of stress/decay cycles for the leakage phase")
-    ap.add_argument("--leakage-stress-s", type=float, default=20.0,
+    ap.add_argument("--leakage-stress-s", type=float, default=10.0,
                     help="GEMM stress duration per leakage cycle")
-    ap.add_argument("--leakage-decay-s", type=float, default=30.0,
+    ap.add_argument("--leakage-decay-s", type=float, default=15.0,
                     help="post-stress idle (cooldown) per leakage cycle")
     ap.add_argument("--leak-window-s", type=float, default=1.0,
                     help="how long after stress stop to average for hot-leakage "
@@ -379,13 +471,16 @@ def main() -> int:
     # Single sampler for the whole run so the timeseries is contiguous and
     # we can slice phases out of it for stats / plotting.
     sampler = PowerSampler(handle, hz=args.sample_hz)
+    print(f"[info] power source: {sampler.power_source}")
     sampler.start()
     sampler.set_phase("startup")
 
     summary = {"gpu_name": gpu_name, "gpu_slug": gpu_slug,
                "cc_major": cc[0], "cc_minor": cc[1],
                "matmul_K": args.matmul_K,
-               "dtype": args.dtype, "mode": args.mode}
+               "dtype": args.dtype, "mode": args.mode,
+               "power_source": sampler.power_source,
+               "sample_hz": args.sample_hz}
     cycles_meta: list[dict] = []
     static_t = max_t = None
     fatal_error: str | None = None
