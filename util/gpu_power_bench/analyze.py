@@ -1876,12 +1876,21 @@ def _resolve_csv(args) -> Path | None:
         return None
     # Prefer tag-suffixed files (those gpu_power_bench.py writes when --tag
     # is used); otherwise match any per-cell CSV. We deliberately exclude
-    # sidecar CSVs (_baseline / _samples / _summary / _rebaseline) so the
-    # user doesn't accidentally analyze the wrong file.
-    # `_rebaseline.csv` is the trickiest of these — it's written AFTER
-    # the main CSV at sweep end, so its mtime is newer; without this
-    # filter it wins the "most recent" tiebreak and analyze.py crashes
-    # with KeyError: 'gpu' (rebaseline schema has no gpu column).
+    # sidecar CSVs so the user doesn't accidentally analyze the wrong file.
+    # Two families to filter:
+    #   gpu_power_bench.py writes : _baseline / _baseline_stats / _samples
+    #                               / _summary / _rebaseline
+    #   analyze.py writes back   : _summary / _summary_by_regime
+    #                               / _dram_rw_split / _dram_marginal
+    # Without this, the most-recent-mtime tiebreak eventually picks one of
+    # analyze.py's own outputs (next re-run after a successful run drops
+    # in newer-mtime sidecars) and crashes with KeyError.
+    SIDECAR_SUFFIXES = (
+        "_baseline.csv", "_baseline_stats.csv",
+        "_samples.csv", "_summary.csv", "_rebaseline.csv",
+        "_summary_by_regime.csv",
+        "_dram_rw_split.csv", "_dram_marginal.csv",
+    )
     patterns = []
     if args.tag:
         patterns += [f"gpu_power_bench_*_{args.tag}.csv",
@@ -1895,9 +1904,7 @@ def _resolve_csv(args) -> Path | None:
             if p in seen:
                 continue
             name = p.name
-            if any(name.endswith(s) for s in ("_baseline.csv", "_baseline_stats.csv",
-                                              "_samples.csv", "_summary.csv",
-                                              "_rebaseline.csv")):
+            if any(name.endswith(s) for s in SIDECAR_SUFFIXES):
                 continue
             seen.add(p)
             candidates.append(p)
