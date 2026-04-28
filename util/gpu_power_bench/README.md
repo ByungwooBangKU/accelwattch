@@ -378,6 +378,81 @@ read 와 write 가 분리돼서 나오고, mixed 의 implied (= (r·R+w·W)/(r+w
 
 **Static vs dynamic 분리**: `dyn_energy_j = total_energy_j − static_power_w × wall_s`. static 은 §3.4 의 baseline 측정 (12 초 idle) 에서 mean ± std 가 5% 이내일 때만 신뢰 가능. baseline plot (`_03_baseline_static_power.png`) 에서 idle trace 가 평탄한지 먼저 확인 후 pJ/bit 해석. **Marginal plot 의 음수 bar 는 P_static 이 너무 높게 잡혀서 l2_hit_100 의 dyn_energy 가 인플레됐다는 신호** — 이 경우 `--rebaseline-every 20` 으로 재측정 권장.
 
+### 3.5.3 결과 해석 — 왜 op 별로 pJ/bit 가 크게 차이 나는가 (자주 나오는 질문)
+
+`dram_energy_marginal.png` / `dram_energy_pjbit.png` 를 처음 보면 **add/mul 은 literature 와 ±50% 안인데 softmax/gelu/layernorm 은 2~3 배 높게** 나옵니다. 이건 측정 버그가 아니라 *pJ/bit 모델이 op 마다 적용 정확도가 다르기 때문*. 이미 `dyn_energy` 에선 board-level idle (HBM2E IDD 포함) 이 빠져 있으니 "static 을 안 빼서" 가 원인은 아닙니다.
+
+#### (a) `direct` (l2_hit_0 의 pJ/bit) 는 풀 스택 → literature 와 직접 비교 안 됨
+
+`direct = dyn_energy / bytes_traffic / 8` 의 dyn_energy 에는 DRAM 전송 외에 **SM compute (op 의 FLOP), L2 lookup, NoC, register file** 등이 다 들어갑니다. 그래서 op 의 FLOP/elem 과 거의 비례:
+
+| op | FLOP/elem | A100 direct (fp16, 예시) |
+|---|---|---|
+| `mul` | 1 | ~16 pJ/bit |
+| `add` | 1 | ~16 |
+| `softmax` | ~5 | ~31 |
+| `gelu` | ~8 | ~25 |
+| `layernorm` | ~8 | ~38 |
+
+direct 는 "이 op 를 한 번 돌려서 한 비트가 보드에 나갈 때까지 든 총 동적 에너지" 라 op 가 무거울수록 큼.
+
+#### (b) `marginal` 은 SM/L2 baseline 을 *수학적으로* 상쇄 → 이론상 DRAM-only
+
+`marginal = J/byte(l2_hit_0) − J/byte(l2_hit_100)`. 같은 op 의 두 cache regime 비용 차이라서 SM compute 와 L2 routing 이 cancel 됨. 그래서 simple op 는 literature 와 정렬:
+
+| op | A100 marginal (fp16) | HBM2E literature (5 pJ/bit) 와 격차 |
+|---|---|---|
+| `add` | 7.6 | +50% (board overhead 감안 OK) |
+| `mul` | 6.4 | +30% (가장 깨끗) |
+| `softmax` | 12.4 | **+150%** (왜?) |
+| `layernorm` | 12.0 | +140% (왜?) |
+| `gelu` | 12.0 | +140% (왜?) |
+
+#### (c) 왜 reduction op (softmax / layernorm) 의 marginal 이 그래도 높은가 — `bytes_traffic` 가 multi-pass DRAM 트래픽을 과소 카운트
+
+`analyze.py` 의 `RW_PER_CALL` 표 :
+
+```python
+RW_PER_CALL = {
+    "mul": 3, "add": 3,                    # 2R + 1W (a, b → out)
+    "gelu": 2,                             # 1R + 1W
+    "softmax": 2, "layernorm": 2,          # 1R + 1W (논리적)
+    "stream_copy": 2, "stream_scale": 2,
+    "stream_triad": 3,
+    "stream_read": 1, "stream_write": 1,
+}
+```
+
+소프트맥스의 *논리적* I/O 는 1R + 1W = 2 인데, **실제 fused softmax 의 DRAM pass 수는 2~3 회** :
+1. max 구하려고 input 한 번 read (전체 row)
+2. sum(exp) 구하려고 input 한 번 더 read
+3. normalize 한 결과 write
+
+l2_hit_0 영역에서는 working set ≫ L2 라 매 pass 가 다시 DRAM 까지 내려갑니다. 즉 **실제 DRAM bytes ≈ 카운트의 2~3 배**. `pJ/bit = energy / bytes` 의 분모가 과소이니 결과가 inflate.
+
+대략적인 보정 :
+- `softmax` 12.4 / 3 ≈ **4.1 pJ/bit** → HBM2E literature 5 와 일치
+- `layernorm` 12.0 / 3 ≈ **4.0 pJ/bit** → 마찬가지
+
+`gelu` 는 1R + 1W 이라 multi-pass 가 아닌데도 marginal 12 — 원인은 다름. FLOP 8 의 무거운 transcendental 이라 **l2_hit_0 (memory-bound, SM 대기 많음) vs l2_hit_100 (compute-bound, SM full) 의 SM 활동 패턴이 달라** L2-baseline 이 깨끗이 안 빠짐.
+
+#### (d) 그럼 어떻게 비교해야 하나
+
+- **literature 의 HBM2E ≈ 5 pJ/bit 와 직접 비교 가능한 건 `add` / `mul` 의 marginal** (단순 1R+1W 패턴, SM compute 가 가벼움)
+- **STREAM probe (`stream_read` / `stream_write` / `stream_copy`)** 는 의도적으로 compute=0 이라 SM cancel 이 깨끗 — `dram_energy_rw.png` 에서 read/write 단가 따로 봄
+- **softmax / layernorm 의 marginal 을 literature 와 직접 비교하지 말 것** — multi-pass 보정 (÷2~3) 후라야 의미 있음
+- **gelu** 도 SM 활동 패턴 차이로 marginal 이 부풀려짐 — STREAM probe 결과 우선
+
+#### (e) matmul 이 marginal plot 에 빠진 이유
+
+`compute_dram_marginal()` 은 `category == "elementwise"` 만 봅니다 (`analyze.py:1648`). matmul 은 의도적으로 제외 :
+
+1. **matmul 은 compute-bound** (arithmetic intensity = O(K)) — DRAM 비용 분석은 "compute ≪ memory" 에서만 유효
+2. **tile reuse 로 bytes_traffic over-count 가 압도적** — logical access (3K²·bpe) vs 실제 DRAM (그것의 1/K 수준) 이 매우 다름. pJ/bit 가 비현실적으로 작게 나옴
+3. **matmul 은 J/FLOP 가 자연 단위** — `_matmul_*.png` 에서 K-sweep 으로 따로 plot
+
+DRAM 단가는 elementwise + STREAM 으로 보고, matmul 은 compute 효율 (J/FLOP, Tensor-Core gap) 로 분석.
+
 ## 4. 측정 방법론
 
 ### 4.1 NVML power telemetry

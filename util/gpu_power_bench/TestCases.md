@@ -50,13 +50,18 @@ cell 키는 5-튜플 `(op, dtype, mode, llm_preset, load_value)` 이지만 **bro
 N 개 원소짜리 입력 텐서에 한 op 를 매 iteration 적용. iteration 수는 `--window-ms` 가 채워지도록 자동 결정 (기본 3000 ms ≈ NVML 60샘플).
 
 #### Cell 정의
-| op | 의미 | bytes/elem (fp16) | flops/elem |
-|---|---|---|---|
-| `mul` | `c = a * b` | 6 | 1 |
-| `add` | `c = a + b` | 6 | 1 |
-| `softmax` | last-dim softmax | 4 | ~5 |
-| `gelu` | torch.nn.functional.gelu | 4 | ~10 |
-| `layernorm` | per-row LayerNorm | 4 | ~7 |
+
+| op | 의미 | logical I/O (per call) | RW_PER_CALL | FLOP/elem | DRAM pass (실제) | 비고 |
+|---|---|---|---|---|---|---|
+| `mul` | `c = a · b` | 2R + 1W | 3 | 1 | 1× | simple — pJ/bit literature 비교 가능 |
+| `add` | `c = a + b` | 2R + 1W | 3 | 1 | 1× | simple — pJ/bit literature 비교 가능 |
+| `softmax` | row-wise softmax | 1R + 1W | 2 | ~5 | **2~3×** (max → exp+sum → norm) | reduction; pJ/bit 가 inflate |
+| `gelu` | tanh-approx GeLU | 1R + 1W | 2 | ~8 | 1× | heavy compute → l2_hit_0/100 SM 패턴 비대칭 |
+| `layernorm` | per-row LayerNorm | 1R + 1W | 2 | ~8 | **2~3×** (mean → var → norm) | reduction; pJ/bit 가 inflate |
+
+`bytes/elem` (fp16) = `RW_PER_CALL × 2`. `RW_PER_CALL` 은 *논리적* read/write 횟수이고 (`analyze.py:145`), 실제 DRAM pass 는 reduction op 의 경우 더 많음 — **자세한 caveat 은 README §3.5.3 참조**.
+
+`FLOP/elem` 는 `benchmarks.py:32` 의 `FLOPS_PER_ELEMENT` 와 일치. 여기서 `softmax = 5` (max, sub, exp, sum, div), `gelu = 8` (tanh 근사 분해), `layernorm = 8` (mean, var, sub, div, mul, add 등). FLOP 카운트가 큰 op 는 J/byte 의 **direct** 측정값에 SM compute 가 비례적으로 섞여 들어감 — `dram_energy_pjbit.png` 에서 add/mul 보다 softmax/gelu/layernorm 이 2~3 배 높게 나오는 이유. 이건 측정 버그가 아니라 *모델의 적용 정확도가 op 마다 다른* 결과.
 
 dtype × ops × load 카르테시안 곱 = **기본 5 op × 2 dtype × 11 load = 110 cell**. (`--cache-sweep` 사용 시엔 11 load 가 3 regime 점 (L2-resident / partial / dram-stream) 으로 줄어 5 × 2 × 3 = 30 cell. `--quick` 은 3 load 점 → 30 cell.)
 
@@ -103,6 +108,7 @@ dtype × ops × load 카르테시안 곱 = **기본 5 op × 2 dtype × 11 load =
 #### 산출물
 - 동일 sweep CSV 안의 `op = stream_*` row 들.
 - `analyze.py` 의 DRAM pJ/bit 막대그래프 + read/write/copy/scale/triad overlay (HBM2 ≈ 7 pJ/bit, HBM3 ≈ 4 pJ/bit literature 가이드).
+- **STREAM probe 가 elementwise 보다 literature 비교에 더 정확** : compute 가 거의 없어 (`stream_copy=0 FLOP`, `stream_scale=1`, `stream_triad=2`) SM baseline 이 깨끗이 cancel 됨. softmax/gelu/layernorm 의 marginal 이 inflate 되는 multi-pass / heavy-compute 문제 (README §3.5.3) 가 STREAM 에선 발생 안 함.
 
 ---
 
