@@ -806,10 +806,25 @@ H100 에서 `matmul_fp8_te` 를 실행하려면 Transformer Engine 이 필요하
 
 이 스크립트는 다음을 수행한다:
 
+- venv 활성 여부 확인 (system Python 설치 거부 — `TE_ALLOW_NO_VENV=1` 으로 override 가능).
 - CUDA toolkit / nvcc 존재 확인.
 - PyTorch 가 CUDA build 인지 확인.
+- venv 의 `nvidia-cublas-cu*` / `nvidia-cudnn-cu*` pip 휠과 system `/usr/local/cuda` toolkit 의 patch level 비교 → 둘 중 **새것** 을 build 와 runtime 양쪽에 prepend 해서 ABI 미스매치 (`undefined symbol: cublasLt*_internal`) 자동 회피.
 - `--no-build-isolation` + `[pytorch]` extra 로 소스 빌드 (meta-package 함정 회피).
-- 빌드 후 실제로 `te.Linear` + `fp8_autocast` forward 를 태워보고 torch backend `.so` 로드까지 검증 (단순 `import` 는 lazy 로딩 때문에 통과하므로 부족).
+- 빌드 후 실제로 `te.Linear` + `fp8_autocast` forward 를 태워보고 torch backend `.so` 로드까지 검증. 실패하면 venv lib 를 LD_PRELOAD 하고 한 번 더 시도 → 통과 시 정확한 source 명령 안내.
+- 성공 시 `te_env.sh` 를 옆에 생성. 새 셸에서 `source util/gpu_power_bench/te_env.sh` 한 줄로 동일 환경 재현.
+
+#### 8.3.0 호환성 매트릭스 (확인된 조합)
+
+스크립트가 사용하는 **known-good** 핀 :
+
+| CUDA | torch | nvidia-cublas (pip) | TE (권장) | 피해야 할 |
+|---|---|---|---|---|
+| 13.0 | 2.11.0+cu130 | 13.1.0.3 | **2.12.0** | `2.14.0` (cu13 + cublas 13.1.x → undefined `cublasLt*_internal` import 시 crash) |
+| 12.8 | 2.5.x+cu128 / 2.6+cu128 | (system) | (latest 가능) | — |
+| 12.4 | 2.4.x+cu124 | (system) | 1.13~2.x | — |
+
+`TE_VERSION` 미지정 시 위 표의 권장 핀을 자동 사용. 사용자가 known-bad 버전 (`13:2.14.0` 등) 을 명시하면 스크립트가 거부 (`TE_ALLOW_BAD=1` 으로 override 가능). 알려진 호환성 정보는 `install_transformer_engine.sh` 의 `TE_RECOMMENDED` / `TE_BAD` dict 에서 관리되며, 새 케이스를 발견할 때마다 PR 로 추가하면 다음 사용자가 동일 함정 안 빠짐.
 
 #### 8.3.1 Troubleshooting: `could not find shared object file for transformer engine torch lib`
 
