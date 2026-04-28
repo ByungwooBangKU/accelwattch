@@ -11,9 +11,17 @@
 #   ./run_bench.sh --devices "0,2,4,6" --tag h100
 #   ./run_bench.sh --num-gpus 4 --sequential   # one at a time (cleaner thermal)
 #
-# All extra args (--window-ms, --llm-shapes, …) are forwarded to gpu_power_bench.py.
-# With multi-GPU, each process gets its own --tag suffix "_gpu<N>" and its own
-# log file under reports/logs/ so you can `tail -f reports/logs/gpu0.log`.
+# All extra args (--window-ms, --llm-shapes, --suite, --cases, …) are
+# forwarded to gpu_power_bench.py.
+#
+# Log layout (multi-GPU AND single-GPU) :
+#     reports/gpu_power_<tag>_<MMDD_hhmm>/
+#         single.log         (single-GPU run)
+#         gpu0.log           (multi-GPU run)
+#         gpu1.log
+#         ...
+# Logs are NEVER deleted on success/failure — you can `tail -f` while
+# the run is in progress and inspect them after.
 #
 # Thermal note: parallel runs share the node's cooling budget and back-plane
 # temperatures, so cross-GPU variance measured this way includes cooling
@@ -61,7 +69,7 @@ if command -v nvidia-smi >/dev/null; then
     sudo -n nvidia-smi -pm 1 >/dev/null 2>&1 || true
 fi
 
-mkdir -p reports reports/logs
+mkdir -p reports
 
 # ---- argv parsing (we only intercept our new flags; rest forwards) ----
 NUM_GPUS=""
@@ -111,6 +119,18 @@ for a in "${FORWARD[@]+"${FORWARD[@]}"}"; do
     esac
 done
 
+# ---- per-experiment log directory ------------------------------------
+# Logs land in reports/gpu_power_<tag>_<MMDD_hhmm>/ so a series of runs
+# (different tags / different days) doesn't pile up in one giant
+# reports/logs/ folder. The MMDD_hhmm stamp is fixed at script start —
+# all per-GPU logs from this run share it. Override RUN_DIR to pick
+# your own location (e.g. an NFS mount with more space).
+RUN_STAMP="${RUN_STAMP:-$(date +%m%d_%H%M)}"
+LOG_TAG="${BASE_TAG:-default}"
+RUN_DIR="${RUN_DIR:-reports/gpu_power_${LOG_TAG}_${RUN_STAMP}}"
+mkdir -p "$RUN_DIR"
+echo "[run-dir] logs → $RUN_DIR/"
+
 # ${var[@]+expand} is the "only expand if set" trick — produces an empty
 # argv on unset/empty arrays without tripping set -u (which we don't use
 # here anyway, but this also works under it). Use this everywhere we
@@ -124,7 +144,10 @@ run_one() {
     else
         full_tag="$tag_suffix"
     fi
-    local log="reports/logs/${full_tag}.log"
+    # Per-GPU log : just gpu<N>.log inside the per-experiment dir.
+    # No need to re-include $BASE_TAG in the filename — the parent dir
+    # already has it (reports/gpu_power_<tag>_<MMDD_hhmm>/gpu<N>.log).
+    local log="$RUN_DIR/gpu${dev}.log"
     # Create the log file BEFORE the subprocess runs so even a fast-dying
     # process leaves evidence. Record the command being executed and the
     # PID so ps / tail can find it.
@@ -150,31 +173,38 @@ run_one() {
 # chain analyze.py automatically. Use --no-auto-analyze to keep just the
 # raw CSV (e.g. when the analyse step will be done elsewhere).
 if [[ ${#DEVS[@]} -eq 0 ]]; then
-    sweep_log=$(mktemp -t bench_sweep.XXXXXX.log)
+    # Single-GPU sweep — same per-experiment dir convention as the
+    # multi-GPU path. We tee through `single.log` so the user still
+    # sees live progress AND the log is preserved for later analysis
+    # (matches multi-GPU's gpu<N>.log convention).
+    sweep_log="$RUN_DIR/single.log"
     "$PYTHON" gpu_power_bench.py ${FORWARD[@]+"${FORWARD[@]}"} 2>&1 | tee "$sweep_log"
     sweep_rc=${PIPESTATUS[0]}
     if (( sweep_rc != 0 )); then
         echo "[error] gpu_power_bench.py exited with code $sweep_rc" >&2
-        rm -f "$sweep_log"; exit $sweep_rc
+        echo "[error] full log preserved at $sweep_log" >&2
+        exit $sweep_rc
     fi
     if (( AUTO_ANALYZE == 1 )); then
         # gpu_power_bench.py writes a "[OUTPUT_CSV] <path>" line at the end
-        # — pluck it out so we don't have to glob.
+        # — pluck it out so we don't have to glob. Log is preserved either
+        # way for later inspection.
         csv_line=$(grep -E '^\[OUTPUT_CSV\] ' "$sweep_log" | tail -n 1)
-        rm -f "$sweep_log"
         if [[ -z "$csv_line" ]]; then
             echo "[warn] sweep finished but no [OUTPUT_CSV] marker found — skip auto-analyze" >&2
+            echo "[info] log: $sweep_log"
             exit 0
         fi
         csv_path="${csv_line#\[OUTPUT_CSV\] }"
         echo
         echo "[auto-analyze] running analyze.py on $csv_path"
         echo "                (skip with --no-auto-analyze; or run later: python3 analyze.py <csv>)"
+        echo "[info] sweep log preserved: $sweep_log"
         echo
         "$PYTHON" analyze.py "$csv_path"
         exit $?
     fi
-    rm -f "$sweep_log"
+    echo "[info] sweep log: $sweep_log"
     exit 0
 fi
 
@@ -226,12 +256,8 @@ else
         echo "[warn] ${#failed_devs[@]} / ${#DEVS[@]} GPU sweeps failed: ${failed_devs[*]}" >&2
         echo "[warn] tail of each failed log (last 30 lines):" >&2
         for dev in "${failed_devs[@]}"; do
-            if [[ -n "$BASE_TAG" ]]; then
-                ftag="${BASE_TAG}_gpu${dev}"
-            else
-                ftag="gpu${dev}"
-            fi
-            log="reports/logs/${ftag}.log"
+            ftag="gpu${dev}"
+            log="$RUN_DIR/${ftag}.log"
             echo "" >&2
             echo "────── $log ──────" >&2
             if [[ -f "$log" ]]; then
