@@ -1510,19 +1510,42 @@ def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
             ax_a.scatter(xs, ys, s=44, color=op_color[op], marker=marker,
                          alpha=0.85, edgecolors="white", label=f"{op} {dt}")
     # Reference lines (only meaningful in the DRAM-streaming regime — but
-    # we draw them across the whole panel for context).
+    # we draw them across the whole panel for context). Two lines from
+    # DRAM_REFERENCES_PJBIT can share a y-value (HBM2 and DDR4 are both
+    # 7.0 pJ/bit), so we stagger labels horizontally in 3 columns and
+    # paint a white background bbox so the dashed line doesn't bleed
+    # through the glyphs.
     ref_colors = ["#888888", "#666666", "#444444", "#aa5555", "#55aaaa"]
-    for (label, val), c in zip(DRAM_REFERENCES_PJBIT.items(), ref_colors):
+    n_regimes = len(regime_order)
+    label_xs = [n_regimes - 1 + 0.05,    # just right of last regime tick
+                -0.55,                   # well left of first regime tick
+                (n_regimes - 1) / 2.0]   # middle, between regime ticks
+    label_has = ["left", "right", "center"]
+    label_bbox = dict(facecolor="white", edgecolor="none", pad=1.5, alpha=0.85)
+    for i, ((label, val), c) in enumerate(
+            zip(DRAM_REFERENCES_PJBIT.items(), ref_colors)):
         ax_a.axhline(val, color=c, ls="--", lw=1, alpha=0.7)
-        ax_a.text(len(regime_order) - 1 + 0.05, val, f" {label} ≈ {val} pJ/bit",
-                  fontsize=7, color=c, va="center", ha="left")
+        col = i % len(label_xs)
+        ax_a.text(label_xs[col], val, f" {label} ≈ {val} pJ/bit ",
+                  fontsize=8, color=c,
+                  va="center", ha=label_has[col],
+                  bbox=label_bbox)
     ax_a.set_xticks(list(regime_x.values()))
     ax_a.set_xticklabels([f"{r}\n({REGIME_HIT_PCT[r]} L2 hit)" for r in regime_order],
                          fontsize=11)
-    ax_a.set_yscale("log")
+    # Linear scale (was log). At log scale the literature reference lines
+    # crowd into a narrow band near the bottom of the panel and the
+    # measured points spread thinly, which made the comparison hard to
+    # read. Linear gives the eye a fair side-by-side; outlier high-FLOP
+    # ops (gelu / softmax / layernorm) just push the upper bound a bit.
+    ax_a.set_yscale("linear")
+    # Pad x range so the left/right label columns aren't clipped.
+    ax_a.set_xlim(-0.85, n_regimes - 1 + 1.05)
     ax_a.set_ylabel("pJ / bit  (working-set traffic)")
     ax_a.set_title(f"DRAM energy — per-cell pJ/bit by cache regime — {gpu}\n"
-                   "l2_hit_0 ≈ DRAM cost; dashed = literature reference (full stack)")
+                   "l2_hit_0 ≈ DRAM cost; dashed = literature reference (full stack)\n"
+                   "marginal pJ/bit (l2_hit_0 − l2_hit_100) is the cleaner DRAM-only "
+                   "estimate — see dram_energy_marginal.png and README §3.5")
     ax_a.grid(True, axis="y", alpha=0.3)
     ax_a.legend(fontsize=8, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     _save_fig(fig_a, out_dir / f"{stem}_02_dram_energy_pjbit.png")
