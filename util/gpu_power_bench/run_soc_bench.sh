@@ -1,45 +1,54 @@
 #!/usr/bin/env bash
-# Launcher for the SoC power-envelope bench (static / max / leakage).
+# DEPRECATED — kept as a thin alias to `run_bench.sh --suite soc`.
 #
-# Usage:
-#   ./run_soc_bench.sh                           # default: GPU 0, fp16/tc, K=16384
-#   ./run_soc_bench.sh --device 3 --tag blackwell
-#   ./run_soc_bench.sh --device 0 --dtype bf16 --matmul-K 12288
-#   ./run_soc_bench.sh --no-leakage              # skip the 5-cycle leakage phase
+# As of the SoC-merge PR, the SoC envelope (static / max / leakage) is a
+# regular test case in gpu_power_bench.py. Run it via :
 #
-# Estimated wall time with defaults: ~10 min (60s static + 60s max +
-# 5x(20s+30s) leakage + cooldown gaps). Override --static-seconds /
-# --max-seconds / --leakage-cycles to shrink.
+#     ./run_bench.sh --suite soc --device 0 --tag h100        # SoC only
+#     ./run_bench.sh --cases soc --device 0 --tag h100        # equivalent
+#     ./run_bench.sh --suite all --device 0 --tag h100        # full + SoC
+#     ./run_bench.sh --num-gpus 8 --suite soc --tag h100      # multi-GPU
 #
-# All extra args are forwarded to soc_power_bench.py.
+# Argument forwarding : this script translates the legacy --no-leakage
+# and --leakage-* flags it used to accept into the new --soc-* names so
+# old shell scripts keep working. Anything else is passed through.
 set -eo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
 
-PYTHON="${PYTHON:-python3}"
-# Force line-buffered Python stdout so phase-progress prints flush
-# immediately even when this script is run under tee / nohup / a CI log
-# capture. Same rationale as run_bench.sh — without it, a 5-min run
-# can look like a 5-min hang for the first ~30s. Override with
-# RUN_BENCH_UNBUFFERED=0 if needed.
-if [[ "${RUN_BENCH_UNBUFFERED:-1}" == "1" ]]; then
-    export PYTHONUNBUFFERED=1
-fi
+echo "[deprecated] run_soc_bench.sh — forwarding to ./run_bench.sh --suite soc"
+echo "             new path: ./run_bench.sh --suite soc [--device N] [--tag X]"
+echo
 
-if ! command -v "$PYTHON" >/dev/null; then
-    echo "error: $PYTHON not found" >&2
-    exit 1
-fi
+# Translate the few flag names that drifted between the two scripts.
+# Legacy form on the LHS, new form on the RHS.
+forwarded=()
+skip_next=0
+for arg in "$@"; do
+    if (( skip_next )); then forwarded+=("$arg"); skip_next=0; continue; fi
+    case "$arg" in
+        --no-max)            forwarded+=("--soc-max-seconds" "0") ;;
+        --no-leakage)        forwarded+=("--soc-leakage-cycles" "0") ;;
+        --static-seconds)    forwarded+=("--soc-static-seconds");    skip_next=1 ;;
+        --static-seconds=*)  forwarded+=("--soc-static-seconds=${arg#*=}") ;;
+        --max-seconds)       forwarded+=("--soc-max-seconds");       skip_next=1 ;;
+        --max-seconds=*)     forwarded+=("--soc-max-seconds=${arg#*=}") ;;
+        --leakage-cycles)    forwarded+=("--soc-leakage-cycles");    skip_next=1 ;;
+        --leakage-cycles=*)  forwarded+=("--soc-leakage-cycles=${arg#*=}") ;;
+        --leakage-stress-s)  forwarded+=("--soc-leakage-stress-s");  skip_next=1 ;;
+        --leakage-stress-s=*) forwarded+=("--soc-leakage-stress-s=${arg#*=}") ;;
+        --leakage-decay-s)   forwarded+=("--soc-leakage-decay-s");   skip_next=1 ;;
+        --leakage-decay-s=*) forwarded+=("--soc-leakage-decay-s=${arg#*=}") ;;
+        --leak-window-s)     forwarded+=("--soc-leak-window-s");     skip_next=1 ;;
+        --leak-window-s=*)   forwarded+=("--soc-leak-window-s=${arg#*=}") ;;
+        --matmul-K)          forwarded+=("--soc-matmul-K");          skip_next=1 ;;
+        --matmul-K=*)        forwarded+=("--soc-matmul-K=${arg#*=}") ;;
+        --dtype)             forwarded+=("--soc-dtype");             skip_next=1 ;;
+        --dtype=*)           forwarded+=("--soc-dtype=${arg#*=}") ;;
+        --mode)              forwarded+=("--soc-mode");              skip_next=1 ;;
+        --mode=*)            forwarded+=("--soc-mode=${arg#*=}") ;;
+        *)                   forwarded+=("$arg") ;;
+    esac
+done
 
-"$PYTHON" -c "import torch, pynvml, matplotlib" 2>/dev/null || {
-    echo "missing python deps — install via: $PYTHON -m pip install -r requirements.txt"
-    exit 1
-}
-
-if command -v nvidia-smi >/dev/null; then
-    sudo -n nvidia-smi -pm 1 >/dev/null 2>&1 || true
-fi
-
-mkdir -p reports
-
-exec "$PYTHON" soc_power_bench.py "$@"
+exec ./run_bench.sh --suite soc "${forwarded[@]+"${forwarded[@]}"}"

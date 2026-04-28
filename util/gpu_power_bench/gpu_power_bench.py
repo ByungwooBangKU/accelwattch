@@ -41,6 +41,11 @@ import torch
 import benchmarks as bm
 from power_monitor import PowerSampler, measure_static_power, wait_for_cooldown
 import preflight
+# SoC envelope phase + plot helpers — same code path the standalone
+# soc_power_bench.py uses, just composed here so we can run sweep + SoC
+# in one process. Imported lazily-friendly (top-level is fine; module
+# loads matplotlib only inside its plot fns).
+import soc_power_bench as sb
 
 
 # ---- defaults --------------------------------------------------------------
@@ -115,51 +120,62 @@ _MEM_SAFETY_FRACTION = 0.25
 #
 # A user may override any field, e.g.:
 #   ./run_bench.sh --suite full --no-matmul   # skip matmul portion of full
+# SUITES are bundles of test-case selections + tuning. Each sets `cases`
+# (the canonical list of test categories to run) plus any per-suite
+# parameter overrides. Legacy fields (no_matmul, llm_shapes, etc.) are
+# omitted here — the new path uses `cases` everywhere — but the legacy
+# CLI flags themselves still work for backward compatibility.
 SUITES: dict[str, dict] = {
     "smoke": {
-        # Minimum-effort sanity check — quick mode (3 small load points)
-        # plus matmul off. ~5 minutes. Good for verifying the pipeline
-        # before spending 30 min on the real sweep.
-        "_doc":   "5-min sanity check (--quick + matmul off)",
-        "quick":      True,
-        "no_matmul":  True,
+        # Minimum-effort sanity check — quick mode + elementwise only.
+        # ~5 minutes. Good for verifying the pipeline before spending
+        # 30 min on the real sweep.
+        "_doc":   "5-min sanity check (elementwise only, quick)",
+        "cases":  ("elementwise",),
+        "quick":  True,
     },
     "powermodel": {
         # Original baseline benchmark — elementwise + matmul, no extras.
         # Produces the canonical k_op coefficient table.
-        "_doc": "elementwise + matmul, no extra probes (default behaviour)",
+        "_doc":  "elementwise + matmul, no extra probes (legacy default)",
+        "cases": ("elementwise", "matmul"),
     },
     "cache": {
-        # Focused 5-point cache-regime sweep (--cache-sweep). Drops the
-        # default load list in favour of L2/8, L2/3, L2, 3·L2, 8·L2
-        # working-set targets so each (op, dtype) gets exactly one cell
-        # per regime bucket. Matmul kept on — its per-K size sweep already
-        # spans regimes naturally.
+        # Focused 5-point cache-regime sweep (--cache-sweep). Each
+        # (op, dtype) gets one cell per regime bucket. Matmul kept on —
+        # its per-K size sweep spans regimes naturally.
         "_doc":         "focused 5-point per-regime cache sweep + matmul",
+        "cases":        ("elementwise", "matmul"),
         "cache_sweep":  True,
     },
     "dram": {
-        # STREAM-style copy/scale/triad probes only. No elementwise, no
-        # matmul — purest signal for pJ/bit derivation.
-        "_doc":           "STREAM-style DRAM bandwidth probes only (pJ/bit)",
-        "dram_bw_test":   True,
-        "no_matmul":      True,
-        "no_elementwise": True,
+        # STREAM-style probes only. Purest signal for pJ/bit derivation.
+        "_doc":  "STREAM-style DRAM bandwidth probes only (pJ/bit)",
+        "cases": ("dram",),
     },
     "llm": {
         # Real LLM layer shapes (gpt-oss-120B presets) at 5 token counts.
-        # Skips the synthetic elementwise / square-matmul sweeps.
-        "_doc":           "gpt-oss-120B layer shapes only (qkv / mlp / lm_head etc.)",
-        "llm_shapes":     True,
-        "no_elementwise": True,
-        "no_matmul":      True,
+        "_doc":  "gpt-oss-120B layer shapes only (qkv / mlp / lm_head etc.)",
+        "cases": ("llm-matmul",),
+    },
+    "soc": {
+        # SoC envelope only — static / max / leakage. ~5 min.
+        # Replaces the old soc_power_bench.py / run_soc_bench.sh combo.
+        "_doc":  "SoC envelope only (static / max / leakage, ~5 min)",
+        "cases": ("soc",),
     },
     "full": {
-        # Most thorough — everything on, plus drift correction. ~75 min.
-        # The recommended suite for a publication-quality measurement.
-        "_doc":             "everything + periodic re-baseline (~75 min)",
-        "llm_shapes":       True,
-        "dram_bw_test":     True,
+        # Everything except SoC envelope, plus drift correction. ~75 min.
+        # The recommended suite for a publication-quality k_op measurement.
+        "_doc":             "everything except SoC + periodic re-baseline (~75 min)",
+        "cases":            ("elementwise", "matmul", "llm-matmul", "dram"),
+        "rebaseline_every": 20,
+    },
+    "all": {
+        # full + SoC envelope. The canonical "give me every measurement"
+        # suite for new GPU characterisation.
+        "_doc":             "full + SoC envelope (~80 min)",
+        "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "soc"),
         "rebaseline_every": 20,
     },
 }
@@ -326,6 +342,28 @@ def main() -> int:
                     help="apply a predefined bundle of flags. See epilog "
                          "above. Individual flags after --suite still "
                          "override the suite's defaults.")
+    # ---- Test cases — orthogonal axis to suites ----------------------------
+    # `--cases` selects which experiment categories to run, decoupled from
+    # the suite presets. When set, it's the authoritative source — any
+    # legacy --no-elementwise / --no-matmul / --llm-shapes / --dram-bw-test
+    # flags are IGNORED so the user gets exactly the cases they asked for.
+    # When NOT set, the existing legacy flag behaviour is preserved
+    # (backward compat for old scripts).
+    #
+    # Cases:
+    #   elementwise  — A.1 elementwise sweep (mul/add/softmax/gelu/layernorm)
+    #   matmul       — A.3 square matmul (5 dtype/mode variants × K-sweep)
+    #   llm-matmul   — A.4 LLM-shape matmul (8 preset × T-sweep)
+    #   dram         — A.2 STREAM-style probes (read/write/copy/scale/triad)
+    #   soc          — B   SoC envelope (static / max / leakage)
+    ALL_CASES = ("elementwise", "matmul", "llm-matmul", "dram", "soc")
+    ap.add_argument("--cases", nargs="+", choices=ALL_CASES, default=None,
+                    metavar="CASE",
+                    help="explicit list of test cases to run. Choices: "
+                         + " / ".join(ALL_CASES) + ". When set, overrides "
+                         "legacy --no-* flags. When unset, derived from "
+                         "legacy flags (--no-elementwise / --no-matmul / "
+                         "--llm-shapes / --dram-bw-test) for back-compat.")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--ops", nargs="+",
                     default=list(bm.OPS),
@@ -428,6 +466,31 @@ def main() -> int:
     ap.add_argument("--dram-bw-loads", type=int, nargs="+", default=None,
                     help="working-set-target N values for --dram-bw-test "
                          "(default: 4 sizes deep into the l2_hit_0 regime)")
+    # ---- SoC envelope (the case formerly known as soc_power_bench.py) ----
+    # Runs static/max/leakage phases as a sidecar. Same defaults as the
+    # standalone soc_power_bench.py (~5 min wall). All flags accept the
+    # exact value names from the standalone script's CLI; only namespace
+    # (`--soc-*`) is added so they don't collide with sweep flags.
+    ap.add_argument("--soc-static-seconds", type=float, default=20.0,
+                    help="SoC envelope: idle-baseline phase duration")
+    ap.add_argument("--soc-max-seconds", type=float, default=30.0,
+                    help="SoC envelope: max-power GEMM phase duration")
+    ap.add_argument("--soc-leakage-cycles", type=int, default=5,
+                    help="SoC envelope: number of stress/decay cycles")
+    ap.add_argument("--soc-leakage-stress-s", type=float, default=10.0,
+                    help="SoC envelope: GEMM stress duration per leakage cycle")
+    ap.add_argument("--soc-leakage-decay-s", type=float, default=15.0,
+                    help="SoC envelope: post-stress idle decay per cycle")
+    ap.add_argument("--soc-leak-window-s", type=float, default=1.0,
+                    help="SoC envelope: window after stress-stop for hot-leakage avg")
+    ap.add_argument("--soc-matmul-K", type=int, default=16384,
+                    help="SoC envelope: square GEMM K for max/stress phases")
+    ap.add_argument("--soc-dtype", type=str, default="fp16",
+                    choices=["fp32", "tf32", "fp16", "bf16", "fp8"],
+                    help="SoC envelope: GEMM dtype")
+    ap.add_argument("--soc-mode", type=str, default="tc",
+                    choices=["simt", "tc", "te"],
+                    help="SoC envelope: compute path (simt/tc/te)")
     args = ap.parse_args()
 
     # If a suite was named, re-parse so its overrides become defaults but
@@ -440,9 +503,34 @@ def main() -> int:
         flags = ", ".join(f"{k}={v}" for k, v in sd.items() if not k.startswith("_"))
         print(f"[suite] '{args.suite}' → {flags or '(no overrides — legacy default)'}")
 
-    if args.no_elementwise and args.no_matmul:
-        print("[error] --no-elementwise and --no-matmul together select zero cells")
+    # ---- Resolve which test cases to actually run ---------------------
+    # Order of precedence:
+    #   1. --cases X Y Z          (explicit; overrides legacy flags)
+    #   2. SUITES[suite]["cases"] (suite-level default; set by re-parse above)
+    #   3. legacy --no-* / --llm-shapes / --dram-bw-test flags + sensible
+    #      default of {elementwise, matmul} if nothing else specified
+    if args.cases is not None:
+        cases = set(args.cases)
+        # User asked for explicit cases — silently ignore legacy --no-* /
+        # --llm-shapes / --dram-bw-test flags (they're noise here).
+    else:
+        cases = set()
+        if not args.no_elementwise:
+            cases.add("elementwise")
+        if not args.no_matmul:
+            cases.add("matmul")
+        if args.llm_shapes:
+            cases.add("llm-matmul")
+        if args.dram_bw_test:
+            cases.add("dram")
+        # SoC envelope is opt-in via --cases or via the soc / all suites.
+        # Suites set args.cases (form 1), so this `else` branch only fires
+        # when neither --cases nor a suite that includes soc was given.
+
+    if not cases:
+        print("[error] no test cases selected — pass --cases ... or pick a suite")
         return 1
+    print(f"[cases] {' '.join(sorted(cases))}")
 
     if args.quick:
         loads = QUICK_LOADS
@@ -564,7 +652,7 @@ def main() -> int:
               f"(per-cell budget: {int(_MEM_SAFETY_FRACTION*100)}% = "
               f"{hbm_bytes*_MEM_SAFETY_FRACTION/(1<<30):.1f} GB)")
     safe_loads = _filter_loads(loads, list(args.ops), list(args.dtypes), hbm_bytes)
-    if not args.no_elementwise:
+    if "elementwise" in cases:
         for dtype in args.dtypes:
             for op in args.ops:
                 # In cache-sweep mode, the global `--loads` is ignored and each
@@ -582,7 +670,7 @@ def main() -> int:
                         "build": (lambda op=op, dtype=dtype, N=N:
                                   bm.build(op, dtype, N, device="cuda")),
                     })
-    if not args.no_matmul:
+    if "matmul" in cases:
         for dtype_label, mode in matmul_variants:
             for K in matmul_sizes:
                 plans.append({
@@ -597,7 +685,7 @@ def main() -> int:
     # so the dyn energy is dominated by HBM traffic. analyze.py converts
     # these into pJ/bit. We pick load sizes deep in the l2_hit_0 regime
     # (working set ≥ 8·L2) so cache reuse is essentially zero.
-    if args.dram_bw_test:
+    if "dram" in cases:
         if args.dram_bw_loads is not None:
             stream_loads = args.dram_bw_loads
         elif l2_bytes > 0:
@@ -635,7 +723,7 @@ def main() -> int:
     # LLM-shape sweep — opt-in via --llm-shapes. We pre-filter (preset, T)
     # combos by HBM budget using llm_matmul_footprint_bytes(), so the fat
     # lm_head @ T=32768 cell doesn't blow memory on smaller GPUs.
-    if args.llm_shapes:
+    if "llm-matmul" in cases:
         presets = args.llm_presets or list(bm.LLM_SHAPES.keys())
         unknown = [p for p in presets if p not in bm.LLM_SHAPES]
         if unknown:
@@ -1023,8 +1111,14 @@ def main() -> int:
         else:
             print(f"\n[save] {csv_path}  ({len(rows)} rows)")
     else:
-        print("\n[warn] no rows collected — nothing saved")
-        return 2
+        # Empty rows is normal for a soc-only run (cases={"soc"}). In any
+        # other case it's a sign the sweep produced nothing, which is a
+        # genuine error.
+        if cases == {"soc"}:
+            print("\n[info] no per-cell rows — soc-only run; skipping main CSV")
+        else:
+            print("\n[warn] no rows collected — nothing saved")
+            return 2
 
     # ---- clip-bias report ------------------------------------------------
     # Tells the user how often the dyn = max(0, raw) clip fired. Frequent
@@ -1108,6 +1202,211 @@ def main() -> int:
             w.writerow([f"{s.t:.4f}", f"{s.power_w:.3f}", s.temp_c,
                         s.sm_mhz, s.mem_mhz, s.gpu_util, s.mem_util, s.phase])
     print(f"[save] {raw_path}  ({len(sampler.samples)} NVML samples)")
+
+    # ---- SoC envelope (run as a sidecar phase if requested) -----------------
+    # When 'soc' is in cases, run the static / max / leakage phases that
+    # used to live in soc_power_bench.py. Outputs are filename-tied to the
+    # main sweep CSV (same gpu / timestamp / tag) so analyze and
+    # multi_gpu_analysis can find them via the existing pattern.
+    if "soc" in cases:
+        # Re-init NVML — it was shut down in the sweep's finally:. Resolve
+        # the same physical GPU via PCI bus id (CUDA_VISIBLE_DEVICES safe).
+        pynvml.nvmlInit()
+        try:
+            try:
+                pci_id = torch.cuda.get_device_properties(args.device).pci_bus_id
+                soc_handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
+            except Exception:
+                soc_handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
+
+            print(f"\n========== SoC envelope ==========")
+            print(f"[soc] static={args.soc_static_seconds}s  "
+                  f"max={args.soc_max_seconds}s  "
+                  f"leakage={args.soc_leakage_cycles}x("
+                  f"{args.soc_leakage_stress_s}s+{args.soc_leakage_decay_s}s)")
+
+            # Build the GEMM that drives max + leakage stress.
+            try:
+                soc_spec = bm.build_matmul(args.soc_matmul_K, args.soc_dtype,
+                                           args.soc_mode, device="cuda")
+                print(f"[soc] GEMM: K={args.soc_matmul_K}  "
+                      f"{args.soc_dtype}/{args.soc_mode}  "
+                      f"compute_unit={soc_spec.compute_unit}")
+            except Exception as e:
+                print(f"[soc] failed to build GEMM "
+                      f"({args.soc_dtype}/{args.soc_mode} K={args.soc_matmul_K}): {e}")
+                soc_spec = None
+
+            if soc_spec is not None:
+                soc_sampler = PowerSampler(soc_handle, hz=args.poll_hz,
+                                           power_source=args.power_source)
+                print(f"[soc] power source: {soc_sampler.power_source}")
+                soc_sampler.start()
+                soc_sampler.set_phase("startup")
+
+                soc_summary = {"gpu_name": gpu_name, "gpu_slug": gpu_slug,
+                               "cc_major": cc[0], "cc_minor": cc[1],
+                               "matmul_K": args.soc_matmul_K,
+                               "dtype": args.soc_dtype, "mode": args.soc_mode,
+                               "power_source": soc_sampler.power_source,
+                               "sample_hz": args.poll_hz}
+                soc_cycles_meta: list[dict] = []
+                soc_static_t = soc_max_t = None
+                soc_fatal: str | None = None
+
+                try:
+                    if args.cooldown_c > 0:
+                        soc_sampler.set_phase("cooldown_pre_static")
+                        wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
+                                          timeout_s=args.cooldown_timeout, verbose=False)
+                    print(f"\n[soc/static] {args.soc_static_seconds}s idle …")
+                    soc_static_t = sb.phase_static(soc_sampler, args.soc_static_seconds)
+
+                    if args.cooldown_c > 0:
+                        soc_sampler.set_phase("cooldown_pre_max")
+                        wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
+                                          timeout_s=args.cooldown_timeout, verbose=False)
+                    print(f"[soc/max] {args.soc_max_seconds}s GEMM …")
+                    try:
+                        soc_max_t = sb.phase_max(soc_sampler, soc_spec, args.soc_max_seconds)
+                    except RuntimeError as e:
+                        print(f"[soc/max] failed: {e}")
+                        soc_fatal = f"max: {e}"
+
+                    if not soc_fatal:
+                        if args.cooldown_c > 0:
+                            soc_sampler.set_phase("cooldown_pre_leakage")
+                            wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
+                                              timeout_s=args.cooldown_timeout, verbose=False)
+                        print(f"[soc/leakage] {args.soc_leakage_cycles} cycles …")
+                        try:
+                            soc_cycles_meta = sb.phase_leakage(
+                                soc_sampler, soc_spec,
+                                args.soc_leakage_cycles,
+                                args.soc_leakage_stress_s,
+                                args.soc_leakage_decay_s)
+                        except RuntimeError as e:
+                            print(f"[soc/leakage] failed mid-cycle: {e}")
+                            soc_fatal = f"leakage: {e}"
+                finally:
+                    soc_sampler.stop()
+
+                if soc_fatal:
+                    soc_summary["fatal_error"] = soc_fatal
+
+                # ---- SoC stats from the in-memory timeseries -------------
+                soc_samples = soc_sampler.samples
+
+                def _slice_stats(t0: float, t1: float) -> dict:
+                    ps = [s.power_w for s in soc_samples
+                          if t0 <= s.t <= t1 and s.power_w >= 0]
+                    ts = [s.temp_c for s in soc_samples
+                          if t0 <= s.t <= t1 and s.temp_c >= 0]
+                    if not ps:
+                        return {"power_mean": -1, "power_peak": -1,
+                                "temp_mean": -1, "temp_peak": -1, "n": 0}
+                    return {
+                        "power_mean": sum(ps) / len(ps),
+                        "power_peak": max(ps),
+                        "temp_mean":  (sum(ts) / len(ts)) if ts else -1,
+                        "temp_peak":  max(ts) if ts else -1,
+                        "n": len(ps),
+                    }
+
+                if soc_static_t:
+                    st = _slice_stats(*soc_static_t)
+                    soc_summary["static_seconds"]      = args.soc_static_seconds
+                    soc_summary["static_power_w_mean"] = round(st["power_mean"], 3)
+                    soc_summary["static_power_w_peak"] = round(st["power_peak"], 3)
+                    soc_summary["static_temp_c_mean"]  = round(st["temp_mean"], 1)
+                    soc_summary["static_temp_c_peak"]  = st["temp_peak"]
+                if soc_max_t:
+                    mx = _slice_stats(*soc_max_t)
+                    soc_summary["max_seconds"]         = args.soc_max_seconds
+                    soc_summary["max_power_w_mean"]    = round(mx["power_mean"], 3)
+                    soc_summary["max_power_w_peak"]    = round(mx["power_peak"], 3)
+                    soc_summary["max_temp_c_mean"]     = round(mx["temp_mean"], 1)
+                    soc_summary["max_temp_c_peak"]     = mx["temp_peak"]
+
+                leak_powers, leak_temps = [], []
+                for c in soc_cycles_meta:
+                    d0 = c["decay_t0"]
+                    st = _slice_stats(d0, d0 + args.soc_leak_window_s)
+                    c["hot_power_w_mean"] = round(st["power_mean"], 3)
+                    c["hot_temp_c_mean"]  = round(st["temp_mean"], 1)
+                    c["hot_temp_c_peak"]  = st["temp_peak"]
+                    st_stress = _slice_stats(c["stress_t0"], c["stress_t1"])
+                    c["stress_temp_c_peak"] = st_stress["temp_peak"]
+                    c["stress_power_w_mean"] = round(st_stress["power_mean"], 3)
+                    if st["power_mean"] > 0:
+                        leak_powers.append(st["power_mean"])
+                        leak_temps.append(st["temp_mean"])
+                if leak_powers:
+                    soc_summary["leakage_cycles"]       = len(leak_powers)
+                    soc_summary["leakage_window_s"]     = args.soc_leak_window_s
+                    soc_summary["leakage_power_w_mean"] = round(sum(leak_powers)/len(leak_powers), 3)
+                    soc_summary["leakage_power_w_min"]  = round(min(leak_powers), 3)
+                    soc_summary["leakage_power_w_max"]  = round(max(leak_powers), 3)
+                    soc_summary["leakage_temp_c_mean"]  = round(sum(leak_temps)/len(leak_temps), 1)
+                    if "static_power_w_mean" in soc_summary:
+                        soc_summary["leakage_minus_static_w"] = round(
+                            soc_summary["leakage_power_w_mean"] -
+                            soc_summary["static_power_w_mean"], 3)
+
+                # ---- write SoC sidecars -----------------------------------
+                stem = csv_path.stem
+                soc_summary_path = out_dir / f"{stem}_soc_summary.csv"
+                with open(soc_summary_path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["metric", "value"])
+                    for k, v in soc_summary.items():
+                        w.writerow([k, v])
+                    w.writerow([])
+                    if soc_cycles_meta:
+                        w.writerow(["leakage_cycle", "stress_temp_c_peak",
+                                    "stress_power_w_mean", "hot_temp_c_peak",
+                                    "hot_power_w_mean", "hot_minus_static_w"])
+                        stat_w = soc_summary.get("static_power_w_mean", 0) or 0
+                        for c in soc_cycles_meta:
+                            w.writerow([c["cycle"] + 1,
+                                        c.get("stress_temp_c_peak", -1),
+                                        c.get("stress_power_w_mean", -1),
+                                        c.get("hot_temp_c_peak", -1),
+                                        c.get("hot_power_w_mean", -1),
+                                        round(c.get("hot_power_w_mean", 0) - stat_w, 3)])
+                print(f"[save] {soc_summary_path}")
+
+                soc_ts_path = out_dir / f"{stem}_soc_timeseries.csv"
+                with open(soc_ts_path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["t_s", "power_w", "temp_c", "sm_mhz",
+                                "mem_mhz", "gpu_util", "phase"])
+                    for s in soc_samples:
+                        w.writerow([f"{s.t:.4f}", f"{s.power_w:.4f}",
+                                    s.temp_c, s.sm_mhz, s.mem_mhz,
+                                    s.gpu_util, s.phase])
+                print(f"[save] {soc_ts_path}")
+
+                phase_png            = out_dir / f"{stem}_soc_phases.png"
+                leakage_png          = out_dir / f"{stem}_soc_leakage.png"
+                leakage_enlarged_png = out_dir / f"{stem}_soc_leakage_enlarged.png"
+                summary_png          = out_dir / f"{stem}_soc_summary.png"
+                sb.plot_phase_timeline(soc_samples, soc_summary, phase_png)
+                if soc_cycles_meta:
+                    sb.plot_leakage_decay(soc_samples, soc_cycles_meta,
+                                          soc_summary, leakage_png)
+                    sb.plot_leakage_decay_zoomed(soc_samples, soc_cycles_meta,
+                                                 soc_summary, leakage_enlarged_png,
+                                                 x_max=3.0, y_min=0.0, y_max=150.0)
+                sb.plot_summary_bars(soc_summary, summary_png)
+                print(f"[save] {phase_png}")
+                if soc_cycles_meta:
+                    print(f"[save] {leakage_png}")
+                    print(f"[save] {leakage_enlarged_png}")
+                print(f"[save] {summary_png}")
+        finally:
+            try: pynvml.nvmlShutdown()
+            except Exception: pass
 
     print("\nnext: python3 analyze.py {}  # generate linearity plots".format(csv_path))
     # Machine-readable last line — run_bench.sh greps this to chain

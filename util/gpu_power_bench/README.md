@@ -997,31 +997,46 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
 
 ## 9. 실행
 
-### 9.0 Test suites — `--suite NAME` (권장 진입점)
+### 9.0 Test suites & Test cases (권장 진입점)
 
-여러 플래그를 매번 외울 필요 없이 **named test-suite 프리셋** 을 사용합니다. 각 suite 는 적절한 플래그 조합으로 자동 펼쳐지고, 사용자가 추가로 명시한 플래그는 suite 의 default 를 override 합니다.
+실험 선택은 **두 축이 분리**돼 있다 :
 
-| Suite | 무엇을 도는가 | 펼쳐진 플래그 | 시간 |
+- **Test cases (`--cases`)** — *무엇* 을 측정할지. 단일 카테고리 단위로 자유 조합 가능 :
+  - `elementwise` : A.1 sweep (mul/add/softmax/gelu/layernorm)
+  - `matmul`      : A.3 square matmul (5 variant × K)
+  - `llm-matmul`  : A.4 LLM-shape matmul (8 preset × T)
+  - `dram`        : A.2 STREAM probes (read/write/copy/scale/triad)
+  - `soc`         : B   SoC envelope (static / max / leakage)
+- **Test suites (`--suite`)** — 자주 쓰는 cases 조합 + 튜닝 파라미터의 *프리셋*. 사용자 explicit flag 는 suite default 를 항상 override.
+
+| Suite | Cases | 추가 옵션 | 시간 |
 |---|---|---|---|
-| `smoke` | 5분 산뜻한 sanity check | `--quick --no-matmul` | ~5 분 |
-| `powermodel` | 기존 baseline benchmark — elementwise + matmul, 추가 probe 없음 | (default) | ~30 분 |
-| `cache` | 5-bucket cache regime 에 정확히 1 cell 씩 + matmul | `--cache-sweep` | ~15 분 |
-| `dram` | STREAM-style 만 (pJ/bit 측정 전용) | `--dram-bw-test --no-matmul --no-elementwise` | ~10 분 |
-| `llm` | gpt-oss-120B layer shape 만 | `--llm-shapes --no-elementwise --no-matmul` | ~25 분 |
-| `full` | 전체 + drift correction (publication-quality) | `--llm-shapes --dram-bw-test --rebaseline-every 20` | ~75 분 |
+| `smoke` | `elementwise` | `--quick` | ~5 분 |
+| `powermodel` | `elementwise + matmul` | (default) | ~30 분 |
+| `cache` | `elementwise + matmul` | `--cache-sweep` | ~15 분 |
+| `dram` | `dram` | — | ~10 분 |
+| `llm` | `llm-matmul` | — | ~25 분 |
+| `soc` | `soc` | — | **~5 분** (SoC envelope only) |
+| `full` | `elementwise + matmul + llm-matmul + dram` | `--rebaseline-every 20` | ~75 분 |
+| `all` | `full + soc` | `--rebaseline-every 20` | ~80 분 |
 
 ```bash
-# 권장: 기본 5분 smoke 후 본 측정 (full)
+# 가장 자주 쓰는 길 — 5분 smoke → publication-quality full + SoC
 ./run_bench.sh --suite smoke --tag h100_smoke
-./run_bench.sh --suite full  --tag h100
+./run_bench.sh --suite all   --tag h100
 
-# Suite + 사용자 override (--no-matmul 으로 matmul 빼기)
-./run_bench.sh --suite full --tag h100 --no-matmul
+# 특정 case 만 자유 조합
+./run_bench.sh --cases dram soc --device 0 --tag h100_mem
+./run_bench.sh --cases soc      --device 1 --tag h100_g1   # 옛 run_soc_bench 와 동등
 
-# 특정 카테고리만 빠르게
-./run_bench.sh --suite cache --tag h100_cache
-./run_bench.sh --suite dram  --tag h100_dram
+# Suite + 추가 override
+./run_bench.sh --suite full --tag h100 --cases matmul   # full 에서 matmul 만
+
+# 다중 GPU + SoC (각 GPU 마다 sweep + SoC envelope)
+./run_bench.sh --suite all --num-gpus 8 --tag h100
 ```
+
+**run_soc_bench.sh** 는 deprecated alias (옛 스크립트는 자동으로 `--suite soc` 로 forward) — 새 코드는 `run_bench.sh --suite soc` 또는 `--cases soc` 직접 사용 권장.
 
 ### 9.1 기본 실행 (auto-pipeline)
 
