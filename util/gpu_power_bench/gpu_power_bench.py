@@ -526,6 +526,7 @@ def main() -> int:
 
     # ---- sampler (runs for the whole sweep, phase is toggled per cell) ----
     sampler = PowerSampler(handle, hz=args.poll_hz)
+    print(f"[info] power source: {sampler.power_source}")
     sampler.start()
 
     # ---- Build a unified list of "plans" — one per (op × dtype × load) ----

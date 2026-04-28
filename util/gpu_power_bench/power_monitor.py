@@ -50,6 +50,77 @@ def _nvml_or(fn, *args, default=-1):
         return default
 
 
+# ---------------------------------------------------------------------------
+# Power-reader resolution
+#
+# `nvmlDeviceGetPowerUsage` returns the *board* power averaged over the last
+# ~50ms by the firmware. On Hopper (sm_90, H100) and newer, NVIDIA exposes a
+# higher-resolution per-IC reading via NVML_FI_DEV_POWER_INSTANT (~1ms
+# cadence, lower latency, slightly different scope: includes faster transients
+# the legacy averaged number smooths out). Field IDs only landed in CUDA 12.x
+# pynvml; older bindings won't have the constant. We probe both: prefer
+# instant when supported, fall back to legacy otherwise.
+#
+# Why bother: for short-duration phases (leakage hot-window of 1s, max-power
+# clock-ramp visible in P(t)), the 50ms averaging is too coarse — we'd see
+# blurred transients. The instant path also matches what nvidia-smi dmon
+# reports under `pwr` on H100.
+# ---------------------------------------------------------------------------
+try:
+    _POWER_INSTANT_FIELD = pynvml.NVML_FI_DEV_POWER_INSTANT
+except AttributeError:
+    # Fallback: numeric ID from NVML headers (CUDA 12.x). Same value across
+    # driver versions; pynvml just hadn't exposed the constant yet.
+    _POWER_INSTANT_FIELD = 186
+
+
+def _make_power_reader(handle):
+    """Return (reader_fn, label). reader_fn() → power in mW (or -1 on error).
+
+    Tries the high-frequency NVML_FI_DEV_POWER_INSTANT path first and falls
+    back to the universal nvmlDeviceGetPowerUsage if the field isn't
+    supported (older driver / pre-Hopper GPU / older pynvml).
+    """
+    # Probe: a single call. If it fails OR returns 0/<0, we use the legacy
+    # path. We don't trust a SUCCESS+0 reading either — some drivers return
+    # 0 instead of UNSUPPORTED for "field exists but not on this GPU".
+    try:
+        # Build a single c_nvmlFieldValue_t and submit it. pynvml's
+        # high-level helper varies across versions; the low-level signature
+        # below is stable.
+        fv = pynvml.c_nvmlFieldValue_t()
+        fv.fieldId = _POWER_INSTANT_FIELD
+        fv.scopeId = 0
+        pynvml.nvmlDeviceGetFieldValues(handle, [fv])
+        if fv.nvmlReturn == pynvml.NVML_SUCCESS and fv.value.uiVal > 0:
+            # Success — wire up the fast-path reader. Reuse the same buffer
+            # across polls to avoid per-sample allocation overhead.
+            buf = pynvml.c_nvmlFieldValue_t()
+            buf.fieldId = _POWER_INSTANT_FIELD
+            buf.scopeId = 0
+
+            def read_instant() -> int:
+                try:
+                    pynvml.nvmlDeviceGetFieldValues(handle, [buf])
+                    if buf.nvmlReturn == pynvml.NVML_SUCCESS:
+                        return int(buf.value.uiVal)
+                    return -1
+                except Exception:
+                    return -1
+
+            return read_instant, "NVML_FI_DEV_POWER_INSTANT"
+    except (AttributeError, pynvml.NVMLError, Exception):
+        # AttributeError: pynvml lacks c_nvmlFieldValue_t / the function.
+        # NVMLError: driver doesn't support this field.
+        # Generic Exception: paranoid catch — driver/libnvml versions vary.
+        pass
+
+    def read_legacy() -> int:
+        return _nvml_or(pynvml.nvmlDeviceGetPowerUsage, handle, default=-1)
+
+    return read_legacy, "nvmlDeviceGetPowerUsage (legacy ~50ms-averaged)"
+
+
 class PowerSampler(threading.Thread):
     """Background NVML poller. Call start(), then set_phase(...) around work."""
 
@@ -61,6 +132,11 @@ class PowerSampler(threading.Thread):
         self._phase = ""
         self.t0 = 0.0
         self.samples: list[PowerSample] = []
+        # Resolve the power source ONCE — `_make_power_reader()` probes the
+        # high-frequency POWER_INSTANT field and falls back to the legacy
+        # averaged path on older HW / driver. `power_source` is exposed for
+        # logging by the driver.
+        self._read_power_mw, self.power_source = _make_power_reader(handle)
 
     def set_phase(self, name: str) -> None:
         self._phase = name
@@ -75,7 +151,7 @@ class PowerSampler(threading.Thread):
     def run(self) -> None:
         while not self._stop_event.is_set():
             now = time.perf_counter() - self.t0
-            p_mw = _nvml_or(pynvml.nvmlDeviceGetPowerUsage, self.h, default=-1)
+            p_mw = self._read_power_mw()
             temp = _nvml_or(pynvml.nvmlDeviceGetTemperature, self.h,
                             pynvml.NVML_TEMPERATURE_GPU, default=-1)
             sm = _nvml_or(pynvml.nvmlDeviceGetClockInfo, self.h,
