@@ -366,6 +366,17 @@ def main() -> int:
                     help="suffix for output filenames (separate runs / configs)")
     ap.add_argument("--skip-preflight", action="store_true")
     ap.add_argument("--poll-hz", type=int, default=100)
+    ap.add_argument("--power-source", choices=["legacy", "instant", "average"],
+                    default="legacy",
+                    help="NVML power source to integrate. 'legacy' "
+                         "(default) = nvmlDeviceGetPowerUsage, matches "
+                         "nvidia-smi exactly. 'instant' = "
+                         "NVML_FI_DEV_POWER_INSTANT (~1ms cadence) — "
+                         "captures transients but on idle GPUs reads "
+                         "+5..40 W higher than nvidia-smi due to DMA / "
+                         "telemetry / heartbeat spikes the averaged "
+                         "source smooths away. 'average' = "
+                         "NVML_FI_DEV_POWER_AVERAGE running average.")
     # --- matmul (Tensor Core vs CUDA-core + TE FP8) ---
     ap.add_argument("--no-matmul", action="store_true",
                     help="skip the matmul (Tensor Core / SIMT) sweep")
@@ -511,7 +522,8 @@ def main() -> int:
                           min_s=args.cooldown_min_s)
     print(f"[baseline] measuring static power for {args.static_seconds:.1f}s …")
     baseline = measure_static_power(handle, seconds=args.static_seconds,
-                                    hz=args.poll_hz)
+                                    hz=args.poll_hz,
+                                    power_source=args.power_source)
     p_static = baseline["power_w_mean"]
     print(f"[baseline] static power = {p_static:.1f} ± {baseline['power_w_std']:.2f} W  "
           f"(min {baseline['power_w_min']:.1f} W, max {baseline['power_w_max']:.1f} W, "
@@ -525,7 +537,8 @@ def main() -> int:
               f"Check the baseline plot before trusting dyn-power numbers.")
 
     # ---- sampler (runs for the whole sweep, phase is toggled per cell) ----
-    sampler = PowerSampler(handle, hz=args.poll_hz)
+    sampler = PowerSampler(handle, hz=args.poll_hz,
+                           power_source=args.power_source)
     print(f"[info] power source: {sampler.power_source}")
     sampler.start()
 
@@ -719,7 +732,8 @@ def main() -> int:
                 torch.cuda.empty_cache()
                 rb = measure_static_power(handle,
                                           seconds=args.rebaseline_seconds,
-                                          hz=args.poll_hz)
+                                          hz=args.poll_hz,
+                                          power_source=args.power_source)
                 new_p = rb["power_w_mean"]
                 drift = new_p - p_static
                 print(f"\n[rebaseline @ cell {i-1}/{total_cells}] "
