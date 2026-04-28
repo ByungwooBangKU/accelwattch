@@ -960,6 +960,34 @@ RuntimeError: CUDA error: an illegal memory access was encountered
 
 - **Recovery 후 분석**: 부분 CSV 도 `analyze.py` 가 정상 처리합니다. fp8_te / llm 행이 없을 뿐 elementwise + 다른 matmul variants 의 k_op / cache_regime / DRAM-energy 분석은 모두 동작.
 
+#### 8.3.4 작은 K 의 `matmul_fp8_te` 가 H100 에서 `J/elem=0` 으로 찍히는 이유 (noise floor)
+
+**증상** : `--suite full` H100 sweep 에서 `matmul_fp8_te K_size=512..2048` cell 들이 `E_dyn=...` 까지는 출력되지만 `J/elem=0  J/FLOP=0` 으로 찍히고, K=3072 부터 정상 값 등장.
+
+**원인** : 버그 아님 — **NVML noise floor 아래로 떨어진 정상 거동**. fp8 + Tensor Core 가 너무 효율적이어서 작은 K 의 GEMM 이 `P_static` (H100 ~200 W) 위로 noise (~5–10 W) 만큼 못 올라가 `dyn_power = avg − P_static < 0` → clip-to-zero.
+
+| K | iters / 3 s window | sustained TFLOPS | H100 fp8 peak 대비 | dyn power |
+|---|---|---|---|---|
+| 512 | ~60 k | ≈ 5 | 0.3 % | < 1 W (noise 아래) |
+| 1024 | ~30 k | ≈ 14 | 0.7 % | ~3 W (clip) |
+| 2048 | ~5 k | ≈ 60 | 3 % | ~10 W (불안정) |
+| **3072** | ~3 k | ≈ 180 | 9 % | **48 W** ← 안정 |
+| 4096+ | … | 더 많음 | … | 정상 |
+
+이를 검증할 컬럼 :
+- `dyn_energy_j_raw` (unclipped) → 음수로 찍혀 있을 것
+- `clip_bias_pct` → 100% (clip 으로 전부 0 이 됐음)
+- `total_energy_j` 는 P_static × wall_s 로 정상 값
+
+**처리** : `analyze.py` 가 `clip_bias_pct > 50%` cell 을 회귀에서 자동 drop 하므로 plot 영향 없음. 단지 sweep 시간이 아까우니 H100 에선 :
+
+```bash
+./run_bench.sh --device 0 --suite full --tag h100 \
+    --matmul-sizes 3072 4096 6144 8192 12288   # 작은 K 4 점 제거
+```
+
+A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 fallback 이라 더 무거움; Blackwell 은 fp8 native 인데 P_static 비율이 다름) — `--matmul-sizes` 기본값 유지 권장.
+
 ### 8.4 환경 권장 사항
 
 - `sudo nvidia-smi -pm 1` : persistence mode.
