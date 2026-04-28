@@ -46,14 +46,25 @@ def discover_csvs(reports_dir: Path, num_gpus: int,
 
     Matching rule — be generous about name shape, but skip sidecars:
       * must contain `_gpu<N>` somewhere in the filename
-      * must NOT end in `_baseline.csv`, `_baseline_stats.csv`, `_samples.csv`,
-        `_summary.csv`, `_summary_by_regime.csv` (these are not per-cell files)
+      * must NOT match any sidecar suffix listed below — those are
+        written by gpu_power_bench.py / analyze.py / SoC envelope
+        AFTER the main per-cell CSV, so their mtime is newer and the
+        "newest mtime wins" rule below would otherwise pick them.
+        Symptom when missed: KeyError: 'total_elements' in
+        aggregate_summaries() because the sidecar lacks that column.
       * if `--tag` is given, must contain that tag as well
       * when more than one CSV matches an index, the newest mtime wins
     """
-    sidecar = ("_baseline.csv", "_baseline_stats.csv",
-               "_samples.csv", "_summary.csv",
-               "_summary_by_regime.csv")
+    sidecar = (
+        # gpu_power_bench.py outputs:
+        "_baseline.csv", "_baseline_stats.csv",
+        "_samples.csv", "_summary.csv", "_rebaseline.csv",
+        # analyze.py outputs (added in PR #41):
+        "_summary_by_regime.csv",
+        "_dram_rw_split.csv", "_dram_marginal.csv",
+        # SoC envelope sidecars (added in PR #48):
+        "_soc_summary.csv", "_soc_timeseries.csv",
+    )
     candidates: dict[int, list[Path]] = {}
     for p in reports_dir.rglob("gpu_power_bench_*.csv"):
         name = p.name
