@@ -132,10 +132,22 @@ Tensor Core 대 CUDA Core 의 **에너지 효율 격차**, dtype/precision 별 J
 | flag | 기본 | 비고 |
 |---|---|---|
 | `--no-matmul` | off | 카테고리 전체 skip |
-| `--matmul-sizes` | `512 1024 1536 2048 3072 4096 6144 8192 12288` | K 리스트 |
+| `--matmul-sizes` | `1024 2048 2880 4096 5760 8192 12288` | **GPT-OSS 120B aware** — README §3.2 |
 | `--matmul-variants` | 5종 전체 | `dtype:mode` list. 예: `--matmul-variants fp16:tc fp8:te` |
 
-K=12288 fp32 ≈ 1.7 GB → A100/H100 80GB 모두 OK. fp32 대형 K 는 OOM 위험 → `_filter_loads` 와 동일 보호.
+**Default K 7 점 — GPT-OSS 120B layer dim 매핑** :
+
+| K | 매핑 |
+|---|---|
+| 1024, 2048 | TC sweet spot baseline (fp32_simt / tf32_tc 에서 의미있는 dyn power) |
+| **2880** | GPT-OSS hidden dim → `qkv` / `q_only` / `kv` / `mlp1` / `mlp2` / `lm_head` 의 contraction |
+| 4096 | GPT-OSS `attn_o` input (head_dim × heads) |
+| **5760** | GPT-OSS MLP intermediate (`mlp1` out / `mlp2` in) |
+| 8192, 12288 | BW saturation 영역 |
+
+이 set 의 의도 : square sweep 결과가 LLM-shape (A.4) 의 같은 K 점들과 J/FLOP 영역에서 **cross-check** 가능하게.
+
+K=12288 fp32 ≈ 1.7 GB → A100/H100 80GB 모두 OK. K=16384 는 fp32 가 3.2 GB → default 빠짐, fp8_te 단독 sweep 시 `--matmul-sizes ... 16384 --matmul-variants fp8:te` 로 명시 추가 권장. 옛 default 의 K=512..1536 은 H100 fp8_te 의 noise floor 아래라 (§8.3.4) drop.
 
 #### 산출물
 - CSV row: `op=matmul, dtype, mode, load_value=K`, FLOPs = 2·K³.

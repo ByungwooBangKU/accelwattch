@@ -200,7 +200,31 @@ matmul 은 **compute dominated** 커널이며, 같은 문제를 다른 compute u
 
 **Transformer Engine 경로** : `fp8_te` 는 `te.fp8_autocast(enabled=True, fp8_recipe=DelayedScaling(...))` context 안에서 `te.Linear` 를 호출한다. 이는 내부적으로 `cublasLtMatmul` 의 FP8 경로를 호출하며, H100 Hopper 의 FP8 Tensor Core 를 직접 사용한다. A100 에서는 미지원이므로 preflight 에서 스킵 처리.
 
-**Matmul size sweep** : `N ∈ {512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288}` 를 sweep. FLOP = `2 · N³`. 메모리 footprint 는 `3 · N² · sizeof(dtype)`, N=12288 FP32 는 ~1.7 GB — 80 GB HBM 안에 충분히 들어감.
+**Matmul size sweep — GPT-OSS 120B aware** :
+
+기본 K = `{1024, 2048, 2880, 4096, 5760, 8192, 12288}` (7 점). FLOP = `2·K³`. 메모리 footprint = `3·K²·sizeof(dtype)`, K=12288 FP32 ≈ 1.7 GB — 80 GB HBM 여유.
+
+K 선택 근거 (옛 9 점 default `{512..12288}` 에서 변경) :
+
+| K | 의미 | 빠진 이유 / 추가 이유 |
+|---|---|---|
+| 512–1536 | TC launch-overhead 영역 | **drop** — H100 fp8_te 가 noise floor 아래 (§8.3.4), 다른 variant 도 fit 에 marginal |
+| 1024 | 작은 TC 사이즈 | retain — fp32_simt / tf32_tc 에서 의미있는 dyn power |
+| 2048 | TC 사이즈 | retain |
+| **2880** | **GPT-OSS 120B hidden dim** | **신규** — `qkv` / `q_only` / `kv` / `mlp1` / `mlp2` / `lm_head` 의 contraction dim. square 결과 ↔ asymmetric LLM-shape 결과 cross-check 의 anchor |
+| 4096 | head_dim × heads | retain — GPT-OSS 의 `attn_o` input dim |
+| **5760** | **GPT-OSS MLP intermediate** | **신규** — `mlp1` output / `mlp2` input. 2× hidden 영역의 BW 동작 |
+| 8192, 12288 | 대형 GEMM, BW saturation | retain |
+| 16384 | fp8 의 의미있는 상한 | default 미포함 (fp32 가 3.2 GB) — fp8_te 단독 sweep 시 명시 추가 권장 |
+
+GPT-OSS 120B 특화 sweep (H100 fp8 가 빛나는 영역) :
+```bash
+./run_bench.sh --suite full --tag h100 \
+    --matmul-sizes 2880 4096 5760 8192 12288 16384 \
+    --matmul-variants fp8:te
+```
+
+A100 처럼 fp32_simt 까지 다 도는 default 면 K=16384 는 `fp32_simt` 가 너무 무거워 (~5 분/cell) 추천 안 함. 대신 K=12288 까지로 충분히 BW saturation 영역 진입.
 
 ### 3.2.1 LLM-shape matmul sweep (`--llm-shapes`, opt-in)
 
