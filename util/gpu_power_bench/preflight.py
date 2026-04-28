@@ -251,7 +251,7 @@ def _check_cuda_and_fp8(r: PreflightResult) -> None:
                    f"To run the fallback for cross-GPU comparison: {hint}")
 
 
-def _check_pynvml(r: PreflightResult) -> None:
+def _check_pynvml(r: PreflightResult, device: int = 0) -> None:
     try:
         import pynvml
     except ImportError:
@@ -262,7 +262,18 @@ def _check_pynvml(r: PreflightResult) -> None:
         r.fail(f"nvmlInit failed: {e}")
         return
     try:
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        # Resolve via PCI bus id so CUDA_VISIBLE_DEVICES re-numbering
+        # doesn't make us read the wrong card. Same logic as
+        # gpu_power_bench.py — see README §9.2.1. Falls back to plain
+        # index lookup if torch isn't installed (the preflight that
+        # would have caught that already failed earlier in the chain).
+        h = None
+        try:
+            import torch
+            pci_id = torch.cuda.get_device_properties(device).pci_bus_id
+            h = pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
+        except Exception:
+            h = pynvml.nvmlDeviceGetHandleByIndex(device)
         # Power: we integrate mW samples → Joules. Required.
         try:
             power_mw = pynvml.nvmlDeviceGetPowerUsage(h)
@@ -293,13 +304,26 @@ def _check_pynvml(r: PreflightResult) -> None:
         pynvml.nvmlShutdown()
 
 
-def check() -> PreflightResult:
+def check(device: int = 0) -> PreflightResult:
+    """Run all preflight checks. `device` selects which GPU to probe for
+    the device-specific checks (cuda+fp8 via torch, NVML power readout).
+    GPU-agnostic checks (pkgs, nvidia-smi, nvcc) ignore it.
+    """
     r = PreflightResult()
+    # Pin torch to the requested device first so _check_cuda_and_fp8's
+    # torch.cuda.current_device() returns this index. NVML check below
+    # also reads the same physical GPU via PCI bus id.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device)
+    except Exception:
+        pass
     _check_pkgs(r)
     _check_nvidia_smi(r)
     _check_nvcc_toolkit(r)
     _check_cuda_and_fp8(r)
-    _check_pynvml(r)
+    _check_pynvml(r, device=device)
     return r
 
 
@@ -322,6 +346,13 @@ def print_report(r: PreflightResult) -> None:
 
 
 if __name__ == "__main__":
-    res = check()
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--device", type=int, default=0,
+                    help="GPU index to probe (default 0). NVML resolution "
+                         "uses PCI bus id so CUDA_VISIBLE_DEVICES re-numbering "
+                         "doesn't pick the wrong card.")
+    args = ap.parse_args()
+    res = check(device=args.device)
     print_report(res)
     sys.exit(0 if res.ok else 1)
