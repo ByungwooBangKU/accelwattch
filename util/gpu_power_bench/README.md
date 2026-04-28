@@ -1490,7 +1490,24 @@ cell 단위로 `slope_dyn`, `slope_tot`, `intercept_dyn`, `intercept_tot`, `r2_d
 ./run_bench.sh --num-gpus 4 --llm-shapes --tag h100_llm
 ```
 
-각 GPU 는 고유 tag 접미사 `_gpu<N>` 을 받고 (`h100_gpu0`, `h100_gpu1`, …), 로그는 `reports/logs/<tag>.log` 로 분리됩니다. 병렬 모드는 node 의 쿨링 예산을 공유하니 **cross-GPU variance 에는 cooling asymmetry 가 섞여 들어갑니다** — 순수 silicon 차이만 보고 싶다면 `--sequential`.
+각 GPU 는 고유 tag 접미사 `_gpu<N>` 을 받고 (`h100_gpu0`, `h100_gpu1`, …), 로그는 **per-experiment 디렉토리** 에 분리 저장 :
+
+```
+reports/gpu_power_<tag>_<MMDD_hhmm>/
+    gpu0.log       # multi-GPU 모드
+    gpu1.log
+    ...
+    single.log     # 단일 GPU 모드
+```
+
+`<tag>` 미지정 시 `default`. 매 실행마다 `MMDD_hhmm` 가 새로 박혀 별도 디렉토리 → 옛 `reports/logs/` 처럼 로그가 한 곳에 누적되지 않음. 같은 분 안에 두 번 실행하면 같은 디렉토리에 합쳐짐 (수동 분리하려면 `RUN_DIR=/path/your/own ./run_bench.sh ...` 로 override).
+
+병렬 모드는 node 의 쿨링 예산을 공유하니 **cross-GPU variance 에는 cooling asymmetry 가 섞여 들어갑니다** — 순수 silicon 차이만 보고 싶다면 `--sequential`.
+
+진행 중 모니터링 :
+```bash
+tail -f reports/gpu_power_h100_*/gpu0.log     # 가장 최근 dir 의 GPU 0 로그
+```
 
 아무 플래그도 안 주면 기존대로 `--device 0` 하나만 실행.
 
