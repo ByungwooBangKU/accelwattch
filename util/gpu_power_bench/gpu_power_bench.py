@@ -911,10 +911,19 @@ def main() -> int:
                 "static_energy_j": f"{static_energy:.4f}",
                 "dyn_energy_j":    f"{dyn_energy:.4f}",
                 "dyn_energy_j_raw":f"{dyn_energy_raw:.4f}",
-                "j_per_element_total": f"{meas['total_energy_j']/total_elements:.3e}",
-                "j_per_element_dyn":   f"{dyn_energy/total_elements:.3e}",
-                "j_per_flop_total":    f"{meas['total_energy_j']/total_flops:.3e}",
-                "j_per_flop_dyn":      f"{dyn_energy/total_flops:.3e}",
+                "j_per_element_total": (f"{meas['total_energy_j']/total_elements:.3e}"
+                                        if total_elements else ""),
+                "j_per_element_dyn":   (f"{dyn_energy/total_elements:.3e}"
+                                        if total_elements else ""),
+                # FLOP-normalised energy is undefined for the STREAM probes
+                # (stream_copy has flops_per_call=0 by design — pure data
+                # movement). Write empty so pandas reads it as NaN and
+                # analyse can drop those rows from J/FLOP regressions
+                # without ZeroDivisionError mid-sweep.
+                "j_per_flop_total":    (f"{meas['total_energy_j']/total_flops:.3e}"
+                                        if total_flops else ""),
+                "j_per_flop_dyn":      (f"{dyn_energy/total_flops:.3e}"
+                                        if total_flops else ""),
                 "start_temp_c":      cooldown_info["final_temp_c"],
                 "avg_temp_c":        f"{meas['avg_temp_c']:.1f}",
                 "peak_temp_c":       meas["peak_temp_c"],
