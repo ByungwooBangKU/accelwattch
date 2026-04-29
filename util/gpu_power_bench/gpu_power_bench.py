@@ -632,6 +632,8 @@ def main() -> int:
     print(f"[baseline] static power = {p_static:.1f} ± {baseline['power_w_std']:.2f} W  "
           f"(min {baseline['power_w_min']:.1f} W, max {baseline['power_w_max']:.1f} W, "
           f"temp {baseline['temp_c_mean']:.1f}°C, n={baseline['n']})")
+    if baseline.get("pstate_filter_note"):
+        print(f"[baseline] {baseline['pstate_filter_note']}")
     # Sanity check: if stdev > 5% of mean, the "idle" wasn't really idle
     # (background kernel, clock ramp, another process) — warn so the user
     # knows the P_static they're subtracting is noisy.
@@ -1241,43 +1243,54 @@ def main() -> int:
                   f"leakage={args.soc_leakage_cycles}x("
                   f"{args.soc_leakage_stress_s}s+{args.soc_leakage_decay_s}s)")
 
-            # Build the GEMM that drives max + leakage stress.
+            # GEMM build is DEFERRED until after the static phase. The 5x
+            # warmup inside _make_matmul_*() pins clocks to P0 and NVIDIA
+            # driver hysteresis keeps them there for ~30..60s after — if
+            # we built first, static would read the boost-clock idle
+            # power (110-120 W on H100), not the true cold idle (~70 W).
+            # See README §3.4 / §9.6 for the full discussion.
+            soc_spec = None
+
+            soc_sampler = PowerSampler(soc_handle, hz=args.poll_hz,
+                                       power_source=args.power_source)
+            print(f"[soc] power source: {soc_sampler.power_source}")
+            soc_sampler.start()
+            soc_sampler.set_phase("startup")
+
+            soc_summary = {"gpu_name": gpu_name, "gpu_slug": gpu_slug,
+                           "cc_major": cc[0], "cc_minor": cc[1],
+                           "matmul_K": args.soc_matmul_K,
+                           "dtype": args.soc_dtype, "mode": args.soc_mode,
+                           "power_source": soc_sampler.power_source,
+                           "sample_hz": args.poll_hz}
+            soc_cycles_meta: list[dict] = []
+            soc_static_t = soc_max_t = None
+            soc_fatal: str | None = None
+
             try:
-                soc_spec = bm.build_matmul(args.soc_matmul_K, args.soc_dtype,
-                                           args.soc_mode, device="cuda")
-                print(f"[soc] GEMM: K={args.soc_matmul_K}  "
-                      f"{args.soc_dtype}/{args.soc_mode}  "
-                      f"compute_unit={soc_spec.compute_unit}")
-            except Exception as e:
-                print(f"[soc] failed to build GEMM "
-                      f"({args.soc_dtype}/{args.soc_mode} K={args.soc_matmul_K}): {e}")
-                soc_spec = None
+                # ---- Static phase first (cold-idle, no GEMM warmup yet) ---
+                if args.cooldown_c > 0:
+                    soc_sampler.set_phase("cooldown_pre_static")
+                    wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
+                                      timeout_s=args.cooldown_timeout, verbose=False)
+                print(f"\n[soc/static] {args.soc_static_seconds}s idle …")
+                soc_static_t = sb.phase_static(soc_sampler, args.soc_static_seconds)
 
-            if soc_spec is not None:
-                soc_sampler = PowerSampler(soc_handle, hz=args.poll_hz,
-                                           power_source=args.power_source)
-                print(f"[soc] power source: {soc_sampler.power_source}")
-                soc_sampler.start()
-                soc_sampler.set_phase("startup")
-
-                soc_summary = {"gpu_name": gpu_name, "gpu_slug": gpu_slug,
-                               "cc_major": cc[0], "cc_minor": cc[1],
-                               "matmul_K": args.soc_matmul_K,
-                               "dtype": args.soc_dtype, "mode": args.soc_mode,
-                               "power_source": soc_sampler.power_source,
-                               "sample_hz": args.poll_hz}
-                soc_cycles_meta: list[dict] = []
-                soc_static_t = soc_max_t = None
-                soc_fatal: str | None = None
-
+                # ---- NOW build the GEMM ----------------------------------
                 try:
-                    if args.cooldown_c > 0:
-                        soc_sampler.set_phase("cooldown_pre_static")
-                        wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
-                                          timeout_s=args.cooldown_timeout, verbose=False)
-                    print(f"\n[soc/static] {args.soc_static_seconds}s idle …")
-                    soc_static_t = sb.phase_static(soc_sampler, args.soc_static_seconds)
+                    soc_spec = bm.build_matmul(args.soc_matmul_K, args.soc_dtype,
+                                               args.soc_mode, device="cuda")
+                    print(f"[soc] GEMM: K={args.soc_matmul_K}  "
+                          f"{args.soc_dtype}/{args.soc_mode}  "
+                          f"compute_unit={soc_spec.compute_unit}")
+                except Exception as e:
+                    print(f"[soc] failed to build GEMM "
+                          f"({args.soc_dtype}/{args.soc_mode} K={args.soc_matmul_K}): {e}")
+                    soc_fatal = f"build: {e}"
+                    soc_spec = None
 
+                # ---- Max phase --------------------------------------------
+                if soc_spec is not None and not soc_fatal:
                     if args.cooldown_c > 0:
                         soc_sampler.set_phase("cooldown_pre_max")
                         wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
@@ -1289,137 +1302,138 @@ def main() -> int:
                         print(f"[soc/max] failed: {e}")
                         soc_fatal = f"max: {e}"
 
-                    if not soc_fatal:
-                        if args.cooldown_c > 0:
-                            soc_sampler.set_phase("cooldown_pre_leakage")
-                            wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
-                                              timeout_s=args.cooldown_timeout, verbose=False)
-                        print(f"[soc/leakage] {args.soc_leakage_cycles} cycles …")
-                        try:
-                            soc_cycles_meta = sb.phase_leakage(
-                                soc_sampler, soc_spec,
-                                args.soc_leakage_cycles,
-                                args.soc_leakage_stress_s,
-                                args.soc_leakage_decay_s)
-                        except RuntimeError as e:
-                            print(f"[soc/leakage] failed mid-cycle: {e}")
-                            soc_fatal = f"leakage: {e}"
-                finally:
-                    soc_sampler.stop()
+                # ---- Leakage phase ----------------------------------------
+                if soc_spec is not None and not soc_fatal:
+                    if args.cooldown_c > 0:
+                        soc_sampler.set_phase("cooldown_pre_leakage")
+                        wait_for_cooldown(soc_handle, target_c=args.cooldown_c,
+                                          timeout_s=args.cooldown_timeout, verbose=False)
+                    print(f"[soc/leakage] {args.soc_leakage_cycles} cycles …")
+                    try:
+                        soc_cycles_meta = sb.phase_leakage(
+                            soc_sampler, soc_spec,
+                            args.soc_leakage_cycles,
+                            args.soc_leakage_stress_s,
+                            args.soc_leakage_decay_s)
+                    except RuntimeError as e:
+                        print(f"[soc/leakage] failed mid-cycle: {e}")
+                        soc_fatal = f"leakage: {e}"
+            finally:
+                soc_sampler.stop()
 
-                if soc_fatal:
-                    soc_summary["fatal_error"] = soc_fatal
+            if soc_fatal:
+                soc_summary["fatal_error"] = soc_fatal
 
-                # ---- SoC stats from the in-memory timeseries -------------
-                soc_samples = soc_sampler.samples
+            # ---- SoC stats from the in-memory timeseries -------------
+            soc_samples = soc_sampler.samples
 
-                def _slice_stats(t0: float, t1: float) -> dict:
-                    ps = [s.power_w for s in soc_samples
-                          if t0 <= s.t <= t1 and s.power_w >= 0]
-                    ts = [s.temp_c for s in soc_samples
-                          if t0 <= s.t <= t1 and s.temp_c >= 0]
-                    if not ps:
-                        return {"power_mean": -1, "power_peak": -1,
-                                "temp_mean": -1, "temp_peak": -1, "n": 0}
-                    return {
-                        "power_mean": sum(ps) / len(ps),
-                        "power_peak": max(ps),
-                        "temp_mean":  (sum(ts) / len(ts)) if ts else -1,
-                        "temp_peak":  max(ts) if ts else -1,
-                        "n": len(ps),
-                    }
+            def _slice_stats(t0: float, t1: float) -> dict:
+                ps = [s.power_w for s in soc_samples
+                      if t0 <= s.t <= t1 and s.power_w >= 0]
+                ts = [s.temp_c for s in soc_samples
+                      if t0 <= s.t <= t1 and s.temp_c >= 0]
+                if not ps:
+                    return {"power_mean": -1, "power_peak": -1,
+                            "temp_mean": -1, "temp_peak": -1, "n": 0}
+                return {
+                    "power_mean": sum(ps) / len(ps),
+                    "power_peak": max(ps),
+                    "temp_mean":  (sum(ts) / len(ts)) if ts else -1,
+                    "temp_peak":  max(ts) if ts else -1,
+                    "n": len(ps),
+                }
 
-                if soc_static_t:
-                    st = _slice_stats(*soc_static_t)
-                    soc_summary["static_seconds"]      = args.soc_static_seconds
-                    soc_summary["static_power_w_mean"] = round(st["power_mean"], 3)
-                    soc_summary["static_power_w_peak"] = round(st["power_peak"], 3)
-                    soc_summary["static_temp_c_mean"]  = round(st["temp_mean"], 1)
-                    soc_summary["static_temp_c_peak"]  = st["temp_peak"]
-                if soc_max_t:
-                    mx = _slice_stats(*soc_max_t)
-                    soc_summary["max_seconds"]         = args.soc_max_seconds
-                    soc_summary["max_power_w_mean"]    = round(mx["power_mean"], 3)
-                    soc_summary["max_power_w_peak"]    = round(mx["power_peak"], 3)
-                    soc_summary["max_temp_c_mean"]     = round(mx["temp_mean"], 1)
-                    soc_summary["max_temp_c_peak"]     = mx["temp_peak"]
+            if soc_static_t:
+                st = _slice_stats(*soc_static_t)
+                soc_summary["static_seconds"]      = args.soc_static_seconds
+                soc_summary["static_power_w_mean"] = round(st["power_mean"], 3)
+                soc_summary["static_power_w_peak"] = round(st["power_peak"], 3)
+                soc_summary["static_temp_c_mean"]  = round(st["temp_mean"], 1)
+                soc_summary["static_temp_c_peak"]  = st["temp_peak"]
+            if soc_max_t:
+                mx = _slice_stats(*soc_max_t)
+                soc_summary["max_seconds"]         = args.soc_max_seconds
+                soc_summary["max_power_w_mean"]    = round(mx["power_mean"], 3)
+                soc_summary["max_power_w_peak"]    = round(mx["power_peak"], 3)
+                soc_summary["max_temp_c_mean"]     = round(mx["temp_mean"], 1)
+                soc_summary["max_temp_c_peak"]     = mx["temp_peak"]
 
-                leak_powers, leak_temps = [], []
-                for c in soc_cycles_meta:
-                    d0 = c["decay_t0"]
-                    st = _slice_stats(d0, d0 + args.soc_leak_window_s)
-                    c["hot_power_w_mean"] = round(st["power_mean"], 3)
-                    c["hot_temp_c_mean"]  = round(st["temp_mean"], 1)
-                    c["hot_temp_c_peak"]  = st["temp_peak"]
-                    st_stress = _slice_stats(c["stress_t0"], c["stress_t1"])
-                    c["stress_temp_c_peak"] = st_stress["temp_peak"]
-                    c["stress_power_w_mean"] = round(st_stress["power_mean"], 3)
-                    if st["power_mean"] > 0:
-                        leak_powers.append(st["power_mean"])
-                        leak_temps.append(st["temp_mean"])
-                if leak_powers:
-                    soc_summary["leakage_cycles"]       = len(leak_powers)
-                    soc_summary["leakage_window_s"]     = args.soc_leak_window_s
-                    soc_summary["leakage_power_w_mean"] = round(sum(leak_powers)/len(leak_powers), 3)
-                    soc_summary["leakage_power_w_min"]  = round(min(leak_powers), 3)
-                    soc_summary["leakage_power_w_max"]  = round(max(leak_powers), 3)
-                    soc_summary["leakage_temp_c_mean"]  = round(sum(leak_temps)/len(leak_temps), 1)
-                    if "static_power_w_mean" in soc_summary:
-                        soc_summary["leakage_minus_static_w"] = round(
-                            soc_summary["leakage_power_w_mean"] -
-                            soc_summary["static_power_w_mean"], 3)
+            leak_powers, leak_temps = [], []
+            for c in soc_cycles_meta:
+                d0 = c["decay_t0"]
+                st = _slice_stats(d0, d0 + args.soc_leak_window_s)
+                c["hot_power_w_mean"] = round(st["power_mean"], 3)
+                c["hot_temp_c_mean"]  = round(st["temp_mean"], 1)
+                c["hot_temp_c_peak"]  = st["temp_peak"]
+                st_stress = _slice_stats(c["stress_t0"], c["stress_t1"])
+                c["stress_temp_c_peak"] = st_stress["temp_peak"]
+                c["stress_power_w_mean"] = round(st_stress["power_mean"], 3)
+                if st["power_mean"] > 0:
+                    leak_powers.append(st["power_mean"])
+                    leak_temps.append(st["temp_mean"])
+            if leak_powers:
+                soc_summary["leakage_cycles"]       = len(leak_powers)
+                soc_summary["leakage_window_s"]     = args.soc_leak_window_s
+                soc_summary["leakage_power_w_mean"] = round(sum(leak_powers)/len(leak_powers), 3)
+                soc_summary["leakage_power_w_min"]  = round(min(leak_powers), 3)
+                soc_summary["leakage_power_w_max"]  = round(max(leak_powers), 3)
+                soc_summary["leakage_temp_c_mean"]  = round(sum(leak_temps)/len(leak_temps), 1)
+                if "static_power_w_mean" in soc_summary:
+                    soc_summary["leakage_minus_static_w"] = round(
+                        soc_summary["leakage_power_w_mean"] -
+                        soc_summary["static_power_w_mean"], 3)
 
-                # ---- write SoC sidecars -----------------------------------
-                stem = csv_path.stem
-                soc_summary_path = out_dir / f"{stem}_soc_summary.csv"
-                with open(soc_summary_path, "w", newline="") as f:
-                    w = csv.writer(f)
-                    w.writerow(["metric", "value"])
-                    for k, v in soc_summary.items():
-                        w.writerow([k, v])
-                    w.writerow([])
-                    if soc_cycles_meta:
-                        w.writerow(["leakage_cycle", "stress_temp_c_peak",
-                                    "stress_power_w_mean", "hot_temp_c_peak",
-                                    "hot_power_w_mean", "hot_minus_static_w"])
-                        stat_w = soc_summary.get("static_power_w_mean", 0) or 0
-                        for c in soc_cycles_meta:
-                            w.writerow([c["cycle"] + 1,
-                                        c.get("stress_temp_c_peak", -1),
-                                        c.get("stress_power_w_mean", -1),
-                                        c.get("hot_temp_c_peak", -1),
-                                        c.get("hot_power_w_mean", -1),
-                                        round(c.get("hot_power_w_mean", 0) - stat_w, 3)])
-                print(f"[save] {soc_summary_path}")
-
-                soc_ts_path = out_dir / f"{stem}_soc_timeseries.csv"
-                with open(soc_ts_path, "w", newline="") as f:
-                    w = csv.writer(f)
-                    w.writerow(["t_s", "power_w", "temp_c", "sm_mhz",
-                                "mem_mhz", "gpu_util", "phase"])
-                    for s in soc_samples:
-                        w.writerow([f"{s.t:.4f}", f"{s.power_w:.4f}",
-                                    s.temp_c, s.sm_mhz, s.mem_mhz,
-                                    s.gpu_util, s.phase])
-                print(f"[save] {soc_ts_path}")
-
-                phase_png            = out_dir / f"{stem}_soc_phases.png"
-                leakage_png          = out_dir / f"{stem}_soc_leakage.png"
-                leakage_enlarged_png = out_dir / f"{stem}_soc_leakage_enlarged.png"
-                summary_png          = out_dir / f"{stem}_soc_summary.png"
-                sb.plot_phase_timeline(soc_samples, soc_summary, phase_png)
+            # ---- write SoC sidecars -----------------------------------
+            stem = csv_path.stem
+            soc_summary_path = out_dir / f"{stem}_soc_summary.csv"
+            with open(soc_summary_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["metric", "value"])
+                for k, v in soc_summary.items():
+                    w.writerow([k, v])
+                w.writerow([])
                 if soc_cycles_meta:
-                    sb.plot_leakage_decay(soc_samples, soc_cycles_meta,
-                                          soc_summary, leakage_png)
-                    sb.plot_leakage_decay_zoomed(soc_samples, soc_cycles_meta,
-                                                 soc_summary, leakage_enlarged_png,
-                                                 x_max=3.0, y_min=0.0, y_max=150.0)
-                sb.plot_summary_bars(soc_summary, summary_png)
-                print(f"[save] {phase_png}")
-                if soc_cycles_meta:
-                    print(f"[save] {leakage_png}")
-                    print(f"[save] {leakage_enlarged_png}")
-                print(f"[save] {summary_png}")
+                    w.writerow(["leakage_cycle", "stress_temp_c_peak",
+                                "stress_power_w_mean", "hot_temp_c_peak",
+                                "hot_power_w_mean", "hot_minus_static_w"])
+                    stat_w = soc_summary.get("static_power_w_mean", 0) or 0
+                    for c in soc_cycles_meta:
+                        w.writerow([c["cycle"] + 1,
+                                    c.get("stress_temp_c_peak", -1),
+                                    c.get("stress_power_w_mean", -1),
+                                    c.get("hot_temp_c_peak", -1),
+                                    c.get("hot_power_w_mean", -1),
+                                    round(c.get("hot_power_w_mean", 0) - stat_w, 3)])
+            print(f"[save] {soc_summary_path}")
+
+            soc_ts_path = out_dir / f"{stem}_soc_timeseries.csv"
+            with open(soc_ts_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["t_s", "power_w", "temp_c", "sm_mhz",
+                            "mem_mhz", "gpu_util", "phase"])
+                for s in soc_samples:
+                    w.writerow([f"{s.t:.4f}", f"{s.power_w:.4f}",
+                                s.temp_c, s.sm_mhz, s.mem_mhz,
+                                s.gpu_util, s.phase])
+            print(f"[save] {soc_ts_path}")
+
+            phase_png            = out_dir / f"{stem}_soc_phases.png"
+            leakage_png          = out_dir / f"{stem}_soc_leakage.png"
+            leakage_enlarged_png = out_dir / f"{stem}_soc_leakage_enlarged.png"
+            summary_png          = out_dir / f"{stem}_soc_summary.png"
+            sb.plot_phase_timeline(soc_samples, soc_summary, phase_png)
+            if soc_cycles_meta:
+                sb.plot_leakage_decay(soc_samples, soc_cycles_meta,
+                                      soc_summary, leakage_png)
+                sb.plot_leakage_decay_zoomed(soc_samples, soc_cycles_meta,
+                                             soc_summary, leakage_enlarged_png,
+                                             x_max=3.0, y_min=50.0, y_max=150.0)
+            sb.plot_summary_bars(soc_summary, summary_png)
+            print(f"[save] {phase_png}")
+            if soc_cycles_meta:
+                print(f"[save] {leakage_png}")
+                print(f"[save] {leakage_enlarged_png}")
+            print(f"[save] {summary_png}")
         finally:
             try: pynvml.nvmlShutdown()
             except Exception: pass
