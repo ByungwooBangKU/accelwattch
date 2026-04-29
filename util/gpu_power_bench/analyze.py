@@ -914,6 +914,219 @@ def _coef_bar_matmul(mm, out_png: Path, gpu: str) -> bool:
     return True
 
 
+def _coef_bar_fp8(summary: pd.DataFrame, out_png: Path, gpu: str) -> bool:
+    """fp8-only k_op bar chart : matmul_fp8_te + softmax_fp8 + gelu_fp8 +
+    layernorm_fp8 on one figure with two panels (matmul J/FLOP on left,
+    elementwise J/element on right) so the unit difference is honest.
+
+    Always includes emulated rows — fp8 elementwise is by definition
+    emulated (cast-compute-cast), and on pre-Hopper fp8_te falls back
+    to FP16 TC. Both are flagged with a hatched bar pattern. The
+    point of THIS plot is to surface fp8 numbers that are otherwise
+    hidden by the default emulated-row filter on the main coef-bar.
+    """
+    if summary.empty:
+        return False
+    fp8 = summary[summary["dtype"] == "fp8"].copy()
+    if fp8.empty:
+        return False
+    fp8_mm = fp8[fp8["category"] == "matmul"]
+    fp8_ew_ops = ("softmax", "gelu", "layernorm")
+    fp8_ew = fp8[(fp8["category"] == "elementwise")
+                 & (fp8["op"].isin(fp8_ew_ops))]
+    if fp8_mm.empty and fp8_ew.empty:
+        return False
+
+    plt = _get_mpl()
+    fig, (ax_mm, ax_ew) = plt.subplots(1, 2, figsize=(20, 8),
+                                       gridspec_kw={"width_ratios": [1, 2]})
+
+    # ---- matmul_fp8_te panel (J/FLOP) ----
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in fp8_mm.columns else "slope_dyn"
+    r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in fp8_mm.columns else "R2_dyn"
+    if not fp8_mm.empty:
+        # Always plotted as a single bar (the only fp8 matmul variant).
+        for _, row in fp8_mm.iterrows():
+            v = float(row[slope_col]) if pd.notna(row[slope_col]) else float("nan")
+            r2 = float(row[r2_col]) if pd.notna(row.get(r2_col, np.nan)) else float("nan")
+            emu = bool(int(row.get("emulated", 0)))
+            label = "matmul_fp8_te" + (" *EMU" if emu else "")
+            bar = ax_mm.bar([0], [v],
+                            color="#9467bd", alpha=0.9, edgecolor="white",
+                            hatch="//" if emu else None)
+            for rect in bar:
+                _annot_bar_pj(rect, v, r2, "pJ/FLOP")
+            ax_mm.set_xticks([0])
+            ax_mm.set_xticklabels([label], fontsize=11, rotation=15, ha="right")
+        ax_mm.set_ylabel("J / FLOP (dynamic)", fontsize=11)
+        ax_mm.set_title("matmul_fp8_te — k_op (pJ/FLOP)", fontsize=11)
+        ax_mm.grid(True, axis="y", alpha=0.3)
+        if pd.notna(fp8_mm[slope_col].iloc[0]) and float(fp8_mm[slope_col].iloc[0]) > 0:
+            ax_mm.set_ylim(0, float(fp8_mm[slope_col].iloc[0]) * 1.4)
+    else:
+        ax_mm.set_visible(False)
+
+    # ---- fp8 elementwise panel (J/element) ----
+    if not fp8_ew.empty:
+        op_order = [op for op in fp8_ew_ops if op in fp8_ew["op"].values]
+        xs = np.arange(len(op_order))
+        vals, r2s, hatches = [], [], []
+        for op in op_order:
+            row = fp8_ew[fp8_ew["op"] == op]
+            if row.empty:
+                vals.append(float("nan")); r2s.append(float("nan"))
+                hatches.append(None); continue
+            v = float(row[slope_col].iloc[0]) if pd.notna(row[slope_col].iloc[0]) else float("nan")
+            r2 = float(row[r2_col].iloc[0]) if pd.notna(row.get(r2_col, pd.Series([np.nan])).iloc[0]) else float("nan")
+            emu = bool(int(row.get("emulated", pd.Series([0])).iloc[0]))
+            vals.append(v); r2s.append(r2)
+            hatches.append("//" if emu else None)
+        bars = ax_ew.bar(xs, vals, color="#d62728", alpha=0.9, edgecolor="white")
+        for rect, h in zip(bars, hatches):
+            if h: rect.set_hatch(h)
+        for rect, v, r2 in zip(bars, vals, r2s):
+            _annot_bar_pj(rect, v, r2, "pJ/elem")
+        ax_ew.set_xticks(xs)
+        ax_ew.set_xticklabels([f"{op}_fp8" for op in op_order], fontsize=11)
+        ax_ew.set_ylabel("J / element (dynamic)", fontsize=11)
+        ax_ew.set_title("fp8 elementwise — k_op (pJ/elem)", fontsize=11)
+        ax_ew.grid(True, axis="y", alpha=0.3)
+        finite_pos = [v for v in vals if pd.notna(v) and v > 0]
+        if finite_pos:
+            ax_ew.set_ylim(0, max(finite_pos) * 1.3)
+    else:
+        ax_ew.set_visible(False)
+
+    fig.suptitle(
+        f"FP8 power-model coefficients — {gpu}\n"
+        "matmul_fp8_te (left, pJ/FLOP) and fp8 elementwise (right, pJ/elem). "
+        "Hatched bar = emulated path (cast-compute-cast or A100 FP16 fallback).",
+        fontsize=11)
+    _save_fig(fig, out_png)
+    return True
+
+
+def _coef_bar_fp8_per_regime(by_regime: pd.DataFrame, out_png: Path, gpu: str) -> bool:
+    """fp8 k_op per cache regime — same 4 ops as `_coef_bar_fp8`, but
+    grouped along the cache_regime x-axis so the locality dependence is
+    visible.
+
+    Two panels :
+      - left : matmul_fp8_te k_op vs regime  (J/FLOP — usually flat,
+        ~1.3-1.5× from l2_resident to dram_stream)
+      - right : fp8 softmax/gelu/layernorm k_op vs regime  (J/element
+        — should drop with hit rate; 5..10× span typical for memory-
+        light ops)
+    """
+    if by_regime is None or by_regime.empty:
+        return False
+    fp8 = by_regime[by_regime["dtype"] == "fp8"].copy()
+    if fp8.empty:
+        return False
+    fp8["cache_regime"] = fp8["cache_regime"].replace(LEGACY_REGIME_MAP)
+    fp8 = fp8[fp8["cache_regime"].isin(REGIME_ORDER)]
+    if fp8.empty:
+        return False
+
+    fp8_mm = fp8[fp8["category"] == "matmul"]
+    fp8_ew_ops = ("softmax", "gelu", "layernorm")
+    fp8_ew = fp8[(fp8["category"] == "elementwise")
+                 & (fp8["op"].isin(fp8_ew_ops))]
+    if fp8_mm.empty and fp8_ew.empty:
+        return False
+
+    plt = _get_mpl()
+    fig, (ax_mm, ax_ew) = plt.subplots(1, 2, figsize=(20, 8),
+                                       gridspec_kw={"width_ratios": [1.2, 2]})
+
+    regime_x = {r: i for i, r in enumerate(REGIME_ORDER)}
+    xpos = np.arange(len(REGIME_ORDER))
+    slope_col = "slope_dyn"
+    r2_col    = "R2_dyn"
+
+    def _bars_for(ax, sub_df, color, op_order, scale_label, scale, is_matmul):
+        if sub_df.empty:
+            ax.set_visible(False); return
+        # If multiple ops, use grouped bars; else single bar per regime
+        keys = op_order if op_order else ["matmul_fp8_te"]
+        width = 0.8 / max(1, len(keys))
+        cmap = plt.get_cmap("tab10")
+        positive_vals: list[float] = []
+        for i, key in enumerate(keys):
+            vals, r2s = [], []
+            for r in REGIME_ORDER:
+                if is_matmul:
+                    row = sub_df[sub_df["cache_regime"] == r]
+                else:
+                    row = sub_df[(sub_df["op"] == key)
+                                 & (sub_df["cache_regime"] == r)]
+                if row.empty:
+                    vals.append(np.nan); r2s.append(np.nan)
+                else:
+                    v = float(row[slope_col].iloc[0])
+                    if not np.isfinite(v) or v <= 0:
+                        med_col = "median_j_per_unit"
+                        if med_col in row.columns:
+                            med = float(row[med_col].iloc[0])
+                            v = med if np.isfinite(med) and med > 0 else np.nan
+                    vals.append(v)
+                    r2s.append(float(row[r2_col].iloc[0]) if r2_col in row.columns else np.nan)
+            bar_col = color if is_matmul else cmap(i % 10)
+            bars = ax.bar(xpos + (i - (len(keys)-1)/2) * width, vals, width,
+                          label=str(key) + ("_fp8" if not is_matmul else ""),
+                          color=bar_col, alpha=0.9, edgecolor="white",
+                          hatch="//")
+            for rect, v, r2 in zip(bars, vals, r2s):
+                if not np.isfinite(v) or v <= 0:
+                    continue
+                positive_vals.append(v)
+                v_p = v * scale
+                if abs(v_p) >= 1:
+                    vtxt = f"{v_p:.2f}"
+                elif abs(v_p) >= 0.01:
+                    vtxt = f"{v_p:.3f}"
+                else:
+                    vtxt = f"{v_p:.2e}"
+                txt = f"{vtxt} {scale_label}"
+                if np.isfinite(r2):
+                    txt += f"\nR²={r2:.2f}"
+                ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                        txt, ha="center", va="bottom", fontsize=8,
+                        linespacing=1.1)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([f"{r}\n({REGIME_HIT_PCT[r]})"
+                            for r in REGIME_ORDER], fontsize=11)
+        if positive_vals:
+            ax.set_ylim(0, max(positive_vals) * 1.30)
+        ax.grid(True, axis="y", alpha=0.3)
+        if not is_matmul:
+            ax.legend(fontsize=9)
+
+    if not fp8_mm.empty:
+        _bars_for(ax_mm, fp8_mm, "#9467bd", [], "pJ/FLOP", 1e12, True)
+        ax_mm.set_ylabel("J / FLOP (dynamic)", fontsize=11)
+        ax_mm.set_title("matmul_fp8_te — k_op per cache regime", fontsize=11)
+    else:
+        ax_mm.set_visible(False)
+    if not fp8_ew.empty:
+        op_order = [op for op in fp8_ew_ops if op in fp8_ew["op"].values]
+        _bars_for(ax_ew, fp8_ew, None, op_order, "pJ/elem", 1e12, False)
+        ax_ew.set_ylabel("J / element (dynamic)", fontsize=11)
+        ax_ew.set_title("fp8 elementwise — k_op per cache regime", fontsize=11)
+    else:
+        ax_ew.set_visible(False)
+
+    fig.suptitle(
+        f"FP8 k_op per cache regime — {gpu}\n"
+        "Hatched bars : emulated path (cast-compute-cast on elementwise; "
+        "FP16 fallback on pre-Hopper matmul). "
+        "Lower hit-rate regimes pay extra DRAM bytes — slope shows the "
+        "memory-cost component of fp8 power.",
+        fontsize=11)
+    _save_fig(fig, out_png)
+    return True
+
+
 def plot_joule_per_op_bar(summary: pd.DataFrame, out_dir: Path, stem: str,
                           gpu: str) -> None:
     """Save the elementwise and matmul k_op bar charts as TWO SEPARATE
@@ -921,6 +1134,7 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_dir: Path, stem: str,
     cramped. Filenames:
         <stem>_01_powermodel_coef_bar_elementwise.png
         <stem>_01_powermodel_coef_bar_matmul.png
+        <stem>_01_powermodel_coef_bar_fp8.png         (NEW)
     """
     ew = summary[summary["category"] == "elementwise"]
     mm = summary[summary["category"] == "matmul"]
@@ -928,6 +1142,11 @@ def plot_joule_per_op_bar(summary: pd.DataFrame, out_dir: Path, stem: str,
         out_dir / f"{stem}_01_powermodel_coef_bar_elementwise.png", gpu)
     _coef_bar_matmul(mm,
         out_dir / f"{stem}_01_powermodel_coef_bar_matmul.png", gpu)
+    # fp8 dedicated panel uses the FULL summary (not the emulated-filtered
+    # plot_summary) so fp8 elementwise bars are always present, regardless
+    # of whether --include-emulated was passed.
+    _coef_bar_fp8(summary,
+        out_dir / f"{stem}_01_powermodel_coef_bar_fp8.png", gpu)
 
 
 def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
@@ -1203,7 +1422,8 @@ def _short_label(r: dict) -> str:
 
 
 def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
-                      out_dir: Path, stem: str, gpu: str) -> None:
+                      out_dir: Path, stem: str, gpu: str,
+                      by_regime_unfiltered: pd.DataFrame | None = None) -> None:
     """Energy-per-operation grouped by cache locality regime — one PNG
     per panel for clean x-axes.
 
@@ -1410,6 +1630,18 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
         _panel_dynpower(mm,
                         f"Matmul — steady-state dyn power per cache regime — {gpu}",
                         out_dir / f"{stem}_02_cache_regime_matmul_dynpower.png")
+
+    # ---- fp8 dedicated panel ------------------------------------------
+    # Even when --include-emulated is OFF (default), surface the fp8
+    # elementwise + fp8_te matmul k_op-per-regime since the user asked
+    # for an fp8-specific view in PR #55. Uses the UNFILTERED by_regime
+    # df (when caller supplied it), so emulated rows are always present
+    # here regardless of the --include-emulated flag.
+    fp8_src = by_regime_unfiltered if by_regime_unfiltered is not None else by_regime
+    if fp8_src is not None and not fp8_src.empty:
+        _coef_bar_fp8_per_regime(
+            fp8_src,
+            out_dir / f"{stem}_02_cache_regime_fp8.png", gpu)
 
 
 def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
@@ -2141,7 +2373,10 @@ def main() -> int:
         ].copy()
     # Cache-regime — 6 separate per-panel PNGs (per-cell strip / k_op bar /
     # mean dyn power × elementwise / matmul) so x-axis stays readable.
-    plot_cache_regime(plot_df, plot_by_regime, out_dir, stem, gpu)
+    # Pass the UNFILTERED by_regime so the fp8-dedicated panel (added in
+    # PR #55) always shows emulated rows, regardless of --include-emulated.
+    plot_cache_regime(plot_df, plot_by_regime, out_dir, stem, gpu,
+                      by_regime_unfiltered=by_regime)
     # DRAM-bandwidth energy — 2 separate PNGs (pJ/bit strip + sustained BW).
     plot_dram_energy(plot_df, out_dir, stem, gpu)
     # DRAM read/write split (only fires when stream_read / stream_write

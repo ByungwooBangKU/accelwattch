@@ -1305,6 +1305,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_01_powermodel_linearity_matmul.png`      | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
 | `<stem>_01_powermodel_coef_bar_elementwise.png` | elementwise k_op bar (pJ/elem + R² + bootstrap CI whisker) — full-width 단독 패널 |
 | `<stem>_01_powermodel_coef_bar_matmul.png`      | matmul k_op bar (pJ/FLOP + R² + bootstrap CI whisker) — full-width 단독 패널 |
+| **`<stem>_01_powermodel_coef_bar_fp8.png`**     | **FP8 dedicated** — 2 panel (matmul_fp8_te `pJ/FLOP` 좌, fp8 elementwise `softmax`/`gelu`/`layernorm` `pJ/elem` 우). `--include-emulated` 미지정해도 항상 표시 (default plot 에서 emulated row 가 가려져도 fp8 비교가 필요한 경우 직접 봄). hatched bar = emulated path |
 | `<stem>_01_powermodel_llm_jperflop.png`          | LLM-shape: J/FLOP vs token count T (preset 별 line + T 라벨) |
 | `<stem>_01_powermodel_llm_per_call.png`          | LLM-shape: per-call mJ vs T |
 | `<stem>_02_cache_regime_elementwise_strip.png`   | elementwise: per-cell J/elem strip per regime (5 bucket) |
@@ -1313,6 +1314,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_02_cache_regime_matmul_strip.png`        | matmul: 동일 strip plot |
 | `<stem>_02_cache_regime_matmul_kop.png`          | matmul: regime 별 k_op (pJ/FLOP) |
 | `<stem>_02_cache_regime_matmul_dynpower.png`     | matmul: regime 별 dyn power |
+| **`<stem>_02_cache_regime_fp8.png`**            | **FP8 dedicated** — 2 panel × 5 regime (matmul_fp8_te `pJ/FLOP` 좌, fp8 elementwise `softmax`/`gelu`/`layernorm` `pJ/elem` 우). 위 fp8 bar 와 동일 op 셋트, regime 별 변화 시각화 |
 | `<stem>_02_dram_energy_pjbit.png`                | pJ/bit strip — HBM2/HBM3 reference 라인 포함 |
 | `<stem>_02_dram_energy_bw.png`                   | l2_hit_0 sustained BW per kernel (HBM peak 비교) |
 | `<stem>_02_dram_energy_rw_split.png`             | (--dram-bw-test 시) read vs write 분리 bar + mixed cross-check |
