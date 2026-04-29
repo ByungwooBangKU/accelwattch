@@ -351,22 +351,29 @@ def plot_leakage_decay(samples, cycles, summary, out_path: Path) -> None:
 
 def plot_leakage_decay_zoomed(samples, cycles, summary, out_path: Path,
                               x_max: float = 3.0,
-                              y_min: float = 0.0,
+                              y_min: float = 50.0,
                               y_max: float = 150.0) -> None:
-    """Zoomed view of the first 3s and 0..150W — the region where the
+    """Zoomed view of the first 3s and (50..150 W) — the region where the
     hot-leakage signal lives.
 
     Same data as `plot_leakage_decay` but with tighter axis limits and
     finer ticks (0.25s minor / 1s major on x, 5W minor / 25W major on y)
     so the cycle-to-cycle hot-window spread and the rapid drop in the
     first second are easy to read off the plot.
+
+    Includes a twin y-axis for temperature : per-cycle die temp during
+    the same decay window, plotted as dashed lines so the reader can
+    correlate "how hot was the chip when this leakage power was
+    measured" without flipping between plots. Higher temp → higher
+    leakage current is the canonical Δ leakage interpretation, so
+    temp on the same panel makes that link visible.
     """
     if not cycles:
         return
     fig, ax = plt.subplots(figsize=(12, 7))
     src = summary.get("power_source", "")
     title = (f"Leakage decay — first {x_max:.0f}s zoom "
-             f"(0–{y_max:.0f} W) — {summary['gpu_name']}")
+             f"({y_min:.0f}–{y_max:.0f} W) — {summary['gpu_name']}")
     if src:
         title += f"   ({src})"
     ax.set_title(title, fontsize=12)
@@ -374,6 +381,43 @@ def plot_leakage_decay_zoomed(samples, cycles, summary, out_path: Path,
                         x_lim=(0.0, x_max), y_lim=(y_min, y_max),
                         x_major=1.0, x_minor=0.25,
                         y_major=25.0, y_minor=5.0)
+
+    # ---- Temperature overlay on a twin y-axis ---------------------------
+    # Per-cycle temp during the same decay window. Same color cycle as
+    # the power lines so cycle 1 power and cycle 1 temp share a hue —
+    # only the linestyle (solid power, dashed temp) differs. Single
+    # legend entry per "Temp (°C)" series to avoid bloating the
+    # already-busy legend.
+    ax_t = ax.twinx()
+    cmap = plt.get_cmap("tab10")
+    temp_min, temp_max = float("inf"), float("-inf")
+    for i, c in enumerate(cycles):
+        sl = [(s.t - c["decay_t0"], s.temp_c) for s in samples
+              if c["decay_t0"] <= s.t <= c["decay_t1"] and s.temp_c >= 0]
+        if not sl:
+            continue
+        ts = [r[0] for r in sl]
+        Ts = [r[1] for r in sl]
+        # Match cycle color (matplotlib default cycle Cn → tab10[n])
+        color = cmap(i % 10)
+        ax_t.plot(ts, Ts, lw=1.0, ls="--", alpha=0.7, color=color,
+                  label=f"cycle {c['cycle']+1} temp" if i == 0 else None)
+        temp_min = min(temp_min, min(Ts))
+        temp_max = max(temp_max, max(Ts))
+    if temp_min < temp_max:
+        # Round to 5°C grid + 2°C headroom each side
+        ax_t.set_ylim(int(temp_min) - 2, int(temp_max) + 2)
+    ax_t.set_ylabel("Temperature (°C, dashed)", fontsize=11, color="#555")
+    ax_t.tick_params(axis="y", labelsize=9, colors="#555")
+    # Single annotation in the upper-right showing the hot-end span :
+    if temp_min < temp_max:
+        ax_t.text(0.99, 0.98,
+                  f"temp range across cycles : {int(temp_min)}…{int(temp_max)} °C",
+                  transform=ax_t.transAxes, ha="right", va="top",
+                  fontsize=9, color="#555",
+                  bbox=dict(facecolor="white", edgecolor="none",
+                            alpha=0.85, pad=2))
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
@@ -506,21 +550,13 @@ def main() -> int:
           f"leakage={args.leakage_cycles}x({args.leakage_stress_s}s+"
           f"{args.leakage_decay_s}s)")
 
-    # Build the GEMM spec ONCE — reused for max and leakage stress phases.
+    # GEMM spec is built AFTER the static phase to avoid the 5x warmup
+    # inside _make_matmul_*() pinning the GPU into P0 (boost clocks)
+    # before we measure idle. NVIDIA's P-state hysteresis keeps the
+    # chip in P0 for tens of seconds after recent activity, which
+    # would inflate static_power_w by 30..50 W on H100. Static
+    # measurement runs first on a truly cold idle, then we build.
     spec = None
-    if not args.no_max or not args.no_leakage:
-        try:
-            spec = bm.build_matmul(args.matmul_K, args.dtype, args.mode,
-                                   device="cuda")
-            print(f"[info] GEMM: K={args.matmul_K}  {args.dtype}/{args.mode}  "
-                  f"compute_unit={spec.compute_unit}")
-            if spec.emulated:
-                print(f"[warn] GEMM is EMULATED on this GPU: {spec.notes}")
-        except Exception as e:
-            print(f"[error] failed to build GEMM ({args.dtype}/{args.mode} "
-                  f"K={args.matmul_K}): {e}")
-            print(f"[error] try a smaller K or a different dtype/mode")
-            return 2
 
     # Single sampler for the whole run so the timeseries is contiguous and
     # we can slice phases out of it for stats / plotting.
@@ -542,6 +578,9 @@ def main() -> int:
 
     try:
         # --- 1) STATIC ------------------------------------------------------
+        # IMPORTANT: build_matmul() has NOT been called yet, so no GEMM
+        # warmup has run. Combined with the wait_for_cooldown below, this
+        # gives us a genuine cold-idle measurement.
         if args.cooldown_c > 0:
             sampler.set_phase("cooldown_pre_static")
             wait_for_cooldown(handle, target_c=args.cooldown_c,
@@ -549,12 +588,34 @@ def main() -> int:
         print(f"\n[phase] static idle for {args.static_seconds}s")
         static_t = phase_static(sampler, args.static_seconds)
 
+        # --- BUILD the GEMM (deferred until after static phase) ----------
+        # Now we can warm up the matmul without contaminating idle. Also
+        # if build itself fails (Blackwell amax race etc.), at least the
+        # static reading is preserved.
+        if not args.no_max or not args.no_leakage:
+            try:
+                spec = bm.build_matmul(args.matmul_K, args.dtype, args.mode,
+                                       device="cuda")
+                print(f"[info] GEMM: K={args.matmul_K}  {args.dtype}/{args.mode}  "
+                      f"compute_unit={spec.compute_unit}")
+                if spec.emulated:
+                    print(f"[warn] GEMM is EMULATED on this GPU: {spec.notes}")
+            except Exception as e:
+                print(f"[error] failed to build GEMM ({args.dtype}/{args.mode} "
+                      f"K={args.matmul_K}): {e}")
+                print(f"[error] try a smaller K or a different dtype/mode")
+                # Don't return — static phase already produced data; mark
+                # max/leakage as unavailable and let the post-loop save
+                # write the partial results.
+                fatal_error = f"build: {e}"
+                spec = None
+
         # --- 2) MAX ---------------------------------------------------------
         # Each compute phase is in its own try/except so that a CUDA fault
         # in max doesn't kill the leakage data, AND so partial telemetry
         # always reaches CSV/plots. _run_gemm_for() already classifies
         # fatal CUDA markers and raises RuntimeError on them.
-        if not args.no_max:
+        if not args.no_max and spec is not None:
             if args.cooldown_c > 0:
                 sampler.set_phase("cooldown_pre_max")
                 wait_for_cooldown(handle, target_c=args.cooldown_c,
@@ -568,7 +629,7 @@ def main() -> int:
                 fatal_error = f"max: {e}"
 
         # --- 3) LEAKAGE -----------------------------------------------------
-        if not args.no_leakage and not fatal_error:
+        if not args.no_leakage and not fatal_error and spec is not None:
             if args.cooldown_c > 0:
                 sampler.set_phase("cooldown_pre_leakage")
                 wait_for_cooldown(handle, target_c=args.cooldown_c,
@@ -707,7 +768,7 @@ def main() -> int:
         # ~15s view compresses into a few pixels.
         plot_leakage_decay_zoomed(samples, cycles_meta, summary,
                                   leakage_enlarged_png,
-                                  x_max=3.0, y_min=0.0, y_max=150.0)
+                                  x_max=3.0, y_min=50.0, y_max=150.0)
     plot_summary_bars(summary, summary_png)
 
     # ---- console report ---------------------------------------------------

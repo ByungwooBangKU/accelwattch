@@ -23,6 +23,7 @@ which is a reasonable compromise.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -263,14 +264,61 @@ def measure_static_power(handle, seconds: float = 5.0, hz: int = 100,
     time.sleep(seconds)
     sampler.stop()
 
-    ps = [s.power_w for s in sampler.samples if s.power_w >= 0]
-    ts = [s.temp_c for s in sampler.samples if s.temp_c >= 0]
+    # ---- P-state filtering ----------------------------------------------
+    # NVIDIA driver hysteresis : after recent kernel activity the GPU
+    # stays in P0 (boost clocks) for tens of seconds even with zero
+    # utilization. nvidia-smi's "idle" reading is P8 (true idle, SM clock
+    # at the floor — H100 ≈ 210 MHz, A100 ≈ 210 MHz). When the script
+    # measures static between phases (or right after CUDA context init
+    # / build_matmul warmup), the early samples are still in P0 and
+    # report 30-50 W higher than the actual cold-idle power.
+    #
+    # Strategy : keep only samples whose sm_mhz indicates the chip has
+    # actually settled into idle clocks. Threshold defaults to 500 MHz
+    # — comfortably above any P8 (~210) and below any meaningful active
+    # state. Override with PSTATE_IDLE_CLOCK_THRESHOLD_MHZ env var.
+    #
+    # Fallbacks :
+    #   * sm_mhz unavailable (older driver / non-CUDA context) → use all
+    #     samples, no filtering possible
+    #   * fewer than 30 % of samples reach P8 within the window → use
+    #     all samples + emit a warning so the operator knows the
+    #     measurement may still be P0-inflated (typical when seconds is
+    #     too short to ride out hysteresis; bump --static-seconds to 30+)
+    p8_threshold = int(os.environ.get("PSTATE_IDLE_CLOCK_THRESHOLD_MHZ", "500"))
+    all_valid = [s for s in sampler.samples if s.power_w >= 0]
+    sm_known  = [s for s in all_valid if s.sm_mhz >= 0]
+    sm_idle   = [s for s in sm_known  if s.sm_mhz < p8_threshold]
+    pstate_filter_note = ""
+    if not all_valid:
+        use_samples = []
+        pstate_filter_note = "no valid samples"
+    elif len(sm_known) < 0.5 * len(all_valid):
+        # Driver isn't reporting sm_mhz reliably — disable the filter.
+        use_samples = all_valid
+        pstate_filter_note = "sm_mhz unavailable; P-state filter disabled"
+    elif len(sm_idle) >= 0.30 * len(sm_known):
+        use_samples = sm_idle
+        pstate_filter_note = (
+            f"P-state filter: kept {len(sm_idle)}/{len(sm_known)} samples "
+            f"with sm_mhz < {p8_threshold} (P8 idle)")
+    else:
+        use_samples = all_valid
+        pstate_filter_note = (
+            f"WARN: only {len(sm_idle)}/{len(sm_known)} samples reached "
+            f"P8 idle (sm_mhz < {p8_threshold}); GPU likely still in P0 "
+            f"due to recent activity. Consider --static-seconds 30+ or "
+            f"`nvidia-smi -rgc` to release boost-state lock. Reading "
+            f"will be inflated by hysteresis.")
+
+    ps = [s.power_w for s in use_samples]
+    ts = [s.temp_c for s in use_samples if s.temp_c >= 0]
     trace = [(s.t, s.power_w, s.temp_c) for s in sampler.samples
              if s.power_w >= 0]
     if not ps:
         return {"power_w_mean": -1.0, "power_w_std": -1.0, "power_w_min": -1.0,
                 "power_w_max": -1.0, "temp_c_mean": -1.0, "n": 0,
-                "samples": []}
+                "samples": [], "pstate_filter_note": pstate_filter_note}
     import statistics as st
     return {
         "power_w_mean": st.fmean(ps),
@@ -283,7 +331,9 @@ def measure_static_power(handle, seconds: float = 5.0, hz: int = 100,
         "duration_s":   seconds,
         "hz":           hz,
         "n":            len(ps),
+        "n_total_samples": len(all_valid),
         "samples":      trace,
+        "pstate_filter_note": pstate_filter_note,
     }
 
 

@@ -477,6 +477,55 @@ l2_hit_0 영역에서는 working set ≫ L2 라 매 pass 가 다시 DRAM 까지 
 
 DRAM 단가는 elementwise + STREAM 으로 보고, matmul 은 compute 효율 (J/FLOP, Tensor-Core gap) 로 분석.
 
+### 3.6 P-state hysteresis 와 cold-idle 측정 (`P_static` / SoC envelope)
+
+NVIDIA driver 는 커널 활동 직후 GPU 를 **P0 (boost clocks)** 에 잡아두고 곧장 P8 (true idle, ~210 MHz) 로 떨어뜨리지 않습니다 — 흔히 30~60 초의 hysteresis. 이 사이 **utilization 0% 인데 clock 은 boost** 인 묘한 상태가 유지되어, "idle" 측정이 nvidia-smi 의 진짜 idle 보다 30~50 W 부풀려질 수 있음. 본 스위트는 두 가지 방어를 적용합니다.
+
+#### (a) `measure_static_power()` 의 자동 sample 필터링 (`power_monitor.py`)
+
+12 초 (또는 `--static-seconds` 만큼) idle 윈도 내의 모든 NVML sample 중 **`sm_mhz < 500 MHz` 인 것만 평균에 사용**. H100 의 P0 (1980 MHz) 와 P8 (210 MHz) 사이 자연 cutoff. 환경변수 `PSTATE_IDLE_CLOCK_THRESHOLD_MHZ` 로 override 가능.
+
+Fallback :
+- **sm_mhz 미보고** (older driver / non-CUDA 컨텍스트) : 필터 비활성, 모든 sample 사용
+- **30% 미만 sample 만 P8 진입** : 필터 비활성 + WARN — `--static-seconds 30+` 권장
+
+콘솔 한 줄 :
+```
+[baseline] static power = 71.5 ± 0.8 W  (min 70.2 W, max 73.4 W, ...)
+[baseline] P-state filter: kept 800/1200 samples with sm_mhz < 500 (P8 idle)
+```
+
+400 sample 이 P0 였는데 필터가 cold-idle 800 sample 만 잡아 정확한 71.5 W (= nvidia-smi 와 일치) 보고. 비활성 시엔 ~115 W 의 P0/P8 평균이 잡혀 모든 dyn 계산이 어긋남.
+
+#### (b) SoC envelope 의 GEMM build deferral
+
+옛 순서 :
+```
+build_matmul()      ← 5× warmup 실행 → P0 진입
+phase_static()      ← 여기서 측정, P-state hysteresis 로 116 W ❌
+phase_max()
+phase_leakage()
+```
+
+새 순서 :
+```
+phase_static()      ← cold idle, 70 W ✓
+build_matmul()      ← 여기서 warmup, max 직전이라 OK
+phase_max()
+phase_leakage()
+```
+
+build cost 자체는 다음 phase 의 warmup 으로 자연 흡수. SoC envelope 의 `static_power_w_mean` 이 nvidia-smi idle 과 ±2 W 이내로 일치.
+
+#### 적용 범위
+
+| 측정 | (a) sm_mhz 필터 | (b) build deferral |
+|---|---|---|
+| Sweep 시작 시 initial baseline | ✓ 자동 | (해당 없음) |
+| `--rebaseline-every` periodic baseline | ✓ 자동 | (해당 없음) |
+| SoC envelope `phase_static` | ✓ (sample 필터는 phase_static 내부엔 없지만, build deferral 로 해결) | ✓ |
+| Per-cell sweep cell | (의도적으로 P0 — 측정 대상이 활성 커널) | (해당 없음) |
+
 ## 4. 측정 방법론
 
 ### 4.1 NVML power telemetry
@@ -1428,7 +1477,7 @@ cd util/gpu_power_bench
 | `_timeseries.csv` | 100 Hz raw (`t`, `power_w`, `temp_c`, `sm_mhz`, `mem_mhz`, `gpu_util`, `phase`) |
 | `_phases.png` | 전체 P(t) + T(t), phase 별 음영, static/max/hot-leak 의 평균 가이드라인 |
 | `_leakage.png` | 5 cycle 의 decay 곡선을 t=0(스트레스 종료) 기준으로 overlay — 누설 감쇠 가시화 |
-| `_leakage_enlarged.png` | 위 plot 의 **첫 3 s × 0–150 W 줌-인**. hot-window (0~`--leak-window-s`) 와 첫 1 초의 급격한 drop 이 압축돼 안 보이는 경우를 위해 동일 데이터 더 촘촘한 ticks 로 (1 s major / 0.25 s minor, 25 W major / 5 W minor) |
+| `_leakage_enlarged.png` | 위 plot 의 **첫 3 s × 50–150 W 줌-인**. hot-window (0~`--leak-window-s`) 와 첫 1 초의 급격한 drop 이 압축돼 안 보이는 경우를 위해 동일 데이터 더 촘촘한 ticks 로 (1 s major / 0.25 s minor, 25 W major / 5 W minor). 우측 y-axis 에 cycle 별 **die 온도** 가 dashed line 으로 overlay (좌 power 와 같은 색 / cycle 1=C0, cycle 2=C1, ...) → "이 leakage power 가 측정된 시점의 silicon 온도" 를 한눈에. y_min=50W 로 idle 영역 잘려 hot-leak 영역 시각 해상도 ↑ |
 | `_summary.png` | static / max-mean / max-peak / hot-leak 막대그래프 + Δ 주석 |
 
 #### 9.6.4 해석 팁
