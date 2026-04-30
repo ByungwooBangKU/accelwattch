@@ -1644,6 +1644,184 @@ def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
             out_dir / f"{stem}_02_cache_regime_fp8.png", gpu)
 
 
+def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
+                              gpu: str) -> bool:
+    """MECE energy breakdown for elementwise ops at l2_hit_0.
+
+    For each (op, dtype) pair where we have BOTH `l2_hit_100` and
+    `l2_hit_0` measurements, decompose the dyn-energy slope at l2_hit_0
+    into three components that are mutually exclusive and collectively
+    exhaustive (MECE) :
+
+        Total          = J(op, dtype, l2_hit_0)
+        ────────────────────────────────────────
+        A) "L2-resident workload"
+           = J(op, fp16, l2_hit_100)
+           Contains : SM compute + L1 / SMEM transit + register-file
+           activity + L2 traffic + kernel launch overhead. NOT further
+           decomposable from NVML measurements alone.
+
+        B) "FP8 cast overhead"  (only when dtype = fp8)
+           = J(op, fp8, l2_hit_100) − J(op, fp16, l2_hit_100)
+           Contains : the extra cost the fp8 emulation path adds on top
+           of fp16 — separate cast kernel launches, fp16 intermediate
+           tensor materialisation, cast-compute itself. Always 0 for
+           fp16 rows by construction.
+
+        C) "DRAM round-trip"
+           = J(op, dtype, l2_hit_0) − J(op, dtype, l2_hit_100)
+           Contains : the marginal cost of streaming the working set
+           through HBM. PR #30's marginal-DRAM technique.
+
+        Identity:  A + B + C  ≡  J(op, dtype, l2_hit_0)
+                   exact algebraic — no double-counting, no missing
+                   piece, hence MECE.
+
+    What we INTENTIONALLY don't try to decompose :
+      * "compute vs L2 vs launch" inside component A — there is no
+        compute-only measurement in the suite (PyTorch does not allow
+        register-resident microbenchmarking), so any further split would
+        be an estimate, not an exact subtraction. Component A stays
+        bundled. The plot's text annotation flags this caveat.
+
+    Plot layout :
+      * One stacked bar per (op, dtype) at l2_hit_0
+      * Three colour-coded layers : resident (green) → cast (orange) →
+        DRAM (red), bottom to top
+      * Bar height equals total pJ/elem; each layer's percentage of
+        total is annotated inline
+      * Title spells out the MECE identity so the reader can verify
+        on the plot itself
+    """
+    if by_regime is None or by_regime.empty:
+        return False
+    ew = by_regime[by_regime["category"] == "elementwise"].copy()
+    if ew.empty:
+        return False
+    ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
+
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
+
+    def _slope(op: str, dtype: str, regime: str):
+        sub = ew[(ew["op"] == op) & (ew["dtype"] == dtype)
+                 & (ew["cache_regime"] == regime)]
+        if sub.empty:
+            return None
+        v = sub[slope_col].iloc[0]
+        if pd.isna(v) or v <= 0:
+            return None
+        return float(v)
+
+    # Build decomposition rows for every (op, dtype) pair that has the
+    # measurements we need. Skip silently when a piece is missing — the
+    # plot just omits that bar rather than confabulating.
+    bars = []
+    for op in sorted(ew["op"].unique()):
+        for dtype in ("fp16", "fp8"):
+            j_self_l2  = _slope(op, dtype, "l2_hit_100")
+            j_self_dr  = _slope(op, dtype, "l2_hit_0")
+            if j_self_l2 is None or j_self_dr is None:
+                continue
+            j_fp16_l2 = _slope(op, "fp16", "l2_hit_100") if dtype == "fp8" else None
+            # Component A — "resident workload" (compute + L2 + launch)
+            # For fp16 : just j_self_l2.
+            # For fp8 : the fp16 baseline of the same op (so cast overhead
+            # is attributed cleanly to component B).
+            if dtype == "fp8":
+                if j_fp16_l2 is None:
+                    # Without an fp16 baseline we can't separate cast
+                    # cleanly — skip rather than misattribute.
+                    continue
+                A = j_fp16_l2
+                B = j_self_l2 - j_fp16_l2     # cast overhead
+            else:
+                A = j_self_l2
+                B = 0.0
+            C = j_self_dr - j_self_l2          # DRAM round-trip
+            total = A + B + C                  # = j_self_dr  (identity)
+            bars.append({
+                "label": f"{op}_{dtype}",
+                "op":    op,
+                "dtype": dtype,
+                "A":     A,
+                "B":     B,
+                "C":     C,
+                "total": total,
+                "j_self_dr": j_self_dr,         # for sanity check
+            })
+    if not bars:
+        return False
+
+    plt = _get_mpl()
+    fig, ax = plt.subplots(figsize=(max(12, 1.4 * len(bars) + 4), 7.5))
+    xs = np.arange(len(bars))
+
+    A_vals = [b["A"] * 1e12 for b in bars]
+    B_vals = [b["B"] * 1e12 for b in bars]
+    C_vals = [b["C"] * 1e12 for b in bars]
+
+    ax.bar(xs, A_vals, color="#2ca02c", edgecolor="white",
+           label="A) L2-resident workload\n(compute + L2 + launch)")
+    ax.bar(xs, B_vals, bottom=A_vals, color="#ff7f0e", edgecolor="white",
+           label="B) FP8 cast overhead\n(cast-compute-cast)")
+    A_plus_B = [a + b for a, b in zip(A_vals, B_vals)]
+    ax.bar(xs, C_vals, bottom=A_plus_B, color="#d62728", edgecolor="white",
+           label="C) DRAM round-trip\n(marginal HBM cost)")
+
+    # Per-bar annotations : total + percent breakdown
+    for i, b in enumerate(bars):
+        total_pj = b["total"] * 1e12
+        a_pct = 100.0 * b["A"] / b["total"] if b["total"] > 0 else 0
+        b_pct = 100.0 * b["B"] / b["total"] if b["total"] > 0 else 0
+        c_pct = 100.0 * b["C"] / b["total"] if b["total"] > 0 else 0
+        # Total label sits above the stack
+        ax.text(xs[i], total_pj * 1.02,
+                f"{total_pj:,.0f} pJ/elem",
+                ha="center", va="bottom", fontsize=9, fontweight="bold")
+        # Inline percent labels — only when slice is wide enough to be readable
+        if a_pct > 5:
+            ax.text(xs[i], A_vals[i] / 2, f"A: {a_pct:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white",
+                    fontweight="bold")
+        if b_pct > 5:
+            ax.text(xs[i], A_vals[i] + B_vals[i] / 2,
+                    f"B: {b_pct:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white",
+                    fontweight="bold")
+        if c_pct > 5:
+            ax.text(xs[i], A_vals[i] + B_vals[i] + C_vals[i] / 2,
+                    f"C: {c_pct:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white",
+                    fontweight="bold")
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels([b["label"] for b in bars], rotation=20, ha="right",
+                       fontsize=10)
+    ax.set_ylabel("pJ / element  (dynamic, at l2_hit_0)", fontsize=11)
+    ax.set_title(
+        f"MECE energy decomposition — elementwise @ l2_hit_0 — {gpu}\n"
+        "A + B + C  ≡  J(op, dtype, l2_hit_0)   (algebraic identity → no overlap, no missing piece)\n"
+        "A = J(op, fp16, l2_hit_100) ;  B = J(op, fp8, l2_hit_100) − J(op, fp16, l2_hit_100) ;  "
+        "C = J(op, dtype, l2_hit_0) − J(op, dtype, l2_hit_100)",
+        fontsize=10)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(loc="upper left", fontsize=9, ncol=1, bbox_to_anchor=(1.01, 1.0))
+
+    # Caveat box — A is bundled because PyTorch can't isolate compute
+    fig.text(
+        0.5, -0.02,
+        "Note : component A (resident workload) bundles compute + L2 "
+        "transit + kernel-launch overhead because no NVML measurement "
+        "in this suite isolates pure compute. Further breakdown of A "
+        "would require an estimate (e.g. FLOP × J_per_FLOP_reference), "
+        "which is NOT MECE — it intentionally remains a single bucket.",
+        ha="center", fontsize=8, color="#444444", wrap=True,
+        bbox=dict(facecolor="#f0f0f0", edgecolor="#bbbbbb", pad=4))
+
+    _save_fig(fig, out_png)
+    return True
+
+
 def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
     """LLM-shape matmul energy per preset as a function of token count T (= M).
 
@@ -2377,6 +2555,12 @@ def main() -> int:
     # PR #55) always shows emulated rows, regardless of --include-emulated.
     plot_cache_regime(plot_df, plot_by_regime, out_dir, stem, gpu,
                       by_regime_unfiltered=by_regime)
+    # MECE energy decomposition — break dyn_energy at l2_hit_0 into
+    # resident workload / fp8 cast overhead / DRAM round-trip. Uses the
+    # UNFILTERED by_regime so fp8 rows participate.
+    plot_energy_decomposition(
+        by_regime,
+        out_dir / f"{stem}_03_energy_decomposition_mece.png", gpu)
     # DRAM-bandwidth energy — 2 separate PNGs (pJ/bit strip + sustained BW).
     plot_dram_energy(plot_df, out_dir, stem, gpu)
     # DRAM read/write split (only fires when stream_read / stream_write
