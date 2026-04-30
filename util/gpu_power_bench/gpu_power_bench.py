@@ -393,6 +393,9 @@ def main() -> int:
                     help="short sweep for smoke-testing")
     ap.add_argument("--window-ms", type=float, default=3000.0,
                     help="target measurement window per cell (ms). Longer = lower NVML noise; "
+                         "for the energy-decomposition workflow (MECE plot in analyze.py), "
+                         "6000+ is recommended because the small-cell numbers it subtracts "
+                         "between are most exposed to the ±5..10 W NVML noise floor. "
                          "3000 ms gives ≈60 power samples per cell at 20 Hz NVML update rate.")
     ap.add_argument("--static-seconds", type=float, default=12.0,
                     help="idle time to measure static/baseline power")

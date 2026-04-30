@@ -1321,6 +1321,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_02_dram_energy_marginal.png`             | direct vs marginal pJ/bit (l2_hit_0 − l2_hit_100) — DRAM-stack 만 |
 | `<stem>_dram_rw_split.csv`                       | (--dram-bw-test 시) per (dtype, op) read/write/mixed pJ/bit 표 |
 | `<stem>_dram_marginal.csv`                       | per (op, dtype) direct vs marginal pJ/bit 표 |
+| **`<stem>_03_energy_decomposition_mece.png`**    | **MECE 분해** — 각 (op, dtype) 의 dyn_energy @ l2_hit_0 을 3 components 로 stacked bar : (A) L2-resident workload (compute + L2 + launch — 통째로) + (B) FP8 cast overhead + (C) DRAM round-trip. **A + B + C ≡ 측정 total** (algebraic identity → MECE). softmax_fp8 의 1940 pJ/elem 이 어디로 가는지 정량적으로 분리. measurement noise 영향 줄이려면 `--window-ms 6000` 권장 (작은 cell 끼리 빼는 연산이 noise floor 에 가장 민감) |
 | `<stem>_03_baseline_static_power.png`            | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
 | `<stem>_04_thermal_diagnostics.png`              | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
 | `<stem>_05_trace_timeline.png`                   | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
