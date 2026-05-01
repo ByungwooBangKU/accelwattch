@@ -245,4 +245,166 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
-(continued — §7 Gap analysis, §8 Recommendations)
+## §7 — Gap Analysis
+
+본 suite 가 GPU 에너지를 component 로 분리할 때 **빠진 부분 / 비-MECE 부분 / 개선 가능한 부분** 을 정리. 각 gap 에 대해 *NVML 한계인지* / *implementation 부재인지* 구분.
+
+### G1. L1 / SMEM / register file 분리   *(NVML fundamental limit)*
+
+**현황** : Component A "L2-resident workload" 가 compute + L1 + SMEM + register + L2 + launch overhead 를 통째로 묶음.
+
+**왜 못 하나** : NVML 의 power 텔레메트리는 board-level 만 제공. 칩 내부 cache layer 별 transit power 는 hardware 가 표면화 안 함. PyTorch / cuBLAS 가 register-resident microbench 허용 안 함 (compile-out 됨).
+
+**우회 방법** :
+- Nsight Compute 의 metric `lts__t_sectors.sum` (L2 traffic) + `l1tex__data_bank_reads.sum` (L1 traffic) 를 별도로 sample 후 J/transaction 가정값 곱셈 → estimate 가능. instrumentation 이 power 를 ±10-20% 왜곡하므로 *교차 검증용* 만 권장.
+
+**Severity** : 정직한 한계 — 본 suite 의 caveat box / README §3.5.3 에서 명시. Severity ≈ 0 (사용자 오해 가능성 낮음).
+
+---
+
+### G2. Pure compute energy isolation   *(NVML + framework limit)*
+
+**현황** : 가장 단순한 op 인 `mul fp16 @ l2_hit_100` 도 compute + 작은 memory 를 항상 같이 측정.
+
+**왜 못 하나** : *zero-memory-traffic* kernel 이 PyTorch 에 없음. CUDA C++ 로 register-only computation kernel 직접 작성하면 가능 (e.g., `for i in range(1000): r += a*b`) 하지만 본 suite 는 PyTorch 만 사용.
+
+**우회 방법** : matmul fp16_TC 의 J/FLOP (0.6 pJ/FLOP) 를 "TC operation 단가" reference 로 사용 — tile reuse 로 memory 비용 amortized, 거의 pure compute. 단, 어디까지나 *근사*.
+
+**Severity** : Component A 의 sub-decomposition 으로만 의미. 현재 suite 의 MECE 정의 안에선 *의도적으로* 안 함.
+
+---
+
+### G3. Per-K k_op 변동 (matmul Tensor Core efficiency curve)   *(implementation gap)*
+
+**현황** : matmul k_op 가 K range 전체에 single slope 으로 fit. 그런데 Hopper FP8 의 Tensor Core 효율은 K 에 따라 변동 (sweet spot K ≥ 8192).
+
+**왜 implementation gap 인가** : measurement 데이터는 있음 (각 K cell 별 J/FLOP). 단지 slope 가 K 평균이라 효율 curve 정보가 사라짐.
+
+**우회 방법** : 현재 `_01_powermodel_linearity_matmul.png` 의 log-log scatter 에서 **per-K J/FLOP annotation 가시** — 실제론 K 마다 J/FLOP 가 다른 게 보임. summary CSV 에 single slope 만 들어감.
+
+**P1 권장** : per-K k_op 컬럼 추가 또는 piecewise fit (K bin 별 slope).
+
+---
+
+### G4. Matmul MECE decomposition 미구현   *(implementation gap)*
+
+**현황** : `plot_energy_decomposition()` 는 elementwise 만 처리. matmul 의 analogous 분해 미실시.
+
+**왜 implementation gap 인가** : matmul 도 동일 framework 적용 가능 :
+- A: register-resident GEMM tile (compute + SMEM + register) = J(matmul, fp16, l2_hit_100)
+- B: fp8_te scaling/cast overhead = J(matmul, fp8, l2_hit_100) − J(matmul, fp16, l2_hit_100)
+- C: DRAM round-trip = J(matmul, dtype, l2_hit_0) − J(matmul, dtype, l2_hit_100)
+
+문제 — matmul 의 cache regime 분류는 logical working set 기반이라 부정확 (tile reuse). 그래서 elementwise 만큼 의미 큰지 *의문*. README §3.5.3 의 "matmul 은 marginal-DRAM plot 에서 의도적 제외" 와 같은 이유.
+
+**P2 권장** : matmul decomposition 시도하되 caveat 명확히 (working-set 기반 regime 이 부정확 → C 항이 noisy).
+
+---
+
+### G5. Cache hit rate heuristic vs 실측   *(NVML limit, intentional)*
+
+**현황** : `l2_hit_100..l2_hit_0` 는 working_set / L2 ratio 로 *추정* 한 라벨. 실제 `l2_tex_hit_rate.pct` 는 측정 안 함.
+
+**왜 intentional** : Nsight Compute instrumentation 이 ~30% 커널 slowdown + power 왜곡 → 측정 quality 저하. trade-off 끝에 heuristic 채택.
+
+**Severity** : README §A.4 에서 명시. AccelWattch 의 cache 항도 보통 working-set ratio 로 모델링하므로 호환.
+
+---
+
+### G6. SoC leakage 가 sweep 의 dyn_energy 보정에 자동 입력 안 됨   *(integration gap)*
+
+**현황** :
+- SoC envelope 의 `leakage_minus_static_w` 는 `_soc_summary.csv` 에 저장.
+- Sweep 의 per-cell `dyn_energy_j = E_total − P_static_cold × wall_s` 는 cold idle 만 사용.
+- 실제로 sweep cell 이 가동 중이면 silicon 이 hot → leakage 가 cold 보다 ~30 W 높음. 이 만큼 `dyn` 이 *과대* 추정.
+
+**왜 implementation gap** : 데이터는 둘 다 있음. analyze.py 가 SoC summary 의 `leakage_minus_static_w` 를 sweep 의 cell 별 `peak_temp_c` 와 결합해 thermal-corrected `dyn_energy_j` 컬럼 추가하면 됨. 미구현.
+
+**P1 권장** : `analyze.py` 에 `add_thermal_correction()` helper — sweep CSV 의 `dyn_energy_j` 와 SoC `leakage_minus_static_w` 를 결합해 `dyn_energy_j_thermal_corrected` 컬럼 derive.
+
+---
+
+### G7. Leakage(T) curve 를 단일 hot point 로만 측정   *(measurement gap)*
+
+**현황** : SoC envelope 가 T_cold + T_hot 두 점만 측정. 사이의 leakage(T) curve 는 plot (decay 곡선) 에 *시각화* 만 됨, fit 안 됨.
+
+**왜 implementation gap** : `_soc_timeseries.csv` 에 decay 의 모든 (T, P) 쌍이 들어있음. exponential `P(T) = P_static + α·exp(β·T)` fit 하면 Arrhenius-style leakage model 추출 가능.
+
+**P2 권장** : `analyze_soc_thermal()` 추가 — decay 곡선에서 leakage(T) 모델 fit + parameters CSV.
+
+---
+
+### G8. P_static drift 가 thermal 인지 단순 noise 인지 구분 부족   *(analysis gap)*
+
+**현황** : `_rebaseline.csv` 가 P_static(t) trace 보존. plot 도 그려짐. 하지만 drift 의 *원인 분류* (thermal warm-up vs random noise vs background process) 를 자동으로 안 함.
+
+**왜 implementation gap** : `_rebaseline.csv` + `peak_temp_c` 결합하면 drift vs temperature 상관관계 시각화 가능. 미실시.
+
+**P2 권장** : `_03_baseline_static_power.png` 에 P_static drift vs avg_temp_c scatter panel 추가.
+
+---
+
+### G9. multi-GPU variance 분석 깊이 제한적   *(implementation gap)*
+
+**현황** : `multi_gpu_analysis.py` 가 cross-GPU variance 측정. 하지만 *왜* variance 가 큰지 (silicon, thermal coupling, cooling asymmetry) 자동 분류 안 함.
+
+**P3 권장** : 옵션 — variance 가 높은 variant 에 대해 "thermal vs silicon" 분리 진단 (e.g., variance 가 sequential 모드에서도 큼 → silicon, parallel 에서만 큼 → thermal coupling).
+
+---
+
+### G10. Real workload (full-model inference) 단위 측정 없음   *(scope gap)*
+
+**현황** : per-op k_op 추출 + LLM-shape per-layer matmul 까지 측정. 그런데 **full Transformer 1 step 의 절대 J** 는 직접 측정 안 함.
+
+**왜 scope gap** : analytical model `Σ k_op · N_op` 로 합산할 수는 있지만 실측과 비교가 불가능 — 본 suite 의 명시적 scope 가 *power model 계수 추출* 이지 *모델 검증* 이 아님.
+
+**P3 권장** (optional) : 실제 model inference (e.g., `transformers` 라이브러리의 LLaMA-7B forward) 를 한 step 돌려 J 측정 → analytical 합산값 vs 실측 비교 plot. AccelWattch 의 validation 단계.
+
+---
+
+## §8 — Prioritised Recommendations
+
+각 gap 에 대해 priority 매김.
+
+| Priority | 의미 |
+|---|---|
+| **P0** | 잘못된 attribution 위험. 즉시 처리. |
+| **P1** | 분석 강도 ↑, 측정 데이터는 이미 있음. 수일 작업. |
+| **P2** | 새 measurement 또는 비-trivial implementation. 의미 큼. |
+| **P3** | nice-to-have. 시간 여유 있을 때. |
+
+### P0 — Required Fixes
+
+| # | gap | 권장 작업 | 작업량 |
+|---|---|---|---|
+| **P0.1** | (없음 — 모든 critical attribution 은 이미 정상) | — | — |
+
+> 본 review 에서 P0 critical issue 는 발견되지 않음. 발견된 모든 gap 은 (a) NVML 의 fundamental limit 으로 정직하게 인정되거나 (b) implementation gap 이지만 분석 강도 향상에 해당, 즉시 위험 없음.
+
+### P1 — High-Value Implementation Gaps
+
+| # | gap | 권장 작업 | 작업량 |
+|---|---|---|---|
+| **P1.1** | G6: SoC leakage → sweep dyn 자동 보정 | `analyze.py` 에 `add_thermal_correction()` helper. 새 컬럼 `dyn_energy_j_thermal_corrected`. | ~1 일 |
+| **P1.2** | G3: matmul per-K k_op | `_fit_one_group()` 옵션으로 piecewise fit. summary CSV 에 `slope_per_K` array 컬럼 또는 K-bin 별 row. | ~1 일 |
+| **P1.3** | (Doc) G1+G2+G5 가 한 곳 모인 "Limitations" 섹션 | README 에 §X "What this suite cannot decompose" 추가. 기존 산재한 한계 표시 통합. | 0.5 일 |
+
+### P2 — Optional Enhancements
+
+| # | gap | 권장 작업 | 작업량 |
+|---|---|---|---|
+| **P2.1** | G4: matmul MECE decomposition | `plot_energy_decomposition()` 의 matmul 변종. caveat 명시 (regime classifier 부정확). | ~1 일 |
+| **P2.2** | G7: leakage(T) curve fit | `_soc_timeseries.csv` decay 구간에서 exponential fit. parameters → CSV. | ~1.5 일 |
+| **P2.3** | G8: P_static drift correlation | baseline plot 에 drift vs avg_temp scatter panel. | 0.5 일 |
+
+### P3 — Nice-to-have
+
+| # | gap | 권장 작업 | 작업량 |
+|---|---|---|---|
+| **P3.1** | G9: variance 원인 분류 | `multi_gpu_analysis.py` 에 sequential vs parallel 비교 자동 진단. | ~2 일 |
+| **P3.2** | G10: full-model 실측 vs 합산 비교 | 새 script `validate_model.py` — LLaMA-7B forward 측정 → 합산값 비교. | ~3 일 |
+| **P3.3** | Nsight Compute 교차 검증 옵션 | optional `--ncu-validate` flag — Nsight metric 으로 cache hit rate / sm__inst_executed 측정 후 우리 heuristic 과 비교. | ~3 일 |
+
+---
+
+(continued — §9 Summary table + close)
