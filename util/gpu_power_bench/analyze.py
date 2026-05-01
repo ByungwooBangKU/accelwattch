@@ -922,8 +922,21 @@ def _save_fig(fig, out_png: Path, dpi: int = 160) -> None:
     """
     import warnings
     with warnings.catch_warnings():
+        # Two distinct matplotlib warnings can fire when a plot intentionally
+        # uses out-of-axes text (caveat boxes) or a `bbox_to_anchor` legend :
+        #   1. "Tight layout not applied. ..."           (older matplotlib)
+        #   2. "This figure includes Axes that are not  (newer matplotlib)
+        #       compatible with tight_layout, so results
+        #       might be incorrect."
+        # Both are advisory ; bbox_inches="tight" + our explicit gridspec
+        # already lay things out correctly. Silence both so the console
+        # log stays readable.
         warnings.filterwarnings("ignore",
                                 message=r"Tight layout not applied")
+        warnings.filterwarnings("ignore",
+                                message=r"This figure includes Axes that are not.*tight_layout")
+        warnings.filterwarnings("ignore", category=UserWarning,
+                                module=r"matplotlib\.figure")
         try:
             fig.tight_layout()
         except Exception:
@@ -2156,14 +2169,13 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
 
     plt = _get_mpl()
     # 2-row layout : main chart on top, caveat box on its own row below.
-    # Reserves a dedicated chunk of the figure for the caveat so it's
-    # never clipped by tight_layout / bbox_inches gymnastics. Also
-    # taller than before (was 7.5 in.) so segments at the bottom of the
-    # stack remain visible even when one component is 99 % of total.
+    # hspace + height_ratios chosen so x-tick labels never touch the
+    # caveat box. Total height 9 in (was 11) — bbox_inches="tight" in
+    # _save_fig crops empty space below the caveat.
     fig, (ax, ax_caveat) = plt.subplots(
         2, 1,
-        figsize=(max(13, 1.6 * len(bars) + 5), 11),
-        gridspec_kw={"height_ratios": [9, 1.2], "hspace": 0.05})
+        figsize=(max(13, 1.6 * len(bars) + 5), 9.0),
+        gridspec_kw={"height_ratios": [9, 1.6], "hspace": 0.32})
     ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
@@ -2262,7 +2274,14 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         "C = J(op, dtype, l2_hit_0) − J(op, dtype, l2_hit_100)",
         fontsize=10)
     ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(loc="upper left", fontsize=9, ncol=1, bbox_to_anchor=(1.01, 1.0))
+    # Legend ordering : reverse so that the TOP entry of the legend
+    # corresponds to the TOP segment of the stacked bar (C → B → A).
+    # Default matplotlib order is insertion order (A → B → C), which
+    # reads the opposite way from the visual stack.
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles[::-1], labels[::-1],
+              loc="upper left", fontsize=9, ncol=1,
+              bbox_to_anchor=(1.01, 1.0))
 
     # Caveat row — guaranteed visible because it lives in its own subplot.
     ax_caveat.text(
@@ -2554,7 +2573,11 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
         "Identity (per variant) :  A + B + C ≡ J(variant, l2_hit_0)   ← MECE",
         fontsize=10)
     ax.grid(True, axis="y", alpha=0.3, which="both")
-    ax.legend(loc="upper right", fontsize=9, ncol=1, bbox_to_anchor=(1.01, 1.0))
+    # Reverse legend so top entry = top of stack (C → B → A).
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles[::-1], labels[::-1],
+              loc="upper left", fontsize=9, ncol=1,
+              bbox_to_anchor=(1.01, 1.0))
 
     # Caveat row — guaranteed visible because it lives in its own subplot.
     ax_caveat.text(
