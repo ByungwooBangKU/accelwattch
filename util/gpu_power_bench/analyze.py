@@ -989,7 +989,11 @@ def _coef_bar_elementwise(ew, out_png: Path, gpu: str) -> bool:
     ax.set_ylabel("J / element (dynamic)  — regression slope")
     if all_positive:
         ax.set_yscale("log")
-        ax.set_ylim(min(all_positive) * 0.3, max(all_positive) * 4)
+        # Headroom 1.6× on log scale ≈ 20% of a decade — enough room for
+        # the per-bar "X pJ/elem  R²=…" annotation without leaving most
+        # of the chart blank above the tallest bar (was 4×, complaint
+        # was that y-axis went to 262922 pJ when max bar was ~65k).
+        ax.set_ylim(min(all_positive) * 0.4, max(all_positive) * 1.6)
     ax.legend(); ax.grid(True, axis="y", alpha=0.3)
     # Detect whether the source is the l2_hit_0 regime (preferred path)
     # or the cross-regime summary (fallback when by_regime not present).
@@ -1077,7 +1081,7 @@ def _coef_bar_matmul(mm, out_png: Path, gpu: str) -> bool:
     positive = [float(v) for v in slope_vals if pd.notna(v) and float(v) > 0]
     if positive:
         ax.set_yscale("log")
-        ax.set_ylim(min(positive) * 0.3, max(positive) * 4)
+        ax.set_ylim(min(positive) * 0.4, max(positive) * 1.6)
     ax.grid(True, axis="y", alpha=0.3)
     title = ("Matmul — per-variant energy coefficient. "
              "Labels: slope (pJ/FLOP) + R²")
@@ -2388,13 +2392,15 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
         return False
 
     plt = _get_mpl()
-    # 2-row layout : main chart + dedicated caveat row at the bottom so
-    # the warning box is always visible (was previously fig.text below
-    # the figure boundary, which clipped on tight bbox layouts).
+    # 2-row layout : main chart + dedicated caveat row. hspace is wide
+    # enough that x-tick labels don't kiss the caveat box ; height_ratios
+    # 9:1.6 keeps the caveat readable but compact. Total figure height
+    # 9 in (was 11) — bbox_inches="tight" in _save_fig crops empty space
+    # below the caveat so the saved PNG isn't dominated by whitespace.
     fig, (ax, ax_caveat) = plt.subplots(
         2, 1,
-        figsize=(max(12, 1.8 * len(bars) + 5), 11),
-        gridspec_kw={"height_ratios": [9, 1.2], "hspace": 0.05})
+        figsize=(max(12, 1.8 * len(bars) + 5), 9.0),
+        gridspec_kw={"height_ratios": [9, 1.6], "hspace": 0.32})
     ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
@@ -2529,6 +2535,15 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=10)
     ax.set_ylabel("pJ / FLOP   (dynamic, at l2_hit_0)", fontsize=11)
     ax.set_yscale("log")
+    # Explicit ylim — the "Σ = X pJ/FLOP" labels above each bar otherwise
+    # push matplotlib's auto-ylim by a full extra decade, leaving most of
+    # the chart blank above the tallest bar. 1.5× cap on log scale gives
+    # the labels enough room without wasting half the canvas.
+    if T_vals:
+        positive_T = [v for v in T_vals if v > 0]
+        positive_min = [v for v in (A_vals + C_vals) if v > 0]
+        if positive_T and positive_min:
+            ax.set_ylim(min(positive_min) * 0.5, max(positive_T) * 1.5)
     ax.set_title(
         f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
         "fp8_te uses 3 components (A: fp16 baseline, B: cast/emulation "
@@ -2756,49 +2771,104 @@ def plot_attention_decomposition(decomp_df: pd.DataFrame, df: pd.DataFrame,
     if sm.empty:
         return False
     plt = _get_mpl()
+    # Wider figure to accommodate the legend OUTSIDE the axes (right side).
     fig, (ax, ax_caveat) = plt.subplots(
-        2, 1, figsize=(max(8, 2.5 * len(sm) + 3), 9),
-        gridspec_kw={"height_ratios": [9, 1.2], "hspace": 0.05})
+        2, 1, figsize=(max(11, 2.5 * len(sm) + 6), 8.5),
+        gridspec_kw={"height_ratios": [9, 1.2], "hspace": 0.22})
     ax_caveat.set_axis_off()
 
     xs = np.arange(len(sm))
     # mJ / call so the numbers are readable (typical attention call ≈ 1..50 mJ)
-    qkv_vals = (sm["j_per_call_baseline"].values) * 1e3
-    sm_vals  = (sm["j_per_call_residual"].values) * 1e3
-    full_vals = (sm["j_per_call_full"].values) * 1e3
+    qkv_vals  = (sm["j_per_call_baseline"].values) * 1e3
+    sm_vals   = (sm["j_per_call_residual"].values) * 1e3
+    full_vals = (sm["j_per_call_full"].values)     * 1e3
 
-    ax.bar(xs, qkv_vals, color="#1f77b4", edgecolor="white",
-           label="QKᵀ + (QKᵀ)V matmuls (no softmax)")
-    # Softmax residual : if negative (rare — would indicate flash is
-    # cheaper than separate matmuls), render as a red-border bar so it's
-    # visually obvious.
-    sm_colors = ["#ff7f0e" if v >= 0 else "#d62728" for v in sm_vals]
-    ax.bar(xs, np.abs(sm_vals), bottom=qkv_vals, color=sm_colors, edgecolor="white",
-           label="softmax-residual = J(flash) − J(QKᵀ+QKV)")
-    # Total label on top
-    for i, (q, s, t) in enumerate(zip(qkv_vals, sm_vals, full_vals)):
-        ax.text(xs[i], q + abs(s),
-                f"flash total\n{t:.2f} mJ", ha="center", va="bottom",
-                fontsize=9, fontweight="bold")
-        if abs(s) > 1e-9:
-            pct = 100.0 * s / t if t > 0 else 0
-            ax.text(xs[i], q + abs(s) / 2, f"softmax\n{s:+.2f} mJ\n({pct:+.1f}%)",
-                    ha="center", va="center", fontsize=8, color="white",
+    # Decomposition rendering depends on the SIGN of the residual :
+    #
+    #   residual ≥ 0  → flash total = matmul-baseline + softmax-residual
+    #                   (decomposable stacked bar — the textbook case)
+    #
+    #   residual < 0  → flash total < matmul-baseline (i.e. the FUSED kernel
+    #                   is more efficient than the 2-call matmul baseline,
+    #                   even before adding softmax). NOT decomposable as a
+    #                   stack — would be misleading. Instead we render the
+    #                   ACTUAL flash bar and a horizontal reference line at
+    #                   matmul-baseline height with a "saves X mJ" tag.
+    #
+    # Either way the visible bar height = ACTUAL fused flash energy, so
+    # cross-bar comparison stays honest.
+    for i in range(len(sm)):
+        q, s, t = qkv_vals[i], sm_vals[i], full_vals[i]
+        if s >= 0:
+            # textbook stacked decomposition
+            ax.bar(xs[i], q, color="#1f77b4", edgecolor="white", alpha=0.85,
+                   label=("matmul-baseline (Q@Kᵀ + (Q@Kᵀ)V)"
+                          if i == 0 else None))
+            ax.bar(xs[i], s, bottom=q, color="#ff7f0e", edgecolor="white",
+                   alpha=0.85,
+                   label=("softmax-residual = J(flash) − J(matmul-baseline)"
+                          if i == 0 else None))
+            # total label
+            ax.text(xs[i], t * 1.02, f"flash = {t:.2f} mJ",
+                    ha="center", va="bottom", fontsize=9, fontweight="bold")
+            # in-bar
+            if q / max(t, 1e-9) > 0.08:
+                ax.text(xs[i], q / 2, f"matmul\n{q:.2f} mJ\n({100*q/t:.0f}%)",
+                        ha="center", va="center", fontsize=8, color="white",
+                        fontweight="bold", linespacing=1.1)
+            if s / max(t, 1e-9) > 0.05:
+                ax.text(xs[i], q + s / 2, f"softmax\n+{s:.2f} mJ\n({100*s/t:.0f}%)",
+                        ha="center", va="center", fontsize=8, color="white",
+                        fontweight="bold", linespacing=1.1)
+        else:
+            # Flash beats separate matmul-pair → not decomposable as a stack.
+            # Show ACTUAL flash bar in green, plus dashed reference line at
+            # matmul-baseline height with a "savings" annotation.
+            ax.bar(xs[i], t, color="#2ca02c", edgecolor="white", alpha=0.85,
+                   label=("flash total (more efficient than the matmul-pair)"
+                          if (i == 0 or sm_vals[:i].min() >= 0) else None))
+            # reference line at matmul-baseline
+            ax.hlines(q, xs[i] - 0.4, xs[i] + 0.4,
+                      colors="#1f77b4", linestyles="--", linewidth=1.5,
+                      label=("matmul-baseline reference (sum of separate matmul-pair)"
+                             if (i == 0 or sm_vals[:i].min() >= 0) else None))
+            # in-bar : flash total
+            ax.text(xs[i], t / 2, f"flash\n{t:.2f} mJ",
+                    ha="center", va="center", fontsize=9, color="white",
                     fontweight="bold", linespacing=1.1)
-        ax.text(xs[i], q / 2, f"matmul\n{q:.2f} mJ\n({100*q/t:.1f}%)",
-                ha="center", va="center", fontsize=8, color="white",
-                fontweight="bold", linespacing=1.1)
+            # baseline label above the dashed line
+            ax.text(xs[i], q * 1.02, f"matmul-baseline = {q:.2f} mJ",
+                    ha="center", va="bottom", fontsize=8, color="#1f77b4",
+                    fontweight="bold")
+            # "savings" annotation between bar top and reference line
+            saved_mJ = q - t
+            saved_pct = 100.0 * saved_mJ / q if q > 0 else 0
+            ax.annotate(
+                f"flash saves\n{saved_mJ:.2f} mJ\n({saved_pct:.1f}% of baseline)",
+                xy=(xs[i] + 0.1, (t + q) / 2),
+                xytext=(15, 0), textcoords="offset points",
+                fontsize=8, ha="left", va="center", color="#2ca02c",
+                fontweight="bold", linespacing=1.1,
+                arrowprops=dict(arrowstyle="-", color="#2ca02c",
+                                lw=0.8, alpha=0.8),
+                bbox=dict(facecolor="#e6f4ea", edgecolor="#2ca02c", pad=3))
 
     labels = [f"{r['dtype']}\n{r.get('shape_full', '')}"
               for _, r in sm.iterrows()]
     ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=9)
     ax.set_ylabel("Energy per attention call  (mJ)")
     ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(loc="upper right", fontsize=9)
+    # Headroom for the "flash = X mJ" label above each bar.
+    visible_max = float(max(np.max(full_vals), np.max(qkv_vals)))
+    ax.set_ylim(0, visible_max * 1.18)
+    # Legend OUTSIDE the axes (right side) so it never covers data.
+    ax.legend(loc="upper left", fontsize=9, bbox_to_anchor=(1.01, 1.0),
+              borderaxespad=0.0, frameon=True)
     ax.set_title(
-        f"MECE attention decomposition (G11 / P1.4) — {gpu}\n"
-        f"flash kernel total = matmuls + softmax-residual.   "
-        f"softmax-residual ⊃ {{ online streaming softmax + scale + masking + rescale }}.",
+        f"Attention decomposition (G11 / P1.4) — {gpu}\n"
+        f"residual ≥ 0  →  stacked bar : matmul-baseline + softmax-residual.   "
+        f"residual < 0  →  flash beats baseline ; bar height = actual flash, "
+        f"dashed line = matmul-baseline reference.",
         fontsize=10)
 
     ax_caveat.text(
@@ -2807,10 +2877,10 @@ def plot_attention_decomposition(decomp_df: pd.DataFrame, df: pd.DataFrame,
         "(Q@Kᵀ)@V using `torch.matmul` — NOT a fused matmul-pair. The "
         "kernel-launch + intermediate-write overhead of the 2-call "
         "baseline is therefore PRESENT in the baseline but ABSENT in the "
-        "fused flash kernel. softmax-residual = J_flash − J_baseline "
-        "thus UNDER-estimates the true softmax cost by that overhead. "
-        "Magnitude is small relative to matmul cost on N≥512 but worth "
-        "knowing. README §3.7.6 / TestCases A.5.",
+        "fused flash kernel. When residual is NEGATIVE this overhead "
+        "exceeds the streaming-softmax cost — the 'savings' you see are "
+        "really 'matmul-pair launch overhead − fused softmax cost', not a "
+        "lower bound on softmax energy. README §3.7.6 / TestCases A.5.",
         ha="center", va="center", fontsize=9, color="#333", wrap=True,
         bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
     _save_fig(fig, out_png)
