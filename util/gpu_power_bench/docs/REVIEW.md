@@ -407,4 +407,80 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
-(continued — §9 Summary table + close)
+## §9 — Summary Table : AccelWattch Power Model Coverage
+
+본 suite 가 AccelWattch-style power model 의 각 항을 *실측으로* 채울 수 있는지 매핑.
+
+### 9.1 Model 항 ↔ Suite 측정 매핑
+
+| AccelWattch 항 | 의미 | Suite 의 해당 측정 | 산출 | 평가 |
+|---|---|---|---|---|
+| **`P_static`** | board idle leakage + uncore | `measure_static_power()` (cold idle, P-state filtered) | `_baseline_stats.csv`, `_03_baseline_static_power.png` | ✓ |
+| **`P_static(T)` thermal model** | 온도 의존 leakage 항 | SoC envelope `phase_leakage` + 5-cycle hot Δ | `leakage_minus_static_w` in soc summary | ✓ (단일 hot point — fit 미실시 → P2.2) |
+| **`k_op` per (op, dtype, regime)** | per-element / per-FLOP 동적 에너지 | `summarize_by_regime()` WLS fit + bootstrap CI | `_summary_by_regime.csv`, `_01_powermodel_coef_bar_*.png` | ✓ |
+| **CUDA core vs Tensor Core gap** | compute path 효율 차 | 5 matmul variants 동시 측정 | bar plot 의 fp32_simt vs *_tc 비교 | ✓ |
+| **dtype 별 compute 단가** | fp32 / tf32 / fp16 / bf16 / fp8 의 J/FLOP | matmul variants × K-sweep | per-variant slope_dyn_wls | ✓ |
+| **DRAM read 단가 (pJ/bit)** | HBM read energy | `stream_read` probe @ l2_hit_0 | `_02_dram_energy_rw_split.png`, `dram_rw_split.csv` | ✓ |
+| **DRAM write 단가 (pJ/bit)** | HBM write energy | `stream_write` probe @ l2_hit_0 | 동일 | ✓ |
+| **DRAM marginal (SM/L2 cancelled)** | 순수 DRAM 단가 | `compute_dram_marginal()` (PR #30) | `_02_dram_energy_marginal.png`, `dram_marginal.csv` | ✓ |
+| **Cache locality factor** | k_op 의 hit rate 의존성 | per-regime k_op (5 regime) | `_02_cache_regime_*_kop.png` | ✓ (regime 은 heuristic 라벨) |
+| **L1 / SMEM / register 단가** | sub-L2 cache layer | — (NVML 한계로 미측정) | bundled in component A | ✗ G1 |
+| **Pure compute energy** | mma / FP unit 단독 비용 | — (PyTorch 한계로 미측정) | bundled in component A | ✗ G2 |
+| **Cast overhead (fp8 emulation)** | cast-compute-cast 추가 비용 | MECE component B = J(fp8) − J(fp16) @ l2_hit_100 | `_03_energy_decomposition_mece.png` | ✓ |
+| **Per-step inference J (full model)** | analytical 합산값 검증 | — (별도 워크로드 측정 미실시) | — | ✗ G10 (P3) |
+| **Cross-GPU normalization** | A100 / H100 / Blackwell 간 비교 | `compare_gpus.py` + `multi_gpu_analysis.py` | `gpu_compare_*.png` | ✓ |
+
+### 9.2 Suite 가 채울 수 있는 power model
+
+```
+                  ┌─────────────────────────────────────────────────────┐
+                  │  Σ E_workload  =                                    │
+                  │      P_static · t_total            ← Axis 1 ✓        │
+                  │    + Σ k_op(op, dtype, regime) · N_op   ← Axes 4,2 ✓ │
+                  │    + (optional) leakage_thermal_corr · t_hot  ← P1.1 │
+                  └─────────────────────────────────────────────────────┘
+```
+
+각 항이 본 suite 의 *측정값* 으로 직접 채워짐. 추가 calibration 없이 AccelWattch-class power model 에 입력 가능.
+
+### 9.3 한계 영역 (이 suite 로는 못 하는 것)
+
+| 못 하는 것 | 이유 |
+|---|---|
+| L1 hit rate 의 에너지 정량 | NVML 한계 (Axis 3, G1) |
+| Pure compute (mma 명령 단독) 단가 | PyTorch + NVML 한계 (Axis 6, G2) |
+| 실제 model inference 1 step 의 절대 J | scope 외 (G10) |
+| 칩 단독 leakage (HBM idle 분리) | board-level NVML 한계 (Axis 5) |
+| Single-instruction (add vs mul vs exp) per-FLOP 단가 | PyTorch 의 elementwise 가 too high-level |
+
+이 한계들은 모두 README / plot caveat / 본 review 에 *명시* 되어 있어 사용자가 "측정 안 된 것" 을 "측정 됨" 으로 오해할 위험 없음.
+
+---
+
+## §10 — Closing
+
+### 핵심 평가
+
+| 항목 | 평가 |
+|---|---|
+| **본 suite 가 AccelWattch power model 항을 채울 수 있는가?** | ✓ **거의 모든 항 가능**. board-level 측정의 fundamental limit 은 honest 하게 인정, 그 한계가 model 에 critical 하지 않음 (AccelWattch 도 보통 board-level 합으로 작동). |
+| **결과의 결정성 / 재현성** | ✓ . NVML 100Hz polling + WLS regression + bootstrap CI + clip-bias audit + noise-floor exclusion. |
+| **MECE 분해의 수학적 정확성** | ✓ A+B+C ≡ Total algebraic identity. component A (resident workload) 의 sub-decomposition 은 *의도적* 미실시 (MECE 보장 위해). |
+| **Multi-GPU robustness** | ✓ PCI bus id 해상, broken-variant skip, rebaseline, parallel/sequential 모드, P-state 필터. |
+| **문서화 quality** | ✓ README 약 1500 line, TestCases.md, REVIEW.md (이 문서), per-plot caveat box, FAQ. |
+
+### Next steps
+
+본 review 의 **P0 권장사항 없음** — 즉시 처리 필요한 critical issue 없음.
+
+P1 권장사항 3 개 (G6 thermal correction, G3 per-K k_op, Limitations 통합 section) 는 측정 데이터는 이미 있고 implementation 만 추가하면 됨. 우선순위 매겨 진행할 수 있음.
+
+P2 / P3 는 시간 여유에 따라.
+
+### 한 줄 결론
+
+> **본 suite 는 AccelWattch-class GPU power model 의 거의 모든 항을 정직하고 robust 하게 측정/추출할 수 있다. 분리 못 하는 component (L1 / pure compute) 는 NVML 의 fundamental limit 이고, suite 가 이를 *명시* 하여 사용자 오해 방지. P0 critical issue 없음.**
+
+---
+
+*Review 작성 : 2026-04-29 (commit `e76ac34` 시점). 다음 review 는 P1 처리 후 또는 새 axis 추가 시 권장.*
