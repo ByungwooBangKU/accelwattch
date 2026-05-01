@@ -946,10 +946,23 @@ def _coef_bar_elementwise(ew, out_png: Path, gpu: str) -> bool:
         ax.set_yscale("log")
         ax.set_ylim(min(all_positive) * 0.3, max(all_positive) * 4)
     ax.legend(); ax.grid(True, axis="y", alpha=0.3)
-    title = ("Elementwise — per-op energy coefficient (all on CUDA cores). "
-             "Labels: slope (pJ/elem) + R²")
+    # Detect whether the source is the l2_hit_0 regime (preferred path)
+    # or the cross-regime summary (fallback when by_regime not present).
+    regime_label = ""
+    if "cache_regime" in ew.columns:
+        rs = set(str(x) for x in ew["cache_regime"].dropna().unique())
+        if rs == {"l2_hit_0"}:
+            regime_label = " @ l2_hit_0 (DRAM streaming — production memory-bound region)"
+        elif len(rs) == 1:
+            regime_label = f" @ {next(iter(rs))}"
+    title = ("Elementwise — per-op energy coefficient (all on CUDA cores)"
+             + regime_label
+             + ". Labels: slope (pJ/elem) + R²")
     if has_emulated:
         title += "\nfp8 bars = cast-compute-cast via FP16 (no native FP8 elementwise in PyTorch)"
+    if regime_label:
+        title += ("\nFitted within a single cache regime to avoid R² "
+                  "collapse from L2→DRAM nonlinearity.")
     ax.set_title(title, fontsize=11)
     fig.suptitle(f"Power-model coefficient — elementwise — {gpu}")
     _save_fig(fig, out_png)
@@ -1245,17 +1258,39 @@ def _coef_bar_fp8_per_regime(by_regime: pd.DataFrame, out_png: Path, gpu: str) -
 
 
 def plot_joule_per_op_bar(summary: pd.DataFrame, out_dir: Path, stem: str,
-                          gpu: str) -> None:
+                          gpu: str,
+                          by_regime: pd.DataFrame | None = None) -> None:
     """Save the elementwise and matmul k_op bar charts as TWO SEPARATE
     full-width PNGs — one per panel — so the x-axis labels never get
     cramped. Filenames:
         <stem>_01_powermodel_coef_bar_elementwise.png
         <stem>_01_powermodel_coef_bar_matmul.png
         <stem>_01_powermodel_coef_bar_fp8.png         (NEW)
+
+    For elementwise, prefers `by_regime` filtered to `l2_hit_0` if
+    supplied — the cross-regime (single) `summary` slope crosses the
+    L2→DRAM boundary where J/element jumps ~10×, so the linear fit
+    R² collapses (~0.087 for mul/add reported by user). Within a
+    single regime the linear assumption holds, R² → ~1.0.
+    Headline elementwise k_op now reflects the DRAM-streaming
+    (l2_hit_0) regime — the production-relevant memory-bound region.
+    Matmul is unaffected (compute-bound, tile reuse keeps the
+    cross-K linear assumption).
     """
-    ew = summary[summary["category"] == "elementwise"]
+    # Elementwise — prefer per-regime fit at l2_hit_0 to avoid the
+    # cross-regime non-linearity (R² collapse on mul/add). Fall back to
+    # the cross-regime summary if by_regime not provided or empty.
+    ew_source = summary[summary["category"] == "elementwise"]
+    if by_regime is not None and not by_regime.empty:
+        br = by_regime.copy()
+        if "cache_regime" in br.columns:
+            br["cache_regime"] = br["cache_regime"].replace(LEGACY_REGIME_MAP)
+            ew_l2_hit_0 = br[(br["category"] == "elementwise")
+                             & (br["cache_regime"] == "l2_hit_0")]
+            if not ew_l2_hit_0.empty:
+                ew_source = ew_l2_hit_0
     mm = summary[summary["category"] == "matmul"]
-    _coef_bar_elementwise(ew,
+    _coef_bar_elementwise(ew_source,
         out_dir / f"{stem}_01_powermodel_coef_bar_elementwise.png", gpu)
     _coef_bar_matmul(mm,
         out_dir / f"{stem}_01_powermodel_coef_bar_matmul.png", gpu)
@@ -1990,8 +2025,16 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     # Build decomposition rows for every (op, dtype) pair that has the
     # measurements we need. Skip silently when a piece is missing — the
     # plot just omits that bar rather than confabulating.
+    #
+    # Excluded ops : `add` is intentionally dropped. Per user feedback —
+    # add_fp8 / add_fp16 are too trivial (1 FLOP/elem, identical pattern
+    # to mul) to be worth the bar real estate in this MECE view. Keeping
+    # mul as the lone simple-op reference is enough.
+    EXCLUDED_OPS = {"add"}
     bars = []
     for op in sorted(ew["op"].unique()):
+        if op in EXCLUDED_OPS:
+            continue
         for dtype in ("fp16", "fp8"):
             j_self_l2  = _slope(op, dtype, "l2_hit_100")
             j_self_dr  = _slope(op, dtype, "l2_hit_0")
@@ -2157,23 +2200,53 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
             return None
         return float(v)
 
-    # 5 variants in canonical order
+    # 5 variants in canonical order. fp8_te gets a 3-component breakdown
+    # (A_fp16_baseline + B_fp8_overhead + C_DRAM); the other 4 stay
+    # 2-component (A + C). The B term captures the *emulation /
+    # cast / scaling* delta vs the FP16 TC baseline:
+    #   * On A100  : matmul_fp8_te falls back to FP16 TC (`emulated=1`),
+    #                so B = J(fp8_te) − J(fp16_tc) is the FP16-fallback
+    #                overhead. Typically small but positive.
+    #   * On H100+ : matmul_fp8_te is NATIVE; B can be near 0 or even
+    #                NEGATIVE (fp8 path is more efficient than fp16).
+    #                When B ≤ 0 we render the fp8_te bar as 2-component
+    #                (its own A + C, no B layer) and add a "FP8 native
+    #                advantage" annotation showing the saved energy.
     variant_order = ["matmul_fp32_simt", "matmul_tf32_tc",
                      "matmul_fp16_tc", "matmul_bf16_tc",
                      "matmul_fp8_te"]
     bars = []
+    fp16_baseline_l2 = _slope("matmul_fp16_tc", "l2_hit_100")  # may be None
     for variant in variant_order:
         if variant not in mm["variant"].values:
             continue
-        A = _slope(variant, "l2_hit_100")
+        A_self = _slope(variant, "l2_hit_100")
         T = _slope(variant, "l2_hit_0")
-        if A is None or T is None:
+        if A_self is None or T is None:
             continue
-        C = T - A
         emu_row = mm[mm["variant"] == variant]
         emu = bool(int(emu_row["emulated"].iloc[0])) if "emulated" in emu_row.columns else False
+        # 3-component path only for fp8_te WHEN the fp16 baseline exists
+        # AND emulation overhead is positive. Otherwise fall back to 2-
+        # component to keep the stacked bar honest.
+        is_fp8 = (variant == "matmul_fp8_te")
+        if is_fp8 and fp16_baseline_l2 is not None:
+            A = fp16_baseline_l2
+            B = A_self - fp16_baseline_l2  # may be ≤ 0 on Hopper native
+        else:
+            A = A_self
+            B = 0.0
+        if B < 0:
+            # Hopper native fp8 — render as 2-component, save B for annotation.
+            B_advantage = -B  # positive number; how much fp8 saved vs fp16
+            A = A_self  # use fp8's own L2-resident
+            B = 0.0
+        else:
+            B_advantage = 0.0
+        C = T - A - B
         bars.append({
-            "variant": variant, "A": A, "C": C, "total": T, "emulated": emu,
+            "variant": variant, "A": A, "B": B, "C": C, "total": T,
+            "emulated": emu, "is_fp8": is_fp8, "B_advantage": B_advantage,
         })
     if not bars:
         return False
@@ -2184,26 +2257,51 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
 
     # Convert J/FLOP to pJ/FLOP for display
     A_vals = [b["A"] * 1e12 for b in bars]
+    B_vals = [b["B"] * 1e12 for b in bars]
     C_vals = [b["C"] * 1e12 for b in bars]
     T_vals = [b["total"] * 1e12 for b in bars]
 
     # palette
     palette = PALETTE_MATMUL_VARIANTS
     base_colors = [palette.get(b["variant"], "gray") for b in bars]
-    # Layer A — variant-coloured solid block, layer C — same colour with hatch
+
+    # Stack order : A (solid) → B (orange = cast/emu overhead) → C (hatched DRAM)
+    legend_a_used = False
+    legend_b_used = False
+    legend_c_used = False
     for i, b in enumerate(bars):
+        # A
         ax.bar(xs[i], A_vals[i], color=base_colors[i], edgecolor="white",
-               label=f"A) L2-resident workload\n(compute + L2 + launch)" if i == 0 else None,
+               label=("A) L2-resident workload (compute + L2 + launch)\n"
+                      "    fp8: uses fp16 baseline; non-fp8: uses own l2_hit_100")
+                     if not legend_a_used else None,
                alpha=0.95)
-        ax.bar(xs[i], C_vals[i], bottom=A_vals[i],
+        legend_a_used = True
+        # B — cast / emulation overhead, only positive layer (Hopper native
+        # fp8's negative case rendered as 2-component instead).
+        if B_vals[i] > 0:
+            ax.bar(xs[i], B_vals[i], bottom=A_vals[i],
+                   color="#ff7f0e", edgecolor="white",
+                   label=("B) FP8 cast / emulation overhead\n"
+                          "    = J(fp8_te) − J(fp16_tc) at l2_hit_100\n"
+                          "    (positive = emulation / cast cost)")
+                         if not legend_b_used else None,
+                   alpha=0.85)
+            legend_b_used = True
+        # C — DRAM
+        ax.bar(xs[i], C_vals[i], bottom=A_vals[i] + B_vals[i],
                color=base_colors[i], edgecolor="white", hatch="///",
-               label=f"C) DRAM round-trip\n(marginal HBM cost)" if i == 0 else None,
+               label=("C) DRAM round-trip (marginal HBM cost)"
+                      if not legend_c_used else None),
                alpha=0.55)
+        legend_c_used = True
 
     # Annotations : total + percentages + variant name
     for i, b in enumerate(bars):
-        a_pct = 100.0 * b["A"] / b["total"] if b["total"] > 0 else 0
-        c_pct = 100.0 * b["C"] / b["total"] if b["total"] > 0 else 0
+        total = b["total"] if b["total"] > 0 else 1
+        a_pct = 100.0 * b["A"] / total
+        b_pct = 100.0 * b["B"] / total
+        c_pct = 100.0 * b["C"] / total
         ax.text(xs[i], T_vals[i] * 1.03,
                 f"{T_vals[i]:.2f} pJ/FLOP",
                 ha="center", va="bottom", fontsize=9, fontweight="bold")
@@ -2211,11 +2309,27 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
             ax.text(xs[i], A_vals[i] / 2, f"A: {a_pct:.0f}%",
                     ha="center", va="center", fontsize=8, color="white",
                     fontweight="bold")
+        if b_pct > 6:
+            ax.text(xs[i], A_vals[i] + B_vals[i] / 2,
+                    f"B: {b_pct:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white",
+                    fontweight="bold")
         if c_pct > 8:
-            ax.text(xs[i], A_vals[i] + C_vals[i] / 2,
+            ax.text(xs[i], A_vals[i] + B_vals[i] + C_vals[i] / 2,
                     f"C: {c_pct:.0f}%",
                     ha="center", va="center", fontsize=8, color="black",
                     fontweight="bold")
+        # FP8 native advantage annotation : when B was negative, surface
+        # the saved energy as a positive number so reader sees "fp8 is
+        # cheaper by X pJ/FLOP than fp16 baseline".
+        if b["is_fp8"] and b["B_advantage"] > 0:
+            adv_pj = b["B_advantage"] * 1e12
+            ax.annotate(
+                f"FP8 native advantage:\n−{adv_pj:.2f} pJ/FLOP\nvs fp16_tc baseline",
+                xy=(xs[i], T_vals[i]),
+                xytext=(0, 30), textcoords="offset points",
+                ha="center", fontsize=8, color="#2ca02c", fontweight="bold",
+                bbox=dict(facecolor="#e6f4ea", edgecolor="#2ca02c", pad=3))
 
     labels = [b["variant"] + (" *EMU" if b["emulated"] else "") for b in bars]
     ax.set_xticks(xs)
@@ -2224,10 +2338,11 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax.set_yscale("log")
     ax.set_title(
         f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
-        "A + C ≡ J(matmul, variant, l2_hit_0)   "
-        "(no fp8-cast term — matmul fp8 is native on H100, FP16-fallback on A100)\n"
-        "A = J(variant, l2_hit_100) ;  "
-        "C = J(variant, l2_hit_0) − J(variant, l2_hit_100)",
+        "fp8_te 는 3-component (A: fp16 baseline, B: cast/emulation overhead, C: DRAM); "
+        "다른 4 variants 는 2-component (A + C).  "
+        "B = J(fp8_te) − J(fp16_tc) at l2_hit_100. B ≤ 0 (Hopper native) 이면 "
+        "fp8_te 도 2-component 로 그리고 'FP8 native advantage' annotation 으로 절감량 표기.\n"
+        "Identity (per variant) :  A + B + C ≡ J(variant, l2_hit_0)   ← MECE",
         fontsize=10)
     ax.grid(True, axis="y", alpha=0.3, which="both")
     ax.legend(loc="upper right", fontsize=9, ncol=1, bbox_to_anchor=(1.01, 1.0))
@@ -2972,7 +3087,12 @@ def main() -> int:
         out_dir / f"{stem}_01_powermodel_linearity_matmul.png", gpu)
     # Coefficient bar — split into two full-width PNGs (elementwise / matmul)
     # so neither x-axis is cramped against the other panel.
-    plot_joule_per_op_bar(plot_summary, out_dir, stem, gpu)
+    # Pass by_regime so the elementwise headline bar can use the
+    # l2_hit_0 regime slope (R² collapse fix — see plot_joule_per_op_bar
+    # docstring). Matmul still uses the cross-K summary (compute-bound,
+    # tile reuse keeps within-K linearity).
+    plot_joule_per_op_bar(plot_summary, out_dir, stem, gpu,
+                          by_regime=by_regime)
     # Filter the by-regime summary in the same way (elementwise fp8 hidden
     # by default) so annotations on the plot stay consistent with the
     # other plots. Matmul rows are kept either way.
