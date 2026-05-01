@@ -387,7 +387,7 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 |---|---|---|---|
 | **P1.1** | G6: SoC leakage → sweep dyn 자동 보정 | `analyze.py` 에 `add_thermal_correction()` helper. 새 컬럼 `dyn_energy_j_thermal_corrected`. | ~1 일 |
 | **P1.2** ✅ | G3: matmul per-K k_op | **DONE — PR A**. `summarize_matmul_per_K()` 가 (variant, K) 별 row 의 sidecar CSV 출력 + `plot_kop_per_K()` 가 K vs pJ/FLOP curve 시각화 (변종마다 best-K annotation). | ~1 일 |
-| **P1.3** | (Doc) G1+G2+G5 가 한 곳 모인 "Limitations" 섹션 | README 에 §X "What this suite cannot decompose" 추가. 기존 산재한 한계 표시 통합. | 0.5 일 |
+| **P1.3** ✅ | (Doc) G1+G2+G5 가 한 곳 모인 "Limitations" 섹션 | **DONE — PR C**. README §13 을 12-row 분류 표로 보강 (NVML boundary / framework / hardware / scope 4 origin). 각 한계마다 우회 + severity 매김. | 0.5 일 |
 
 ### P2 — Optional Enhancements
 

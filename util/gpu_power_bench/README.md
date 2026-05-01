@@ -1651,13 +1651,30 @@ fp16_mul elementwise       4 9.778e-13 1.555e-13    15.90       9.001e-13 1.211e
 - [ ] `cooldown_reached = True` 비율 ≥ 90%.
 - [ ] `fp16_mul` 과 `fp16_add` 의 `slope_dyn` 이 ±15% 이내 (HW path 동일).
 
-## 13. 알려진 한계
+## 13. 알려진 한계   *(unified — 본 suite 가 *분리해 측정 못 하는* 것 모음)*
 
-1. **Board-level NVML** : GPU core 와 HBM 이 구별되지 않음. 원한다면 별도로 NVIDIA Nsight 의 per-unit counter 필요.
-2. **20 Hz sensor rate** : 초단기 power spike 는 smooth 처리됨. 평균값은 보존되므로 `k_op` 에는 영향 없음.
-3. **FP8 elementwise cast overhead** : 순수 FP8 HW path 측정은 matmul 만 가능. elementwise 는 "cast + compute" 의 composite.
-4. **Intra-GPU single-process focus** : 같은 노드 여러 GPU 의 **variance / outlier 분석**은 §11.1 `multi_gpu_analysis.py` 로 가능하지만, **GPU 간 NCCL / P2P 통신 에너지**는 여전히 대상이 아님 (각 카드는 독립 sweep 으로 측정됨).
-5. **훈련 중 workload 와 차이** : microbenchmark 는 순수 kernel 을 무한 반복하므로, 실제 훈련의 scheduling gap / memory fragment 는 재현 못함.
+[`docs/REVIEW.md`](docs/REVIEW.md) §9.3 의 short table 의 README-friendly 풀어쓰기 + 의도 / 우회 / severity 동봉. 본 suite 의 한계는 모두 (a) **NVML 측정 boundary** (board-level 만, sub-L2 layer 분리 불가) (b) **framework 표면** (PyTorch 가 register-resident microbench 미허용) (c) **scope 결정** (microbenchmark, full-model 측정 아님) 중 하나에 속함.
+
+### 13.1 분류 표
+
+| 한계 | 분류 | 우회 | severity (실측 정확성 영향) |
+|---|---|---|---|
+| **L1 / SMEM / register file 단가 분리 불가** | NVML boundary | Nsight Compute `l1tex__data_bank_reads` 같은 metric 사용 가능, instrumentation 이 power 를 ±10–20% 왜곡하니 *교차 검증* 만 권장 | low — component A bundled, MECE 보장 안에 위치 |
+| **Pure compute (단일 mma / FP unit) 단가 분리 불가** | NVML + framework | CUDA C++ register-resident kernel 직접 작성 가능 — 본 suite 의 scope 외 | low — component A bundled |
+| **L2 ↔ DRAM bus 와 DRAM cells 자체가 분리 안 됨** | NVML boundary | board-level NVML 의 fundamental limit. literature pJ/bit 도 보통 같은 boundary 사용 | low — literature 비교 가능 |
+| **Cache hit rate 는 heuristic label, 실측 아님** | intentional | Nsight Compute `l2_tex_hit_rate.pct` 사용 가능, ~30% kernel slowdown 으로 power 측정 왜곡 | medium — `--cache-sweep` 모드가 5 regime bucket 에 정확히 hit 되도록 N 자동 계산 |
+| **Matmul 의 `cache_regime` 분류는 logical working set 기반** | intentional (compute-bound op 한정) | tile reuse 로 실제 DRAM ≪ logical. matmul 의 marginal-DRAM 분석은 의도적 제외, MECE 분해 caveat box 로 명시 | low — caveat documented |
+| **Chip 단독 leakage (HBM idle 분리)** | NVML boundary | HBM 의 IDD0 datasheet 값 사용해 추정 가능 — 본 suite 미수행 | low — board-level leakage 가 AccelWattch 입력에 적합 |
+| **20 Hz NVML averaging** | hardware | `NVML_FI_DEV_POWER_INSTANT` (~1ms) 옵션 (PR #36/#47) — `--power-source instant` 로 활성. idle 측정엔 부적합 (P-state hysteresis 노출) | low — sustained 측정의 평균값은 동일 |
+| **FP8 elementwise 는 native HW 없음** | hardware (PyTorch + 모든 GPU) | 어떤 GPU 든 cast-compute-cast. `emulated=1` 로 자동 식별, MECE 분해의 component B 로 분리 측정 | none — 측정 자체는 정확, label 명시 |
+| **Single-instruction (add vs mul vs exp) per-FLOP 단가** | framework (PyTorch elementwise too high-level) | CUDA microbench 직접 작성, 본 suite 외 | low — `FLOPS_PER_ELEMENT` 통합 카운트로 충분 |
+| **NCCL / P2P 통신 에너지** | scope | 본 suite 는 single-GPU compute 에 한정. NCCL bench 는 별도 도구 (nccl-tests) | low — orthogonal axis |
+| **Full-model inference 1 step 의 절대 J** | scope | analytical `Σ k_op · N_op` 합산 가능, 측정 검증은 별도 워크 | medium — REVIEW.md G10 (P3) 으로 추적 |
+| **훈련 중 scheduling gap / memory fragment** | scope | microbench 는 무한 반복이라 실제 훈련의 idle gap 미반영. trace-driven simulation 영역 | low — `k_op` 자체는 보존 |
+
+### 13.2 한 줄 요약
+
+> 본 suite 가 분리 못 하는 항목은 모두 **명시되어 있고**, 사용자가 측정값을 잘못 해석할 수 있는 케이스마다 plot 의 **caveat box** 또는 컬럼의 **`emulated=1`** flag 로 안전망. AccelWattch-class power model 의 항을 채우는 데 필요한 *모든* component 는 측정 가능 (G1/G2 의 sub-decomposition 만 NVML 한계로 bundled — REVIEW.md §9.1 매핑 표).
 
 ## 14. 확장 아이디어
 
