@@ -2418,8 +2418,12 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     # below the caveat so the saved PNG isn't dominated by whitespace.
     fig, (ax, ax_caveat) = plt.subplots(
         2, 1,
-        figsize=(max(12, 1.8 * len(bars) + 5), 9.0),
-        gridspec_kw={"height_ratios": [9, 1.6], "hspace": 0.32})
+        # Tighter x : 1.3 in/bar (was 1.8). Variant labels are shortened
+        # below (we strip the redundant "matmul_" prefix), so each bar
+        # needs less horizontal real estate. Caveat row gets enough
+        # height to fit the 6 explicit lines below.
+        figsize=(max(10, 1.3 * len(bars) + 3.5), 8.5),
+        gridspec_kw={"height_ratios": [8.5, 2.0], "hspace": 0.32})
     ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
@@ -2549,9 +2553,12 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
                 ha="center", fontsize=8, color="#2ca02c", fontweight="bold",
                 bbox=dict(facecolor="#e6f4ea", edgecolor="#2ca02c", pad=3))
 
-    labels = [b["variant"] + (" *EMU" if b["emulated"] else "") for b in bars]
+    # x-tick labels : strip the redundant "matmul_" prefix (title already
+    # says "matmul"), so each bar's label is short — no rotation needed.
+    labels = [b["variant"].removeprefix("matmul_") + (" *EMU" if b["emulated"] else "")
+              for b in bars]
     ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=10)
+    ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=10)
     ax.set_ylabel("pJ / FLOP   (dynamic, at l2_hit_0)", fontsize=11)
     ax.set_yscale("log")
     # Explicit ylim — the "Σ = X pJ/FLOP" labels above each bar otherwise
@@ -2580,15 +2587,17 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
               bbox_to_anchor=(1.01, 1.0))
 
     # Caveat row — guaranteed visible because it lives in its own subplot.
+    # Explicit line breaks (rather than `wrap=True`) so the layout is
+    # identical across matplotlib versions / figure widths.
     ax_caveat.text(
         0.5, 0.5,
-        "CRITICAL CAVEAT : matmul's `cache_regime` is based on LOGICAL "
-        "working set (3·K²·bpe). cuBLAS/TE matmul kernels reuse each "
-        "input element O(K) times via SM tile cache, so actual DRAM "
-        "traffic ≪ logical. Component C is therefore a NOISY UPPER BOUND "
-        "on real DRAM cost — interpret as 'extra cost when working set "
-        "exceeds L2', not literal HBM bytes. README §3.5.3.",
-        ha="center", va="center", fontsize=9, color="#333", wrap=True,
+        "CRITICAL CAVEAT : matmul's `cache_regime` is based on LOGICAL working set (3·K²·bpe).\n"
+        "cuBLAS / TE matmul kernels reuse each input element O(K) times via SM tile cache,\n"
+        "so actual DRAM traffic ≪ logical.\n"
+        "Component C is therefore a NOISY UPPER BOUND on real DRAM cost\n"
+        "— interpret as 'extra cost when working set exceeds L2', not literal HBM bytes.\n"
+        "(README §3.5.3)",
+        ha="center", va="center", fontsize=9, color="#333", linespacing=1.35,
         bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
 
     _save_fig(fig, out_png)
