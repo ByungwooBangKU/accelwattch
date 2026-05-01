@@ -1075,6 +1075,35 @@ def _coef_bar_matmul(mm, out_png: Path, gpu: str) -> bool:
         _annot_bar_pj(rect, float(v) if pd.notna(v) else float("nan"),
                       float(r2) if pd.notna(r2) else float("nan"),
                       "pJ/FLOP")
+    # High-CI warning : when bootstrap CI half-width / slope > 0.5 (i.e.
+    # error bar > 50% of bar height), the per-variant fit is too noisy
+    # to trust. Common on `matmul_fp32_simt` because :
+    #   * CUDA-core path is 10..16× slower than TC → wall time per cell
+    #     long, thermal drift + clock throttling distort dyn_energy_j
+    #   * dyn_energy_j vs total_flops can show concave-down curvature
+    #     (small-K = bandwidth-bound, large-K = compute-bound) →
+    #     a single linear slope is the wrong model
+    # Tag those bars so the operator notices instead of trusting a
+    # variance-saturated coefficient.
+    if yerr is not None:
+        for i, (rect, v, lo_e, hi_e) in enumerate(zip(
+                bars, slope_vals, yerr[0], yerr[1])):
+            if pd.isna(v) or float(v) <= 0:
+                continue
+            ci_half = (float(lo_e) + float(hi_e)) / 2.0
+            if ci_half / float(v) > 0.5:
+                # Place the warning INSIDE the bar (just below the top)
+                # so it's visible on the log-scaled y-axis. xy uses the
+                # bar value, not value+hi_e (which often falls above ylim).
+                ax.text(
+                    rect.get_x() + rect.get_width() / 2,
+                    float(v),
+                    "⚠ wide CI\n(±{:.0f}% of slope)\n→ longer --window-ms\nor more K sizes".format(
+                        100.0 * ci_half / float(v)),
+                    fontsize=7.5, ha="center", va="top",
+                    color="#b03030", fontweight="bold", linespacing=1.1,
+                    bbox=dict(facecolor="#fff0f0", edgecolor="#b03030",
+                              alpha=0.92, pad=2))
     def _tick(v):
         cu = str(mm2.loc[v, "compute_unit"]) if "compute_unit" in mm2.columns else ""
         if cu.startswith("Tensor Core (FP16 fallback)"):
@@ -1129,14 +1158,30 @@ def _coef_bar_fp8(summary: pd.DataFrame, out_png: Path, gpu: str) -> bool:
     if fp8_mm.empty and fp8_ew.empty:
         return False
 
+    # Pick the layout based on which panels actually have data.
+    # Previously we always allocated a 2-panel 20×8 figure, so when
+    # `fp8_ew` was empty (e.g. sweep didn't include softmax_fp8 /
+    # gelu_fp8 / layernorm_fp8 cells, or all of them errored out)
+    # the right half rendered as wasted whitespace and the left bar
+    # looked tiny — exactly the "왼쪽에만 이미지" symptom.
+    have_mm = not fp8_mm.empty
+    have_ew = not fp8_ew.empty
     plt = _get_mpl()
-    fig, (ax_mm, ax_ew) = plt.subplots(1, 2, figsize=(20, 8),
-                                       gridspec_kw={"width_ratios": [1, 2]})
+    if have_mm and have_ew:
+        fig, (ax_mm, ax_ew) = plt.subplots(
+            1, 2, figsize=(16, 7),
+            gridspec_kw={"width_ratios": [1, 2]})
+    elif have_mm:
+        fig, ax_mm = plt.subplots(figsize=(6, 7))
+        ax_ew = None
+    else:  # have_ew only
+        fig, ax_ew = plt.subplots(figsize=(11, 7))
+        ax_mm = None
 
     # ---- matmul_fp8_te panel (J/FLOP) ----
-    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in fp8_mm.columns else "slope_dyn"
-    r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in fp8_mm.columns else "R2_dyn"
-    if not fp8_mm.empty:
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in fp8.columns else "slope_dyn"
+    r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in fp8.columns else "R2_dyn"
+    if ax_mm is not None and not fp8_mm.empty:
         # Always plotted as a single bar (the only fp8 matmul variant).
         for _, row in fp8_mm.iterrows():
             v = float(row[slope_col]) if pd.notna(row[slope_col]) else float("nan")
@@ -1155,11 +1200,9 @@ def _coef_bar_fp8(summary: pd.DataFrame, out_png: Path, gpu: str) -> bool:
         ax_mm.grid(True, axis="y", alpha=0.3)
         if pd.notna(fp8_mm[slope_col].iloc[0]) and float(fp8_mm[slope_col].iloc[0]) > 0:
             ax_mm.set_ylim(0, float(fp8_mm[slope_col].iloc[0]) * 1.4)
-    else:
-        ax_mm.set_visible(False)
 
     # ---- fp8 elementwise panel (J/element) ----
-    if not fp8_ew.empty:
+    if ax_ew is not None and not fp8_ew.empty:
         op_order = [op for op in fp8_ew_ops if op in fp8_ew["op"].values]
         xs = np.arange(len(op_order))
         vals, r2s, hatches = [], [], []
@@ -1186,8 +1229,6 @@ def _coef_bar_fp8(summary: pd.DataFrame, out_png: Path, gpu: str) -> bool:
         finite_pos = [v for v in vals if pd.notna(v) and v > 0]
         if finite_pos:
             ax_ew.set_ylim(0, max(finite_pos) * 1.3)
-    else:
-        ax_ew.set_visible(False)
 
     fig.suptitle(
         f"FP8 power-model coefficients — {gpu}\n"
@@ -2237,7 +2278,23 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         # Use a separate y for outside labels so they don't pile up.
         outside_y_cursor = total_pj * 0.05  # start near bottom of bar
         for name, value_pj, pct, mid_y, _bot, _color in segments:
+            # Even when value_pj <= 0 (negative or zero component, rare
+            # but possible when fp8 cast is cheaper than fp16 on a given
+            # GPU), still surface the value as an outside annotation so
+            # the user knows the component was MEASURED — silent omission
+            # is a footgun.
             if value_pj <= 0:
+                ax.annotate(
+                    f"{name}: {_fmt_pj(value_pj)} pJ\n({pct:.1f}%)",
+                    xy=(xs[i] + 0.30, total_pj * 0.02),
+                    xytext=(xs[i] + LEADER_X_OFFSET, outside_y_cursor),
+                    fontsize=7.5, ha="left", va="center", color="#888",
+                    arrowprops=dict(arrowstyle="-", color="#bbb",
+                                    lw=0.6, alpha=0.6,
+                                    connectionstyle="arc3,rad=0.0"),
+                    bbox=dict(facecolor="white", edgecolor="#cccccc",
+                              alpha=0.85, pad=2))
+                outside_y_cursor += total_pj * 0.06
                 continue
             label = f"{name}: {_fmt_pj(value_pj)} pJ\n({pct:.1f}%)"
             if pct >= INLINE_PCT_THRESHOLD:
@@ -2283,16 +2340,14 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
               loc="upper left", fontsize=9, ncol=1,
               bbox_to_anchor=(1.01, 1.0))
 
-    # Caveat row — guaranteed visible because it lives in its own subplot.
+    # Caveat — explicit `\n` (4 lines) for layout stability.
     ax_caveat.text(
         0.5, 0.5,
-        "Note : component A (resident workload) bundles compute + L2 transit + "
-        "kernel-launch overhead because no NVML measurement in this suite isolates "
-        "pure compute. Further breakdown of A would require an estimate "
-        "(e.g. FLOP × J_per_FLOP_reference), which is NOT MECE — "
-        "it intentionally remains a single bucket.",
-        ha="center", va="center", fontsize=9, color="#333",
-        wrap=True,
+        "Note : component A (resident workload) bundles compute + L2 transit + kernel-launch overhead.\n"
+        "No NVML measurement in this suite isolates pure compute, so A intentionally remains one bucket.\n"
+        "Further breakdown would require an estimate (e.g. FLOP × J_per_FLOP_reference)\n"
+        "which is NOT MECE.",
+        ha="center", va="center", fontsize=9, color="#333", linespacing=1.4,
         bbox=dict(facecolor="#f0f0f0", edgecolor="#bbbbbb", pad=6))
 
     _save_fig(fig, out_png)
@@ -2418,12 +2473,11 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     # below the caveat so the saved PNG isn't dominated by whitespace.
     fig, (ax, ax_caveat) = plt.subplots(
         2, 1,
-        # Tighter x : 1.3 in/bar (was 1.8). Variant labels are shortened
-        # below (we strip the redundant "matmul_" prefix), so each bar
-        # needs less horizontal real estate. Caveat row gets enough
-        # height to fit the 6 explicit lines below.
-        figsize=(max(10, 1.3 * len(bars) + 3.5), 8.5),
-        gridspec_kw={"height_ratios": [8.5, 2.0], "hspace": 0.32})
+        # Tighter x : 1.3 in/bar (was 1.8). Caveat row enlarged to keep
+        # the (now 4-line) caveat from spilling into the main axes ;
+        # hspace 0.4 keeps the x-tick labels clear of the caveat box.
+        figsize=(max(10, 1.3 * len(bars) + 3.5), 9.5),
+        gridspec_kw={"height_ratios": [8.5, 2.0], "hspace": 0.40})
     ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
@@ -2572,11 +2626,10 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
             ax.set_ylim(min(positive_min) * 0.5, max(positive_T) * 1.5)
     ax.set_title(
         f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
-        "fp8_te uses 3 components (A: fp16 baseline, B: cast/emulation "
-        "overhead, C: DRAM); the other 4 variants use 2 components (A + C). "
-        "B = J(fp8_te) − J(fp16_tc) at l2_hit_100. When B ≤ 0 (Hopper "
-        "native), fp8_te falls back to 2 components plus an "
-        "'FP8 native advantage' annotation showing the saved energy.\n"
+        "fp8_te : 3 components (A: fp16 baseline, B: cast/emu overhead, C: DRAM)\n"
+        "others (4 variants) : 2 components (A + C)\n"
+        "B = J(fp8_te) − J(fp16_tc) at l2_hit_100. When B ≤ 0 (Hopper native), "
+        "B is collapsed and an 'FP8 native advantage' tag shows saved energy.\n"
         "Identity (per variant) :  A + B + C ≡ J(variant, l2_hit_0)   ← MECE",
         fontsize=10)
     ax.grid(True, axis="y", alpha=0.3, which="both")
@@ -2586,18 +2639,15 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
               loc="upper left", fontsize=9, ncol=1,
               bbox_to_anchor=(1.01, 1.0))
 
-    # Caveat row — guaranteed visible because it lives in its own subplot.
-    # Explicit line breaks (rather than `wrap=True`) so the layout is
-    # identical across matplotlib versions / figure widths.
+    # Caveat row — explicit `\n` (not wrap=True) so layout is stable
+    # across matplotlib versions. Compressed to 4 lines per user request.
     ax_caveat.text(
         0.5, 0.5,
-        "CRITICAL CAVEAT : matmul's `cache_regime` is based on LOGICAL working set (3·K²·bpe).\n"
-        "cuBLAS / TE matmul kernels reuse each input element O(K) times via SM tile cache,\n"
-        "so actual DRAM traffic ≪ logical.\n"
-        "Component C is therefore a NOISY UPPER BOUND on real DRAM cost\n"
-        "— interpret as 'extra cost when working set exceeds L2', not literal HBM bytes.\n"
-        "(README §3.5.3)",
-        ha="center", va="center", fontsize=9, color="#333", linespacing=1.35,
+        "CRITICAL CAVEAT : `cache_regime` is based on LOGICAL working set (3·K²·bpe).\n"
+        "cuBLAS / TE kernels reuse each input O(K) times in SM tile cache,\n"
+        "so actual DRAM traffic ≪ logical → C is a NOISY UPPER BOUND on real DRAM cost.\n"
+        "Read C as 'extra cost when working set exceeds L2', not literal HBM bytes.   (README §3.5.3)",
+        ha="center", va="center", fontsize=9, color="#333", linespacing=1.4,
         bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
 
     _save_fig(fig, out_png)
