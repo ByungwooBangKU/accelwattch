@@ -2116,7 +2116,16 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         return False
 
     plt = _get_mpl()
-    fig, ax = plt.subplots(figsize=(max(12, 1.4 * len(bars) + 4), 7.5))
+    # 2-row layout : main chart on top, caveat box on its own row below.
+    # Reserves a dedicated chunk of the figure for the caveat so it's
+    # never clipped by tight_layout / bbox_inches gymnastics. Also
+    # taller than before (was 7.5 in.) so segments at the bottom of the
+    # stack remain visible even when one component is 99 % of total.
+    fig, (ax, ax_caveat) = plt.subplots(
+        2, 1,
+        figsize=(max(13, 1.6 * len(bars) + 5), 11),
+        gridspec_kw={"height_ratios": [9, 1.2], "hspace": 0.05})
+    ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
     A_vals = [b["A"] * 1e12 for b in bars]
@@ -2131,36 +2140,82 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     ax.bar(xs, C_vals, bottom=A_plus_B, color="#d62728", edgecolor="white",
            label="C) DRAM round-trip\n(marginal HBM cost)")
 
-    # Per-bar annotations : total + percent breakdown
+    def _fmt_pj(v):
+        """Format pJ value with reasonable precision."""
+        if v == 0:
+            return "0"
+        if abs(v) >= 1000:
+            return f"{v:,.0f}"
+        if abs(v) >= 10:
+            return f"{v:.1f}"
+        if abs(v) >= 1:
+            return f"{v:.2f}"
+        if abs(v) >= 0.01:
+            return f"{v:.3f}"
+        return f"{v:.2e}"
+
+    # Per-bar annotations : total at top + per-component value+pct.
+    # Strategy : if a segment is too small (< 6% of total) for an inline
+    # label, render the label OUTSIDE the bar with a leader line so the
+    # value is still visible. Otherwise render inline (white text on
+    # the coloured segment).
+    INLINE_PCT_THRESHOLD = 6.0
+    LEADER_X_OFFSET = 0.42  # how far right of the bar to place outside labels
     for i, b in enumerate(bars):
         total_pj = b["total"] * 1e12
         a_pct = 100.0 * b["A"] / b["total"] if b["total"] > 0 else 0
         b_pct = 100.0 * b["B"] / b["total"] if b["total"] > 0 else 0
         c_pct = 100.0 * b["C"] / b["total"] if b["total"] > 0 else 0
-        # Total label sits above the stack
+
+        # Total above the stack
         ax.text(xs[i], total_pj * 1.02,
-                f"{total_pj:,.0f} pJ/elem",
-                ha="center", va="bottom", fontsize=9, fontweight="bold")
-        # Inline percent labels — only when slice is wide enough to be readable
-        if a_pct > 5:
-            ax.text(xs[i], A_vals[i] / 2, f"A: {a_pct:.0f}%",
-                    ha="center", va="center", fontsize=8, color="white",
-                    fontweight="bold")
-        if b_pct > 5:
-            ax.text(xs[i], A_vals[i] + B_vals[i] / 2,
-                    f"B: {b_pct:.0f}%",
-                    ha="center", va="center", fontsize=8, color="white",
-                    fontweight="bold")
-        if c_pct > 5:
-            ax.text(xs[i], A_vals[i] + B_vals[i] + C_vals[i] / 2,
-                    f"C: {c_pct:.0f}%",
-                    ha="center", va="center", fontsize=8, color="white",
-                    fontweight="bold")
+                f"Σ = {_fmt_pj(total_pj)} pJ/elem",
+                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
+
+        segments = [
+            ("A", A_vals[i], a_pct, A_vals[i] / 2,
+             0,  # bottom of A
+             "white"),
+            ("B", B_vals[i], b_pct, A_vals[i] + B_vals[i] / 2,
+             A_vals[i],  # bottom of B
+             "white"),
+            ("C", C_vals[i], c_pct, A_vals[i] + B_vals[i] + C_vals[i] / 2,
+             A_vals[i] + B_vals[i],  # bottom of C
+             "white"),
+        ]
+        # Use a separate y for outside labels so they don't pile up.
+        outside_y_cursor = total_pj * 0.05  # start near bottom of bar
+        for name, value_pj, pct, mid_y, _bot, _color in segments:
+            if value_pj <= 0:
+                continue
+            label = f"{name}: {_fmt_pj(value_pj)} pJ\n({pct:.1f}%)"
+            if pct >= INLINE_PCT_THRESHOLD:
+                # Inline — fits comfortably in the segment
+                ax.text(xs[i], mid_y, label,
+                        ha="center", va="center", fontsize=8.5,
+                        color=_color, fontweight="bold", linespacing=1.1)
+            else:
+                # Outside — leader line from segment to right-side text
+                ax.annotate(
+                    label,
+                    xy=(xs[i] + 0.30, mid_y),                       # bar edge
+                    xytext=(xs[i] + LEADER_X_OFFSET, outside_y_cursor),
+                    fontsize=8, ha="left", va="center",
+                    color="#222",
+                    arrowprops=dict(arrowstyle="-", color="#888",
+                                    lw=0.8, alpha=0.7,
+                                    connectionstyle="arc3,rad=0.0"),
+                    bbox=dict(facecolor="white", edgecolor="#aaaaaa",
+                              alpha=0.92, pad=2))
+                outside_y_cursor += total_pj * 0.06   # next outside label below
 
     ax.set_xticks(xs)
     ax.set_xticklabels([b["label"] for b in bars], rotation=20, ha="right",
                        fontsize=10)
     ax.set_ylabel("pJ / element  (dynamic, at l2_hit_0)", fontsize=11)
+    # Headroom for the Σ label above each bar.
+    if any(v > 0 for v in [b["total"] for b in bars]):
+        ax.set_ylim(0, max(b["total"] for b in bars) * 1.15 * 1e12)
     ax.set_title(
         f"MECE energy decomposition — elementwise @ l2_hit_0 — {gpu}\n"
         "A + B + C  ≡  J(op, dtype, l2_hit_0)   (algebraic identity → no overlap, no missing piece)\n"
@@ -2170,16 +2225,17 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(loc="upper left", fontsize=9, ncol=1, bbox_to_anchor=(1.01, 1.0))
 
-    # Caveat box — A is bundled because PyTorch can't isolate compute
-    fig.text(
-        0.5, -0.02,
-        "Note : component A (resident workload) bundles compute + L2 "
-        "transit + kernel-launch overhead because no NVML measurement "
-        "in this suite isolates pure compute. Further breakdown of A "
-        "would require an estimate (e.g. FLOP × J_per_FLOP_reference), "
-        "which is NOT MECE — it intentionally remains a single bucket.",
-        ha="center", fontsize=8, color="#444444", wrap=True,
-        bbox=dict(facecolor="#f0f0f0", edgecolor="#bbbbbb", pad=4))
+    # Caveat row — guaranteed visible because it lives in its own subplot.
+    ax_caveat.text(
+        0.5, 0.5,
+        "Note : component A (resident workload) bundles compute + L2 transit + "
+        "kernel-launch overhead because no NVML measurement in this suite isolates "
+        "pure compute. Further breakdown of A would require an estimate "
+        "(e.g. FLOP × J_per_FLOP_reference), which is NOT MECE — "
+        "it intentionally remains a single bucket.",
+        ha="center", va="center", fontsize=9, color="#333",
+        wrap=True,
+        bbox=dict(facecolor="#f0f0f0", edgecolor="#bbbbbb", pad=6))
 
     _save_fig(fig, out_png)
     return True
@@ -2297,7 +2353,14 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
         return False
 
     plt = _get_mpl()
-    fig, ax = plt.subplots(figsize=(max(11, 1.6 * len(bars) + 4), 7.5))
+    # 2-row layout : main chart + dedicated caveat row at the bottom so
+    # the warning box is always visible (was previously fig.text below
+    # the figure boundary, which clipped on tight bbox layouts).
+    fig, (ax, ax_caveat) = plt.subplots(
+        2, 1,
+        figsize=(max(12, 1.8 * len(bars) + 5), 11),
+        gridspec_kw={"height_ratios": [9, 1.2], "hspace": 0.05})
+    ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
     # Convert J/FLOP to pJ/FLOP for display
@@ -2341,38 +2404,88 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
                alpha=0.55)
         legend_c_used = True
 
-    # Annotations : total + percentages + variant name
+    def _fmt_pj(v):
+        """Format pJ value with reasonable precision for matmul (typ 0.01-100)."""
+        if v == 0:
+            return "0"
+        if abs(v) >= 1000:
+            return f"{v:,.0f}"
+        if abs(v) >= 10:
+            return f"{v:.1f}"
+        if abs(v) >= 1:
+            return f"{v:.2f}"
+        if abs(v) >= 0.01:
+            return f"{v:.3f}"
+        return f"{v:.2e}"
+
+    # Annotations : total above + per-component value+pct.
+    # Inline label when component pct is large enough; otherwise a
+    # leader line points to a label outside the bar (right side).
+    # On log y-scale we use offset_points for the outside labels so
+    # vertical spacing is uniform regardless of magnitude.
+    INLINE_PCT_THRESHOLD = 8.0
+    LEADER_X_OFFSET = 0.42
     for i, b in enumerate(bars):
         total = b["total"] if b["total"] > 0 else 1
         a_pct = 100.0 * b["A"] / total
         b_pct = 100.0 * b["B"] / total
         c_pct = 100.0 * b["C"] / total
-        ax.text(xs[i], T_vals[i] * 1.03,
-                f"{T_vals[i]:.2f} pJ/FLOP",
-                ha="center", va="bottom", fontsize=9, fontweight="bold")
-        if a_pct > 8:
-            ax.text(xs[i], A_vals[i] / 2, f"A: {a_pct:.0f}%",
-                    ha="center", va="center", fontsize=8, color="white",
-                    fontweight="bold")
-        if b_pct > 6:
-            ax.text(xs[i], A_vals[i] + B_vals[i] / 2,
-                    f"B: {b_pct:.0f}%",
-                    ha="center", va="center", fontsize=8, color="white",
-                    fontweight="bold")
-        if c_pct > 8:
-            ax.text(xs[i], A_vals[i] + B_vals[i] + C_vals[i] / 2,
-                    f"C: {c_pct:.0f}%",
-                    ha="center", va="center", fontsize=8, color="black",
-                    fontweight="bold")
+        # Total above the stack
+        ax.text(xs[i], T_vals[i] * 1.04,
+                f"Σ = {_fmt_pj(T_vals[i])} pJ/FLOP",
+                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
+
+        # Geometric midpoints work better on a log axis than arithmetic.
+        def _gmid(top, bot):
+            if top <= 0 or bot <= 0:
+                return (top + bot) / 2.0
+            import math
+            return math.exp((math.log(top) + math.log(bot)) / 2.0)
+
+        a_top = A_vals[i]
+        b_top = A_vals[i] + B_vals[i]
+        c_top = A_vals[i] + B_vals[i] + C_vals[i]
+        segments = [
+            ("A", A_vals[i], a_pct,
+             _gmid(a_top, max(a_top * 1e-6, 1e-9)) if a_top > 0 else 0,
+             "white"),
+            ("B", B_vals[i], b_pct, _gmid(b_top, a_top) if B_vals[i] > 0 else 0,
+             "white"),
+            ("C", C_vals[i], c_pct, _gmid(c_top, b_top) if C_vals[i] > 0 else 0,
+             "black"),
+        ]
+        outside_offset_points = -10.0  # cumulative pt offset for leader labels
+        for name, value_pj, pct, mid_y, txt_color in segments:
+            if value_pj <= 0:
+                continue
+            label = f"{name}: {_fmt_pj(value_pj)} pJ\n({pct:.1f}%)"
+            if pct >= INLINE_PCT_THRESHOLD and mid_y > 0:
+                ax.text(xs[i], mid_y, label,
+                        ha="center", va="center", fontsize=8.5,
+                        color=txt_color, fontweight="bold", linespacing=1.1)
+            else:
+                # Outside leader. Use display coords for the text by
+                # offsetting from the bar-edge anchor in points.
+                ax.annotate(
+                    label,
+                    xy=(xs[i] + 0.30, mid_y if mid_y > 0 else value_pj),
+                    xytext=(40, outside_offset_points),
+                    textcoords="offset points",
+                    fontsize=8, ha="left", va="center", color="#222",
+                    arrowprops=dict(arrowstyle="-", color="#888",
+                                    lw=0.8, alpha=0.7),
+                    bbox=dict(facecolor="white", edgecolor="#aaaaaa",
+                              alpha=0.92, pad=2))
+                outside_offset_points -= 30.0  # stack subsequent labels
         # FP8 native advantage annotation : when B was negative, surface
         # the saved energy as a positive number so reader sees "fp8 is
         # cheaper by X pJ/FLOP than fp16 baseline".
         if b["is_fp8"] and b["B_advantage"] > 0:
             adv_pj = b["B_advantage"] * 1e12
             ax.annotate(
-                f"FP8 native advantage:\n−{adv_pj:.2f} pJ/FLOP\nvs fp16_tc baseline",
+                f"FP8 native advantage:\n−{_fmt_pj(adv_pj)} pJ/FLOP\nvs fp16_tc baseline",
                 xy=(xs[i], T_vals[i]),
-                xytext=(0, 30), textcoords="offset points",
+                xytext=(0, 40), textcoords="offset points",
                 ha="center", fontsize=8, color="#2ca02c", fontweight="bold",
                 bbox=dict(facecolor="#e6f4ea", edgecolor="#2ca02c", pad=3))
 
@@ -2393,16 +2506,17 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax.grid(True, axis="y", alpha=0.3, which="both")
     ax.legend(loc="upper right", fontsize=9, ncol=1, bbox_to_anchor=(1.01, 1.0))
 
-    fig.text(
-        0.5, -0.04,
+    # Caveat row — guaranteed visible because it lives in its own subplot.
+    ax_caveat.text(
+        0.5, 0.5,
         "CRITICAL CAVEAT : matmul's `cache_regime` is based on LOGICAL "
         "working set (3·K²·bpe). cuBLAS/TE matmul kernels reuse each "
         "input element O(K) times via SM tile cache, so actual DRAM "
         "traffic ≪ logical. Component C is therefore a NOISY UPPER BOUND "
         "on real DRAM cost — interpret as 'extra cost when working set "
         "exceeds L2', not literal HBM bytes. README §3.5.3.",
-        ha="center", fontsize=8, color="#444444", wrap=True,
-        bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=4))
+        ha="center", va="center", fontsize=9, color="#333", wrap=True,
+        bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
 
     _save_fig(fig, out_png)
     return True
