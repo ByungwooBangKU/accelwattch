@@ -2473,11 +2473,13 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     # below the caveat so the saved PNG isn't dominated by whitespace.
     fig, (ax, ax_caveat) = plt.subplots(
         2, 1,
-        # Tighter x : 1.3 in/bar (was 1.8). Caveat row enlarged to keep
-        # the (now 4-line) caveat from spilling into the main axes ;
-        # hspace 0.4 keeps the x-tick labels clear of the caveat box.
-        figsize=(max(10, 1.3 * len(bars) + 3.5), 9.5),
-        gridspec_kw={"height_ratios": [8.5, 2.0], "hspace": 0.40})
+        # Tighter x : 1.3 in/bar. Caveat row trimmed (2.0 → 1.4 of 8.5)
+        # so the saved PNG doesn't have ~1 in of empty space below the
+        # caveat. caveat box itself is anchored to top of its row
+        # (va="top") so any leftover slack falls below the visible text
+        # and gets cropped by bbox_inches="tight".
+        figsize=(max(10, 1.3 * len(bars) + 3.5), 8.5),
+        gridspec_kw={"height_ratios": [8.5, 1.4], "hspace": 0.40})
     ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
@@ -2487,17 +2489,22 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     C_vals = [b["C"] * 1e12 for b in bars]
     T_vals = [b["total"] * 1e12 for b in bars]
 
-    # palette
-    palette = PALETTE_MATMUL_VARIANTS
-    base_colors = [palette.get(b["variant"], "gray") for b in bars]
+    # Semantic A/B/C palette — same colors as the elementwise MECE plot.
+    # Previously each bar used its variant color (PALETTE_MATMUL_VARIANTS),
+    # which made fp8_te indistinguishable (A solid red + C hatched red,
+    # both = #d62728). Now A/B/C are immediately distinct on every bar ;
+    # variant identity is in the x-tick label.
+    COLOR_A = "#2ca02c"   # green   — L2-resident workload
+    COLOR_B = "#ff7f0e"   # orange  — fp8 cast / emulation overhead
+    COLOR_C = "#1f77b4"   # blue    — DRAM round-trip
 
-    # Stack order : A (solid) → B (orange = cast/emu overhead) → C (hatched DRAM)
+    # Stack order : A (solid green) → B (solid orange) → C (solid blue)
     legend_a_used = False
     legend_b_used = False
     legend_c_used = False
     for i, b in enumerate(bars):
         # A
-        ax.bar(xs[i], A_vals[i], color=base_colors[i], edgecolor="white",
+        ax.bar(xs[i], A_vals[i], color=COLOR_A, edgecolor="white",
                label=("A) L2-resident workload (compute + L2 + launch)\n"
                       "    fp8: uses fp16 baseline; non-fp8: uses own l2_hit_100")
                      if not legend_a_used else None,
@@ -2507,19 +2514,19 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
         # fp8's negative case rendered as 2-component instead).
         if B_vals[i] > 0:
             ax.bar(xs[i], B_vals[i], bottom=A_vals[i],
-                   color="#ff7f0e", edgecolor="white",
+                   color=COLOR_B, edgecolor="white",
                    label=("B) FP8 cast / emulation overhead\n"
                           "    = J(fp8_te) − J(fp16_tc) at l2_hit_100\n"
                           "    (positive = emulation / cast cost)")
                          if not legend_b_used else None,
-                   alpha=0.85)
+                   alpha=0.95)
             legend_b_used = True
         # C — DRAM
         ax.bar(xs[i], C_vals[i], bottom=A_vals[i] + B_vals[i],
-               color=base_colors[i], edgecolor="white", hatch="///",
+               color=COLOR_C, edgecolor="white",
                label=("C) DRAM round-trip (marginal HBM cost)"
                       if not legend_c_used else None),
-               alpha=0.55)
+               alpha=0.95)
         legend_c_used = True
 
     def _fmt_pj(v):
@@ -2614,16 +2621,14 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax.set_xticks(xs)
     ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=10)
     ax.set_ylabel("pJ / FLOP   (dynamic, at l2_hit_0)", fontsize=11)
-    ax.set_yscale("log")
-    # Explicit ylim — the "Σ = X pJ/FLOP" labels above each bar otherwise
-    # push matplotlib's auto-ylim by a full extra decade, leaving most of
-    # the chart blank above the tallest bar. 1.5× cap on log scale gives
-    # the labels enough room without wasting half the canvas.
+    # Linear y-axis (per user request) — log made tiny segments (B for
+    # fp8_te) visually invisible and the variant-color overlap (A red /
+    # C red-hatched) hard to read. Linear with explicit headroom for
+    # the "Σ" total label.
     if T_vals:
         positive_T = [v for v in T_vals if v > 0]
-        positive_min = [v for v in (A_vals + C_vals) if v > 0]
-        if positive_T and positive_min:
-            ax.set_ylim(min(positive_min) * 0.5, max(positive_T) * 1.5)
+        if positive_T:
+            ax.set_ylim(0, max(positive_T) * 1.15)
     ax.set_title(
         f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
         "fp8_te : 3 components (A: fp16 baseline, B: cast/emu overhead, C: DRAM)\n"
@@ -2639,15 +2644,17 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
               loc="upper left", fontsize=9, ncol=1,
               bbox_to_anchor=(1.01, 1.0))
 
-    # Caveat row — explicit `\n` (not wrap=True) so layout is stable
-    # across matplotlib versions. Compressed to 4 lines per user request.
+    # Caveat — anchored to TOP of its row (va="top", y≈0.95) so any
+    # leftover slack falls below the visible text and gets cropped away
+    # by `bbox_inches="tight"` in `_save_fig`. Was va="center" which
+    # left ~1 in of empty space below the caveat box in the saved PNG.
     ax_caveat.text(
-        0.5, 0.5,
+        0.5, 0.95,
         "CRITICAL CAVEAT : `cache_regime` is based on LOGICAL working set (3·K²·bpe).\n"
         "cuBLAS / TE kernels reuse each input O(K) times in SM tile cache,\n"
         "so actual DRAM traffic ≪ logical → C is a NOISY UPPER BOUND on real DRAM cost.\n"
         "Read C as 'extra cost when working set exceeds L2', not literal HBM bytes.   (README §3.5.3)",
-        ha="center", va="center", fontsize=9, color="#333", linespacing=1.4,
+        ha="center", va="top", fontsize=9, color="#333", linespacing=1.4,
         bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
 
     _save_fig(fig, out_png)
