@@ -29,7 +29,7 @@ import torch
 
 # FLOPs-per-element estimates for each op, used only for reporting
 # joule-per-FLOP as a secondary metric. The primary metric is joule-per-element.
-FLOPS_PER_ELEMENT = {
+FLOP_PER_ELEMENT = {
     "mul":       1,   # a * b
     "add":       1,   # a + b
     "softmax":   5,   # max, sub, exp, sum, div
@@ -463,12 +463,12 @@ def build(op: str, dtype_label: str, n_elements: int,
     fn = builders[op](shape, dtype_label, device)
     # `.get(..., 0)` defends against the historic foot-gun of registering
     # a new op in _BUILDERS / _STREAM_BUILDERS but forgetting the matching
-    # FLOPS_PER_ELEMENT entry — the cell will still run, just with
+    # FLOP_PER_ELEMENT entry — the cell will still run, just with
     # FLOPs=0 (treated as compute-light, J/FLOP comes out NaN per
     # gpu_power_bench.py's zero-divisor guard). Without this, you'd see
     # "build failed: '<op>'" with KeyError, exactly the symptom the
     # stream_read / stream_write addition triggered.
-    flops = actual_n * FLOPS_PER_ELEMENT.get(op, 0)
+    flops = actual_n * FLOP_PER_ELEMENT.get(op, 0)
     name = f"{dtype_label}_{op}"
     # Elementwise ops never hit Tensor Cores — TC is matmul-only silicon.
     compute_unit = "CUDA core"
