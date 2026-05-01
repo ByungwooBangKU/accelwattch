@@ -915,3 +915,342 @@ def llm_matmul_footprint_bytes(preset: str, T: int, dtype_label: str,
     if dtype_label == "fp8":
         base = int(base * 1.5) + K * N * 2
     return base
+
+
+# ============================================================================
+# Fused vs Standalone (G11 / P1.4) — measure softmax / gelu / layernorm both
+# as standalone PyTorch ops (already in `_BUILDERS` above) AND as part of a
+# fused kernel (FlashAttention / linear+gelu / ln+linear). Standalone J/elem
+# is dominated by HBM round-trip ; the fused variant amortises HBM across
+# the surrounding matmul. Comparison via subtraction (analyze.py decomposition).
+#
+# Default shapes are taken from openai/gpt-oss-120b/config.json :
+#   * attention : B=1, H_q=64, H_kv=8, N_q=N_kv=2048, D_head=64
+#                 (full-attention layer ; sliding-window layer N_kv=128 not
+#                  measured in phase 1)
+#   * MLP       : M=2048, D_in=D_out=2880  (per-expert MoE intermediate ;
+#                 1 of top-4 active experts)
+# CLI overrides : --attn-shape, --mlp-shape (gpu_power_bench.py).
+# Caveat — GPT-OSS uses SiLU/SwiGLU + RMSNorm, not GeLU/LayerNorm. Phase 1
+# keeps the user-named ops for structure comparison ; SiLU/RMSNorm phase
+# is REVIEW.md G12 / P2.4. See README §3.7.
+# ============================================================================
+
+FUSED_VARIANTS = (
+    "attention_flash",        # Q@K + softmax + scale + (P@V) — full SDPA flash kernel
+    "attention_qkv_matmul",   # Q@K + (Q@K)@V only (softmax replaced by identity) — subtraction baseline
+    "linear_gelu",            # gelu(linear(x)+b) — torch.compile epilogue fusion
+    "linear_baseline_gelu",   # linear(x)+b only — same shape, no activation — subtraction baseline
+    "ln_linear",              # linear(layer_norm(x))+b — torch.compile pre-norm fusion
+    "linear_baseline_ln",     # linear(x)+b only — matches ln_linear shape — subtraction baseline
+)
+
+
+def _sdpa_kernel_ctx(enable_flash=True, enable_cudnn=True,
+                     enable_math=False, enable_mem_efficient=False):
+    """Cross-version SDPA backend selector. PyTorch's API moved from
+    `torch.backends.cuda.sdp_kernel` → `torch.nn.attention.sdpa_kernel`.
+    Try the new path first, fall back to the legacy one, then to a
+    no-op. The benchmark warns if math/mem-efficient runs unintentionally
+    (verifiable post-hoc with `fusion_check.py`)."""
+    try:
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        backends = []
+        if enable_flash: backends.append(SDPBackend.FLASH_ATTENTION)
+        if enable_cudnn:
+            try: backends.append(SDPBackend.CUDNN_ATTENTION)
+            except AttributeError: pass
+        if enable_math: backends.append(SDPBackend.MATH)
+        if enable_mem_efficient: backends.append(SDPBackend.EFFICIENT_ATTENTION)
+        return sdpa_kernel(backends)
+    except Exception:
+        pass
+    try:
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=enable_flash, enable_math=enable_math,
+            enable_mem_efficient=enable_mem_efficient)
+    except Exception:
+        from contextlib import nullcontext
+        return nullcontext()
+
+
+def _try_native_gqa_supported() -> bool:
+    """Probe whether SDPA's `enable_gqa` kwarg is available (PyTorch >= 2.5)."""
+    try:
+        q = torch.zeros(1, 1, 1, 8, dtype=torch.float16, device="cuda")
+        torch.nn.functional.scaled_dot_product_attention(q, q, q, enable_gqa=True)
+        return True
+    except TypeError:
+        return False
+    except Exception:
+        return False
+
+
+def _make_attention_flash(B: int, H_q: int, H_kv: int, N_q: int, N_kv: int,
+                          D_head: int, dtype: torch.dtype, device,
+                          causal: bool = False) -> Callable[[], None]:
+    """Full fused attention via SDPA + FlashAttention backend.
+
+    GQA path : K/V have H_kv heads, Q has H_q. PyTorch >= 2.5 supports this
+    natively via `enable_gqa=True` ; older versions need manual
+    `repeat_interleave`. The fusion_check.py PoC verifies which path is
+    available before the sweep.
+    """
+    q = torch.randn(B, H_q,  N_q, D_head, dtype=dtype, device=device)
+    k = torch.randn(B, H_kv, N_kv, D_head, dtype=dtype, device=device)
+    v = torch.randn(B, H_kv, N_kv, D_head, dtype=dtype, device=device)
+    enable_gqa = (H_q != H_kv) and _try_native_gqa_supported()
+    if H_q != H_kv and not enable_gqa:
+        groups = H_q // H_kv
+        k = k.repeat_interleave(groups, dim=1).contiguous()
+        v = v.repeat_interleave(groups, dim=1).contiguous()
+    sdpa_kwargs = {"is_causal": causal}
+    if enable_gqa:
+        sdpa_kwargs["enable_gqa"] = True
+
+    def f():
+        with _sdpa_kernel_ctx(enable_flash=True, enable_cudnn=True,
+                              enable_math=False, enable_mem_efficient=False):
+            torch.nn.functional.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+    return f
+
+
+def _make_attention_qkv_matmul(B: int, H_q: int, H_kv: int, N_q: int, N_kv: int,
+                               D_head: int, dtype: torch.dtype, device,
+                               causal: bool = False) -> Callable[[], None]:
+    """Subtraction baseline for `attention_flash` :  Q@Kᵀ then result@V,
+    NO softmax / scaling / masking. Same input shape, same FLOPs (4·B·H_q·
+    N_q·N_kv·D excluding the softmax FLOPs which are tiny in standalone).
+
+    Energy attribution :
+        J(attention_flash) − J(attention_qkv_matmul) ≈
+            J of (online streaming softmax + max/sum/exp/scale/rescale +
+                  whatever masking the flash kernel applies)
+    """
+    q = torch.randn(B, H_q,  N_q, D_head, dtype=dtype, device=device)
+    k = torch.randn(B, H_kv, N_kv, D_head, dtype=dtype, device=device)
+    v = torch.randn(B, H_kv, N_kv, D_head, dtype=dtype, device=device)
+    if H_q != H_kv:
+        groups = H_q // H_kv
+        k = k.repeat_interleave(groups, dim=1).contiguous()
+        v = v.repeat_interleave(groups, dim=1).contiguous()
+    # We use `torch.matmul` chains : Q @ K.T → (Q@K.T) @ V. NO softmax.
+    # The shape of Q@K.T is (B, H_q, N_q, N_kv).
+    def f():
+        s = torch.matmul(q, k.transpose(-1, -2))
+        torch.matmul(s, v)
+    return f
+
+
+# ---------- helper : torch.compile fusion with TE fallback ------------------
+
+_COMPILE_FALLBACK_WARNED: dict[str, bool] = {}
+
+
+def _compile_or_eager(fn_eager, label: str, force: str = "auto"):
+    """Wrap fn_eager with torch.compile ; fall back to eager + warning if
+    the compile / first call raises. `force` ∈ {"auto", "compile", "eager"}.
+
+    Returns (callable, backend_label). backend_label ∈ {"compile", "eager"}.
+    """
+    if force == "eager":
+        return fn_eager, "eager"
+    if force in ("auto", "compile"):
+        try:
+            compiled = torch.compile(fn_eager, mode="reduce-overhead", dynamic=False)
+            return compiled, "compile"
+        except Exception as e:
+            if not _COMPILE_FALLBACK_WARNED.get(label):
+                _COMPILE_FALLBACK_WARNED[label] = True
+                print(f"[fused] torch.compile failed for {label} "
+                      f"({type(e).__name__}: {e}) — falling back to eager. "
+                      f"Energy will include kernel-launch overhead per op "
+                      f"(NOT representative of fused).")
+            return fn_eager, "eager"
+    return fn_eager, "eager"
+
+
+def _make_linear_gelu(M: int, D_in: int, D_out: int, dtype: torch.dtype,
+                      device, force_backend: str = "auto") -> tuple[Callable[[], None], str]:
+    """`gelu(linear(x) + b)` fused via torch.compile. Returns (run_fn, backend).
+    backend ∈ {"compile", "eager"} — caller can flag emulated=1 when "eager"."""
+    x = torch.randn(M, D_in, dtype=dtype, device=device)
+    W = torch.randn(D_in, D_out, dtype=dtype, device=device) * (1.0 / D_in ** 0.5)
+    b = torch.zeros(D_out, dtype=dtype, device=device)
+
+    def fn_eager(x=x):
+        torch.nn.functional.gelu(x @ W + b, approximate="tanh")
+
+    fn_compiled, backend = _compile_or_eager(fn_eager, "linear_gelu", force_backend)
+    # Warm the compile so the first sampled call doesn't include compile time.
+    try:
+        for _ in range(3):
+            fn_compiled()
+        torch.cuda.synchronize()
+    except Exception as e:
+        # Fallback if compiled fn fails on first call.
+        print(f"[fused] linear_gelu compiled call failed ({e}); using eager.")
+        fn_compiled, backend = fn_eager, "eager"
+        for _ in range(3): fn_compiled()
+        torch.cuda.synchronize()
+    return fn_compiled, backend
+
+
+def _make_linear_baseline_gelu(M: int, D_in: int, D_out: int, dtype: torch.dtype,
+                               device, force_backend: str = "auto") -> tuple[Callable[[], None], str]:
+    """Subtraction baseline for `linear_gelu` : pure `linear(x)+b`, no GeLU.
+    Compiled with the same backend so kernel-launch overhead cancels in subtraction."""
+    x = torch.randn(M, D_in, dtype=dtype, device=device)
+    W = torch.randn(D_in, D_out, dtype=dtype, device=device) * (1.0 / D_in ** 0.5)
+    b = torch.zeros(D_out, dtype=dtype, device=device)
+
+    def fn_eager(x=x):
+        _ = x @ W + b
+
+    fn_compiled, backend = _compile_or_eager(fn_eager, "linear_baseline_gelu", force_backend)
+    try:
+        for _ in range(3):
+            fn_compiled()
+        torch.cuda.synchronize()
+    except Exception as e:
+        print(f"[fused] linear_baseline_gelu compiled call failed ({e}); using eager.")
+        fn_compiled, backend = fn_eager, "eager"
+        for _ in range(3): fn_compiled()
+        torch.cuda.synchronize()
+    return fn_compiled, backend
+
+
+def _make_ln_linear(M: int, D_in: int, D_out: int, dtype: torch.dtype,
+                    device, force_backend: str = "auto") -> tuple[Callable[[], None], str]:
+    """`linear(layer_norm(x)) + b` fused via torch.compile. Pre-norm pattern."""
+    x = torch.randn(M, D_in, dtype=dtype, device=device)
+    g = torch.ones(D_in,  dtype=dtype, device=device)
+    bln = torch.zeros(D_in, dtype=dtype, device=device)
+    W = torch.randn(D_in, D_out, dtype=dtype, device=device) * (1.0 / D_in ** 0.5)
+    blin = torch.zeros(D_out, dtype=dtype, device=device)
+
+    def fn_eager(x=x):
+        h = torch.nn.functional.layer_norm(x, (D_in,), g, bln, eps=1e-5)
+        _ = h @ W + blin
+
+    fn_compiled, backend = _compile_or_eager(fn_eager, "ln_linear", force_backend)
+    try:
+        for _ in range(3):
+            fn_compiled()
+        torch.cuda.synchronize()
+    except Exception as e:
+        print(f"[fused] ln_linear compiled call failed ({e}); using eager.")
+        fn_compiled, backend = fn_eager, "eager"
+        for _ in range(3): fn_compiled()
+        torch.cuda.synchronize()
+    return fn_compiled, backend
+
+
+def _make_linear_baseline_ln(M: int, D_in: int, D_out: int, dtype: torch.dtype,
+                             device, force_backend: str = "auto") -> tuple[Callable[[], None], str]:
+    """Subtraction baseline for `ln_linear` : pure `linear(x)+b`, no LN.
+    Same shape as ln_linear; compiled with the same backend."""
+    return _make_linear_baseline_gelu(M, D_in, D_out, dtype, device, force_backend)
+
+
+# ---------- public entry point ----------------------------------------------
+
+def build_fused(variant: str, dtype_label: str,
+                attn_shape: tuple[int, int, int, int, int, int] = (1, 64, 8, 2048, 2048, 64),
+                mlp_shape: tuple[int, int, int] = (2048, 2880, 2880),
+                causal: bool = False,
+                fusion_backend: str = "auto",
+                device: str | torch.device = "cuda") -> BenchSpec:
+    """Build one fused-vs-standalone variant (G11 / P1.4).
+
+    Args:
+      variant: one of FUSED_VARIANTS.
+      dtype_label: "fp16" | "bf16". fp8 fused is REVIEW.md G12 / P2.4.
+      attn_shape: (B, H_q, H_kv, N_q, N_kv, D_head) for attention variants.
+      mlp_shape:  (M, D_in, D_out) for MLP / LN variants.
+      causal: if True, attention uses causal mask (halves softmax cost).
+      fusion_backend: "auto" | "compile" | "eager".
+
+    Returns BenchSpec ; `emulated=1` indicates fusion did NOT take effect
+    (eager fallback) — analyze.py honours this when computing residuals.
+    """
+    if variant not in FUSED_VARIANTS:
+        raise ValueError(f"unknown fused variant {variant!r}; "
+                         f"choices: {FUSED_VARIANTS}")
+    if dtype_label not in ("fp16", "bf16"):
+        raise ValueError(f"fused variants only support fp16/bf16 (got {dtype_label!r}); "
+                         f"fp8 fused is G12/P2.4 follow-up")
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_label]
+    notes = ""
+    backend_used = "tc"  # default for fused — output reaches Tensor Cores
+    emulated = False
+
+    if variant in ("attention_flash", "attention_qkv_matmul"):
+        B, H_q, H_kv, N_q, N_kv, D_head = attn_shape
+        if H_q % H_kv != 0:
+            raise ValueError(f"attention: H_q ({H_q}) must be divisible by H_kv ({H_kv})")
+        builder = (_make_attention_flash if variant == "attention_flash"
+                   else _make_attention_qkv_matmul)
+        fn = builder(B, H_q, H_kv, N_q, N_kv, D_head, dtype, device, causal=causal)
+        # FLOPs : Q@Kᵀ = 2·B·H_q·N_q·N_kv·D , (Q@Kᵀ)@V = 2·B·H_q·N_q·N_kv·D
+        # → 4·B·H_q·N_q·N_kv·D total (softmax FLOPs negligible here).
+        flops = 4 * B * H_q * N_q * N_kv * D_head
+        n_out = B * H_q * N_q * D_head
+        shape = attn_shape
+        compute_unit = "Tensor Core"
+        if variant == "attention_flash":
+            notes = "FlashAttention via SDPA (forced flash/cudnn backend)"
+        else:
+            notes = "subtraction baseline : Q@Kᵀ + (Q@Kᵀ)@V, no softmax"
+        if causal: notes += " ; causal=1"
+
+    elif variant in ("linear_gelu", "linear_baseline_gelu",
+                     "ln_linear", "linear_baseline_ln"):
+        M, D_in, D_out = mlp_shape
+        builder_map = {
+            "linear_gelu":          _make_linear_gelu,
+            "linear_baseline_gelu": _make_linear_baseline_gelu,
+            "ln_linear":            _make_ln_linear,
+            "linear_baseline_ln":   _make_linear_baseline_ln,
+        }
+        fn, backend_used = builder_map[variant](M, D_in, D_out, dtype, device,
+                                                fusion_backend)
+        # FLOPs : linear = 2·M·D_in·D_out + bias add (M·D_out).
+        # Activation / norm FLOPs are tiny (~8·M·D_out vs 2·M·D_in·D_out
+        # which dominates when D_in is large) — bundled into total flops
+        # as "compute" but not separately costed.
+        flops = 2 * M * D_in * D_out
+        if variant == "linear_gelu":
+            flops += 8 * M * D_out         # tanh-approx GeLU
+        elif variant == "ln_linear":
+            flops += 8 * M * D_in          # LN over D_in
+        n_out = M * D_out
+        shape = mlp_shape
+        compute_unit = "Tensor Core"
+        notes = f"backend={backend_used}"
+        emulated = (backend_used == "eager")
+        if emulated:
+            notes += " (FUSION FAILED — eager fallback, residual will inflate)"
+
+    else:
+        raise AssertionError(f"unhandled fused variant {variant!r}")
+
+    name = variant   # CSV `variant` column = exactly the variant key
+    # cache_regime — fused inputs typically span multiple L2-sized
+    # tensors (Q+K+V or x+W+y). Compute working set ; classify.
+    if "attention" in variant:
+        B, H_q, H_kv, N_q, N_kv, D_head = attn_shape
+        ws = (B * (H_q + 2 * H_kv) * N_kv * D_head + B * H_q * N_q * D_head) * 2  # bf16/fp16
+    else:
+        M, D_in, D_out = mlp_shape
+        ws = (M * D_in + D_in * D_out + M * D_out) * 2
+    dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
+    regime = classify_cache_regime(ws, get_l2_bytes(dev_idx))
+
+    return BenchSpec(
+        name=name, op=variant, dtype_label=dtype_label,
+        shape=tuple(shape), n_elements=int(n_out),
+        flops_per_call=int(flops), run=fn,
+        compute_unit=compute_unit, emulated=emulated,
+        cache_regime=regime, notes=notes,
+    )

@@ -485,6 +485,38 @@ def main() -> int:
     ap.add_argument("--dram-bw-loads", type=int, nargs="+", default=None,
                     help="working-set-target N values for --dram-bw-test "
                          "(default: 4 sizes deep into the l2_hit_0 regime)")
+    # ---- Fused vs Standalone (G11 / P1.4 — opt-in) -----------------------
+    # 6 new variants : attention_flash + attention_qkv_matmul (subtraction
+    # baseline), linear_gelu + linear_baseline_gelu, ln_linear +
+    # linear_baseline_ln. Each variant runs as a SINGLE cell at fixed
+    # shape (no load sweep — the load axis is the shape itself, fixed by
+    # GPT-OSS 120B defaults). analyze.py pairs full ↔ baseline by op
+    # group and computes residual + bootstrap CI. See README §3.7.
+    ap.add_argument("--include-fused", action="store_true",
+                    help="opt-in: add the 6 fused-vs-standalone variants. "
+                         "Doubles the elementwise CSV row count by ~30%. "
+                         "See README §3.7 / TestCases A.5 / REVIEW.md G11.")
+    ap.add_argument("--attn-shape", type=str, default="1,64,8,2048,2048,64",
+                    help="attention_flash / attention_qkv_matmul shape — "
+                         "B,H_q,H_kv,N_q,N_kv,D_head. Default = GPT-OSS 120B "
+                         "full-attention layer.")
+    ap.add_argument("--mlp-shape", type=str, default="2048,2880,2880",
+                    help="linear_gelu / ln_linear shape — M,D_in,D_out. "
+                         "Default = GPT-OSS 120B per-expert MoE intermediate.")
+    ap.add_argument("--fused-causal", action="store_true",
+                    help="attention_flash : use causal mask. Halves "
+                         "softmax cost (lower bound). Default off "
+                         "= upper bound estimate.")
+    ap.add_argument("--fused-fusion-backend", choices=["auto", "compile", "eager"],
+                    default="auto",
+                    help="how to enforce fusion for linear_gelu / ln_linear. "
+                         "'auto' tries torch.compile and falls back to eager "
+                         "with a warning. 'eager' disables fusion entirely "
+                         "(diagnostic only — residuals will inflate).")
+    ap.add_argument("--fused-dtypes", nargs="+", default=None,
+                    help="dtypes for fused variants. Default = intersection "
+                         "of --dtypes with {fp16, bf16}. fp8 fused is "
+                         "REVIEW.md G12 / P2.4 (not yet supported).")
     # ---- SoC envelope (the case formerly known as soc_power_bench.py) ----
     # Runs static/max/leakage phases as a sidecar. Same defaults as the
     # standalone soc_power_bench.py (~5 min wall). All flags accept the
@@ -788,11 +820,73 @@ def main() -> int:
             for preset, T, dt, fp in dropped_llm:
                 print(f"[memcheck]   {preset:>8s} @ T={T:<6d} {dt:>4s}  "
                       f"≈ {fp/(1<<30):.2f} GB")
+
+    # Fused vs Standalone (G11 / P1.4) — opt-in. Each variant runs as
+    # a single cell at fixed shape (no load sweep). Shape comes from
+    # CLI (--attn-shape / --mlp-shape, GPT-OSS 120B defaults).
+    if args.include_fused:
+        try:
+            attn_shape = tuple(int(x) for x in args.attn_shape.split(","))
+            assert len(attn_shape) == 6, "expected 6 numbers"
+        except (ValueError, AssertionError) as e:
+            print(f"[error] bad --attn-shape {args.attn_shape!r}: {e}. "
+                  f"Expected B,H_q,H_kv,N_q,N_kv,D_head")
+            return 1
+        try:
+            mlp_shape = tuple(int(x) for x in args.mlp_shape.split(","))
+            assert len(mlp_shape) == 3, "expected 3 numbers"
+        except (ValueError, AssertionError) as e:
+            print(f"[error] bad --mlp-shape {args.mlp_shape!r}: {e}. "
+                  f"Expected M,D_in,D_out")
+            return 1
+        # dtype filter : intersection with {fp16, bf16}; fp8 fused is G12.
+        if args.fused_dtypes is not None:
+            fused_dtypes = list(args.fused_dtypes)
+        else:
+            fused_dtypes = [d for d in args.dtypes if d in ("fp16", "bf16")]
+            if not fused_dtypes:
+                fused_dtypes = ["bf16"]
+                print(f"[fused] --dtypes had no fp16/bf16; defaulting fused to bf16")
+        unsupported = [d for d in fused_dtypes if d not in ("fp16", "bf16")]
+        if unsupported:
+            print(f"[error] fused only supports fp16/bf16; got {unsupported}. "
+                  f"fp8 fused = REVIEW.md G12 / P2.4 (not yet)")
+            return 1
+        for dtype in fused_dtypes:
+            for variant in bm.FUSED_VARIANTS:
+                # The "load value" here is the fixed shape — encoded as a
+                # human-readable summary so each cell is uniquely keyed.
+                if variant in ("attention_flash", "attention_qkv_matmul"):
+                    load_value = (f"B{attn_shape[0]}_Hq{attn_shape[1]}_"
+                                  f"Hkv{attn_shape[2]}_Nq{attn_shape[3]}_"
+                                  f"Nkv{attn_shape[4]}_D{attn_shape[5]}")
+                else:
+                    load_value = f"M{mlp_shape[0]}_Din{mlp_shape[1]}_Dout{mlp_shape[2]}"
+                plans.append({
+                    "category": "fused",
+                    "mode": "fused",
+                    "op": variant, "dtype": dtype,
+                    "load_name": "shape",
+                    "load_value": load_value,
+                    "build": (lambda v=variant, d=dtype,
+                                     a=attn_shape, m=mlp_shape,
+                                     c=args.fused_causal,
+                                     fb=args.fused_fusion_backend:
+                              bm.build_fused(v, d, attn_shape=a, mlp_shape=m,
+                                             causal=c, fusion_backend=fb,
+                                             device="cuda")),
+                })
+        print(f"[fused] {len(fused_dtypes) * len(bm.FUSED_VARIANTS)} fused "
+              f"cells added "
+              f"(dtypes={fused_dtypes}, attn={attn_shape}, mlp={mlp_shape}, "
+              f"causal={args.fused_causal}, backend={args.fused_fusion_backend})")
+
     total_cells = len(plans)
     print(f"[info] scheduling {total_cells} cells "
           f"(elementwise={sum(1 for p in plans if p['category']=='elementwise')}, "
           f"matmul={sum(1 for p in plans if p['category']=='matmul')}, "
-          f"matmul_llm={sum(1 for p in plans if p['category']=='matmul_llm')})")
+          f"matmul_llm={sum(1 for p in plans if p['category']=='matmul_llm')}, "
+          f"fused={sum(1 for p in plans if p['category']=='fused')})")
 
     rows: list[dict] = []
     # Re-baseline drift bookkeeping. p_static_ts records the wall clock
