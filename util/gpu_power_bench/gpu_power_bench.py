@@ -40,7 +40,8 @@ import torch
 
 import benchmarks as bm
 from power_monitor import (PowerSampler, measure_static_power,
-                            wait_for_cooldown, resolve_nvml_handle)
+                            wait_for_cooldown, wait_for_pstate_idle,
+                            resolve_nvml_handle)
 import preflight
 # SoC envelope phase + plot helpers — same code path the standalone
 # soc_power_bench.py uses, just composed here so we can run sweep + SoC
@@ -408,6 +409,18 @@ def main() -> int:
     ap.add_argument("--cooldown-timeout", type=float, default=180.0)
     ap.add_argument("--no-cooldown", action="store_true",
                     help="skip thermal cool-down between cells")
+    ap.add_argument("--pstate-idle-wait", type=float, default=30.0,
+                    help="before each static / re-baseline measurement, "
+                         "block until the GPU's SM clock drops below "
+                         "PSTATE_IDLE_CLOCK_THRESHOLD_MHZ (default 500) for "
+                         "3 consecutive samples — proves P8 idle was actually "
+                         "reached. 0 = disable. wait_for_cooldown only checks "
+                         "TEMPERATURE; P-state hysteresis can keep clocks in "
+                         "P0 even after temp drops, inflating P_static by "
+                         "30..50 W and triggering the '0/N samples reached "
+                         "P8' warning. Recommended: 30s on H100, longer if "
+                         "boost-clock lock survives. `nvidia-smi -rgc` before "
+                         "sweep is a stronger but root-only alternative.")
     ap.add_argument("--rebaseline-every", type=int, default=0,
                     help="re-measure idle / static power every N cells "
                          "(0 = once at start, no drift correction). 20 is a "
@@ -649,6 +662,10 @@ def main() -> int:
         wait_for_cooldown(handle, target_c=args.cooldown_c,
                           timeout_s=args.cooldown_timeout,
                           min_s=args.cooldown_min_s)
+    # Wait for actual P8 idle (boost-clock hysteresis can keep SMs at P0
+    # for tens of seconds even after temperature drops).
+    if args.pstate_idle_wait > 0:
+        wait_for_pstate_idle(handle, timeout_s=args.pstate_idle_wait)
     print(f"[baseline] measuring static power for {args.static_seconds:.1f}s …")
     baseline = measure_static_power(handle, seconds=args.static_seconds,
                                     hz=args.poll_hz,
@@ -923,6 +940,13 @@ def main() -> int:
                 # Drain any pending GPU work before measuring idle.
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+                # Same P8-wait as the initial baseline so re-baselines
+                # don't get hit by the P0 hysteresis that always follows
+                # an active cell.
+                if args.pstate_idle_wait > 0:
+                    wait_for_pstate_idle(handle,
+                                         timeout_s=args.pstate_idle_wait,
+                                         verbose=False)
                 rb = measure_static_power(handle,
                                           seconds=args.rebaseline_seconds,
                                           hz=args.poll_hz,

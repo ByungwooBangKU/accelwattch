@@ -63,7 +63,7 @@ import pynvml
 import torch
 
 import benchmarks as bm
-from power_monitor import PowerSampler, wait_for_cooldown
+from power_monitor import PowerSampler, wait_for_cooldown, wait_for_pstate_idle
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +731,11 @@ def main() -> int:
     ap.add_argument("--cooldown-c", type=int, default=45,
                     help="target temp before each phase. Set 0 to disable.")
     ap.add_argument("--cooldown-timeout", type=float, default=180.0)
+    ap.add_argument("--pstate-idle-wait", type=float, default=30.0,
+                    help="wait this many seconds for SM clock to drop below "
+                         "P8 idle threshold before measuring static. 0 to "
+                         "disable. P0→P8 hysteresis can outlast cooldown_c "
+                         "by tens of seconds, inflating P_static.")
     ap.add_argument("--no-leakage", action="store_true")
     ap.add_argument("--no-max", action="store_true")
     args = ap.parse_args()
@@ -781,6 +786,12 @@ def main() -> int:
             sampler.set_phase("cooldown_pre_static")
             wait_for_cooldown(handle, target_c=args.cooldown_c,
                               timeout_s=args.cooldown_timeout, verbose=False)
+        # Wait for actual P8 idle — wait_for_cooldown only checks temp.
+        if getattr(args, "pstate_idle_wait", 30.0) > 0:
+            sampler.set_phase("pstate_wait_pre_static")
+            wait_for_pstate_idle(handle,
+                                 timeout_s=getattr(args, "pstate_idle_wait", 30.0),
+                                 verbose=True)
         print(f"\n[phase] static idle for {args.static_seconds}s")
         static_t = phase_static(sampler, args.static_seconds)
 
