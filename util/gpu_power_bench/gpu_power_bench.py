@@ -1425,12 +1425,26 @@ def main() -> int:
             leakage_enlarged_png = out_dir / f"{stem}_soc_leakage_enlarged.png"
             summary_png          = out_dir / f"{stem}_soc_summary.png"
             sb.plot_phase_timeline(soc_samples, soc_summary, phase_png)
+            leakage_t_png = out_dir / f"{stem}_soc_leakage_temperature.png"
             if soc_cycles_meta:
                 sb.plot_leakage_decay(soc_samples, soc_cycles_meta,
                                       soc_summary, leakage_png)
                 sb.plot_leakage_decay_zoomed(soc_samples, soc_cycles_meta,
                                              soc_summary, leakage_enlarged_png,
                                              x_max=3.0, y_min=50.0, y_max=150.0)
+                # Leakage(T) curve fit (PR B / P2.2 / G7) — Arrhenius +
+                # linear sanity-check on the (T, P) decay-window pairs.
+                leak_t_fit = sb.fit_leakage_temperature(soc_samples, soc_cycles_meta)
+                if leak_t_fit["n_points"] >= 5:
+                    for k, v in leak_t_fit.items():
+                        if isinstance(v, tuple):
+                            soc_summary[f"leakage_t_{k}_min"] = v[0]
+                            soc_summary[f"leakage_t_{k}_max"] = v[1]
+                        else:
+                            soc_summary[f"leakage_t_{k}"] = v
+                    sb.plot_leakage_temperature(
+                        soc_samples, soc_cycles_meta, leak_t_fit,
+                        leakage_t_png, gpu_name)
             sb.plot_summary_bars(soc_summary, summary_png)
             print(f"[save] {phase_png}")
             if soc_cycles_meta:

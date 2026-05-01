@@ -324,7 +324,7 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
-### G7. Leakage(T) curve 를 단일 hot point 로만 측정   *(measurement gap)*
+### G7. Leakage(T) curve 를 단일 hot point 로만 측정   *(measurement gap)*   **✅ DONE — PR B**
 
 **현황** : SoC envelope 가 T_cold + T_hot 두 점만 측정. 사이의 leakage(T) curve 는 plot (decay 곡선) 에 *시각화* 만 됨, fit 안 됨.
 
@@ -334,7 +334,7 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
-### G8. P_static drift 가 thermal 인지 단순 noise 인지 구분 부족   *(analysis gap)*
+### G8. P_static drift 가 thermal 인지 단순 noise 인지 구분 부족   *(analysis gap)*   **✅ DONE — PR B**
 
 **현황** : `_rebaseline.csv` 가 P_static(t) trace 보존. plot 도 그려짐. 하지만 drift 의 *원인 분류* (thermal warm-up vs random noise vs background process) 를 자동으로 안 함.
 
@@ -394,8 +394,8 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 | # | gap | 권장 작업 | 작업량 |
 |---|---|---|---|
 | **P2.1** ✅ | G4: matmul MECE decomposition | **DONE — PR A**. `plot_energy_decomposition_matmul()` 가 5 variants 의 (A: L2-resident, C: DRAM) 2-component stacked bar 출력. fp8 cast 항 제외 (matmul fp8 은 GPU 마다 의미 다름). caveat box 에 logical-working-set 한계 명시. | ~1 일 |
-| **P2.2** | G7: leakage(T) curve fit | `_soc_timeseries.csv` decay 구간에서 exponential fit. parameters → CSV. | ~1.5 일 |
-| **P2.3** | G8: P_static drift correlation | baseline plot 에 drift vs avg_temp scatter panel. | 0.5 일 |
+| **P2.2** ✅ | G7: leakage(T) curve fit | **DONE — PR B**. `fit_leakage_temperature()` + `plot_leakage_temperature()` — Arrhenius-like exponential `P(T)=a+b·exp(c·T)` + linear baseline. parameters (a/b/c/R²) 자동으로 SoC summary CSV 에. | ~1.5 일 |
+| **P2.3** ✅ | G8: P_static drift correlation | **DONE — PR B**. `plot_pstatic_drift_vs_temp()` — 별도 `_03_baseline_pstatic_vs_temp.png` 로 P_static(t) trace + P vs T scatter + linear fit + Pearson r + verdict ("thermal-driven / uncorrelated / mixed"). | 0.5 일 |
 
 ### P3 — Nice-to-have
 

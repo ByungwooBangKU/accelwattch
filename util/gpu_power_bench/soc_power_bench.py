@@ -480,6 +480,190 @@ def plot_summary_bars(summary, out_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Leakage(T) curve fit  (P2.2 / G7)  — extract a power(temperature) model
+# from the decay-window (T, P) samples we already collect for the
+# leakage plot. Lets the user feed an Arrhenius-like leakage term into
+# AccelWattch instead of a single hot-vs-cold delta.
+# ---------------------------------------------------------------------------
+def fit_leakage_temperature(samples, cycles) -> dict:
+    """Fit an exponential power(temperature) model to the decay
+    samples — (T, P) pairs collected during each leakage cycle's decay
+    window (from t=0 stress-stop to t = decay_s).
+
+    Model :
+        P(T) = a + b · exp(c · T)
+        where T is die temperature in °C, P in W.
+
+    The exponential captures the Arrhenius-like temperature dependence
+    of silicon leakage current (≈ doubles every 10 °C). On idle silicon
+    cooling from hot, this is exactly what we measure.
+
+    Falls back to linear fit `P(T) = a + b·T` if exponential fit fails
+    (e.g. noisy data, narrow temp range). Both fits are reported in the
+    return dict so the user can pick.
+
+    Returns dict with :
+        n_points              : number of (T, P) samples used
+        temp_range_c          : (min, max) of the fitted T range
+        power_range_w         : (min, max) of the fitted P range
+        exp_a, exp_b, exp_c   : exponential fit parameters (NaN on fail)
+        exp_r2                : R² of the exponential fit
+        lin_a, lin_b          : linear fit P = a + b·T
+        lin_r2                : R² of the linear fit
+        recommended           : "exponential" or "linear" — better R²
+    """
+    # Aggregate (T, P) pairs from every decay window of every cycle.
+    pairs = []
+    for c in cycles:
+        d0 = c.get("decay_t0")
+        d1 = c.get("decay_t1")
+        if d0 is None or d1 is None:
+            continue
+        for s in samples:
+            if d0 <= s.t <= d1 and s.power_w >= 0 and s.temp_c >= 0:
+                pairs.append((float(s.temp_c), float(s.power_w)))
+    out = {
+        "n_points": len(pairs),
+        "temp_range_c": (float("nan"), float("nan")),
+        "power_range_w": (float("nan"), float("nan")),
+        "exp_a": float("nan"), "exp_b": float("nan"),
+        "exp_c": float("nan"), "exp_r2": float("nan"),
+        "lin_a": float("nan"), "lin_b": float("nan"),
+        "lin_r2": float("nan"),
+        "recommended": "none",
+    }
+    if len(pairs) < 5:
+        return out
+    import numpy as _np
+    T = _np.array([p[0] for p in pairs], dtype=float)
+    P = _np.array([p[1] for p in pairs], dtype=float)
+    out["temp_range_c"]  = (float(T.min()), float(T.max()))
+    out["power_range_w"] = (float(P.min()), float(P.max()))
+
+    # ---- Linear fit (always works as a sanity check) ----
+    try:
+        lin_b, lin_a = _np.polyfit(T, P, 1)   # P = lin_a + lin_b · T
+        P_lin = lin_a + lin_b * T
+        ss_res = _np.sum((P - P_lin) ** 2)
+        ss_tot = _np.sum((P - P.mean()) ** 2)
+        lin_r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        out["lin_a"], out["lin_b"], out["lin_r2"] = float(lin_a), float(lin_b), float(lin_r2)
+    except Exception:
+        pass
+
+    # ---- Exponential fit P = a + b · exp(c · T) ----
+    # Use scipy.optimize.curve_fit; if scipy unavailable, fall back to
+    # log-linear approximation : log(P − P_min_safe) ≈ log(b) + c·T,
+    # with P_min_safe being a small offset to keep log defined.
+    exp_ok = False
+    try:
+        from scipy.optimize import curve_fit
+        def _expmodel(T, a, b, c):
+            return a + b * _np.exp(c * T)
+        # initial guesses : a ≈ P_min, b small positive, c ≈ 0.05
+        try:
+            (a, b, c), _ = curve_fit(_expmodel, T, P,
+                                     p0=[float(P.min()), 1.0, 0.05],
+                                     maxfev=8000)
+            P_exp = _expmodel(T, a, b, c)
+            ss_res = _np.sum((P - P_exp) ** 2)
+            ss_tot = _np.sum((P - P.mean()) ** 2)
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+            out["exp_a"], out["exp_b"], out["exp_c"] = float(a), float(b), float(c)
+            out["exp_r2"] = float(r2)
+            exp_ok = _np.isfinite(r2)
+        except Exception:
+            pass
+    except ImportError:
+        # Log-linear fallback : assume offset = floor(P) − ε.
+        try:
+            P_offset = float(P.min()) - 0.1
+            log_dy = _np.log(_np.maximum(P - P_offset, 1e-6))
+            c_est, log_b = _np.polyfit(T, log_dy, 1)
+            a = P_offset
+            b = float(_np.exp(log_b))
+            c = float(c_est)
+            P_exp = a + b * _np.exp(c * T)
+            ss_res = _np.sum((P - P_exp) ** 2)
+            ss_tot = _np.sum((P - P.mean()) ** 2)
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+            out["exp_a"], out["exp_b"], out["exp_c"] = a, b, c
+            out["exp_r2"] = float(r2)
+            exp_ok = _np.isfinite(r2)
+        except Exception:
+            pass
+
+    # Pick the better fit
+    if exp_ok and out["exp_r2"] >= out.get("lin_r2", -1):
+        out["recommended"] = "exponential"
+    elif _np.isfinite(out.get("lin_r2", float("nan"))):
+        out["recommended"] = "linear"
+    return out
+
+
+def plot_leakage_temperature(samples, cycles, fit, out_path, gpu: str) -> bool:
+    """Scatter (T, P) from leakage decay windows + exponential / linear
+    fit overlays. Companion to fit_leakage_temperature().
+    """
+    if not cycles:
+        return False
+    pairs = []
+    cycle_idx = []
+    for i, c in enumerate(cycles):
+        d0 = c.get("decay_t0"); d1 = c.get("decay_t1")
+        if d0 is None or d1 is None:
+            continue
+        for s in samples:
+            if d0 <= s.t <= d1 and s.power_w >= 0 and s.temp_c >= 0:
+                pairs.append((s.temp_c, s.power_w))
+                cycle_idx.append(i)
+    if len(pairs) < 5:
+        return False
+    import numpy as _np
+    T = _np.array([p[0] for p in pairs], dtype=float)
+    P = _np.array([p[1] for p in pairs], dtype=float)
+    cycle_idx = _np.array(cycle_idx)
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    cmap = plt.get_cmap("tab10")
+    for i in sorted(set(cycle_idx)):
+        m = cycle_idx == i
+        ax.scatter(T[m], P[m], s=24, color=cmap(i % 10), alpha=0.7,
+                   label=f"cycle {i+1}", edgecolors="white", linewidths=0.5)
+
+    # Overlay fits
+    T_fit = _np.linspace(T.min(), T.max(), 100)
+    if _np.isfinite(fit.get("exp_r2", float("nan"))):
+        a, b, c = fit["exp_a"], fit["exp_b"], fit["exp_c"]
+        P_exp = a + b * _np.exp(c * T_fit)
+        ax.plot(T_fit, P_exp, "-", color="#d62728", lw=2.5,
+                label=(f"exp fit: P = {a:.1f} + {b:.3f}·exp({c:.4f}·T)"
+                       f"   R²={fit['exp_r2']:.3f}"))
+    if _np.isfinite(fit.get("lin_r2", float("nan"))):
+        a, b = fit["lin_a"], fit["lin_b"]
+        P_lin = a + b * T_fit
+        ax.plot(T_fit, P_lin, "--", color="#7f7f7f", lw=1.5, alpha=0.7,
+                label=(f"linear fit: P = {a:.1f} + {b:.3f}·T   "
+                       f"R²={fit['lin_r2']:.3f}"))
+
+    ax.set_xlabel("Die temperature (°C)", fontsize=11)
+    ax.set_ylabel("Power (W)", fontsize=11)
+    src = " — recommended: " + fit.get("recommended", "?")
+    ax.set_title(
+        f"Leakage power vs die temperature — {gpu}\n"
+        "P(T) extracted from leakage-cycle decay windows. Exponential "
+        "form is the canonical Arrhenius-like leakage model; "
+        "linear form is the sanity-check baseline." + src,
+        fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -769,6 +953,21 @@ def main() -> int:
         plot_leakage_decay_zoomed(samples, cycles_meta, summary,
                                   leakage_enlarged_png,
                                   x_max=3.0, y_min=50.0, y_max=150.0)
+        # Leakage(T) curve fit (P2.2 / G7) — Arrhenius-like exponential
+        # plus linear sanity-check, on (T, P) pairs from decay windows.
+        leak_t_fit = fit_leakage_temperature(samples, cycles_meta)
+        if leak_t_fit["n_points"] >= 5:
+            # Bake fit parameters into summary CSV for AccelWattch
+            # consumption.
+            for k, v in leak_t_fit.items():
+                if isinstance(v, tuple):
+                    summary[f"leakage_t_{k}_min"] = v[0]
+                    summary[f"leakage_t_{k}_max"] = v[1]
+                else:
+                    summary[f"leakage_t_{k}"] = v
+            leakage_t_png = base.parent / f"{base.name}_leakage_temperature.png"
+            plot_leakage_temperature(samples, cycles_meta, leak_t_fit,
+                                     leakage_t_png, gpu_name)
     plot_summary_bars(summary, summary_png)
 
     # ---- console report ---------------------------------------------------

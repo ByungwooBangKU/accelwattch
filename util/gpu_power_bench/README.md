@@ -1328,6 +1328,8 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | **`<stem>_03_energy_decomposition_matmul_mece.png`** | **MECE 분해 (matmul, PR A / G4)** — 5 variants 의 dyn_energy @ l2_hit_0 을 2 components stacked bar : (A) L2-resident workload + (C) DRAM round-trip. fp8 cast 항 없음 — matmul fp8_te 가 H100 에선 native, A100 에선 FP16-fallback 이라 단일 의미의 cast overhead 가 없음. caveat box : matmul 의 cache_regime 분류는 logical working set 기반이라 tile reuse 무시. C 는 noisy upper bound. |
 | **`<stem>_01_powermodel_kop_per_K.png`** | (PR A / G3) matmul variants 의 K (log) vs pJ/FLOP (log) curve. single slope 으로 가려진 Tensor Core 효율 sweet spot (Hopper FP8 K ≥ 8192 의 ~67% peak) 시각화. variant 마다 best-K annotation |
 | `<stem>_03_baseline_static_power.png`            | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
+| **`<stem>_03_baseline_pstatic_vs_temp.png`**     | (PR B / G8) `--rebaseline-every` 사용 시 자동 생성 — P_static drift 가 thermal 인지 random noise 인지 분리. (좌) P_static(t), (우) P_static vs avg_temp 산점도 + 선형 회귀 + Pearson r + verdict ("thermal-driven" / "uncorrelated" / "mixed") |
+| **`<stem>_soc_leakage_temperature.png`**         | (PR B / G7) SoC envelope 의 leakage cycle decay window 의 (T, P) 점들로 Arrhenius-like exponential fit + linear sanity-check. AccelWattch 의 leakage(T) 항에 입력 가능한 parameters (a, b, c, R²) 가 SoC summary CSV 에 자동 저장 |
 | `<stem>_04_thermal_diagnostics.png`              | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
 | `<stem>_05_trace_timeline.png`                   | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |
 

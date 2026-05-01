@@ -1434,6 +1434,164 @@ def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
     print(f"[save] {out_png}")
 
 
+def plot_pstatic_drift_vs_temp(rebaseline_csv: Path, df: pd.DataFrame,
+                               out_png: Path, gpu: str) -> bool:
+    """P_static drift over the sweep, plotted against avg_temp_c at the
+    same wall_ts. Distinguishes thermal-driven drift (correlated with
+    rising temperature) from random NVML noise (uncorrelated).
+
+    Closes G8 (P2.3) from REVIEW.md §7. Useful when `--rebaseline-every N`
+    is on and the user wants to know whether the reported drift is
+    "rack warming up" (slope > 0, R² high) or "background process /
+    NVML jitter" (no correlation).
+
+    Two side-by-side panels :
+      A : P_static(t) trace over the sweep duration — same as the
+          existing _baseline_static_power panel B but at full width
+          for clarity.
+      B : Scatter (avg_temp_c, p_static_w) per rebaseline event +
+          linear fit + Pearson r. Shows thermal correlation.
+
+    Inputs:
+      rebaseline_csv : path to <stem>_rebaseline.csv (one row per
+                        baseline event — initial + each periodic
+                        re-baseline). Columns: after_cell, kind,
+                        p_static_w, p_static_w_std, duration_s, wall_ts.
+      df              : main per-cell CSV; used only to source
+                        avg_temp_c per (wall_ts) by nearest-cell match.
+    """
+    if not rebaseline_csv.exists():
+        return False
+    try:
+        rb = pd.read_csv(rebaseline_csv)
+    except Exception:
+        return False
+    if rb.empty or "p_static_w" not in rb.columns:
+        return False
+
+    rb["p_static_w"]   = pd.to_numeric(rb["p_static_w"],   errors="coerce")
+    rb["wall_ts"]      = pd.to_numeric(rb.get("wall_ts",   pd.Series([])), errors="coerce")
+    rb = rb[rb["p_static_w"].notna()]
+    if rb.empty:
+        return False
+
+    # Match each rebaseline event to the nearest cell's avg_temp_c.
+    # The sweep CSV doesn't have wall_ts directly — we approximate by
+    # cell ordering. If df has 'avg_temp_c', take rolling mean of cells
+    # near each rebaseline event.
+    avg_temps = []
+    if "avg_temp_c" in df.columns and not df.empty:
+        cell_temps = pd.to_numeric(df["avg_temp_c"], errors="coerce")
+        cell_temps = cell_temps.dropna().tolist()
+    else:
+        cell_temps = []
+    if cell_temps and "after_cell" in rb.columns:
+        for after_cell in rb["after_cell"].astype(int).tolist():
+            if after_cell <= 0:
+                avg_temps.append(float("nan"))
+            else:
+                idx = min(after_cell - 1, len(cell_temps) - 1)
+                # Rolling-window context: 3 cells centred at after_cell
+                lo = max(0, idx - 1)
+                hi = min(len(cell_temps), idx + 2)
+                window = cell_temps[lo:hi]
+                avg_temps.append(sum(window) / len(window) if window else float("nan"))
+    elif "avg_temp_c" in df.columns:
+        # Fallback : use mean of all cells
+        mean_t = float(pd.to_numeric(df["avg_temp_c"], errors="coerce").mean())
+        avg_temps = [mean_t] * len(rb)
+    else:
+        avg_temps = [float("nan")] * len(rb)
+    rb = rb.assign(avg_temp_c=avg_temps)
+
+    plt = _get_mpl()
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(16, 6),
+                                     gridspec_kw={"width_ratios": [1.4, 1]})
+
+    # ---- Panel A : P_static(t) over the sweep ----
+    if rb["wall_ts"].notna().any():
+        x_a = rb["wall_ts"].to_numpy(dtype=float)
+        x_a = x_a - x_a.min()  # zero at sweep start
+        ax_a.set_xlabel("wall time since sweep start (s)", fontsize=11)
+    else:
+        x_a = np.arange(len(rb))
+        ax_a.set_xlabel("rebaseline index", fontsize=11)
+    y_a = rb["p_static_w"].to_numpy(dtype=float)
+    ax_a.plot(x_a, y_a, "-o", color="#1f77b4", lw=1.6, markersize=6, alpha=0.85)
+    ax_a.set_ylabel("P_static (W)", fontsize=11)
+    ax_a.set_title("P_static drift over the sweep", fontsize=11)
+    if len(y_a) > 1:
+        net = y_a[-1] - y_a[0]
+        rng = y_a.max() - y_a.min()
+        ax_a.text(0.02, 0.97,
+                  f"net drift: {net:+.2f} W\nrange: {rng:.2f} W\nn = {len(y_a)}",
+                  transform=ax_a.transAxes, va="top", fontsize=10,
+                  bbox=dict(facecolor="white", alpha=0.85, pad=4))
+    ax_a.grid(True, alpha=0.3)
+
+    # ---- Panel B : P_static vs temperature scatter + fit ----
+    have_temp = rb["avg_temp_c"].notna().any()
+    if have_temp and len(rb) >= 3:
+        T = rb["avg_temp_c"].to_numpy(dtype=float)
+        P = rb["p_static_w"].to_numpy(dtype=float)
+        m = np.isfinite(T) & np.isfinite(P)
+        T, P = T[m], P[m]
+        if len(T) >= 3 and (T.max() - T.min()) > 0.1:
+            # Linear fit
+            b, a = np.polyfit(T, P, 1)
+            P_fit = a + b * T
+            ss_res = np.sum((P - P_fit) ** 2)
+            ss_tot = np.sum((P - P.mean()) ** 2)
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+            # Pearson r (signed)
+            if T.std() > 0 and P.std() > 0:
+                r = float(np.corrcoef(T, P)[0, 1])
+            else:
+                r = float("nan")
+
+            ax_b.scatter(T, P, s=44, color="#d62728", alpha=0.8,
+                         edgecolors="white", linewidths=0.5)
+            T_line = np.linspace(T.min(), T.max(), 50)
+            ax_b.plot(T_line, a + b * T_line, "-", color="#444", lw=1.8,
+                      label=(f"P = {a:.2f} + {b:.3f}·T\n"
+                             f"R² = {r2:.3f}, Pearson r = {r:+.3f}"))
+            ax_b.legend(loc="best", fontsize=9)
+            # Verdict box
+            if abs(r) > 0.7:
+                verdict = "→ thermal-driven drift (correlated with T)"
+                color = "#d62728"
+            elif abs(r) < 0.3:
+                verdict = "→ uncorrelated with T (random noise / background)"
+                color = "#2ca02c"
+            else:
+                verdict = "→ partial correlation (mixed thermal + noise)"
+                color = "#ff7f0e"
+            ax_b.text(0.5, -0.18, verdict, transform=ax_b.transAxes,
+                      ha="center", fontsize=10, color=color, fontweight="bold")
+        else:
+            ax_b.text(0.5, 0.5,
+                      "insufficient temperature variation\n"
+                      "(need ≥ 3 rebaseline events with T spread > 0.1 °C)",
+                      ha="center", va="center", transform=ax_b.transAxes,
+                      fontsize=10, color="#888")
+    else:
+        ax_b.text(0.5, 0.5,
+                  "no avg_temp_c data available\n(need --rebaseline-every >0)",
+                  ha="center", va="center", transform=ax_b.transAxes,
+                  fontsize=10, color="#888")
+    ax_b.set_xlabel("avg cell temperature near rebaseline (°C)", fontsize=11)
+    ax_b.set_ylabel("P_static (W)", fontsize=11)
+    ax_b.set_title("P_static vs temperature — drift origin", fontsize=11)
+    ax_b.grid(True, alpha=0.3)
+
+    fig.suptitle(f"P_static drift diagnostics — {gpu}", y=0.99, fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=140)
+    plt.close(fig)
+    print(f"[save] {out_png}")
+    return True
+
+
 def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
                      gpu: str) -> None:
     """Thermal diagnostics per cell — complements the static-power plot.
@@ -2921,6 +3079,13 @@ def main() -> int:
             args.baseline = cand
     plot_static_power(plot_df, args.baseline,
                       out_dir / f"{stem}_03_baseline_static_power.png", gpu)
+    # P_static drift vs temperature scatter (P2.3 / G8) — auto-detect
+    # the rebaseline sidecar; no-op if --rebaseline-every wasn't used.
+    rebaseline_cand = args.csv.with_name(stem + "_rebaseline.csv")
+    if rebaseline_cand.exists():
+        plot_pstatic_drift_vs_temp(
+            rebaseline_cand, plot_df,
+            out_dir / f"{stem}_03_baseline_pstatic_vs_temp.png", gpu)
     plot_temperature(plot_df, plot_summary,
                      out_dir / f"{stem}_04_thermal_diagnostics.png", gpu)
 
