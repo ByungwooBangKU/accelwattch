@@ -68,6 +68,31 @@ def resolve_nvml_handle(device_idx: int) -> tuple[object, str]:
     is set.
     """
     import torch
+    # Validate the device index FIRST so we can produce an actionable
+    # error message instead of `AssertionError: Invalid device id` —
+    # which doesn't tell the operator which indices ARE valid or which
+    # CLI flag they should use.
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpus == 0:
+        raise RuntimeError(
+            "no CUDA devices visible to PyTorch. "
+            "Check `nvidia-smi`, driver install, and CUDA_VISIBLE_DEVICES.")
+    if device_idx < 0 or device_idx >= n_gpus:
+        valid = f"0..{n_gpus - 1}" if n_gpus > 1 else "0"
+        # Friendly hint : the most common mistake is passing
+        # `--device N` (singular = ONE GPU at index N) when the user
+        # meant `--num-gpus N` or `--devices "0,1,...,N-1"` (multiple).
+        hint = ""
+        if device_idx == n_gpus:
+            hint = (f"\n  hint : `--device {device_idx}` means RUN ON THE GPU "
+                    f"AT INDEX {device_idx} (a single card). If you wanted to "
+                    f"run on {device_idx} GPUs in sequence, use\n"
+                    f"           `--num-gpus {device_idx} --sequential`\n"
+                    f"         or\n"
+                    f"           `--devices \"0,1,...,{device_idx - 1}\" --sequential`")
+        raise RuntimeError(
+            f"--device {device_idx} is out of range (CUDA reports {n_gpus} "
+            f"visible GPUs ; valid indices: {valid}).{hint}")
     props = torch.cuda.get_device_properties(device_idx)
 
     # --- attempt 1 : pci_bus_id as str -------------------------------------
