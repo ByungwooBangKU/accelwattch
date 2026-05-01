@@ -41,6 +41,7 @@ import torch
 import benchmarks as bm
 from power_monitor import (PowerSampler, measure_static_power,
                             wait_for_cooldown, wait_for_pstate_idle,
+                            force_p8_for_measurement,
                             resolve_nvml_handle)
 import preflight
 # SoC envelope phase + plot helpers — same code path the standalone
@@ -666,10 +667,18 @@ def main() -> int:
     # for tens of seconds even after temperature drops).
     if args.pstate_idle_wait > 0:
         wait_for_pstate_idle(handle, timeout_s=args.pstate_idle_wait)
+    # Aggressively force P8 (NVML clock-lock or `nvidia-smi -rgc`) so the
+    # static measurement actually captures cold-idle, not P0-locked boost
+    # idle. The restore() callback unlocks clocks AFTER the measurement,
+    # so the workload phase keeps full DVFS.
+    p8_ctx = force_p8_for_measurement(handle) if args.pstate_idle_wait > 0 else \
+             {"success": False, "method": "skipped", "restore": None}
     print(f"[baseline] measuring static power for {args.static_seconds:.1f}s …")
     baseline = measure_static_power(handle, seconds=args.static_seconds,
                                     hz=args.poll_hz,
                                     power_source=args.power_source)
+    if p8_ctx.get("restore"):
+        p8_ctx["restore"]()
     p_static = baseline["power_w_mean"]
     print(f"[baseline] static power = {p_static:.1f} ± {baseline['power_w_std']:.2f} W  "
           f"(min {baseline['power_w_min']:.1f} W, max {baseline['power_w_max']:.1f} W, "
@@ -947,10 +956,17 @@ def main() -> int:
                     wait_for_pstate_idle(handle,
                                          timeout_s=args.pstate_idle_wait,
                                          verbose=False)
+                # Force P8 around each rebaseline too — quiet (verbose=False)
+                # so a 130-cell sweep doesn't print 6 force-p8 noise blocks.
+                rb_p8 = (force_p8_for_measurement(handle, verbose=False)
+                          if args.pstate_idle_wait > 0
+                          else {"success": False, "restore": None})
                 rb = measure_static_power(handle,
                                           seconds=args.rebaseline_seconds,
                                           hz=args.poll_hz,
                                           power_source=args.power_source)
+                if rb_p8.get("restore"):
+                    rb_p8["restore"]()
                 new_p = rb["power_w_mean"]
                 drift = new_p - p_static
                 print(f"\n[rebaseline @ cell {i-1}/{total_cells}] "

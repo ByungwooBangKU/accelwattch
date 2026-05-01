@@ -515,3 +515,95 @@ def wait_for_pstate_idle(handle, threshold_mhz: int = 500,
                   f"elapsed={elapsed:.0f}s consecutive_idle={consecutive}")
             last_print = elapsed
         time.sleep(poll_s)
+
+
+def force_p8_for_measurement(handle, base_clock_mhz: int = 210,
+                              verbose: bool = True):
+    """Aggressively try to drive the GPU into P8 (low SM clock) so the
+    upcoming `measure_static_power()` actually captures *cold idle*,
+    not P0-locked boost-clock idle.
+
+    Returns a context-manager-like dict :
+        {"success": bool, "method": str, "restore": callable_or_None}
+
+    Tries the following, in order :
+
+      1. `nvmlDeviceSetGpuLockedClocks(handle, 210, 210)` — pin SM clock
+         to base via NVML field-values API. Strongest path : the GPU
+         physically can't run boost clocks while locked. Usually requires
+         root + `nvidia-smi -pm 1` (persistence) on most distros, but
+         worth trying — it Just Works on some setups.
+         `restore` = `nvmlDeviceResetGpuLockedClocks(handle)`.
+
+      2. `nvidia-smi -rgc -i <idx>` via subprocess — releases the
+         "boost clock retention" hold. Doesn't lock low, just tells the
+         driver "stop holding the boost". Then natural P-state transition
+         takes effect (usually within 1-2 s of zero util).
+         `restore` = no-op (subprocess already handed control back).
+
+      3. Give up — return success=False, caller will rely on the fallback
+         P-state filter inside `measure_static_power` and log a clear
+         warning that the reading may be P0-inflated.
+
+    Caller is expected to invoke `restore()` AFTER the static measurement
+    completes so the workload phase isn't artificially clock-locked.
+    """
+    # --- Attempt 1 : NVML lock ---------------------------------------------
+    try:
+        if hasattr(pynvml, "nvmlDeviceSetGpuLockedClocks"):
+            pynvml.nvmlDeviceSetGpuLockedClocks(handle, base_clock_mhz,
+                                                  base_clock_mhz)
+            if verbose:
+                print(f"[force-p8] NVML clock lock @ {base_clock_mhz} MHz "
+                      f"(success — measurement guaranteed P8)")
+            def _restore():
+                try:
+                    pynvml.nvmlDeviceResetGpuLockedClocks(handle)
+                except pynvml.NVMLError:
+                    pass
+            return {"success": True, "method": "nvml_locked",
+                    "restore": _restore}
+    except (pynvml.NVMLError, AttributeError) as e:
+        if verbose:
+            err = str(e).lower()
+            hint = ""
+            if "permission" in err or "no_permission" in err or "not_supported" in err:
+                hint = " (typically needs root + persistence mode : `sudo nvidia-smi -pm 1`)"
+            print(f"[force-p8] NVML clock lock unavailable ({type(e).__name__}: {e}){hint}")
+
+    # --- Attempt 2 : nvidia-smi -rgc ---------------------------------------
+    try:
+        import subprocess
+        try:
+            idx = pynvml.nvmlDeviceGetIndex(handle)
+        except pynvml.NVMLError:
+            idx = 0
+        result = subprocess.run(
+            ["nvidia-smi", "-rgc", "-i", str(idx)],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            if verbose:
+                print(f"[force-p8] `nvidia-smi -rgc -i {idx}` OK — "
+                      f"boost-clock retention released")
+            return {"success": True, "method": "nvidia_smi_rgc",
+                    "restore": None}
+        else:
+            if verbose:
+                err = (result.stderr or result.stdout or "").strip().splitlines()
+                first = err[0] if err else "(no stderr)"
+                print(f"[force-p8] nvidia-smi -rgc failed (rc={result.returncode}): "
+                      f"{first[:120]}")
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        if verbose:
+            print(f"[force-p8] nvidia-smi unavailable ({type(e).__name__}: {e})")
+
+    # --- Give up -----------------------------------------------------------
+    if verbose:
+        print(f"[force-p8] could not actively force P8. The static reading "
+              f"will reflect whatever P-state the GPU is in. If the GPU is "
+              f"stuck in P0 (boost-clock idle), the measurement will be "
+              f"30..50 W INFLATED vs true P8 idle (~70W on H100). "
+              f"Mitigation : `sudo nvidia-smi -pm 1 && sudo nvidia-smi -rgc` "
+              f"before sweep, or run as root, or `--pstate-idle-wait 120` "
+              f"to allow longer hysteresis ride-out.")
+    return {"success": False, "method": "none", "restore": None}
