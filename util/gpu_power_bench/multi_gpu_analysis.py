@@ -62,6 +62,10 @@ def discover_csvs(reports_dir: Path, num_gpus: int,
         # analyze.py outputs (added in PR #41):
         "_summary_by_regime.csv",
         "_dram_rw_split.csv", "_dram_marginal.csv",
+        # analyze.py outputs (added in PR #60 — matmul per-K):
+        "_summary_matmul_per_K.csv",
+        # analyze.py outputs (added in PR #69 — fused vs standalone):
+        "_fused_decomposition.csv",
         # SoC envelope sidecars (added in PR #48):
         "_soc_summary.csv", "_soc_timeseries.csv",
     )
