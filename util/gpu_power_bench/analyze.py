@@ -2170,14 +2170,14 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     # measurements we need. Skip silently when a piece is missing — the
     # plot just omits that bar rather than confabulating.
     #
-    # Excluded ops : `add` is intentionally dropped. Per user feedback —
-    # add_fp8 / add_fp16 are too trivial (1 FLOP/elem, identical pattern
-    # to mul) to be worth the bar real estate in this MECE view. Keeping
-    # mul as the lone simple-op reference is enough.
-    EXCLUDED_OPS = {"add"}
+    # Restrict to the 3 NON-trivial ops (per user request) — softmax /
+    # gelu / layernorm. mul / add are dropped because they're 1 FLOP/elem,
+    # identical patterns, and crowd the bar layout. Iteration order is
+    # deterministic for stable plot reading.
+    INCLUDED_OPS = ("softmax", "gelu", "layernorm")
     bars = []
-    for op in sorted(ew["op"].unique()):
-        if op in EXCLUDED_OPS:
+    for op in INCLUDED_OPS:
+        if op not in ew["op"].values:
             continue
         for dtype in ("fp16", "fp8"):
             j_self_l2  = _slope(op, dtype, "l2_hit_100")
@@ -2257,8 +2257,16 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     # label, render the label OUTSIDE the bar with a leader line so the
     # value is still visible. Otherwise render inline (white text on
     # the coloured segment).
+    #
+    # Font sizes reduced (per user feedback) so adjacent A/B outside
+    # labels on the same bar don't overlap. Vertical spacing between
+    # outside labels also bumped (6% → 11% of total) for the same reason.
     INLINE_PCT_THRESHOLD = 6.0
-    LEADER_X_OFFSET = 0.42  # how far right of the bar to place outside labels
+    LEADER_X_OFFSET = 0.48
+    OUTSIDE_Y_STEP   = 0.11      # fraction of total_pj between stacked labels
+    OUTSIDE_FS       = 7.0
+    INLINE_FS        = 7.5
+    SIGMA_FS         = 8.5
     for i, b in enumerate(bars):
         total_pj = b["total"] * 1e12
         a_pct = 100.0 * b["A"] / b["total"] if b["total"] > 0 else 0
@@ -2268,18 +2276,14 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         # Total above the stack
         ax.text(xs[i], total_pj * 1.02,
                 f"Σ = {_fmt_pj(total_pj)} pJ/elem",
-                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
+                ha="center", va="bottom", fontsize=SIGMA_FS, fontweight="bold")
 
         segments = [
-            ("A", A_vals[i], a_pct, A_vals[i] / 2,
-             0,  # bottom of A
-             "white"),
+            ("A", A_vals[i], a_pct, A_vals[i] / 2, 0, "white"),
             ("B", B_vals[i], b_pct, A_vals[i] + B_vals[i] / 2,
-             A_vals[i],  # bottom of B
-             "white"),
+             A_vals[i], "white"),
             ("C", C_vals[i], c_pct, A_vals[i] + B_vals[i] + C_vals[i] / 2,
-             A_vals[i] + B_vals[i],  # bottom of C
-             "white"),
+             A_vals[i] + B_vals[i], "white"),
         ]
         # Use a separate y for outside labels so they don't pile up.
         outside_y_cursor = total_pj * 0.05  # start near bottom of bar
@@ -2291,37 +2295,38 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
             # is a footgun.
             if value_pj <= 0:
                 ax.annotate(
-                    f"{name}: {_fmt_pj(value_pj)} pJ\n({pct:.1f}%)",
+                    f"{name}: {_fmt_pj(value_pj)} pJ ({pct:.1f}%)",
                     xy=(xs[i] + 0.30, total_pj * 0.02),
                     xytext=(xs[i] + LEADER_X_OFFSET, outside_y_cursor),
-                    fontsize=7.5, ha="left", va="center", color="#888",
+                    fontsize=OUTSIDE_FS - 0.5, ha="left", va="center",
+                    color="#888",
                     arrowprops=dict(arrowstyle="-", color="#bbb",
                                     lw=0.6, alpha=0.6,
                                     connectionstyle="arc3,rad=0.0"),
                     bbox=dict(facecolor="white", edgecolor="#cccccc",
-                              alpha=0.85, pad=2))
-                outside_y_cursor += total_pj * 0.06
+                              alpha=0.85, pad=1.5))
+                outside_y_cursor += total_pj * OUTSIDE_Y_STEP
                 continue
-            label = f"{name}: {_fmt_pj(value_pj)} pJ\n({pct:.1f}%)"
+            label = f"{name}: {_fmt_pj(value_pj)} pJ ({pct:.1f}%)"
             if pct >= INLINE_PCT_THRESHOLD:
                 # Inline — fits comfortably in the segment
                 ax.text(xs[i], mid_y, label,
-                        ha="center", va="center", fontsize=8.5,
-                        color=_color, fontweight="bold", linespacing=1.1)
+                        ha="center", va="center", fontsize=INLINE_FS,
+                        color=_color, fontweight="bold", linespacing=1.05)
             else:
                 # Outside — leader line from segment to right-side text
                 ax.annotate(
                     label,
                     xy=(xs[i] + 0.30, mid_y),                       # bar edge
                     xytext=(xs[i] + LEADER_X_OFFSET, outside_y_cursor),
-                    fontsize=8, ha="left", va="center",
+                    fontsize=OUTSIDE_FS, ha="left", va="center",
                     color="#222",
                     arrowprops=dict(arrowstyle="-", color="#888",
                                     lw=0.8, alpha=0.7,
                                     connectionstyle="arc3,rad=0.0"),
                     bbox=dict(facecolor="white", edgecolor="#aaaaaa",
-                              alpha=0.92, pad=2))
-                outside_y_cursor += total_pj * 0.06   # next outside label below
+                              alpha=0.92, pad=1.5))
+                outside_y_cursor += total_pj * OUTSIDE_Y_STEP
 
     ax.set_xticks(xs)
     ax.set_xticklabels([b["label"] for b in bars], rotation=20, ha="right",
