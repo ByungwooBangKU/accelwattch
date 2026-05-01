@@ -16,11 +16,22 @@
 # gpu_power_bench.py.
 #
 # Log layout (multi-GPU AND single-GPU) :
-#     reports/gpu_power_<tag>_<MMDD_hhmm>/
-#         single.log         (single-GPU run)
-#         gpu0.log           (multi-GPU run)
-#         gpu1.log
-#         ...
+#     reports/gpu_power_<tag>_<MMDD_hhmm>/         (= $RUN_DIR)
+#         single.log                  (single-GPU run)
+#         gpu_power_bench_*.csv       (single-GPU run, all CSVs + PNGs here)
+#         *.png
+#
+#         gpu0/                       (multi-GPU run — one subdir per GPU)
+#             gpu0.log
+#             gpu_power_bench_*.csv   (CSVs + PNGs colocated with the log)
+#             *.png
+#         gpu1/
+#             gpu1.log
+#             ...
+#
+# Logs AND data are colocated per-GPU so post-mortem inspection only
+# needs ONE directory per card. multi_gpu_analysis.py walks $RUN_DIR
+# recursively to find all per-GPU CSVs.
 # Logs are NEVER deleted on success/failure — you can `tail -f` while
 # the run is in progress and inspect them after.
 #
@@ -145,10 +156,13 @@ run_one() {
     else
         full_tag="$tag_suffix"
     fi
-    # Per-GPU log : just gpu<N>.log inside the per-experiment dir.
-    # No need to re-include $BASE_TAG in the filename — the parent dir
-    # already has it (reports/gpu_power_<tag>_<MMDD_hhmm>/gpu<N>.log).
-    local log="$RUN_DIR/gpu${dev}.log"
+    # Per-GPU subdir holds EVERYTHING for this card : log + CSVs + plots.
+    # Both gpu_power_bench.py (--out-dir) and analyze.py (defaults to
+    # same dir as CSV) write to this directory, so a single `ls` on
+    # $subdir gives the operator everything from this card's run.
+    local subdir="$RUN_DIR/gpu${dev}"
+    mkdir -p "$subdir"
+    local log="$subdir/gpu${dev}.log"
     # Create the log file BEFORE the subprocess runs so even a fast-dying
     # process leaves evidence. Record the command being executed and the
     # PID so ps / tail can find it.
@@ -156,16 +170,18 @@ run_one() {
         echo "== run_bench.sh launch =="
         echo "dev        : $dev"
         echo "tag        : $full_tag"
+        echo "out_dir    : $subdir"
         echo "stripped   : ${STRIPPED[*]+"${STRIPPED[*]}"}"
-        echo "cmdline    : $PYTHON gpu_power_bench.py --device $dev --tag $full_tag ${STRIPPED[*]+"${STRIPPED[*]}"}"
+        echo "cmdline    : $PYTHON gpu_power_bench.py --device $dev --tag $full_tag --out-dir $subdir ${STRIPPED[*]+"${STRIPPED[*]}"}"
         echo "pid        : $$  (subshell)"
         echo "start_time : $(date --iso-8601=seconds 2>/dev/null || date)"
         echo "-- subprocess stdout/stderr below --"
     } > "$log"
-    echo "[launch] GPU $dev  tag=$full_tag  log=$log"
+    echo "[launch] GPU $dev  tag=$full_tag  out_dir=$subdir  log=$log"
     "$PYTHON" gpu_power_bench.py \
         --device "$dev" \
         --tag "$full_tag" \
+        --out-dir "$subdir" \
         ${STRIPPED[@]+"${STRIPPED[@]}"} \
         >> "$log" 2>&1
 }
@@ -177,9 +193,12 @@ if [[ ${#DEVS[@]} -eq 0 ]]; then
     # Single-GPU sweep — same per-experiment dir convention as the
     # multi-GPU path. We tee through `single.log` so the user still
     # sees live progress AND the log is preserved for later analysis
-    # (matches multi-GPU's gpu<N>.log convention).
+    # (matches multi-GPU's gpu<N>.log convention). CSVs + PNGs land
+    # in $RUN_DIR alongside the log via --out-dir.
     sweep_log="$RUN_DIR/single.log"
-    "$PYTHON" gpu_power_bench.py ${FORWARD[@]+"${FORWARD[@]}"} 2>&1 | tee "$sweep_log"
+    "$PYTHON" gpu_power_bench.py \
+        --out-dir "$RUN_DIR" \
+        ${FORWARD[@]+"${FORWARD[@]}"} 2>&1 | tee "$sweep_log"
     sweep_rc=${PIPESTATUS[0]}
     if (( sweep_rc != 0 )); then
         echo "[error] gpu_power_bench.py exited with code $sweep_rc" >&2
@@ -258,7 +277,7 @@ else
         echo "[warn] tail of each failed log (last 30 lines):" >&2
         for dev in "${failed_devs[@]}"; do
             ftag="gpu${dev}"
-            log="$RUN_DIR/${ftag}.log"
+            log="$RUN_DIR/${ftag}/${ftag}.log"
             echo "" >&2
             echo "────── $log ──────" >&2
             if [[ -f "$log" ]]; then
@@ -293,18 +312,38 @@ if (( rc != 0 )); then
         echo "       To retry only the failing cards, use --devices '<csv>'." >&2
     fi
 else
-    echo "[done] per-GPU CSVs written under reports/."
+    echo "[done] per-GPU CSVs written under $RUN_DIR/gpu*/"
     if (( AUTO_ANALYZE == 1 )); then
-        echo "[auto-analyze] running multi_gpu_analysis.py on the new CSVs"
+        # Step 1 : per-GPU analyze.py — generates this card's plots
+        # next to its CSV (analyze.py defaults --out-dir to CSV parent).
+        echo "[auto-analyze] running analyze.py for each per-GPU CSV"
         echo "                (skip with --no-auto-analyze)"
+        for dev in "${DEVS[@]}"; do
+            gpulog="$RUN_DIR/gpu${dev}/gpu${dev}.log"
+            if [[ ! -f "$gpulog" ]]; then
+                echo "[skip-analyze] gpu${dev}: log missing — sweep died early"
+                continue
+            fi
+            csv_line=$(grep -E '^\[OUTPUT_CSV\] ' "$gpulog" | tail -n 1)
+            if [[ -z "$csv_line" ]]; then
+                echo "[skip-analyze] gpu${dev}: no [OUTPUT_CSV] marker (sweep failed?)"
+                continue
+            fi
+            csv_path="${csv_line#\[OUTPUT_CSV\] }"
+            echo "[auto-analyze] gpu${dev}: $csv_path"
+            "$PYTHON" analyze.py "$csv_path" || echo "[warn] analyze.py failed for gpu${dev}"
+        done
+        # Step 2 : cross-GPU variance analysis on the run dir.
         echo
+        echo "[auto-analyze] running multi_gpu_analysis.py on $RUN_DIR"
         if [[ -n "$BASE_TAG" ]]; then
-            "$PYTHON" multi_gpu_analysis.py reports/ "${#DEVS[@]}" --tag "$BASE_TAG" || rc=$?
+            "$PYTHON" multi_gpu_analysis.py "$RUN_DIR" "${#DEVS[@]}" --tag "$BASE_TAG" || rc=$?
         else
-            "$PYTHON" multi_gpu_analysis.py reports/ "${#DEVS[@]}" || rc=$?
+            "$PYTHON" multi_gpu_analysis.py "$RUN_DIR" "${#DEVS[@]}" || rc=$?
         fi
     else
-        echo "  next: python3 multi_gpu_analysis.py reports/ ${#DEVS[@]}${BASE_TAG:+ --tag $BASE_TAG}"
+        echo "  next: python3 analyze.py $RUN_DIR/gpu<N>/gpu_power_bench_*.csv  # per-GPU plots"
+        echo "  next: python3 multi_gpu_analysis.py $RUN_DIR ${#DEVS[@]}${BASE_TAG:+ --tag $BASE_TAG}"
     fi
 fi
 exit $rc
