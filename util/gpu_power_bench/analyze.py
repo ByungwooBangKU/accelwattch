@@ -909,9 +909,15 @@ def _annot_bar_pj(rect, value_j, r2, scale_label):
             label, ha="center", va="bottom", fontsize=9, linespacing=1.1)
 
 
-def _save_fig(fig, out_png: Path, dpi: int = 160) -> None:
+def _save_fig(fig, out_png: Path, dpi: int = 160,
+              pad_inches: float = 0.3) -> None:
     """Save with a fixed pad and a hard size cap — defends against the
     gigapixel-PNG bug whenever log axes end up with pathological bounds.
+
+    `pad_inches` is the white-space border around the (already
+    bbox_inches="tight"-cropped) figure. Default 0.3 in. Pass a smaller
+    value (0.05 ~ 0.1) for plots that already have an in-figure caveat
+    or footer text and don't need extra breathing room.
 
     `tight_layout()` is wrapped + silenced because some plots (MECE
     decompositions, anything with a `fig.text()` caveat box ABOVE or
@@ -944,7 +950,7 @@ def _save_fig(fig, out_png: Path, dpi: int = 160) -> None:
     w_in, h_in = fig.get_size_inches()
     if w_in > 30 or h_in > 18:
         fig.set_size_inches(min(w_in, 30), min(h_in, 18))
-    fig.savefig(out_png, dpi=dpi, pad_inches=0.3, bbox_inches="tight")
+    fig.savefig(out_png, dpi=dpi, pad_inches=pad_inches, bbox_inches="tight")
     print(f"[save] {out_png}")
     import matplotlib.pyplot as plt
     plt.close(fig)
@@ -2555,10 +2561,15 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
         a_pct = 100.0 * b["A"] / total
         b_pct = 100.0 * b["B"] / total
         c_pct = 100.0 * b["C"] / total
-        # Total above the stack
-        ax.text(xs[i], T_vals[i] * 1.04,
-                f"Σ = {_fmt_pj(T_vals[i])} pJ/FLOP",
-                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
+        # Total above the stack — but only when it fits inside the
+        # fixed y-axis cap. For bars that exceed the cap, the
+        # "↑ X pJ (clipped at 1400)" annotation below already
+        # surfaces the total, so showing Σ above-frame would be both
+        # redundant and visually messy (label floating above the chart).
+        if T_vals[i] <= 1400.0:
+            ax.text(xs[i], T_vals[i] * 1.04,
+                    f"Σ = {_fmt_pj(T_vals[i])} pJ/FLOP",
+                    ha="center", va="bottom", fontsize=9.5, fontweight="bold")
 
         # Geometric midpoints work better on a log axis than arithmetic.
         def _gmid(top, bot):
@@ -2621,14 +2632,23 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax.set_xticks(xs)
     ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=10)
     ax.set_ylabel("pJ / FLOP   (dynamic, at l2_hit_0)", fontsize=11)
-    # Linear y-axis (per user request) — log made tiny segments (B for
-    # fp8_te) visually invisible and the variant-color overlap (A red /
-    # C red-hatched) hard to read. Linear with explicit headroom for
-    # the "Σ" total label.
+    # Linear y-axis with FIXED upper bound = 1400 pJ/FLOP per user request.
+    # This caps any single-cell outlier (e.g. fp32_simt thermal-throttled
+    # at 1800+ pJ) from blowing up the scale and squashing the smaller
+    # bars. Bars exceeding 1400 are clipped at the top with a visible
+    # "↑ exceeds 1400" annotation so the operator notices truncation.
+    Y_MAX_FIXED = 1400.0
+    ax.set_ylim(0, Y_MAX_FIXED)
     if T_vals:
-        positive_T = [v for v in T_vals if v > 0]
-        if positive_T:
-            ax.set_ylim(0, max(positive_T) * 1.15)
+        for i, t in enumerate(T_vals):
+            if t > Y_MAX_FIXED:
+                ax.annotate(
+                    f"↑ {_fmt_pj(t)} pJ\n(clipped at {Y_MAX_FIXED:.0f})",
+                    xy=(xs[i], Y_MAX_FIXED * 0.99),
+                    ha="center", va="top", fontsize=8, color="#b03030",
+                    fontweight="bold", linespacing=1.1,
+                    bbox=dict(facecolor="#fff0f0", edgecolor="#b03030",
+                              alpha=0.92, pad=2))
     ax.set_title(
         f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
         "fp8_te : 3 components (A: fp16 baseline, B: cast/emu overhead, C: DRAM)\n"
@@ -2972,7 +2992,10 @@ def plot_attention_decomposition(decomp_df: pd.DataFrame, df: pd.DataFrame,
         "lower bound on softmax energy. README §3.7.6 / TestCases A.5.",
         ha="center", va="center", fontsize=9, color="#333", wrap=True,
         bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
-    _save_fig(fig, out_png)
+    # Small pad — caveat is already in-figure, no extra breathing
+    # room needed below. Trims ~0.2 in of empty space at the bottom
+    # of the saved PNG.
+    _save_fig(fig, out_png, pad_inches=0.05)
     return True
 
 
