@@ -1414,15 +1414,30 @@ def plot_static_power(df: pd.DataFrame, baseline_csv: Path | None,
         ax_a.grid(True, alpha=0.3)
 
     # ---------------- B+C: per-cell static vs dynamic energy ----------------
-    # Order: elementwise first (by op, dtype), then matmul (by variant, K).
+    # Order: elementwise first (by op, dtype), then matmul (by variant, K),
+    # then matmul_llm (by preset, dtype, T), then fused (by variant, dtype).
+    def _safe_int(v, default=0):
+        # load_value is an int for elementwise/matmul/matmul_llm but a
+        # shape-encoded string for `fused` (e.g. "B1_Hq64_..."). Anything
+        # non-int returns `default` so the sort key stays type-stable.
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
     def _cell_key(r):
         cat = r.get("category", "elementwise")
         if cat == "matmul":
-            return (1, r.get("variant", ""), int(r["load_value"]))
+            return (1, r.get("variant", ""), _safe_int(r["load_value"]))
         if cat == "matmul_llm":
             return (2, r.get("llm_preset", ""), r.get("dtype", ""),
-                    int(r["load_value"]))
-        return (0, r["op"], r["dtype"], int(r["load_value"]))
+                    _safe_int(r["load_value"]))
+        if cat == "fused":
+            # Fused : 1 cell per (variant, dtype) at a fixed shape, so the
+            # exact load_value text is fine as a stable secondary key.
+            return (3, r.get("variant", ""), r.get("dtype", ""),
+                    str(r.get("load_value", "")))
+        return (0, r["op"], r["dtype"], _safe_int(r["load_value"]))
 
     rows = df.to_dict("records")
     rows.sort(key=_cell_key)
@@ -1691,14 +1706,23 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
     ax_s = fig.add_subplot(gs[2])
 
     # ---- A+B: per-cell temperatures and cool-down time ----
+    def _safe_int(v, default=0):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
     def _cell_key(r):
         cat = r.get("category", "elementwise")
         if cat == "matmul":
-            return (1, r.get("variant", ""), int(r["load_value"]))
+            return (1, r.get("variant", ""), _safe_int(r["load_value"]))
         if cat == "matmul_llm":
             return (2, r.get("llm_preset", ""), r.get("dtype", ""),
-                    int(r["load_value"]))
-        return (0, r["op"], r["dtype"], int(r["load_value"]))
+                    _safe_int(r["load_value"]))
+        if cat == "fused":
+            return (3, r.get("variant", ""), r.get("dtype", ""),
+                    str(r.get("load_value", "")))
+        return (0, r["op"], r["dtype"], _safe_int(r["load_value"]))
 
     rows = df.to_dict("records")
     rows.sort(key=_cell_key)
@@ -1769,11 +1793,22 @@ def plot_temperature(df: pd.DataFrame, summary: pd.DataFrame, out_png: Path,
 
 def _short_label(r: dict) -> str:
     """Compact cell label used as x-tick in the static-power bar chart."""
+    def _i(v):
+        # load_value is int for elementwise/matmul/matmul_llm but a
+        # shape-encoded string for `fused`. Render whatever it is as text.
+        try:
+            return str(int(v))
+        except (TypeError, ValueError):
+            return str(v)
     if r.get("category") == "matmul":
-        return f"{r.get('variant','matmul')}·K{int(r['load_value'])}"
+        return f"{r.get('variant','matmul')}·K{_i(r['load_value'])}"
     if r.get("category") == "matmul_llm":
-        return f"llm·{r.get('llm_preset','?')}·{r.get('dtype','?')}·T{int(r['load_value'])}"
-    return f"{r['dtype']}·{r['op']}·N{int(r['load_value'])}"
+        return f"llm·{r.get('llm_preset','?')}·{r.get('dtype','?')}·T{_i(r['load_value'])}"
+    if r.get("category") == "fused":
+        # Compact : "fused·attention_flash·bf16" — load_value (long
+        # shape string) is omitted to keep the x-tick narrow.
+        return f"fused·{r.get('variant','?')}·{r.get('dtype','?')}"
+    return f"{r['dtype']}·{r['op']}·N{_i(r['load_value'])}"
 
 
 def plot_cache_regime(df: pd.DataFrame, by_regime: pd.DataFrame,
