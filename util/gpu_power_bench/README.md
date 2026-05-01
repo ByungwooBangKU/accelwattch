@@ -46,6 +46,20 @@
 | `R²` | 선형회귀 결정계수. `k_op` 를 상수로 본 가정의 유효성을 가늠. |
 | TC | Tensor Core. matrix-multiply-accumulate 전용 유닛. |
 | SIMT | Streaming Multi-Threaded. 일반 CUDA core 경로. |
+
+### FLOP / FLOPs / FLOPS — 헷갈리기 쉬운 단위 정리
+
+본 suite 는 **count (개수)** 와 **rate (처리율)** 를 엄격히 구분. 이 셋을 혼동하면 단위 분석이 깨짐.
+
+| 표기 | 의미 | 종류 | 예 |
+|---|---|---|---|
+| **FLOP** | 단일 floating-point 연산 (1 회) | count, 단수 | "matmul output 1 개 = K 회의 mul-add = 2K FLOP" |
+| **FLOPs** | 여러 FLOP 의 복수형 (개수) | count, 복수 | "이 cell 의 total_FLOPs = 2K³ × iters" |
+| **FLOPS** | FLOPs **per second** (처리율) | **rate**, 항상 "초당" | "H100 FP8 peak = ~2 PFLOPS = 2 × 10¹⁵ FLOPs/sec" |
+
+→ 에너지 단위는 **`pJ/FLOP`** / **`J/FLOP`** (한 *연산* 당) 만 올바름. **`pJ/FLOPS`** 는 의미상 "에너지 / (연산/초)" 로 단위 분석 깨짐 — 본 suite 에 그런 표기는 없음.
+
+`benchmarks.py` 의 상수 `FLOP_PER_ELEMENT` 는 *element 당 FLOP 개수* (count, 단수). PR #63 에서 옛 `FLOPS_PER_ELEMENT` 명을 rename 해 ambiguity 제거.
 | TE | Transformer Engine. NVIDIA FP8 GEMM 래퍼 라이브러리 (`fp8_autocast`). |
 
 ## 1. 배경 (Motivation & Background)
@@ -1667,7 +1681,7 @@ fp16_mul elementwise       4 9.778e-13 1.555e-13    15.90       9.001e-13 1.211e
 | **Chip 단독 leakage (HBM idle 분리)** | NVML boundary | HBM 의 IDD0 datasheet 값 사용해 추정 가능 — 본 suite 미수행 | low — board-level leakage 가 AccelWattch 입력에 적합 |
 | **20 Hz NVML averaging** | hardware | `NVML_FI_DEV_POWER_INSTANT` (~1ms) 옵션 (PR #36/#47) — `--power-source instant` 로 활성. idle 측정엔 부적합 (P-state hysteresis 노출) | low — sustained 측정의 평균값은 동일 |
 | **FP8 elementwise 는 native HW 없음** | hardware (PyTorch + 모든 GPU) | 어떤 GPU 든 cast-compute-cast. `emulated=1` 로 자동 식별, MECE 분해의 component B 로 분리 측정 | none — 측정 자체는 정확, label 명시 |
-| **Single-instruction (add vs mul vs exp) per-FLOP 단가** | framework (PyTorch elementwise too high-level) | CUDA microbench 직접 작성, 본 suite 외 | low — `FLOPS_PER_ELEMENT` 통합 카운트로 충분 |
+| **Single-instruction (add vs mul vs exp) per-FLOP 단가** | framework (PyTorch elementwise too high-level) | CUDA microbench 직접 작성, 본 suite 외 | low — `FLOP_PER_ELEMENT` 통합 카운트로 충분 |
 | **NCCL / P2P 통신 에너지** | scope | 본 suite 는 single-GPU compute 에 한정. NCCL bench 는 별도 도구 (nccl-tests) | low — orthogonal axis |
 | **Full-model inference 1 step 의 절대 J** | scope | analytical `Σ k_op · N_op` 합산 가능, 측정 검증은 별도 워크 | medium — REVIEW.md G10 (P3) 으로 추적 |
 | **훈련 중 scheduling gap / memory fragment** | scope | microbench 는 무한 반복이라 실제 훈련의 idle gap 미반영. trace-driven simulation 영역 | low — `k_op` 자체는 보존 |
