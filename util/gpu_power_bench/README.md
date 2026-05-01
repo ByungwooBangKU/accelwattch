@@ -1303,6 +1303,7 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 |---|---|
 | `<stem>_summary.csv` | cell 당 1 행 — `slope_dyn` (OLS) + **`slope_dyn_wls`** (권장 headline) + **`slope_dyn_ci_lo` / `slope_dyn_ci_hi`** (95% bootstrap CI) + `R2_dyn_wls` + `slope_dyn_unclipped` / `clip_bias_pct` (raw-vs-clipped 영향) |
 | `<stem>_summary_by_regime.csv` | `(op, dtype, mode, cache_regime)` 당 1 행 — regime 별 `slope_dyn` (= `k_op`), `R2_dyn`, `median_j_per_unit`, `mean_dyn_power_w` |
+| **`<stem>_summary_matmul_per_K.csv`** | (PR A / G3) matmul 의 (variant, K) 별 1 행 — `j_per_flop_dyn`, `dyn_energy_j`, `dyn_power_w`, `cache_regime` 등. single-slope 가 가린 Tensor Core 효율 curve 를 K 별로 노출 |
 | `<stem>_01_powermodel_linearity_elementwise.png` | elementwise 10 종 log-log 선형성 + wall time + J/elem |
 | `<stem>_01_powermodel_linearity_matmul.png`      | matmul 5 variant log-log — `[CUDA]` · `[TC]` 태그 + 각 point 의 swept K 와 J/FLOP 값 annotate |
 | `<stem>_01_powermodel_coef_bar_elementwise.png` | elementwise k_op bar (pJ/elem + R² + bootstrap CI whisker) — full-width 단독 패널 |
@@ -1323,7 +1324,9 @@ python3 analyze.py reports/gpu_power_bench_h100_sxm_20260421_123456_h100.csv
 | `<stem>_02_dram_energy_marginal.png`             | direct vs marginal pJ/bit (l2_hit_0 − l2_hit_100) — DRAM-stack 만 |
 | `<stem>_dram_rw_split.csv`                       | (--dram-bw-test 시) per (dtype, op) read/write/mixed pJ/bit 표 |
 | `<stem>_dram_marginal.csv`                       | per (op, dtype) direct vs marginal pJ/bit 표 |
-| **`<stem>_03_energy_decomposition_mece.png`**    | **MECE 분해** — 각 (op, dtype) 의 dyn_energy @ l2_hit_0 을 3 components 로 stacked bar : (A) L2-resident workload (compute + L2 + launch — 통째로) + (B) FP8 cast overhead + (C) DRAM round-trip. **A + B + C ≡ 측정 total** (algebraic identity → MECE). softmax_fp8 의 1940 pJ/elem 이 어디로 가는지 정량적으로 분리. measurement noise 영향 줄이려면 `--window-ms 6000` 권장 (작은 cell 끼리 빼는 연산이 noise floor 에 가장 민감) |
+| **`<stem>_03_energy_decomposition_mece.png`**    | **MECE 분해 (elementwise)** — 각 (op, dtype) 의 dyn_energy @ l2_hit_0 을 3 components 로 stacked bar : (A) L2-resident workload (compute + L2 + launch — 통째로) + (B) FP8 cast overhead + (C) DRAM round-trip. **A + B + C ≡ 측정 total** (algebraic identity → MECE). softmax_fp8 의 1940 pJ/elem 이 어디로 가는지 정량적으로 분리. measurement noise 영향 줄이려면 `--window-ms 6000` 권장 |
+| **`<stem>_03_energy_decomposition_matmul_mece.png`** | **MECE 분해 (matmul, PR A / G4)** — 5 variants 의 dyn_energy @ l2_hit_0 을 2 components stacked bar : (A) L2-resident workload + (C) DRAM round-trip. fp8 cast 항 없음 — matmul fp8_te 가 H100 에선 native, A100 에선 FP16-fallback 이라 단일 의미의 cast overhead 가 없음. caveat box : matmul 의 cache_regime 분류는 logical working set 기반이라 tile reuse 무시. C 는 noisy upper bound. |
+| **`<stem>_01_powermodel_kop_per_K.png`** | (PR A / G3) matmul variants 의 K (log) vs pJ/FLOP (log) curve. single slope 으로 가려진 Tensor Core 효율 sweet spot (Hopper FP8 K ≥ 8192 의 ~67% peak) 시각화. variant 마다 best-K annotation |
 | `<stem>_03_baseline_static_power.png`            | 3 패널 P_static 진단 (idle trace + 구성비 + 점유율) |
 | `<stem>_04_thermal_diagnostics.png`              | 3 패널 thermal 진단 (start/avg/peak + cooldown + J/op vs T) |
 | `<stem>_05_trace_timeline.png`                   | 전체 run 의 power/temp/clock 타임라인 (samples CSV 존재 시) |

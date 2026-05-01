@@ -274,7 +274,7 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
-### G3. Per-K k_op 변동 (matmul Tensor Core efficiency curve)   *(implementation gap)*
+### G3. Per-K k_op 변동 (matmul Tensor Core efficiency curve)   *(implementation gap)*   **✅ DONE — PR A**
 
 **현황** : matmul k_op 가 K range 전체에 single slope 으로 fit. 그런데 Hopper FP8 의 Tensor Core 효율은 K 에 따라 변동 (sweet spot K ≥ 8192).
 
@@ -286,7 +286,7 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
-### G4. Matmul MECE decomposition 미구현   *(implementation gap)*
+### G4. Matmul MECE decomposition 미구현   *(implementation gap)*   **✅ DONE — PR A**
 
 **현황** : `plot_energy_decomposition()` 는 elementwise 만 처리. matmul 의 analogous 분해 미실시.
 
@@ -386,14 +386,14 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 | # | gap | 권장 작업 | 작업량 |
 |---|---|---|---|
 | **P1.1** | G6: SoC leakage → sweep dyn 자동 보정 | `analyze.py` 에 `add_thermal_correction()` helper. 새 컬럼 `dyn_energy_j_thermal_corrected`. | ~1 일 |
-| **P1.2** | G3: matmul per-K k_op | `_fit_one_group()` 옵션으로 piecewise fit. summary CSV 에 `slope_per_K` array 컬럼 또는 K-bin 별 row. | ~1 일 |
+| **P1.2** ✅ | G3: matmul per-K k_op | **DONE — PR A**. `summarize_matmul_per_K()` 가 (variant, K) 별 row 의 sidecar CSV 출력 + `plot_kop_per_K()` 가 K vs pJ/FLOP curve 시각화 (변종마다 best-K annotation). | ~1 일 |
 | **P1.3** | (Doc) G1+G2+G5 가 한 곳 모인 "Limitations" 섹션 | README 에 §X "What this suite cannot decompose" 추가. 기존 산재한 한계 표시 통합. | 0.5 일 |
 
 ### P2 — Optional Enhancements
 
 | # | gap | 권장 작업 | 작업량 |
 |---|---|---|---|
-| **P2.1** | G4: matmul MECE decomposition | `plot_energy_decomposition()` 의 matmul 변종. caveat 명시 (regime classifier 부정확). | ~1 일 |
+| **P2.1** ✅ | G4: matmul MECE decomposition | **DONE — PR A**. `plot_energy_decomposition_matmul()` 가 5 variants 의 (A: L2-resident, C: DRAM) 2-component stacked bar 출력. fp8 cast 항 제외 (matmul fp8 은 GPU 마다 의미 다름). caveat box 에 logical-working-set 한계 명시. | ~1 일 |
 | **P2.2** | G7: leakage(T) curve fit | `_soc_timeseries.csv` decay 구간에서 exponential fit. parameters → CSV. | ~1.5 일 |
 | **P2.3** | G8: P_static drift correlation | baseline plot 에 drift vs avg_temp scatter panel. | 0.5 일 |
 
