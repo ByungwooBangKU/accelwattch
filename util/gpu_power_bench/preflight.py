@@ -262,16 +262,15 @@ def _check_pynvml(r: PreflightResult, device: int = 0) -> None:
         r.fail(f"nvmlInit failed: {e}")
         return
     try:
-        # Resolve via PCI bus id so CUDA_VISIBLE_DEVICES re-numbering
+        # Resolve via PCI bus id / UUID so CUDA_VISIBLE_DEVICES re-numbering
         # doesn't make us read the wrong card. Same logic as
         # gpu_power_bench.py — see README §9.2.1. Falls back to plain
         # index lookup if torch isn't installed (the preflight that
         # would have caught that already failed earlier in the chain).
         h = None
         try:
-            import torch
-            pci_id = torch.cuda.get_device_properties(device).pci_bus_id
-            h = pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
+            from power_monitor import resolve_nvml_handle
+            h, _ = resolve_nvml_handle(device)
         except Exception:
             h = pynvml.nvmlDeviceGetHandleByIndex(device)
         # Power: we integrate mW samples → Joules. Required.

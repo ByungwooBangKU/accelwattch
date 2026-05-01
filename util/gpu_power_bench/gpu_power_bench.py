@@ -39,7 +39,8 @@ import pynvml
 import torch
 
 import benchmarks as bm
-from power_monitor import PowerSampler, measure_static_power, wait_for_cooldown
+from power_monitor import (PowerSampler, measure_static_power,
+                            wait_for_cooldown, resolve_nvml_handle)
 import preflight
 # SoC envelope phase + plot helpers — same code path the standalone
 # soc_power_bench.py uses, just composed here so we can run sweep + SoC
@@ -627,23 +628,12 @@ def main() -> int:
     gpu_name = torch.cuda.get_device_name(args.device)
     cc = torch.cuda.get_device_capability(args.device)
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    try:
-        # PyTorch returns the bus id like "0000:81:00.0"; pynvml expects the
-        # same domain:bus:device.function string (case-insensitive).
-        pci_id = torch.cuda.get_device_properties(args.device).pci_bus_id
-        handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
-        nvml_resolution = f"by PCI bus id {pci_id}"
-    except Exception as e:
-        # Older torch builds may lack pci_bus_id; fall back to index but
-        # warn loudly when CUDA_VISIBLE_DEVICES is in play (the case where
-        # the index-based call would silently read the wrong card).
-        handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
-        nvml_resolution = f"by index {args.device}  (pci_bus_id lookup failed: {e})"
-        if cvd:
-            print(f"[warn] CUDA_VISIBLE_DEVICES={cvd!r} is set but we couldn't "
-                  f"resolve the GPU by PCI bus id — NVML reads may target the "
-                  f"WRONG physical GPU. Prefer `--device {args.device}` without "
-                  f"CUDA_VISIBLE_DEVICES, or upgrade torch.")
+    handle, nvml_resolution = resolve_nvml_handle(args.device)
+    if "by index" in nvml_resolution and cvd:
+        print(f"[warn] CUDA_VISIBLE_DEVICES={cvd!r} is set but we could not "
+              f"resolve the GPU by PCI bus id / UUID — NVML reads may target "
+              f"the WRONG physical GPU. Prefer `--device {args.device}` "
+              f"without CUDA_VISIBLE_DEVICES, or upgrade torch.")
     gpu_slug = _slugify(gpu_name)
     print(f"\n[info] GPU={gpu_name}  cc={cc[0]}.{cc[1]}  slug={gpu_slug}")
     print(f"[info] NVML handle resolved {nvml_resolution}"
@@ -1328,11 +1318,7 @@ def main() -> int:
         # the same physical GPU via PCI bus id (CUDA_VISIBLE_DEVICES safe).
         pynvml.nvmlInit()
         try:
-            try:
-                pci_id = torch.cuda.get_device_properties(args.device).pci_bus_id
-                soc_handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
-            except Exception:
-                soc_handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
+            soc_handle, _ = resolve_nvml_handle(args.device)
 
             print(f"\n========== SoC envelope ==========")
             print(f"[soc] static={args.soc_static_seconds}s  "
