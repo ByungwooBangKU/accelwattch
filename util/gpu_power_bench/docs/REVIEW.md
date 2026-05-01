@@ -132,4 +132,117 @@ DRAM 까지의 분리는 rigorous (marginal subtraction + R/W split + literature
 
 ---
 
-(continued — Axis 4 ~ 6)
+## Axis 4 — k_op 추출 방법론   **✓ 잘 됨**
+
+### 핵심 질문
+*"`E_dyn = k_op · N_op + ε` 의 k_op 가 robust 하게 회귀로 추출되는가? 노이즈 / clipping / drift 에 대해 가드가 있는가?"*
+
+### 구현된 메커니즘
+
+| 메커니즘 | 위치 | 역할 |
+|---|---|---|
+| OLS + WLS 동시 fit | `_fit_one_group()` `linear_fit()` / `linear_fit_wls()` | OLS (legacy 호환) + WLS (1/y² 가중, headline) 둘 다 보고 |
+| **Bootstrap 95% CI** | `bootstrap_slope_ci()` 1000 resample | slope 의 sampling 불확실성 정량 → bar plot 의 whisker 로 표시 |
+| **Per-regime fit** | `summarize_by_regime()` | (op, dtype, regime) 별 slope → cache locality 의 k_op 영향 분리 |
+| **Clip-bias detection** | `clip_bias_pct` column | `(slope_dyn_wls − slope_unclipped) / slope_unclipped × 100` |
+| **Noise-floor 자동 제외** | `pos_mask` (PR #53) | `dyn_energy_j ≤ 0` row 는 dyn 회귀에서 drop, `n_points_dyn_fit` / `n_dropped_clipped` 로 transparency |
+| Single-point fallback | `n=1` 처리 | degenerate group 에 대해 `y/x` per-point coefficient 라도 보고 |
+| Total-energy 회귀 | `slope_total` | `dyn` 과 별도로 `E_total` 회귀도 fit → P_static drift 영향 cross-check |
+
+### 강점
+
+- **WLS 가중 (1/y²) 이 power 측정의 noise 모델과 일치** — σ(y) ∝ y (constant relative error) 가정. log-space 에서 등가중. `_fit_one_group` (analyze.py:412)
+- **Bootstrap CI 가 single-number slope 에 *불확실성* 명시** — 옛 OLS-only 구현의 false confidence 제거. 작은 K 의 fp8_te 같이 noisy 한 cell 은 CI 가 wide 해서 bar 위 whisker 로 즉시 가시.
+- **Clip-bias 자동 alarm** — `dyn_energy_j_raw` 컬럼 보존 + clipped vs unclipped slope 비교 → ±2% 이내면 신뢰, 초과면 P_static drift 의심으로 user 에게 안내.
+- **Noise floor 의 자동 처리** (PR #53) — H100 fp8_te K=1024..2048 같은 "전부 clipped" 변종은 slope_dyn_wls = NaN 으로 떨어져 bar plot 에서 invisible — 가짜 0 표시 안 함.
+
+### 한계
+
+| 한계 | 의미 |
+|---|---|
+| **Linear model 은 intercept = 0 가정** | 실제로는 launch overhead 가 작은 N 에선 일정 offset. WLS slope 는 N 변화량의 비율이라 큰 N 가중치 ↑ → overhead 영향 작음. 그래도 약간의 systematic bias 잔존. |
+| **Matmul 의 단일 slope 이 K 변화 평균** | TC 효율이 K 에 따라 변화 (Hopper FP8 sweet spot K ≥ 8192) 인데 fit 은 모든 K 평균. README §3.5.3 acknowledged. per-K k_op 가 필요하면 additional 분석 필요. |
+| **fp16 / fp8 mixed 그룹 제외** | 회귀가 `(category, op, dtype, mode, llm_preset)` 단위라 dtype 이 같은 op 의 slope 는 분리. fp8 vs fp16 직접 비교는 plot 단계에서 함. |
+
+### 평가 — ✓
+
+power-model 계수 추출의 statistical rigor 는 이 분야에서 흔히 보는 것보다 강력 (bootstrap CI, clip-bias, noise floor). methodology 자체는 fundamentally sound, 한계도 정직하게 노출.
+
+---
+
+## Axis 5 — Thermal & Leakage   **✓ 잘 됨**
+
+### 핵심 질문
+*"온도 의존 leakage current 가 측정 + 정량되어 AccelWattch 의 thermal 항에 들어갈 데이터가 나오는가?"*
+
+### 구현된 메커니즘
+
+| 메커니즘 | 위치 | 역할 |
+|---|---|---|
+| SoC envelope 3-phase | `soc_power_bench.py` (또는 `gpu_power_bench --cases soc`) | static / max / leakage 5-cycle |
+| **Hot-leakage** | `phase_leakage()` + 1 s `--leak-window-s` post-stress | 5 사이클 평균 → noise 평균화, `leakage_minus_static_w` = 온도 의존 leakage Δ |
+| Per-cell thermal 컨텍스트 | `peak_temp_c` / `temp_rise_c` / `start_temp_c` columns | sweep cell 마다 전후 온도 기록 |
+| Cooldown between cells | `wait_for_cooldown()` | thermal carry-over 감소, target_c=45 default |
+| Decay zoom plot ([PR #58 자매](#)) | `_soc_leakage_enlarged.png` | 첫 3 s × 50–150 W 줌인 + cycle 별 온도 dashed overlay |
+
+### 강점
+
+- **5-cycle averaging 으로 noise 감소** — 한 cycle 의 hot power 가 NVML noise 에 흔들려도 5 평균으로 ±1 W 안정.
+- **Decay 곡선 + 온도 overlay** — `_soc_leakage_enlarged.png` 의 우측 y-axis dashed temp 와 좌측 power 동시 plot → "이 X W leakage 가 Y °C 에서 측정됨" 시각적 직접 매핑.
+- **Stress→stop transition 이 정확히 caputred** — `_run_gemm_for()` 가 phase 끝에 `torch.cuda.synchronize()` → 첫 sample 부터 hot-idle 시작.
+- **Build-defer pattern** ([PR #54](https://github.com/ByungwooBangKU/accelwattch/pull/54)) — `build_matmul()` 의 5× warmup 이 `phase_static` 후로 옮겨져 cold idle 측정 보존.
+
+### 한계
+
+| 한계 | 의미 |
+|---|---|
+| **Board-level leakage** | 칩 leakage + HBM idle leakage + VRM 합. 칩 단독 분리 못 함 (board-level NVML 한계). AccelWattch 도 보통 board total 사용하므로 호환. |
+| **Leakage(T) curve 전체가 아닌 단일 hot point** | T_hot vs T_cold 두 점만 측정 → linear approximation. exponential 한 leakage(T) 모델 fitting 하려면 cooldown 중간 point 도 잡아야 함. 현재 `_leakage_enlarged.png` 의 decay trace 가 이 데이터를 *시각화* 하지만 fit 은 안 함. |
+| **Thermal coupling between phases 미통제** | 매 phase 마다 cooldown 하지만 완벽하지 않음. 5 cycle 안에서 silicon 이 약간 누적 가열 → 첫 cycle vs 5번째 cycle hot 온도 다를 수 있음. 현재 plot 에서 cycle 간 온도 spread 보임. |
+| **Leakage 가 sweep 의 dyn_energy 에 자동 보정 안 됨** | SoC envelope 결과가 별도 sidecar CSV. sweep 의 per-cell `dyn_energy_j` 계산은 cold P_static 만 사용. thermal-corrected dyn 은 사용자가 후처리. |
+
+### 평가 — ✓
+
+leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로, 5-cycle 평균으로 noise 처리. AccelWattch 의 thermal 항에 그대로 입력 가능. 다만 sweep 데이터와 자동 통합은 안 됨 (P1 권장사항으로 §8 에서 다룰 예정).
+
+---
+
+## Axis 6 — MECE Decomposition   **✓ 잘 됨 (한계 명시)**
+
+### 핵심 질문
+*"한 측정값을 component (compute / memory / cast 등) 로 *수학적으로 깨끗하게* 분해할 수 있는가? overlap / missing 없는가?"*
+
+### 구현된 메커니즘
+
+| 메커니즘 | 위치 | 역할 |
+|---|---|---|
+| **3-component 항등식** | `plot_energy_decomposition()` ([PR #58](https://github.com/ByungwooBangKU/accelwattch/pull/58)) | A + B + C ≡ J(op, dtype, l2_hit_0) — algebraic |
+| Component A "L2-resident workload" | `J(op, fp16, l2_hit_100)` | compute + L2 + register + launch overhead (bundled) |
+| Component B "FP8 cast overhead" | `J(op, fp8, l2_hit_100) − J(op, fp16, l2_hit_100)` | cast-compute-cast 추가 비용 |
+| Component C "DRAM round-trip" | `J(op, dtype, l2_hit_0) − J(op, dtype, l2_hit_100)` | HBM streaming marginal |
+| Stacked bar visualization | `_03_energy_decomposition_mece.png` | A/B/C 비율 + 총 pJ/elem 표기 |
+| **Caveat box** in plot | `fig.text()` at bottom | "A 는 NVML 측정으로 더 분리 못 해 bundled 유지. 추정으로 더 쪼개면 MECE 깨짐" 명시 |
+
+### 강점
+
+- **순수 algebraic identity** — A, B, C 정의가 측정값 *차이* 라 substitution 으로 합 = 측정 total 검증 가능. overlap 없고 missing 없음.
+- **Stacked bar 가 분해 결과를 한 눈에** — softmax_fp8 의 1940 pJ/elem 이 "거의 100% A (resident workload)" 인지, "절반 B (cast)" 인지 즉시 판독.
+- **명시적 한계 표시** — plot 밑 caveat box 에 "A 는 더 분리 못 함" 명문화 → 사용자가 추정값을 측정값처럼 오해 방지.
+- **Window-ms 권장값 동봉** — README §10 + CLI help 에 `--window-ms 6000` 권장 (분해는 작은 cell 끼리 빼는 연산이라 noise floor 에 가장 민감).
+
+### 한계
+
+| 한계 | 의미 |
+|---|---|
+| **Component A 안의 compute vs L2 vs launch 분리 불가** | NVML 만으로는 fundamental limit (Axis 3 한계와 같음). 추정 (FLOP × J/FLOP_reference) 가능하나 *MECE 깨지므로* 의도적 미실시. |
+| **Elementwise only — matmul 미지원** | 현재 decomposition 은 `category == "elementwise"` 만. matmul 의 analogous 분해 (A: register-tile resident, B: fp8 scaling overhead, C: DRAM) 는 미구현. |
+| **fp8 baseline 없으면 B 항 0** | `mul_fp8` 만 측정하고 `mul_fp16` 측정 없으면 cast overhead 분리 못 함 → 그 (op, dtype) bar 자체 skip. cell coverage 의존. |
+| **Single-regime decomposition** | 현재 `l2_hit_0` 에서만 분해. 다른 regime (l2_hit_100 / l2_hit_50) 에서도 같은 framework 적용 가능하나 plot 에 1 점만. |
+
+### 평가 — ✓
+
+분해 자체는 algebraic 으로 MECE — 수학적 보장. 한계 (A bundling, elementwise-only) 가 plot/문서에서 정직하게 명시. AccelWattch 의 component-별 비용 입력에 가장 직접적 활용 가능.
+
+---
+
+(continued — §7 Gap analysis, §8 Recommendations)
