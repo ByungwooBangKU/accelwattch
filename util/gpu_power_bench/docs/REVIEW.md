@@ -362,6 +362,50 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
+### G11. Standalone op 측정값이 fused kernel 안의 op 에너지와 다름   *(scope/measurement gap)*   **PLANNED — see P1.4**
+
+**현황** : `softmax` / `gelu` / `layernorm` 은 PyTorch standalone op (`F.softmax`, `F.gelu`, `F.layer_norm`) 으로 측정. 즉 *각 op 마다 독립 CUDA kernel + 전체 HBM 라운드트립*.
+
+**왜 gap** : 실제 LLM 에서는 이들이 **fused kernel** 안에서 실행됨 :
+* `softmax` → FlashAttention 내부 **online (streaming) softmax** : tile 단위로 running `m_i, l_i` 갱신, `S = QKᵀ` / `P = softmax(S)` 가 register/SRAM 에만 거주, HBM 미접근. `e^{m_old−m_new}·O_old` rescale 항이 standalone 엔 없음.
+* `gelu` → matmul epilogue 에 fuse (`gelu(x @ W + b)`). intermediate 가 register 거주, HBM 미접근.
+* `layernorm` → 다음 linear 와 fuse (pre-norm block, `linear(layer_norm(x))`). LN 출력이 SRAM 거주.
+
+**6-axis 차이 :**
+
+| Axis | Standalone | Fused 안 |
+|------|------------|----------|
+| Algorithm | one-pass | online (streaming) — tile-wise running stats |
+| Reduction width | full row (D=2880 / N=2048) | tile (Bc=64..128) × 다단 incremental |
+| Intermediate (S, P, activation 출력) | HBM read+write | register / SMEM 만 (HBM 0) |
+| HBM traffic | op 단독 round-trip | 0 (matmul 의 Q/K/V/O · MLP 의 x/W/y 만 HBM) |
+| Compute schedule | 독립 kernel | matmul 의 mma 대기 슬롯에 latency-hide |
+| 추가 cost | 없음 | online softmax `O_old` rescale 항 (standalone 엔 부재) |
+
+**측정 결과의 의미** :
+- `J_softmax_standalone` ≈ `J_HBM_2N` (l2_hit_0 regime 에서 거의 다 HBM) + 작은 compute 항
+- `J_softmax_in_fused` ≈ streaming compute + rescale (HBM 항 0)
+- 두 값은 **정의가 다름** — standalone 을 fused 의 추정치로 쓰면 HBM 항이 double-count 됨.
+
+**P1 권장 (P1.4)** : Fused variant 6 개 + 차감 (decomposition) 으로 fused 안의 op 에너지 추정. GPT-OSS 120B shape 기준.
+
+> Phase 1 shape : (`B=1, H_q=64, H_kv=8, N_q=N_kv=2048, D_head=64`) for attention, (`M=2048, D_in=D_out=2880`) for MLP — `openai/gpt-oss-120b/config.json` (full-attention layer, per-expert MoE intermediate).
+> 사용자가 명시한 ops (gelu, layernorm) 으로 진행하되, GPT-OSS 실제 사용 ops (SiLU/SwiGLU, RMSNorm) 은 **G12 (Phase 2)** 로 따로 등록.
+
+---
+
+### G12. GPT-OSS-aligned activation/norm (SiLU/SwiGLU + RMSNorm) 미측정   *(scope gap, Phase 2 of G11)*
+
+**현황** : G11 Phase 1 은 사용자 명시 ops `gelu` / `layernorm` 의 fused variant 만 추가. 그런데 GPT-OSS 120B 실제로는 :
+* activation : **SiLU** in **SwiGLU** (`down_proj(silu(gate_proj(x)) * up_proj(x))`)
+* normalization : **RMSNorm** (`rms_norm_eps = 1e-5`)
+
+`gelu` / `layernorm` 측정값은 *구조 비교* (standalone vs fused gap) 엔 충분하지만 *GPT-OSS 절대 에너지 모델링* 엔 부정확.
+
+**P2 권장** : `silu` / `rmsnorm` standalone variant + `swiglu_mlp` (full 3-matmul SwiGLU expert) / `rmsnorm_linear` fused variant 추가. G11 의 결과와 비교해 activation/norm 종류가 fused 비중에 미치는 영향 정량.
+
+---
+
 ## §8 — Prioritised Recommendations
 
 각 gap 에 대해 priority 매김.
@@ -388,6 +432,7 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 | **P1.1** | G6: SoC leakage → sweep dyn 자동 보정 | `analyze.py` 에 `add_thermal_correction()` helper. 새 컬럼 `dyn_energy_j_thermal_corrected`. | ~1 일 |
 | **P1.2** ✅ | G3: matmul per-K k_op | **DONE — PR A**. `summarize_matmul_per_K()` 가 (variant, K) 별 row 의 sidecar CSV 출력 + `plot_kop_per_K()` 가 K vs pJ/FLOP curve 시각화 (변종마다 best-K annotation). | ~1 일 |
 | **P1.3** ✅ | (Doc) G1+G2+G5 가 한 곳 모인 "Limitations" 섹션 | **DONE — PR C**. README §13 을 12-row 분류 표로 보강 (NVML boundary / framework / hardware / scope 4 origin). 각 한계마다 우회 + severity 매김. | 0.5 일 |
+| **P1.4** | G11: fused vs standalone op 분리 측정 + decomposition | `benchmarks.py` 에 6 신규 variant (`attention_flash`, `linear_gelu`, `ln_linear`, `attention_qkv_matmul`, `linear_baseline_gelu`, `linear_baseline_ln`). `analyze.py` 에 `summarize_fused_decomposition()` (차감 + bootstrap CI) + 신규 plot 3 종 (`_fused_vs_standalone_bar.png`, `_attention_decomposition.png`, `_fused_components_pie.png`). GPT-OSS 120B shape default (`B=1, H_q=64, H_kv=8, N=2048, D=64` for attention; `M=2048, D_in=D_out=2880` for MLP). `--include-fused` opt-in. README §3.7 / TestCases A.5 에 동시 반영. | ~3.8 일 |
 
 ### P2 — Optional Enhancements
 
@@ -396,6 +441,7 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 | **P2.1** ✅ | G4: matmul MECE decomposition | **DONE — PR A**. `plot_energy_decomposition_matmul()` 가 5 variants 의 (A: L2-resident, C: DRAM) 2-component stacked bar 출력. fp8 cast 항 제외 (matmul fp8 은 GPU 마다 의미 다름). caveat box 에 logical-working-set 한계 명시. | ~1 일 |
 | **P2.2** ✅ | G7: leakage(T) curve fit | **DONE — PR B**. `fit_leakage_temperature()` + `plot_leakage_temperature()` — Arrhenius-like exponential `P(T)=a+b·exp(c·T)` + linear baseline. parameters (a/b/c/R²) 자동으로 SoC summary CSV 에. | ~1.5 일 |
 | **P2.3** ✅ | G8: P_static drift correlation | **DONE — PR B**. `plot_pstatic_drift_vs_temp()` — 별도 `_03_baseline_pstatic_vs_temp.png` 로 P_static(t) trace + P vs T scatter + linear fit + Pearson r + verdict ("thermal-driven / uncorrelated / mixed"). | 0.5 일 |
+| **P2.4** | G12: GPT-OSS-aligned activation/norm | P1.4 (G11) 의 phase 2 — `silu` / `rmsnorm` standalone variant + `swiglu_mlp` (3-matmul SwiGLU expert) / `rmsnorm_linear` fused variant 추가. P1.4 결과 (gelu/layernorm 기반) 와 비교 후 진행. | ~2 일 |
 
 ### P3 — Nice-to-have
 
