@@ -628,9 +628,35 @@ def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
 # "0.31 pJ/elem  R²=0.99" two-line annotation on top of any bar.
 # ---------------------------------------------------------------------------
 
+def _setup_cjk_fonts(matplotlib_module) -> None:
+    """Prepend Korean / CJK-capable fonts to matplotlib's sans-serif fallback
+    list so titles / labels with 한글 render instead of emitting "Glyph
+    XXXXX missing from font(s) DejaVu Sans" warnings + tofu boxes.
+
+    Tries (in order, first hit wins):
+        Noto Sans CJK KR / SC / TC   (most Linux distros via fonts-noto-cjk)
+        NanumGothic / NanumBarunGothic (common Korean dev installs)
+        Malgun Gothic                  (Windows default Korean)
+        AppleGothic                    (macOS default Korean)
+        DejaVu Sans                    (final fallback)
+    """
+    from matplotlib import font_manager
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    preferred = ["Noto Sans CJK KR", "Noto Sans CJK SC", "Noto Sans CJK TC",
+                 "NanumGothic", "NanumBarunGothic", "Malgun Gothic",
+                 "AppleGothic", "Source Han Sans KR", "DejaVu Sans"]
+    chosen = [f for f in preferred if f in available]
+    if not chosen:
+        chosen = ["DejaVu Sans"]   # nothing CJK-capable; keep default
+    matplotlib_module.rcParams["font.sans-serif"] = (
+        chosen + matplotlib_module.rcParams.get("font.sans-serif", []))
+    matplotlib_module.rcParams["axes.unicode_minus"] = False  # Korean fonts
+
+
 def _get_mpl():
     import matplotlib
     matplotlib.use("Agg")
+    _setup_cjk_fonts(matplotlib)
     import matplotlib.pyplot as plt
     return plt
 
@@ -830,8 +856,12 @@ def plot_kop_per_K(per_K_df: pd.DataFrame, out_png: Path, gpu: str) -> bool:
         emu = bool(int(g["emulated"].iloc[0])) if "emulated" in g else False
         c = palette.get(v, "gray")
         line_label = v + (" *EMU" if emu else "")
-        ax.plot(g["K_size"], g["pj_per_flop"], "-o", color=c, label=line_label,
-                linewidth=2, markersize=7, alpha=0.85,
+        # marker only — linestyle is set explicitly below to avoid the
+        # "redundantly defined" matplotlib warning that "-o" + linestyle
+        # kwarg triggered in the previous code path.
+        ax.plot(g["K_size"], g["pj_per_flop"], color=c, label=line_label,
+                marker="o", markersize=7,
+                linewidth=2, alpha=0.85,
                 linestyle="--" if emu else "-")
         # Annotate the K with the lowest pJ/FLOP — the variant's "sweet spot"
         if len(g) >= 3:
@@ -881,12 +911,27 @@ def _annot_bar_pj(rect, value_j, r2, scale_label):
 
 def _save_fig(fig, out_png: Path, dpi: int = 160) -> None:
     """Save with a fixed pad and a hard size cap — defends against the
-    gigapixel-PNG bug whenever log axes end up with pathological bounds."""
-    fig.tight_layout()
+    gigapixel-PNG bug whenever log axes end up with pathological bounds.
+
+    `tight_layout()` is wrapped + silenced because some plots (MECE
+    decompositions, anything with a `fig.text()` caveat box ABOVE or
+    BELOW the axes) intentionally place text outside the axes; tight
+    layout can't reconcile that and prints "Tight layout not applied"
+    warnings even though the saved figure is fine. We rely on
+    `bbox_inches="tight"` to actually clip whitespace.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore",
+                                message=r"Tight layout not applied")
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
     w_in, h_in = fig.get_size_inches()
     if w_in > 30 or h_in > 18:
         fig.set_size_inches(min(w_in, 30), min(h_in, 18))
-    fig.savefig(out_png, dpi=dpi, pad_inches=0.3)
+    fig.savefig(out_png, dpi=dpi, pad_inches=0.3, bbox_inches="tight")
     print(f"[save] {out_png}")
     import matplotlib.pyplot as plt
     plt.close(fig)
@@ -2338,10 +2383,11 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax.set_yscale("log")
     ax.set_title(
         f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
-        "fp8_te 는 3-component (A: fp16 baseline, B: cast/emulation overhead, C: DRAM); "
-        "다른 4 variants 는 2-component (A + C).  "
-        "B = J(fp8_te) − J(fp16_tc) at l2_hit_100. B ≤ 0 (Hopper native) 이면 "
-        "fp8_te 도 2-component 로 그리고 'FP8 native advantage' annotation 으로 절감량 표기.\n"
+        "fp8_te uses 3 components (A: fp16 baseline, B: cast/emulation "
+        "overhead, C: DRAM); the other 4 variants use 2 components (A + C). "
+        "B = J(fp8_te) − J(fp16_tc) at l2_hit_100. When B ≤ 0 (Hopper "
+        "native), fp8_te falls back to 2 components plus an "
+        "'FP8 native advantage' annotation showing the saved energy.\n"
         "Identity (per variant) :  A + B + C ≡ J(variant, l2_hit_0)   ← MECE",
         fontsize=10)
     ax.grid(True, axis="y", alpha=0.3, which="both")

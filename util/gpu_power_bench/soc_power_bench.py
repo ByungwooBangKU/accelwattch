@@ -47,6 +47,17 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
+# Prefer CJK-capable fonts so 한글 titles render without "Glyph missing"
+# warnings + tofu boxes. Same fallback chain as analyze.py.
+from matplotlib import font_manager as _font_manager
+_AVAILABLE_FONTS = {f.name for f in _font_manager.fontManager.ttflist}
+_PREFERRED = ["Noto Sans CJK KR", "Noto Sans CJK SC", "Noto Sans CJK TC",
+              "NanumGothic", "NanumBarunGothic", "Malgun Gothic",
+              "AppleGothic", "Source Han Sans KR", "DejaVu Sans"]
+_CHOSEN = [f for f in _PREFERRED if f in _AVAILABLE_FONTS] or ["DejaVu Sans"]
+matplotlib.rcParams["font.sans-serif"] = (
+    _CHOSEN + matplotlib.rcParams.get("font.sans-serif", []))
+matplotlib.rcParams["axes.unicode_minus"] = False
 import matplotlib.pyplot as plt
 import pynvml
 import torch
