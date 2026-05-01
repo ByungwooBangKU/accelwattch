@@ -2522,6 +2522,266 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     return True
 
 
+# ============================================================================
+# Fused vs Standalone (G11 / P1.4) — decomposition + plots
+# ============================================================================
+#
+# Pair each "full" fused variant with its "baseline" (no softmax / no
+# activation / no LN) and compute the residual energy that's attributable
+# to the op INSIDE the fused kernel. Compare against the existing
+# `softmax` / `gelu` / `layernorm` standalone measurements to expose the
+# difference (often ≫ 1× because standalone includes HBM round-trip).
+#
+# Pairing :
+#   ("softmax",   "attention_flash"     , "attention_qkv_matmul")
+#   ("gelu",      "linear_gelu"         , "linear_baseline_gelu")
+#   ("layernorm", "ln_linear"           , "linear_baseline_ln")
+#
+# Statistical significance heuristic — NVML measurement noise has typical
+# CV ~3..5% per cell ; subtraction of two independent noisy measurements
+# inflates the variance by √2. So if the residual is < ~10% of the full
+# measurement, it's within noise and we label "not statistically
+# distinguishable from zero" (analogous to the M(esidual) < 2σ rule).
+# ============================================================================
+
+_FUSED_PAIRS = (
+    ("softmax",   "attention_flash",     "attention_qkv_matmul"),
+    ("gelu",      "linear_gelu",         "linear_baseline_gelu"),
+    ("layernorm", "ln_linear",           "linear_baseline_ln"),
+)
+_FUSED_NOISE_FLOOR_PCT = 5.0 * np.sqrt(2.0)   # ~7.1%
+
+
+def summarize_fused_decomposition(df: pd.DataFrame) -> pd.DataFrame:
+    """Pair fused full/baseline rows by op group and compute residual energy.
+
+    Returns one row per (op_group, dtype) with :
+      * j_per_call_full           — fused full kernel energy (e.g. attention_flash)
+      * j_per_call_baseline       — same shape, op stripped (e.g. attention_qkv_matmul)
+      * j_per_call_residual       — full − baseline ; "fused op contribution"
+      * residual_pct_of_full      — residual / full × 100
+      * stat_significant          — 1 if |residual_pct| ≥ 2 × NVML noise floor (~14%)
+      * j_per_element_residual    — residual / n_elements_full
+      * j_standalone_per_element  — standalone op J/elem at l2_hit_0 (for ratio)
+      * ratio_residual_to_standalone — residual / standalone (per-elem) ;
+                                       1 = no difference, ≪ 1 = fused is much cheaper
+      * fusion_emulated           — 1 if torch.compile fell back to eager (residual unreliable)
+
+    Empty DataFrame when no fused rows exist (sweep didn't use --include-fused).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    fused = df[df["category"] == "fused"].copy()
+    if fused.empty:
+        return pd.DataFrame()
+    # Per-call dynamic energy = dyn_energy_j / iters. Use this rather than
+    # j_per_element_dyn because n_elements meaning differs across variants.
+    fused["dyn_energy_j_n"] = pd.to_numeric(fused["dyn_energy_j"], errors="coerce")
+    fused["iters_n"]        = pd.to_numeric(fused["iters"], errors="coerce")
+    fused["j_per_call_dyn"] = fused["dyn_energy_j_n"] / fused["iters_n"]
+    fused["n_elem_n"]       = pd.to_numeric(fused["n_elements"], errors="coerce")
+
+    # Standalone J/elem at l2_hit_0 — for ratio comparison. Use the
+    # dyn_energy_j / total_elements averaged over the largest cells
+    # (l2_hit_0 regime) per (op, dtype). Falls back to NaN when missing.
+    standalone = df[df["category"] == "elementwise"].copy()
+    standalone["jpe"] = pd.to_numeric(standalone["j_per_element_dyn"], errors="coerce")
+    if "cache_regime" in standalone.columns:
+        standalone["cache_regime"] = standalone["cache_regime"].replace(LEGACY_REGIME_MAP)
+        # l2_hit_0 = pure DRAM-streaming = closest to "standalone op cost
+        # in real workload" because LLM tensors typically don't fit L2.
+        sa_l2_hit_0 = standalone[standalone["cache_regime"] == "l2_hit_0"]
+        sa_summary = (sa_l2_hit_0.groupby(["op", "dtype"])["jpe"].median()
+                      if not sa_l2_hit_0.empty else
+                      standalone.groupby(["op", "dtype"])["jpe"].median())
+    else:
+        sa_summary = standalone.groupby(["op", "dtype"])["jpe"].median()
+
+    rows = []
+    for op_group, full_var, base_var in _FUSED_PAIRS:
+        for dtype in sorted(fused["dtype"].unique()):
+            sf = fused[(fused["op"] == full_var) & (fused["dtype"] == dtype)]
+            sb = fused[(fused["op"] == base_var) & (fused["dtype"] == dtype)]
+            if sf.empty or sb.empty:
+                continue
+            J_full = float(sf["j_per_call_dyn"].iloc[0])
+            J_base = float(sb["j_per_call_dyn"].iloc[0])
+            J_res = J_full - J_base
+            n_elem = int(sf["n_elem_n"].iloc[0]) if not pd.isna(sf["n_elem_n"].iloc[0]) else 0
+            residual_pct = 100.0 * J_res / J_full if J_full > 0 else float("nan")
+            stat_sig = (not pd.isna(residual_pct)
+                        and abs(residual_pct) >= 2.0 * _FUSED_NOISE_FLOOR_PCT)
+            jpe_residual = J_res / n_elem if n_elem > 0 else float("nan")
+            jpe_standalone = float(sa_summary.get((op_group, dtype), float("nan")))
+            ratio = (jpe_residual / jpe_standalone
+                     if jpe_standalone > 0 and not pd.isna(jpe_residual)
+                     else float("nan"))
+            fusion_emu = int(sf["emulated"].astype(int).iloc[0]) if "emulated" in sf.columns else 0
+            rows.append({
+                "op_group": op_group,
+                "dtype": dtype,
+                "full_variant": full_var,
+                "baseline_variant": base_var,
+                "j_per_call_full":     J_full,
+                "j_per_call_baseline": J_base,
+                "j_per_call_residual": J_res,
+                "residual_pct_of_full":     residual_pct,
+                "residual_pct_noise_floor": _FUSED_NOISE_FLOOR_PCT,
+                "stat_significant":         int(bool(stat_sig)),
+                "n_elements_full":          n_elem,
+                "j_per_element_residual":   jpe_residual,
+                "j_per_element_standalone": jpe_standalone,
+                "ratio_residual_to_standalone": ratio,
+                "fusion_emulated": fusion_emu,
+                "shape_full": str(sf["shape"].iloc[0]) if "shape" in sf.columns else "",
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_fused_vs_standalone_bar(decomp_df: pd.DataFrame, out_png: Path,
+                                 gpu: str) -> bool:
+    """Grouped bar — 3 op groups × 2 metrics (standalone J/elem vs
+    fused-residual J/elem). Annotates ratio fused/standalone and flags
+    "near noise floor" residuals. Returns True if rendered.
+    """
+    if decomp_df is None or decomp_df.empty:
+        return False
+    plt = _get_mpl()
+    # One panel per dtype so fp16/bf16 don't get squashed.
+    dtypes = sorted(decomp_df["dtype"].unique())
+    fig, axes = plt.subplots(1, len(dtypes), figsize=(7 * len(dtypes), 6.5),
+                             squeeze=False)
+    op_order = [p[0] for p in _FUSED_PAIRS]
+    for ax_idx, dtype in enumerate(dtypes):
+        ax = axes[0, ax_idx]
+        sub = decomp_df[decomp_df["dtype"] == dtype].set_index("op_group")
+        sub = sub.reindex([o for o in op_order if o in sub.index])
+        if sub.empty:
+            ax.set_visible(False); continue
+        xs = np.arange(len(sub))
+        w = 0.35
+        std_vals = (sub["j_per_element_standalone"] * 1e12).values
+        res_vals = (sub["j_per_element_residual"]   * 1e12).values
+        ax.bar(xs - w/2, std_vals, w, color="#1f77b4", edgecolor="white",
+               label="standalone (PyTorch op, l2_hit_0)")
+        # Highlight residuals that aren't statistically distinguishable from 0.
+        bar_colors = ["#a4d4a4" if s else "#d4a4a4" for s in sub["stat_significant"].values]
+        ax.bar(xs + w/2, res_vals, w, color=bar_colors, edgecolor="black",
+               hatch=["" if s else "//" for s in sub["stat_significant"].values],
+               label="fused-residual (full − baseline)")
+        # Annotate ratio above the residual bar
+        for i, (_, row) in enumerate(sub.iterrows()):
+            if not pd.isna(row["ratio_residual_to_standalone"]):
+                ratio = row["ratio_residual_to_standalone"]
+                tag = ""
+                if not row["stat_significant"]:
+                    tag = "\n(within noise)"
+                if row["fusion_emulated"]:
+                    tag += "\n⚠ fusion failed"
+                ax.text(xs[i] + w/2, res_vals[i],
+                        f"ratio = {ratio:.2f}×{tag}",
+                        ha="center", va="bottom", fontsize=8, linespacing=1.1)
+            ax.text(xs[i] - w/2, std_vals[i],
+                    f"{std_vals[i]:.1f} pJ", ha="center", va="bottom", fontsize=8)
+            ax.text(xs[i] + w/2, res_vals[i] if res_vals[i] > 0 else 0,
+                    f"{res_vals[i]:+.2f} pJ", ha="center", va="top", fontsize=7,
+                    color="#444")
+        ax.set_xticks(xs); ax.set_xticklabels(sub.index, fontsize=11)
+        ax.set_ylabel("pJ / element  (dynamic)")
+        ax.set_yscale("symlog", linthresh=0.01)
+        ax.grid(True, axis="y", alpha=0.3, which="both")
+        ax.set_title(f"{dtype} — fused vs standalone")
+        ax.legend(loc="upper left", fontsize=9)
+    fig.suptitle(
+        f"Fused-vs-Standalone — softmax / gelu / layernorm — {gpu}\n"
+        f"blue = standalone PyTorch op at l2_hit_0  ;  green = fused-residual "
+        f"(stat. distinguishable from 0)  ;  red+hatch = within NVML noise floor "
+        f"({2*_FUSED_NOISE_FLOOR_PCT:.1f}%).  ratio = fused-residual / standalone "
+        f"(≪ 1 = HBM-bound standalone overstates fused)",
+        y=1.02, fontsize=10)
+    _save_fig(fig, out_png)
+    return True
+
+
+def plot_attention_decomposition(decomp_df: pd.DataFrame, df: pd.DataFrame,
+                                 out_png: Path, gpu: str) -> bool:
+    """Stacked bar — for each dtype, attention_flash energy split into
+    matmul (QKᵀ + (QKᵀ)V) + softmax-residual.
+
+    `decomp_df` row corresponds to `op_group="softmax"` :
+        J_qkv_matmul = j_per_call_baseline   (the matmul-only baseline)
+        J_softmax    = j_per_call_residual   (what flash adds beyond matmul)
+        J_full       = j_per_call_full
+
+    Returns True if rendered.
+    """
+    if decomp_df is None or decomp_df.empty:
+        return False
+    sm = decomp_df[decomp_df["op_group"] == "softmax"]
+    if sm.empty:
+        return False
+    plt = _get_mpl()
+    fig, (ax, ax_caveat) = plt.subplots(
+        2, 1, figsize=(max(8, 2.5 * len(sm) + 3), 9),
+        gridspec_kw={"height_ratios": [9, 1.2], "hspace": 0.05})
+    ax_caveat.set_axis_off()
+
+    xs = np.arange(len(sm))
+    # mJ / call so the numbers are readable (typical attention call ≈ 1..50 mJ)
+    qkv_vals = (sm["j_per_call_baseline"].values) * 1e3
+    sm_vals  = (sm["j_per_call_residual"].values) * 1e3
+    full_vals = (sm["j_per_call_full"].values) * 1e3
+
+    ax.bar(xs, qkv_vals, color="#1f77b4", edgecolor="white",
+           label="QKᵀ + (QKᵀ)V matmuls (no softmax)")
+    # Softmax residual : if negative (rare — would indicate flash is
+    # cheaper than separate matmuls), render as a red-border bar so it's
+    # visually obvious.
+    sm_colors = ["#ff7f0e" if v >= 0 else "#d62728" for v in sm_vals]
+    ax.bar(xs, np.abs(sm_vals), bottom=qkv_vals, color=sm_colors, edgecolor="white",
+           label="softmax-residual = J(flash) − J(QKᵀ+QKV)")
+    # Total label on top
+    for i, (q, s, t) in enumerate(zip(qkv_vals, sm_vals, full_vals)):
+        ax.text(xs[i], q + abs(s),
+                f"flash total\n{t:.2f} mJ", ha="center", va="bottom",
+                fontsize=9, fontweight="bold")
+        if abs(s) > 1e-9:
+            pct = 100.0 * s / t if t > 0 else 0
+            ax.text(xs[i], q + abs(s) / 2, f"softmax\n{s:+.2f} mJ\n({pct:+.1f}%)",
+                    ha="center", va="center", fontsize=8, color="white",
+                    fontweight="bold", linespacing=1.1)
+        ax.text(xs[i], q / 2, f"matmul\n{q:.2f} mJ\n({100*q/t:.1f}%)",
+                ha="center", va="center", fontsize=8, color="white",
+                fontweight="bold", linespacing=1.1)
+
+    labels = [f"{r['dtype']}\n{r.get('shape_full', '')}"
+              for _, r in sm.iterrows()]
+    ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("Energy per attention call  (mJ)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(loc="upper right", fontsize=9)
+    ax.set_title(
+        f"MECE attention decomposition (G11 / P1.4) — {gpu}\n"
+        f"flash kernel total = matmuls + softmax-residual.   "
+        f"softmax-residual ⊃ {{ online streaming softmax + scale + masking + rescale }}.",
+        fontsize=10)
+
+    ax_caveat.text(
+        0.5, 0.5,
+        "CAVEAT : `attention_qkv_matmul` baseline computes Q@Kᵀ then "
+        "(Q@Kᵀ)@V using `torch.matmul` — NOT a fused matmul-pair. The "
+        "kernel-launch + intermediate-write overhead of the 2-call "
+        "baseline is therefore PRESENT in the baseline but ABSENT in the "
+        "fused flash kernel. softmax-residual = J_flash − J_baseline "
+        "thus UNDER-estimates the true softmax cost by that overhead. "
+        "Magnitude is small relative to matmul cost on N≥512 but worth "
+        "knowing. README §3.7.6 / TestCases A.5.",
+        ha="center", va="center", fontsize=9, color="#333", wrap=True,
+        bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
+    _save_fig(fig, out_png)
+    return True
+
+
 def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
     """LLM-shape matmul energy per preset as a function of token count T (= M).
 
@@ -3285,6 +3545,29 @@ def main() -> int:
         plot_kop_per_K(
             matmul_per_K,
             out_dir / f"{stem}_01_powermodel_kop_per_K.png", gpu)
+    # Fused-vs-Standalone decomposition (G11 / P1.4) — fires only when
+    # the sweep used --include-fused. Pairs full ↔ baseline, computes
+    # residual energy attributable to softmax / gelu / layernorm INSIDE
+    # the fused kernel, compares to standalone J/elem at l2_hit_0.
+    fused_decomp = summarize_fused_decomposition(df)
+    if not fused_decomp.empty:
+        decomp_path = out_dir / f"{stem}_fused_decomposition.csv"
+        fused_decomp.to_csv(decomp_path, index=False)
+        print(f"[save] {decomp_path}")
+        plot_fused_vs_standalone_bar(fused_decomp,
+            out_dir / f"{stem}_03_fused_vs_standalone_bar.png", gpu)
+        plot_attention_decomposition(fused_decomp, df,
+            out_dir / f"{stem}_03_attention_decomposition.png", gpu)
+        # Tidy console summary so user sees ratios without opening CSV.
+        print("\n== Fused-vs-Standalone decomposition (G11 / P1.4) ==")
+        with pd.option_context("display.width", 160,
+                               "display.float_format", lambda v: f"{v:.3e}"):
+            cols = ["op_group", "dtype",
+                    "j_per_element_residual", "j_per_element_standalone",
+                    "ratio_residual_to_standalone",
+                    "residual_pct_of_full", "stat_significant",
+                    "fusion_emulated"]
+            print(fused_decomp[cols].to_string(index=False))
     # DRAM-bandwidth energy — 2 separate PNGs (pJ/bit strip + sustained BW).
     plot_dram_energy(plot_df, out_dir, stem, gpu)
     # DRAM read/write split (only fires when stream_read / stream_write

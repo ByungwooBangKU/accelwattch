@@ -11,8 +11,9 @@
 #   ./run_bench.sh --devices "0,2,4,6" --tag h100
 #   ./run_bench.sh --num-gpus 4 --sequential   # one at a time (cleaner thermal)
 #
-# All extra args (--window-ms, --llm-shapes, --suite, --cases, …) are
-# forwarded to gpu_power_bench.py.
+# All extra args (--window-ms, --llm-shapes, --suite, --cases,
+# --include-fused, --attn-shape, --mlp-shape, …) are forwarded to
+# gpu_power_bench.py.
 #
 # Log layout (multi-GPU AND single-GPU) :
 #     reports/gpu_power_<tag>_<MMDD_hhmm>/
