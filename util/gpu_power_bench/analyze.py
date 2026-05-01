@@ -525,6 +525,48 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def summarize_matmul_per_K(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-K k_op rows for every matmul variant — one row per (variant, K).
+
+    Existing `summarize()` produces a single slope across the K range,
+    but matmul J/FLOP varies with K (Hopper FP8 sweet spot K ≥ 8192,
+    small K shows launch overhead, large K shows sustained Tensor Core
+    throughput). This sidecar exposes that K-by-K detail in a
+    machine-readable form so downstream tools and notebooks can plot
+    or fit the efficiency curve themselves.
+
+    Closes G3 from REVIEW.md §7. Companion plot:
+    `_01_powermodel_kop_per_K.png`.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    mm = df[df["category"] == "matmul"].copy()
+    if mm.empty:
+        return pd.DataFrame()
+    keep_cols = [
+        "category", "op", "dtype", "mode", "compute_unit", "emulated",
+        "load_value",                        # = K for matmul
+        "n_elements",                        # = K^2
+        "total_flops",                       # = 2*K^3 * iters
+        "iters",
+        "wall_s",
+        "dyn_energy_j", "dyn_energy_j_raw",
+        "j_per_flop_dyn",
+        "dyn_power_w",
+        "cache_regime",
+        "peak_temp_c", "avg_temp_c",
+    ]
+    keep_cols = [c for c in keep_cols if c in mm.columns]
+    out = mm[keep_cols].copy()
+    out = out.rename(columns={"load_value": "K_size"})
+    # Build the variant column (matmul_fp32_simt, etc.) for grouping.
+    out["variant"] = ("matmul_" + out["dtype"].astype(str) + "_"
+                      + out["mode"].astype(str))
+    # Sort for readable output.
+    out = out.sort_values(["variant", "K_size"]).reset_index(drop=True)
+    return out
+
+
 def summarize_by_regime(df: pd.DataFrame) -> pd.DataFrame:
     """Same power-model regression as summarize(), but grouped additionally
     by cache_regime.
@@ -741,6 +783,81 @@ def plot_linearity_matmul(df: pd.DataFrame, out_png: Path, gpu: str) -> None:
                  ha="center", fontsize=8, color="#d62728")
     fig.tight_layout(); fig.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[save] {out_png}")
+
+
+def plot_kop_per_K(per_K_df: pd.DataFrame, out_png: Path, gpu: str) -> bool:
+    """Per-K J/FLOP curve for every matmul variant — exposes the Tensor
+    Core efficiency ramp that single-slope summaries hide.
+
+    On Hopper, fp8_te has a clear sweet spot at K ≥ 8192 where Tensor
+    Cores reach ~67% of theoretical peak. Smaller K is dominated by
+    launch overhead + cuBLAS algorithm selection picking smaller tiles.
+    Single slope across the K range averages the two regimes and hides
+    where the variant actually performs best.
+
+    Closes G3 (P1.2) from REVIEW.md §7. Companion CSV:
+    `_summary_matmul_per_K.csv`.
+
+    x : K (log scale)
+    y : pJ/FLOP (log scale — order-of-magnitude differences across
+        variants need log)
+    one line per variant
+    """
+    if per_K_df is None or per_K_df.empty:
+        return False
+    plt = _get_mpl()
+    df = per_K_df.copy()
+    df["pj_per_flop"] = pd.to_numeric(df["j_per_flop_dyn"],
+                                      errors="coerce") * 1e12
+    df["K_size"] = pd.to_numeric(df["K_size"], errors="coerce")
+    df = df[(df["pj_per_flop"] > 0) & df["K_size"].notna()]
+    if df.empty:
+        return False
+
+    fig, ax = plt.subplots(figsize=(13, 7.5))
+    palette = PALETTE_MATMUL_VARIANTS
+    variants = sorted(df["variant"].unique(),
+                      key=lambda v: ["matmul_fp32_simt", "matmul_tf32_tc",
+                                     "matmul_fp16_tc", "matmul_bf16_tc",
+                                     "matmul_fp8_te"].index(v)
+                                    if v in ["matmul_fp32_simt", "matmul_tf32_tc",
+                                             "matmul_fp16_tc", "matmul_bf16_tc",
+                                             "matmul_fp8_te"] else 99)
+    for v in variants:
+        g = df[df["variant"] == v].sort_values("K_size")
+        if g.empty:
+            continue
+        emu = bool(int(g["emulated"].iloc[0])) if "emulated" in g else False
+        c = palette.get(v, "gray")
+        line_label = v + (" *EMU" if emu else "")
+        ax.plot(g["K_size"], g["pj_per_flop"], "-o", color=c, label=line_label,
+                linewidth=2, markersize=7, alpha=0.85,
+                linestyle="--" if emu else "-")
+        # Annotate the K with the lowest pJ/FLOP — the variant's "sweet spot"
+        if len(g) >= 3:
+            row_min = g.loc[g["pj_per_flop"].idxmin()]
+            ax.annotate(f"K={int(row_min['K_size'])}\n{row_min['pj_per_flop']:.2f} pJ/FLOP",
+                        xy=(row_min["K_size"], row_min["pj_per_flop"]),
+                        xytext=(0, -35), textcoords="offset points",
+                        ha="center", fontsize=8, color=c,
+                        arrowprops=dict(arrowstyle="-", color=c, alpha=0.6))
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("K   (square matmul, M = N = K)", fontsize=11)
+    ax.set_ylabel("pJ / FLOP (dynamic)", fontsize=11)
+    ax.set_title(
+        f"matmul k_op (J/FLOP) — per-K curve — {gpu}\n"
+        "Tensor Core efficiency varies with K — small K shows launch / "
+        "tile-selection overhead, large K shows sustained throughput. "
+        "Single-slope summary averages the two regimes.",
+        fontsize=11)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=10, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=140)
+    plt.close(fig)
+    return True
 
 
 def _annot_bar_pj(rect, value_j, r2, scale_label):
@@ -1822,6 +1939,156 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     return True
 
 
+def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
+                                     gpu: str) -> bool:
+    """MECE energy breakdown for MATMUL variants at l2_hit_0.
+
+    Unlike the elementwise version (PR #58) which has 3 components
+    (resident / fp8-cast-overhead / DRAM), matmul has only 2 :
+
+        Total      = J(matmul, variant, l2_hit_0)
+        ──────────────────────────────────────────────
+        A) "L2-resident workload"
+           = J(matmul, variant, l2_hit_100)
+           bundles SM/TC compute + L2 traffic + register file +
+           kernel launch. NOT further decomposable.
+
+        C) "DRAM round-trip"
+           = J(matmul, variant, l2_hit_0) − J(matmul, variant, l2_hit_100)
+           marginal HBM cost.
+
+        Identity:  A + C ≡ J(matmul, variant, l2_hit_0)   ← MECE
+
+    Why no "B" cast-overhead term :
+      * On H100, matmul_fp8_te is NATIVE (no emulation) → fp8 vs fp16
+        delta is a *hardware advantage*, not an overhead. Calling it
+        "cast" would be misleading.
+      * On A100, fp8_te falls back to FP16 TC → fp8 vs fp16 delta ≈ 0.
+        Again no cast overhead.
+      * Each variant gets its own bar (5 bars for 5 variants), each
+        decomposed into its own A + C. Comparison across variants is
+        the point — see Tensor Core gap (fp32_simt vs fp16_tc) and
+        FP8 advantage (fp16_tc vs fp8_te) by reading off the bar
+        heights.
+
+    CRITICAL CAVEAT — matmul cache regime is approximate :
+      `classify_cache_regime()` uses *logical* working set
+      (3·K²·bpe). cuBLAS / TE matmul kernels do tile reuse, so the
+      ACTUAL DRAM traffic is much less than logical (each input
+      element is reused O(K) times within an SM tile cache). That
+      means C is a noisy upper bound on real DRAM cost. The plot's
+      caveat box flags this.
+
+    Closes G4 (P2.1) from REVIEW.md §7.
+    """
+    if by_regime is None or by_regime.empty:
+        return False
+    mm = by_regime[by_regime["category"] == "matmul"].copy()
+    if mm.empty:
+        return False
+    mm["cache_regime"] = mm["cache_regime"].replace(LEGACY_REGIME_MAP)
+
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm.columns else "slope_dyn"
+
+    def _slope(variant: str, regime: str):
+        sub = mm[(mm["variant"] == variant) & (mm["cache_regime"] == regime)]
+        if sub.empty:
+            return None
+        v = sub[slope_col].iloc[0]
+        if pd.isna(v) or v <= 0:
+            return None
+        return float(v)
+
+    # 5 variants in canonical order
+    variant_order = ["matmul_fp32_simt", "matmul_tf32_tc",
+                     "matmul_fp16_tc", "matmul_bf16_tc",
+                     "matmul_fp8_te"]
+    bars = []
+    for variant in variant_order:
+        if variant not in mm["variant"].values:
+            continue
+        A = _slope(variant, "l2_hit_100")
+        T = _slope(variant, "l2_hit_0")
+        if A is None or T is None:
+            continue
+        C = T - A
+        emu_row = mm[mm["variant"] == variant]
+        emu = bool(int(emu_row["emulated"].iloc[0])) if "emulated" in emu_row.columns else False
+        bars.append({
+            "variant": variant, "A": A, "C": C, "total": T, "emulated": emu,
+        })
+    if not bars:
+        return False
+
+    plt = _get_mpl()
+    fig, ax = plt.subplots(figsize=(max(11, 1.6 * len(bars) + 4), 7.5))
+    xs = np.arange(len(bars))
+
+    # Convert J/FLOP to pJ/FLOP for display
+    A_vals = [b["A"] * 1e12 for b in bars]
+    C_vals = [b["C"] * 1e12 for b in bars]
+    T_vals = [b["total"] * 1e12 for b in bars]
+
+    # palette
+    palette = PALETTE_MATMUL_VARIANTS
+    base_colors = [palette.get(b["variant"], "gray") for b in bars]
+    # Layer A — variant-coloured solid block, layer C — same colour with hatch
+    for i, b in enumerate(bars):
+        ax.bar(xs[i], A_vals[i], color=base_colors[i], edgecolor="white",
+               label=f"A) L2-resident workload\n(compute + L2 + launch)" if i == 0 else None,
+               alpha=0.95)
+        ax.bar(xs[i], C_vals[i], bottom=A_vals[i],
+               color=base_colors[i], edgecolor="white", hatch="///",
+               label=f"C) DRAM round-trip\n(marginal HBM cost)" if i == 0 else None,
+               alpha=0.55)
+
+    # Annotations : total + percentages + variant name
+    for i, b in enumerate(bars):
+        a_pct = 100.0 * b["A"] / b["total"] if b["total"] > 0 else 0
+        c_pct = 100.0 * b["C"] / b["total"] if b["total"] > 0 else 0
+        ax.text(xs[i], T_vals[i] * 1.03,
+                f"{T_vals[i]:.2f} pJ/FLOP",
+                ha="center", va="bottom", fontsize=9, fontweight="bold")
+        if a_pct > 8:
+            ax.text(xs[i], A_vals[i] / 2, f"A: {a_pct:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white",
+                    fontweight="bold")
+        if c_pct > 8:
+            ax.text(xs[i], A_vals[i] + C_vals[i] / 2,
+                    f"C: {c_pct:.0f}%",
+                    ha="center", va="center", fontsize=8, color="black",
+                    fontweight="bold")
+
+    labels = [b["variant"] + (" *EMU" if b["emulated"] else "") for b in bars]
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=10)
+    ax.set_ylabel("pJ / FLOP   (dynamic, at l2_hit_0)", fontsize=11)
+    ax.set_yscale("log")
+    ax.set_title(
+        f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
+        "A + C ≡ J(matmul, variant, l2_hit_0)   "
+        "(no fp8-cast term — matmul fp8 is native on H100, FP16-fallback on A100)\n"
+        "A = J(variant, l2_hit_100) ;  "
+        "C = J(variant, l2_hit_0) − J(variant, l2_hit_100)",
+        fontsize=10)
+    ax.grid(True, axis="y", alpha=0.3, which="both")
+    ax.legend(loc="upper right", fontsize=9, ncol=1, bbox_to_anchor=(1.01, 1.0))
+
+    fig.text(
+        0.5, -0.04,
+        "CRITICAL CAVEAT : matmul's `cache_regime` is based on LOGICAL "
+        "working set (3·K²·bpe). cuBLAS/TE matmul kernels reuse each "
+        "input element O(K) times via SM tile cache, so actual DRAM "
+        "traffic ≪ logical. Component C is therefore a NOISY UPPER BOUND "
+        "on real DRAM cost — interpret as 'extra cost when working set "
+        "exceeds L2', not literal HBM bytes. README §3.5.3.",
+        ha="center", fontsize=8, color="#444444", wrap=True,
+        bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=4))
+
+    _save_fig(fig, out_png)
+    return True
+
+
 def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
     """LLM-shape matmul energy per preset as a function of token count T (= M).
 
@@ -2476,6 +2743,14 @@ def main() -> int:
         by_regime_path = out_dir / f"{stem}_summary_by_regime.csv"
         by_regime.to_csv(by_regime_path, index=False)
         print(f"[save] {by_regime_path}")
+
+    # Per-K matmul k_op sidecar (P1.2 / G3) — exposes Tensor Core
+    # efficiency curve that single-slope summaries hide.
+    matmul_per_K = summarize_matmul_per_K(df)
+    if not matmul_per_K.empty:
+        mm_per_K_path = out_dir / f"{stem}_summary_matmul_per_K.csv"
+        matmul_per_K.to_csv(mm_per_K_path, index=False)
+        print(f"[save] {mm_per_K_path}")
         print("\nk_op per cache regime (J/element for elementwise, "
               "J/FLOP for matmul):")
         with pd.option_context("display.width", 200,
@@ -2561,6 +2836,17 @@ def main() -> int:
     plot_energy_decomposition(
         by_regime,
         out_dir / f"{stem}_03_energy_decomposition_mece.png", gpu)
+    # MECE for matmul (P2.1 / G4) — 2 components (no fp8 cast term;
+    # matmul fp8_te is native on H100, FP16-fallback on A100).
+    plot_energy_decomposition_matmul(
+        by_regime,
+        out_dir / f"{stem}_03_energy_decomposition_matmul_mece.png", gpu)
+    # Per-K J/FLOP curve for every matmul variant (P1.2 / G3) — exposes
+    # Tensor Core efficiency ramp that single-slope summary hides.
+    if not matmul_per_K.empty:
+        plot_kop_per_K(
+            matmul_per_K,
+            out_dir / f"{stem}_01_powermodel_kop_per_K.png", gpu)
     # DRAM-bandwidth energy — 2 separate PNGs (pJ/bit strip + sustained BW).
     plot_dram_energy(plot_df, out_dir, stem, gpu)
     # DRAM read/write split (only fires when stream_read / stream_write
