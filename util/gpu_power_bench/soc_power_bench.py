@@ -85,8 +85,9 @@ def _resolve_nvml_handle(device: int):
     canonical bridge.
     """
     try:
-        pci_id = torch.cuda.get_device_properties(device).pci_bus_id
-        return pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
+        from power_monitor import resolve_nvml_handle
+        h, _ = resolve_nvml_handle(device)
+        return h
     except Exception:
         return pynvml.nvmlDeviceGetHandleByIndex(device)
 

@@ -51,6 +51,61 @@ def _nvml_or(fn, *args, default=-1):
         return default
 
 
+def resolve_nvml_handle(device_idx: int) -> tuple[object, str]:
+    """Return (NVML handle, resolution_label) for a CUDA device, robust to
+    PyTorch version differences and CUDA_VISIBLE_DEVICES scenarios.
+
+    Resolution order :
+      1. PCI bus id as a properly-formatted string  (canonical NVML path)
+      2. PCI bus id as int → format `{domain:04x}:{bus:02x}:{device:02x}.0`
+         (some PyTorch versions return `pci_bus_id` as int instead of str)
+      3. UUID-based lookup via `nvmlDeviceGetHandleByUUID`
+      4. Fallback : `nvmlDeviceGetHandleByIndex(device_idx)`
+
+    The fallback is correct on simple machines but READS THE WRONG GPU when
+    `CUDA_VISIBLE_DEVICES` re-orders devices — caller should warn loudly
+    when (a) the resolution label says "by index" AND (b) CUDA_VISIBLE_DEVICES
+    is set.
+    """
+    import torch
+    props = torch.cuda.get_device_properties(device_idx)
+
+    # --- attempt 1 : pci_bus_id as str -------------------------------------
+    pci_id = getattr(props, "pci_bus_id", None)
+    if isinstance(pci_id, str) and pci_id:
+        try:
+            h = pynvml.nvmlDeviceGetHandleByPciBusId(pci_id.encode())
+            return h, f"by PCI bus id {pci_id}"
+        except (pynvml.NVMLError, AttributeError, TypeError):
+            pass
+
+    # --- attempt 2 : pci_bus_id as int → constructed BDF string ------------
+    if isinstance(pci_id, int):
+        domain = getattr(props, "pci_domain_id", 0) or 0
+        bus = pci_id
+        dev = getattr(props, "pci_device_id", 0) or 0
+        constructed = f"{domain:04x}:{bus:02x}:{dev:02x}.0"
+        try:
+            h = pynvml.nvmlDeviceGetHandleByPciBusId(constructed.encode())
+            return h, f"by PCI bus id {constructed} (constructed from int)"
+        except (pynvml.NVMLError, AttributeError, TypeError):
+            pass
+
+    # --- attempt 3 : UUID --------------------------------------------------
+    uuid = getattr(props, "uuid", None)
+    if uuid is not None:
+        uuid_str = str(uuid) if not isinstance(uuid, str) else uuid
+        try:
+            h = pynvml.nvmlDeviceGetHandleByUUID(uuid_str.encode())
+            return h, f"by UUID {uuid_str}"
+        except (pynvml.NVMLError, AttributeError, TypeError):
+            pass
+
+    # --- attempt 4 : fall back to index ------------------------------------
+    h = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+    return h, f"by index {device_idx}"
+
+
 # ---------------------------------------------------------------------------
 # Power-reader resolution
 #
