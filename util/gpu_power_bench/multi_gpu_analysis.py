@@ -90,6 +90,43 @@ def discover_csvs(reports_dir: Path, num_gpus: int,
 # aggregation
 # ---------------------------------------------------------------------------
 
+def _collect_baseline_values(csv_path: Path, df: pd.DataFrame) -> list[float]:
+    """Return every P_static measurement we can find for one run.
+
+    Two sources, merged & deduped :
+      1. `_rebaseline.csv` sidecar — has one row per baseline measurement
+         (initial + each `--rebaseline-every` refresh). This is the
+         canonical source.
+      2. The `static_power_w` column in the main per-cell CSV. Every cell
+         records the active P_static, so periodic re-baselines surface
+         here too. Used as fallback if the sidecar is missing.
+
+    Why we don't trust the FIRST baseline alone : NVIDIA driver hysteresis
+    can leave the GPU in P0 boost-clock for tens of seconds after CUDA
+    context init / build_matmul warmup. The very first
+    `measure_static_power` call may sample mostly P0, inflating the
+    reading by 30..50 W vs true cold idle. Subsequent re-baselines (after
+    cells have run and cooled) usually reach P8 → the MIN of all
+    measurements is the cleanest cold-idle estimate.
+    """
+    values: list[float] = []
+    sidecar = csv_path.with_name(csv_path.stem + "_rebaseline.csv")
+    if sidecar.exists():
+        try:
+            sb = pd.read_csv(sidecar)
+            if "p_static_w" in sb.columns:
+                vals = pd.to_numeric(sb["p_static_w"], errors="coerce").dropna()
+                values.extend(float(v) for v in vals)
+        except Exception as e:
+            print(f"[warn] {sidecar.name}: could not read ({e})")
+    if not values and "static_power_w" in df.columns:
+        vals = pd.to_numeric(df["static_power_w"], errors="coerce").dropna()
+        # Per-cell column repeats the same baseline until next refresh,
+        # so unique() gives us one value per actual measurement.
+        values.extend(float(v) for v in vals.unique())
+    return values
+
+
 def aggregate_summaries(csvs: dict[int, Path]) -> pd.DataFrame:
     """Load each per-GPU CSV, summarise it, stack. Adds a `gpu_index` column."""
     frames = []
@@ -103,10 +140,23 @@ def aggregate_summaries(csvs: dict[int, Path]) -> pd.DataFrame:
         # Carry the node-side gpu name forward so the report can label
         # which physical GPU each index maps to.
         s["gpu_name"] = df["gpu"].iloc[0] if "gpu" in df.columns else f"gpu{idx}"
-        # Idle/static power is one value per run — pull it from the raw df.
-        if "static_power_w" in df.columns:
-            ps = pd.to_numeric(df["static_power_w"], errors="coerce").dropna()
-            s["static_power_w_run"] = float(ps.iloc[0]) if len(ps) else float("nan")
+        # P_static : surface first / median / min so the per-GPU health
+        # plot can use min (cleanest cold idle) and flag P0 hysteresis
+        # when first ≫ min.
+        bvals = _collect_baseline_values(csvs[idx], df)
+        if bvals:
+            arr = np.asarray(bvals, dtype=float)
+            s["static_power_w_first"] = float(arr[0])
+            s["static_power_w_min"]   = float(np.min(arr))
+            s["static_power_w_p50"]   = float(np.median(arr))
+            s["static_power_w_n"]     = int(len(arr))
+        else:
+            s["static_power_w_first"] = float("nan")
+            s["static_power_w_min"]   = float("nan")
+            s["static_power_w_p50"]   = float("nan")
+            s["static_power_w_n"]     = 0
+        # Back-compat alias used elsewhere.
+        s["static_power_w_run"] = s["static_power_w_min"]
         frames.append(s)
     if not frames:
         return pd.DataFrame()
@@ -160,18 +210,25 @@ def per_gpu_scalar_table(agg: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for idx, sub in agg.groupby("gpu_index"):
+        def _f(col, default=float("nan")):
+            return float(sub[col].iloc[0]) if col in sub else default
         rows.append({
-            "gpu_index": int(idx),
-            "gpu_name":  str(sub["gpu_name"].iloc[0]),
-            "static_power_w":   float(sub["static_power_w_run"].iloc[0])
-                                if "static_power_w_run" in sub else float("nan"),
-            "mean_dyn_power_w": float(pd.to_numeric(sub["mean_dyn_power_w"],
-                                                    errors="coerce").mean()),
-            "mean_temp_c":      float(pd.to_numeric(sub["mean_temp_c"],
-                                                    errors="coerce").mean()),
-            "peak_temp_c":      float(pd.to_numeric(sub["peak_temp_c"],
-                                                    errors="coerce").max()),
-            "n_variants":       int(len(sub)),
+            "gpu_index":              int(idx),
+            "gpu_name":               str(sub["gpu_name"].iloc[0]),
+            # Reported "idle power" = the MIN of all baseline measurements
+            # in the run. See _collect_baseline_values for rationale.
+            "static_power_w":         _f("static_power_w_min"),
+            "static_power_w_first":   _f("static_power_w_first"),
+            "static_power_w_p50":     _f("static_power_w_p50"),
+            "static_power_w_min":     _f("static_power_w_min"),
+            "static_power_w_n_meas":  int(_f("static_power_w_n", 0) or 0),
+            "mean_dyn_power_w":       float(pd.to_numeric(sub["mean_dyn_power_w"],
+                                                          errors="coerce").mean()),
+            "mean_temp_c":            float(pd.to_numeric(sub["mean_temp_c"],
+                                                          errors="coerce").mean()),
+            "peak_temp_c":            float(pd.to_numeric(sub["peak_temp_c"],
+                                                          errors="coerce").max()),
+            "n_variants":             int(len(sub)),
         })
     return pd.DataFrame(rows).sort_values("gpu_index").reset_index(drop=True)
 
@@ -293,20 +350,63 @@ def plot_per_gpu_scalars(pg_df: pd.DataFrame, out_png: Path,
     xs = np.arange(len(pg_df))
 
     ax = axes[0]
-    bars = ax.bar(xs, pg_df["static_power_w"].values,
-                  color="#6a994e", alpha=0.85, edgecolor="white")
-    mean = pg_df["static_power_w"].mean()
-    ax.axhline(mean, color="#d62728", lw=1, ls="--",
-               label=f"mean = {mean:.1f} W")
-    for rect, v in zip(bars, pg_df["static_power_w"].values):
-        if not np.isnan(v):
-            ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
-                    f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+    # Bar = MIN of all baseline measurements taken during the run
+    # (initial + every `--rebaseline-every` refresh). Min is the
+    # cleanest cold-idle number because re-baselines after several
+    # cells have run usually settle into P8 (no boost-clock hysteresis).
+    # The very first baseline can be 30..50 W inflated when CUDA
+    # context init / build_matmul warmup pinned the GPU to P0.
+    has_first = "static_power_w_first" in pg_df.columns
+    has_p50   = "static_power_w_p50"   in pg_df.columns
+    has_n     = "static_power_w_n_meas" in pg_df.columns
+    bar_vals  = pg_df["static_power_w"].values
+    bars = ax.bar(xs, bar_vals,
+                  color="#6a994e", alpha=0.85, edgecolor="white",
+                  label="min over all baselines (cold idle)")
+    mean_min = np.nanmean(bar_vals)
+    ax.axhline(mean_min, color="#d62728", lw=1, ls="--",
+               label=f"mean (min) = {mean_min:.1f} W")
+    # Optional first-baseline marker — exposes P0 hysteresis at a glance.
+    HYSTERESIS_W = 15.0
+    if has_first:
+        first_vals = pg_df["static_power_w_first"].values
+        ax.scatter(xs, first_vals, marker="x", color="#d62728", s=60,
+                   zorder=5, label="first baseline (initial)")
+    for i, (rect, v_min) in enumerate(zip(bars, bar_vals)):
+        if np.isnan(v_min):
+            continue
+        v_first = pg_df["static_power_w_first"].iloc[i] if has_first else float("nan")
+        v_p50   = pg_df["static_power_w_p50"].iloc[i]   if has_p50   else float("nan")
+        n_meas  = int(pg_df["static_power_w_n_meas"].iloc[i]) if has_n else 0
+        # Multi-line label : min on top, then "p50 / first / n=…"
+        # so the operator sees both the trustworthy number AND the
+        # spread that justifies trusting it.
+        lines = [f"{v_min:.1f} W  (min)"]
+        if not np.isnan(v_p50) and abs(v_p50 - v_min) > 0.5:
+            lines.append(f"p50 = {v_p50:.1f} W")
+        if not np.isnan(v_first):
+            delta = v_first - v_min
+            tag = "  ⚠ P0?" if delta >= HYSTERESIS_W else ""
+            lines.append(f"first = {v_first:.1f} W  (Δ {delta:+.1f}){tag}")
+        if n_meas > 0:
+            lines.append(f"n = {n_meas} baseline{'s' if n_meas != 1 else ''}")
+        ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                "\n".join(lines), ha="center", va="bottom",
+                fontsize=7, linespacing=1.15)
     ax.set_xticks(xs); ax.set_xticklabels([f"gpu{i}" for i in pg_df["gpu_index"]],
                                           rotation=0)
     ax.set_ylabel("static (idle) power (W)")
-    ax.set_title("Idle power per GPU\n(high = bad silicon / stuck clock)")
-    ax.grid(True, axis="y", alpha=0.3); ax.legend(fontsize=8)
+    ax.set_title("Idle power per GPU  —  MIN baseline (cold idle)\n"
+                 "× = first baseline; ⚠ P0? when first − min ≥ 15 W "
+                 "(boost-clock hysteresis suspected)")
+    ax.grid(True, axis="y", alpha=0.3); ax.legend(fontsize=7, loc="best")
+    # Headroom for multi-line annotations.
+    finite = bar_vals[~np.isnan(bar_vals)]
+    if has_first:
+        ff = pg_df["static_power_w_first"].values
+        finite = np.concatenate([finite, ff[~np.isnan(ff)]])
+    if finite.size:
+        ax.set_ylim(0, float(np.max(finite)) * 1.30)
 
     ax = axes[1]
     bars = ax.bar(xs, pg_df["mean_dyn_power_w"].values,
