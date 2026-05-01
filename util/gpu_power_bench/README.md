@@ -542,6 +542,97 @@ build cost 자체는 다음 phase 의 warmup 으로 자연 흡수. SoC envelope 
 | SoC envelope `phase_static` | ✓ (sample 필터는 phase_static 내부엔 없지만, build deferral 로 해결) | ✓ |
 | Per-cell sweep cell | (의도적으로 P0 — 측정 대상이 활성 커널) | (해당 없음) |
 
+### 3.7 Fused vs Standalone 측정 (`--include-fused`, opt-in)   *(planned — REVIEW.md G11 / P1.4)*
+
+#### 3.7.1 동기
+
+§3.1 의 `softmax`, `gelu`, `layernorm` 은 PyTorch **standalone** op (`F.softmax` 등) — 매 호출이 **독립 CUDA kernel + 전체 HBM round-trip**. 그러나 실제 LLM 에서는 :
+
+* `softmax` → **FlashAttention** 안의 *online (streaming) softmax*. tile 단위로 running `(m_i, l_i)` 갱신, intermediate `S = QKᵀ` / `P = softmax(S)` 가 **register/SRAM 거주, HBM 미접근**. 추가로 standalone 엔 없는 `O_old` rescale 항.
+* `gelu` → matmul **epilogue 에 fuse** (`gelu(x @ W + b)`). activation 출력이 register 거주.
+* `layernorm` → 다음 linear 와 fuse (pre-norm block, `linear(layer_norm(x))`).
+
+→ standalone 측정값을 fused 안의 op 에너지 추정에 그대로 쓰면 **HBM 항이 double-count** 됨 (자세한 6-axis 비교는 [REVIEW.md G11](./docs/REVIEW.md)).
+
+#### 3.7.2 6-variant 추가 + 차감 (option B+C)
+
+| Group | Variant | 정의 |
+|-------|---------|------|
+| **Fused (전체)** | `attention_flash` | `F.scaled_dot_product_attention` (FlashAttention-2 backend). softmax 가 안에 있음 |
+| | `linear_gelu` | `torch.compile` 로 fuse 한 `gelu(linear(x))`. inductor 가 epilogue fusion 안 하면 TransformerEngine `LayerNormMLP` 로 fallback |
+| | `ln_linear` | `torch.compile` 로 fuse 한 `linear(layer_norm(x))` (pre-norm) |
+| **Subtract baseline** | `attention_qkv_matmul` | `Q @ Kᵀ` + `P @ V` 두 matmul 만 (softmax 자리에 identity), 같은 (B,H,N,D) |
+| | `linear_baseline_gelu` | pure `linear(x, W, b)`, `linear_gelu` 와 동일 shape |
+| | `linear_baseline_ln` | pure `linear(x, W, b)`, `ln_linear` 와 동일 shape |
+
+차감식 :
+
+```
+J_softmax_in_fused   ≈  J(attention_flash)  − J(attention_qkv_matmul)
+J_gelu_in_fused      ≈  J(linear_gelu)      − J(linear_baseline_gelu)
+J_layernorm_in_fused ≈  J(ln_linear)        − J(linear_baseline_ln)
+```
+
+residual 의 95% bootstrap CI 가 0 을 포함하면 "유의미한 fused 항 검출 못 함" 으로 honest 보고.
+
+#### 3.7.3 Default shape — GPT-OSS 120B
+
+`openai/gpt-oss-120b/config.json` 직접 확인 :
+
+| Param | Value | 출처 |
+|-------|-------|------|
+| `hidden_size` | 2880 | config.json |
+| `num_hidden_layers` | 36 | |
+| `num_attention_heads` (Q) | **64** | |
+| `num_key_value_heads` (KV) | **8** | GQA group size = 64/8 = 8 |
+| `head_dim` | **64** | |
+| `intermediate_size` (per-expert) | 2880 | MoE expert MLP up-proj |
+| `num_local_experts` / `num_experts_per_tok` | 128 / 4 | top-4 routing |
+| `max_position_embeddings` | 131072 | YaRN scaling factor 32 |
+| `sliding_window` | 128 | alternating layer 만 |
+| Norm | **RMSNorm** (`rms_norm_eps = 1e-5`) | full-attn 과 sliding-attn 모두 |
+| Activation | **SiLU** (`hidden_act = "silu"`, in SwiGLU) | |
+
+→ Phase 1 측정 shape :
+
+| Variant | Default | 근거 |
+|---------|---------|------|
+| `attention_flash` / `attention_qkv_matmul` | `B=1, H_q=64, H_kv=8, N_q=N_kv=2048, D_head=64`, **non-causal** | full-attention layer (sliding-window 아닌 layer). N=2048 은 prefill 1 step 의 일반적인 token count. CLI 로 override : `--attn-shape B,H_q,H_kv,N_q,N_kv,D_head` |
+| `linear_gelu` / `linear_baseline_gelu` | `M=2048, D_in=D_out=2880` | 1 of top-4 active expert 의 up_proj / down_proj 차원. `--mlp-shape M,D_in,D_out` |
+| `ln_linear` / `linear_baseline_ln` | `M=2048, D=2880` | pre-norm QKV proj 입력 차원 |
+
+> **Caveat — activation/norm 종류** : GPT-OSS 120B 의 실제 activation 은 **SiLU** (in SwiGLU), norm 은 **RMSNorm**. 본 phase 1 은 *standalone-vs-fused 구조 비교* 에 집중하기 위해 사용자 명시 ops (`gelu`, `layernorm`) 그대로 유지. GPT-OSS 절대 에너지 모델링용 **SiLU/SwiGLU + RMSNorm** 측정은 [REVIEW.md G12 (P2.4)](./docs/REVIEW.md) 에 phase 2 로 등록.
+
+#### 3.7.4 결정 사항
+
+| 항목 | 결정 | 근거 |
+|------|------|------|
+| Fusion 메커니즘 | `torch.compile` 우선, 안 fuse 되면 TransformerEngine fallback, 둘 다 fail 시 variant skip + warn | TE 는 fp8_te 경로에서 이미 import — 추가 의존성 부담 0 |
+| Causal mask | non-causal default | softmax 항의 *upper bound* 측정. causal 은 절반 cost — follow-up |
+| Sweep 통합 | **opt-in `--include-fused`** | 6 variant × 5 cache regime = 30 신규 cell, sweep ~30% 증가. 기본 sweep 영향 없음 |
+| Default 수치 검증 방법 | 합성 + 실측 양쪽. residual 음수 → 측정 invalid 로 ERROR | 차감 noise propagation 은 bootstrap CI 로 정량 |
+
+#### 3.7.5 산출물
+
+| 종류 | 파일 | 내용 |
+|------|------|------|
+| CSV sidecar | `*_fused_decomposition.csv` | row 당 `(op, J_full, J_baseline, J_residual, residual_ci_lo, residual_ci_hi, ratio_residual_to_standalone)` |
+| Plot | `_fused_vs_standalone_bar.png` | 3 op 의 standalone J/elem vs fused-residual J/elem 그룹 막대 + ratio + residual CI 에러바 |
+| Plot | `_attention_decomposition.png` | `attention_flash` 의 stacked bar : `J_qk_matmul + J_pv_matmul + J_softmax_residual` MECE. caveat box 에 차감 noise 한계 명시 |
+| Plot | `_fused_components_pie.png` (optional) | fused kernel 안에서 matmul vs softmax/activation 비중 |
+
+기존 plot (`MECE`, `k_op_bar`, `k_op_per_K`) 은 standalone 과 fused 가 다른 `category` 로 분리 — 범례에 `(standalone)` / `(fused-residual)` 라벨 붙임.
+
+#### 3.7.6 한계 (구현 전 합의 완료)
+
+1. **Fusion 보장 환경 의존** : torch.inductor epilogue fusion 은 PyTorch 버전 / shape / dtype 에 따라 안 될 수 있음. PoC 단계에서 graph 캡처로 검증 후 fail 시 TE fallback.
+2. **차감 noise propagation** : `J_full ≈ J_baseline` 이면 residual ≈ 0, 측정 noise 만 보임. 95% CI 0 포함 시 honest 라벨 "fused contribution not statistically distinguishable from zero".
+3. **Online softmax rescale 항** 은 standalone 엔 부재 — residual 에 들어가지만 알고리즘 자체로부터 분리 불가능 (B+C 의 본질적 한계). plot caption 에 명시.
+4. **GPT-OSS sliding-window layer (N_kv=128) 미측정** — full-attention 만. SWA layer 의 softmax 항은 N_kv 가 작아 cost 가 크게 다름 → 별도 variant 로 추가 검토 가능.
+5. **fp8 fused 경로 미포함** — fp16/bf16 만. fp8 fused attention (TE FA + fp8) 은 standalone fp8 softmax 와 의미가 또 다름 → G12 follow-up 에서 같이.
+
+---
+
 ## 4. 측정 방법론
 
 ### 4.1 NVML power telemetry
