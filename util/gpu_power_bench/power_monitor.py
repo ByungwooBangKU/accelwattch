@@ -431,3 +431,87 @@ def wait_for_cooldown(handle, target_c: int = 45, timeout_s: float = 180.0,
             print(f"[cooldown] waiting… {cur}°C → {target_c}°C ({elapsed:.0f}s)")
             last_print = elapsed
         time.sleep(poll_s)
+
+
+def wait_for_pstate_idle(handle, threshold_mhz: int = 500,
+                         timeout_s: float = 30.0, poll_s: float = 0.5,
+                         min_consecutive: int = 3,
+                         verbose: bool = True) -> dict:
+    """Block until SM clock drops below `threshold_mhz` for `min_consecutive`
+    consecutive samples — proving the GPU has actually entered P8 idle.
+
+    Why this exists : `wait_for_cooldown` blocks on GPU TEMPERATURE, but
+    NVIDIA driver's P0→P8 transition is driven by ACTIVITY HYSTERESIS, not
+    temperature. After CUDA context init / build_matmul warmup the chip
+    can sit in P0 (boost clocks) for tens of seconds even with zero
+    utilization and falling die temp. If `measure_static_power()` runs
+    before P8 is reached, its P-state filter (sm_mhz < 500) finds 0%
+    of samples below threshold and degrades to "use all samples", so
+    the reported P_static is inflated by 30..50 W — exactly the warning
+    the user reports as "0/1201 samples reached P8 idle".
+
+    `min_consecutive` samples — typically 3 — guards against the chip
+    momentarily dipping below threshold during a clock ramp. Real P8
+    stays low for many polling intervals.
+
+    `threshold_mhz` defaults to 500 (override via env
+    `PSTATE_IDLE_CLOCK_THRESHOLD_MHZ` — same env var that
+    `measure_static_power` honours, so they're consistent).
+
+    Returns dict with:
+        final_sm_mhz       — last sm_mhz observed
+        elapsed_s          — wall time in this wait
+        reached            — True if P8 condition met
+        n_consecutive_idle — how many consecutive idle samples accumulated
+        reason             — "ok" | "timeout" | "sm_mhz_unavailable" | "disabled"
+    """
+    if timeout_s <= 0:
+        return {"final_sm_mhz": -1, "elapsed_s": 0.0, "reached": False,
+                "n_consecutive_idle": 0, "reason": "disabled"}
+    threshold_mhz = int(os.environ.get(
+        "PSTATE_IDLE_CLOCK_THRESHOLD_MHZ", str(threshold_mhz)))
+    t0 = time.perf_counter()
+    last_print = 0.0
+    consecutive = 0
+    last_mhz = -1
+    while True:
+        sm = _nvml_or(pynvml.nvmlDeviceGetClockInfo, handle,
+                      pynvml.NVML_CLOCK_SM, default=-1)
+        elapsed = time.perf_counter() - t0
+        if sm < 0:
+            # Driver doesn't expose sm_mhz reliably — bail out so caller
+            # falls through to existing P-state filter logic, which
+            # itself handles the "sm_mhz unavailable" case.
+            if verbose:
+                print(f"[pstate-idle] sm_mhz unavailable from NVML "
+                      f"after {elapsed:.1f}s — skipping P8 wait")
+            return {"final_sm_mhz": -1, "elapsed_s": elapsed,
+                    "reached": False, "n_consecutive_idle": 0,
+                    "reason": "sm_mhz_unavailable"}
+        last_mhz = sm
+        if sm < threshold_mhz:
+            consecutive += 1
+            if consecutive >= min_consecutive:
+                if verbose:
+                    print(f"[pstate-idle] P8 reached: sm_mhz={sm}<{threshold_mhz} "
+                          f"({consecutive} consecutive samples) in {elapsed:.1f}s")
+                return {"final_sm_mhz": sm, "elapsed_s": elapsed,
+                        "reached": True, "n_consecutive_idle": consecutive,
+                        "reason": "ok"}
+        else:
+            consecutive = 0
+        if elapsed >= timeout_s:
+            if verbose:
+                print(f"[pstate-idle] timeout after {elapsed:.1f}s — "
+                      f"GPU still in P0 (last sm_mhz={last_mhz}, target<{threshold_mhz}). "
+                      f"Static reading WILL be inflated by hysteresis. "
+                      f"Mitigations: `nvidia-smi -rgc` before sweep, "
+                      f"longer --pstate-idle-wait, or longer --static-seconds.")
+            return {"final_sm_mhz": last_mhz, "elapsed_s": elapsed,
+                    "reached": False, "n_consecutive_idle": consecutive,
+                    "reason": "timeout"}
+        if verbose and (elapsed - last_print) >= 5.0:
+            print(f"[pstate-idle] waiting for P8… sm_mhz={sm} (target<{threshold_mhz}) "
+                  f"elapsed={elapsed:.0f}s consecutive_idle={consecutive}")
+            last_print = elapsed
+        time.sleep(poll_s)
