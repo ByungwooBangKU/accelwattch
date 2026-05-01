@@ -28,6 +28,8 @@
 - [부록 B. NVML power telemetry semantics](#부록-b-nvml-power-telemetry-semantics)
 
 > 📋 **실험 카탈로그** : 모든 test case 의 *목적 / 동작 / 입력 파라미터 / 산출물* 을 대분류 → 중분류 → 개별 cell 의 3 단계로 정리한 문서는 **[`TestCases.md`](TestCases.md)** 에 별도로 있다. 새 실험 추가 시 그 문서의 §A~§D 에 한 줄 등록하면 자동으로 README 흐름에 합류한다.
+>
+> 🔍 **에너지 분리 design review** : 본 suite 가 GPU 에너지를 component (P_static / k_op / DRAM / leakage 등) 별로 얼마나 깨끗이 분리해 측정하는지 6 axis 평가 + 10 gap 분석 + P0/P1/P2/P3 권장사항 → **[`docs/REVIEW.md`](docs/REVIEW.md)**.
 
 ## 0. 용어와 기호
 
@@ -1678,6 +1680,8 @@ util/gpu_power_bench/
 ├── run_soc_bench.sh             SoC envelope 런처
 ├── install_transformer_engine.sh  TE 설치 헬퍼
 ├── TestCases.md                 실험 카탈로그 (대/중분류, 입력/산출물)
+├── docs/REVIEW.md               에너지 분리 design review (6 axis + gap analysis)
+├── docs/flop_unit_worksheet.xlsx FLOP/elem ↔ pJ 변환 라이브 워크북
 └── reports/                     출력 디렉토리
 ```
 
