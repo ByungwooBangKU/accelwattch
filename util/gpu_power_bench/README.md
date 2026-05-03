@@ -618,7 +618,8 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "유의미한 fused 항 검
 |------|------|------|
 | CSV sidecar | `*_fused_decomposition.csv` | row 당 `(op, J_full, J_baseline, J_residual, residual_ci_lo, residual_ci_hi, ratio_residual_to_standalone)` |
 | Plot | `_fused_vs_standalone_bar.png` | 3 op 의 standalone J/elem vs fused-residual J/elem 그룹 막대 + ratio + residual CI 에러바 |
-| Plot | `_attention_decomposition.png` | `attention_flash` 의 stacked bar : `J_qk_matmul + J_pv_matmul + J_softmax_residual` MECE. caveat box 에 차감 noise 한계 명시 |
+| Plot | `_attention_decomposition.png` | `attention_flash` 의 stacked bar : `J_qk_matmul + J_pv_matmul + J_softmax_residual` MECE. fp16/bf16 만 (fp8 baseline 미구현). caveat box 에 차감 noise 한계 명시 |
+| Plot | `_attention_dtype_compare.png` | `attention_flash` 의 cross-dtype 비교 — fp16 / bf16 / fp8 의 J/call 막대 + bf16 대비 ratio. fp8 의 절감률 한눈에 (예 : `0.64× of bf16, +35.9% saved`). pre-Hopper 는 fp8 bar 가 emulated (해치 패턴) 로 표시. |
 | Plot | `_fused_components_pie.png` (optional) | fused kernel 안에서 matmul vs softmax/activation 비중 |
 
 기존 plot (`MECE`, `k_op_bar`, `k_op_per_K`) 은 standalone 과 fused 가 다른 `category` 로 분리 — 범례에 `(standalone)` / `(fused-residual)` 라벨 붙임.
@@ -629,7 +630,7 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "유의미한 fused 항 검
 2. **차감 noise propagation** : `J_full ≈ J_baseline` 이면 residual ≈ 0, 측정 noise 만 보임. 95% CI 0 포함 시 honest 라벨 "fused contribution not statistically distinguishable from zero".
 3. **Online softmax rescale 항** 은 standalone 엔 부재 — residual 에 들어가지만 알고리즘 자체로부터 분리 불가능 (B+C 의 본질적 한계). plot caption 에 명시.
 4. **GPT-OSS sliding-window layer (N_kv=128) 미측정** — full-attention 만. SWA layer 의 softmax 항은 N_kv 가 작아 cost 가 크게 다름 → 별도 variant 로 추가 검토 가능.
-5. **fp8 fused 경로 미포함** — fp16/bf16 만. fp8 fused attention (TE FA + fp8) 은 standalone fp8 softmax 와 의미가 또 다름 → G12 follow-up 에서 같이.
+5. **fp8 fused 부분 지원** — `attention_flash` 만 fp8 가능 (Transformer Engine `DotProductAttention` + `fp8_autocast(E4M3)`). 다른 fused variant (matmul baseline / linear_gelu / ln_linear) 는 fp16/bf16 만. fp8 attention 은 cross-dtype compare plot (`_03_attention_dtype_compare.png`) 으로 fp16/bf16 대비 에너지 절감률 확인 가능 — *decomposition (matmul + softmax-residual) 은 fp8 의 baseline matmul 을 TE 가 public API 로 안 노출해서 미구현*. fp8 MLP fused / SiLU·SwiGLU / RMSNorm 은 [REVIEW.md G12 / P2.4b](./docs/REVIEW.md) follow-up.
 
 ---
 

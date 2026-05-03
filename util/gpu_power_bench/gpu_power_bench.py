@@ -530,8 +530,12 @@ def main() -> int:
                          "(diagnostic only — residuals will inflate).")
     ap.add_argument("--fused-dtypes", nargs="+", default=None,
                     help="dtypes for fused variants. Default = intersection "
-                         "of --dtypes with {fp16, bf16}. fp8 fused is "
-                         "REVIEW.md G12 / P2.4 (not yet supported).")
+                         "of --dtypes with {fp16, bf16, fp8}. fp8 only "
+                         "applies to attention_flash (via Transformer "
+                         "Engine + fp8_autocast) — all other fused "
+                         "variants (qkv_matmul baseline, linear_gelu, "
+                         "ln_linear) remain fp16/bf16. fp8 MLP fused is "
+                         "REVIEW.md G12 / P2.4 follow-up.")
     # ---- SoC envelope (the case formerly known as soc_power_bench.py) ----
     # Runs static/max/leakage phases as a sidecar. Same defaults as the
     # standalone soc_power_bench.py (~5 min wall). All flags accept the
@@ -855,21 +859,29 @@ def main() -> int:
             print(f"[error] bad --mlp-shape {args.mlp_shape!r}: {e}. "
                   f"Expected M,D_in,D_out")
             return 1
-        # dtype filter : intersection with {fp16, bf16}; fp8 fused is G12.
+        # dtype filter : intersection with {fp16, bf16, fp8}.
+        # NOTE — fp8 fused only supports `attention_flash` (TE-based).
+        # All other fused variants (qkv_matmul baseline, MLP variants)
+        # remain fp16/bf16-only ; G12/P2.4 follow-up will add fp8 paths.
         if args.fused_dtypes is not None:
             fused_dtypes = list(args.fused_dtypes)
         else:
-            fused_dtypes = [d for d in args.dtypes if d in ("fp16", "bf16")]
+            fused_dtypes = [d for d in args.dtypes if d in ("fp16", "bf16", "fp8")]
             if not fused_dtypes:
                 fused_dtypes = ["bf16"]
-                print(f"[fused] --dtypes had no fp16/bf16; defaulting fused to bf16")
-        unsupported = [d for d in fused_dtypes if d not in ("fp16", "bf16")]
+                print(f"[fused] --dtypes had no fp16/bf16/fp8; defaulting fused to bf16")
+        unsupported = [d for d in fused_dtypes if d not in ("fp16", "bf16", "fp8")]
         if unsupported:
-            print(f"[error] fused only supports fp16/bf16; got {unsupported}. "
-                  f"fp8 fused = REVIEW.md G12 / P2.4 (not yet)")
+            print(f"[error] fused only supports fp16/bf16/fp8; got {unsupported}.")
             return 1
+        n_fused_cells = 0
         for dtype in fused_dtypes:
             for variant in bm.FUSED_VARIANTS:
+                # fp8 only supports attention_flash for now ; quietly skip
+                # other variants for fp8 so the user can pass `--dtypes
+                # fp16 bf16 fp8` without manual filtering.
+                if dtype == "fp8" and variant != "attention_flash":
+                    continue
                 # The "load value" here is the fixed shape — encoded as a
                 # human-readable summary so each cell is uniquely keyed.
                 if variant in ("attention_flash", "attention_qkv_matmul"):
@@ -892,10 +904,11 @@ def main() -> int:
                                              causal=c, fusion_backend=fb,
                                              device="cuda")),
                 })
-        print(f"[fused] {len(fused_dtypes) * len(bm.FUSED_VARIANTS)} fused "
-              f"cells added "
+                n_fused_cells += 1
+        print(f"[fused] {n_fused_cells} fused cells added "
               f"(dtypes={fused_dtypes}, attn={attn_shape}, mlp={mlp_shape}, "
-              f"causal={args.fused_causal}, backend={args.fused_fusion_backend})")
+              f"causal={args.fused_causal}, backend={args.fused_fusion_backend} ; "
+              f"fp8 → attention_flash only)")
 
     total_cells = len(plans)
     print(f"[info] scheduling {total_cells} cells "

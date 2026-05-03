@@ -1015,6 +1015,113 @@ def _make_attention_flash(B: int, H_q: int, H_kv: int, N_q: int, N_kv: int,
     return f
 
 
+def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
+                               N_q: int, N_kv: int, D_head: int,
+                               device, causal: bool = False
+                               ) -> tuple[Callable[[], None], bool]:
+    """FP8 fused attention via Transformer Engine + `fp8_autocast`.
+
+    Returns (run_fn, emulated_flag). emulated=True when the GPU is pre-Hopper
+    (no native FP8 attention) and TE silently falls back to a half-precision
+    code path — same convention as `_make_matmul_fp8_te`.
+
+    Implementation : `te.DotProductAttention` accepts (Q, K, V) tensors in
+    `bshd` (Batch-Seq-Head-Dim) layout and dispatches to cuDNN / FlashAttention
+    internally ; under `te.fp8_autocast(enabled=True, recipe=DelayedScaling
+    (E4M3))` the whole attention chain (Q@Kᵀ → softmax → P@V) runs in FP8 on
+    Hopper. GQA is handled via `num_gqa_groups=H_kv` (TE param name).
+
+    No subtraction baseline yet — TE does not expose a public batched-fp8-gemm
+    API that we can use to construct an "attention_qkv_matmul_fp8" baseline
+    cleanly. So fp8 is INFORMATIONAL (full attention energy only) for now ;
+    decomposition (matmul + softmax-residual) is fp16/bf16 only. See README
+    §3.7 / TestCases A.5 / REVIEW.md G12.
+    """
+    _install_hint = ("Run ./install_transformer_engine.sh — the same script "
+                     "used by matmul_fp8_te.")
+    try:
+        import transformer_engine.pytorch as te
+        from transformer_engine.common import recipe as te_recipe
+    except (ImportError, OSError, RuntimeError) as e:
+        raise RuntimeError(
+            f"transformer_engine not usable for fp8 attention "
+            f"({type(e).__name__}: {e}). {_install_hint}") from e
+
+    # `te.DotProductAttention` lives at the top of the te.pytorch namespace
+    # in TE >= 1.0. Older versions exposed it under te.attention only.
+    DPA = getattr(te, "DotProductAttention", None)
+    if DPA is None:
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention as DPA
+        except (ImportError, AttributeError) as e:
+            raise RuntimeError(
+                f"te.DotProductAttention unavailable (TE version too old) "
+                f"({type(e).__name__}: {e}). Upgrade TE >= 1.0 to use "
+                f"fp8 fused attention.") from e
+
+    cc = torch.cuda.get_device_capability()
+    is_hopper = cc[0] >= 9
+    emulated = not is_hopper   # TE on pre-Hopper falls back to FP16 attention
+
+    # bshd layout : (B, S, H, D). TE prefers this for attention.
+    q = torch.randn(B, N_q,  H_q,  D_head, dtype=torch.float16, device=device)
+    k = torch.randn(B, N_kv, H_kv, D_head, dtype=torch.float16, device=device)
+    v = torch.randn(B, N_kv, H_kv, D_head, dtype=torch.float16, device=device)
+
+    try:
+        dpa = DPA(
+            num_attention_heads=H_q,
+            kv_channels=D_head,
+            num_gqa_groups=H_kv,
+            attention_dropout=0.0,
+            qkv_format="bshd",
+            attn_mask_type="causal" if causal else "no_mask",
+        ).to(device)
+    except TypeError:
+        # Some TE versions don't accept all of these kwargs (older API).
+        # Try the minimal signature.
+        try:
+            dpa = DPA(
+                num_attention_heads=H_q,
+                kv_channels=D_head,
+                attention_dropout=0.0,
+            ).to(device)
+        except Exception as e:
+            raise RuntimeError(
+                f"te.DotProductAttention construction failed "
+                f"({type(e).__name__}: {e}); your TE version may have a "
+                f"different API. Upgrade TE or skip fp8 attention.") from e
+
+    fp8_recipe = te_recipe.DelayedScaling(
+        fp8_format=te_recipe.Format.E4M3,
+        amax_history_len=16,
+        amax_compute_algo="max",
+    )
+
+    # Warmup 5× — same Blackwell + small-N safeguard as matmul_fp8_te.
+    # If TE's amax-buffer dance is going to trip the CUDA context, surface
+    # it here as a clean RuntimeError so build() can skip the cell.
+    try:
+        for _ in range(5):
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                dpa(q, k, v)
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        msg = str(e)
+        if "illegal memory access" in msg or "CUDA error" in msg:
+            raise RuntimeError(
+                f"te.DotProductAttention fp8 warmup failed on shape "
+                f"(B={B}, H_q={H_q}, H_kv={H_kv}, N_q={N_q}, N_kv={N_kv}, "
+                f"D={D_head}). CUDA context unrecoverable in this process. "
+                f"Original: {e}") from e
+        raise
+
+    def f():
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            dpa(q, k, v)
+    return f, emulated
+
+
 def _make_attention_qkv_matmul(B: int, H_q: int, H_kv: int, N_q: int, N_kv: int,
                                D_head: int, dtype: torch.dtype, device,
                                causal: bool = False) -> Callable[[], None]:
@@ -1177,10 +1284,19 @@ def build_fused(variant: str, dtype_label: str,
     if variant not in FUSED_VARIANTS:
         raise ValueError(f"unknown fused variant {variant!r}; "
                          f"choices: {FUSED_VARIANTS}")
-    if dtype_label not in ("fp16", "bf16"):
-        raise ValueError(f"fused variants only support fp16/bf16 (got {dtype_label!r}); "
-                         f"fp8 fused is G12/P2.4 follow-up")
-    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_label]
+    if dtype_label not in ("fp16", "bf16", "fp8"):
+        raise ValueError(f"fused variants only support fp16/bf16/fp8 (got {dtype_label!r}); "
+                         f"other dtypes are G12/P2.4 follow-up")
+    if dtype_label == "fp8" and variant != "attention_flash":
+        raise ValueError(
+            f"fp8 fused only supports `attention_flash` for now (got "
+            f"{variant!r}). fp8 needs a baseline (e.g. attention_qkv_matmul "
+            f"in fp8) for full decomposition — that requires a public "
+            f"batched-fp8-gemm API which TE doesn't expose. fp8 MLP fused "
+            f"variants (linear_gelu / ln_linear) are also pending. "
+            f"See REVIEW.md G12 / P2.4.")
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+             "fp8":  torch.float16}[dtype_label]   # fp8 stores as fp16 ; TE autocasts internally
     notes = ""
     backend_used = "tc"  # default for fused — output reaches Tensor Cores
     emulated = False
@@ -1189,19 +1305,30 @@ def build_fused(variant: str, dtype_label: str,
         B, H_q, H_kv, N_q, N_kv, D_head = attn_shape
         if H_q % H_kv != 0:
             raise ValueError(f"attention: H_q ({H_q}) must be divisible by H_kv ({H_kv})")
-        builder = (_make_attention_flash if variant == "attention_flash"
-                   else _make_attention_qkv_matmul)
-        fn = builder(B, H_q, H_kv, N_q, N_kv, D_head, dtype, device, causal=causal)
+        if dtype_label == "fp8":
+            # FP8 path : TE DotProductAttention + fp8_autocast
+            fn, emulated = _make_attention_flash_fp8(
+                B, H_q, H_kv, N_q, N_kv, D_head, device, causal=causal)
+            notes = ("fp8 FlashAttention via te.DotProductAttention + "
+                     "fp8_autocast(E4M3)")
+            if emulated:
+                notes += " (pre-Hopper FP16 fallback)"
+        else:
+            builder = (_make_attention_flash if variant == "attention_flash"
+                       else _make_attention_qkv_matmul)
+            fn = builder(B, H_q, H_kv, N_q, N_kv, D_head, dtype, device, causal=causal)
+            if variant == "attention_flash":
+                notes = "FlashAttention via SDPA (forced flash/cudnn backend)"
+            else:
+                notes = "subtraction baseline : Q@Kᵀ + (Q@Kᵀ)@V, no softmax"
         # FLOPs : Q@Kᵀ = 2·B·H_q·N_q·N_kv·D , (Q@Kᵀ)@V = 2·B·H_q·N_q·N_kv·D
         # → 4·B·H_q·N_q·N_kv·D total (softmax FLOPs negligible here).
         flops = 4 * B * H_q * N_q * N_kv * D_head
         n_out = B * H_q * N_q * D_head
         shape = attn_shape
-        compute_unit = "Tensor Core"
-        if variant == "attention_flash":
-            notes = "FlashAttention via SDPA (forced flash/cudnn backend)"
-        else:
-            notes = "subtraction baseline : Q@Kᵀ + (Q@Kᵀ)@V, no softmax"
+        compute_unit = ("Tensor Core (FP8)" if dtype_label == "fp8" and not emulated
+                        else "Tensor Core (FP16 fallback)" if emulated
+                        else "Tensor Core")
         if causal: notes += " ; causal=1"
 
     elif variant in ("linear_gelu", "linear_baseline_gelu",

@@ -3004,6 +3004,89 @@ def plot_attention_decomposition(decomp_df: pd.DataFrame, df: pd.DataFrame,
     return True
 
 
+def plot_fused_attention_dtype_compare(df: pd.DataFrame, out_png: Path,
+                                        gpu: str) -> bool:
+    """Cross-dtype FlashAttention energy compare — bar per dtype.
+
+    The full `attention_decomposition` plot only shows fp16/bf16 because the
+    fp8 case has no matmul-baseline (TE doesn't expose a public
+    batched-fp8-gemm we can use to construct one). This plot complements it :
+    just the FULL `attention_flash` energy per dtype, plus a ratio
+    annotation against the bf16/fp16 baseline so the operator can read off
+    "fp8 saves X % vs bf16" at a glance.
+
+    Returns True if rendered.
+    """
+    if df is None or df.empty:
+        return False
+    af = df[(df["category"] == "fused") & (df["op"] == "attention_flash")].copy()
+    if af.empty:
+        return False
+    af["dyn_J_n"] = pd.to_numeric(af["dyn_energy_j"], errors="coerce")
+    af["iters_n"] = pd.to_numeric(af["iters"], errors="coerce")
+    af["j_per_call_dyn"] = af["dyn_J_n"] / af["iters_n"]
+    af["emulated_n"] = pd.to_numeric(af.get("emulated", 0), errors="coerce").fillna(0).astype(int)
+    # group by dtype : one row per dtype (assume single shape per sweep)
+    grouped = (af.groupby("dtype", sort=False)
+                 .agg(j_per_call=("j_per_call_dyn", "mean"),
+                      n=("j_per_call_dyn", "size"),
+                      emulated=("emulated_n", "max"),
+                      shape=("shape", "first"))
+                 .reset_index())
+    if grouped.empty:
+        return False
+    # Display order : fp16, bf16, fp8 — pick whichever exist.
+    order = [d for d in ("fp16", "bf16", "fp8") if d in grouped["dtype"].values]
+    grouped = grouped.set_index("dtype").reindex(order).reset_index()
+
+    # Reference for ratio : bf16 if present, else fp16.
+    ref_dtype = "bf16" if "bf16" in order else ("fp16" if "fp16" in order else None)
+    j_ref = float(grouped[grouped["dtype"] == ref_dtype]["j_per_call"].iloc[0]) \
+            if ref_dtype else float("nan")
+
+    plt = _get_mpl()
+    fig, ax = plt.subplots(figsize=(max(6, 1.8 * len(grouped) + 2), 6.5))
+    xs = np.arange(len(grouped))
+    j_vals = (grouped["j_per_call"].values) * 1e3   # mJ
+    colors = {"fp16": "#1f77b4", "bf16": "#9467bd", "fp8": "#d62728"}
+    bar_colors = [colors.get(d, "#666666") for d in grouped["dtype"]]
+    bars = ax.bar(xs, j_vals, color=bar_colors, edgecolor="white",
+                  alpha=0.92,
+                  hatch=["//" if e else None for e in grouped["emulated"]])
+    # Annotate each bar : absolute mJ + ratio vs ref
+    for i, (rect, d, j_per_mJ, emu) in enumerate(zip(
+            bars, grouped["dtype"], j_vals, grouped["emulated"])):
+        ratio_txt = ""
+        if not pd.isna(j_ref) and j_ref > 0 and ref_dtype:
+            r = (j_per_mJ / 1e3) / j_ref
+            if d == ref_dtype:
+                ratio_txt = "  (ref)"
+            else:
+                pct_save = (1.0 - r) * 100.0
+                ratio_txt = f"\n{r:.2f}× of {ref_dtype}\n({pct_save:+.1f} % saved)"
+        emu_txt = "\n(EMU — pre-Hopper FP16 fallback)" if int(emu) else ""
+        ax.text(rect.get_x() + rect.get_width() / 2,
+                rect.get_height(),
+                f"{j_per_mJ:.2f} mJ{ratio_txt}{emu_txt}",
+                ha="center", va="bottom", fontsize=9, linespacing=1.15)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(grouped["dtype"].values, fontsize=11)
+    ax.set_ylabel("Energy per attention call  (mJ)")
+    ax.grid(True, axis="y", alpha=0.3)
+    finite = j_vals[~np.isnan(j_vals)]
+    if finite.size:
+        ax.set_ylim(0, float(np.max(finite)) * 1.40)
+    shape_str = grouped["shape"].iloc[0] if "shape" in grouped.columns else ""
+    ax.set_title(
+        f"FlashAttention energy by dtype — {gpu}\n"
+        f"shape : {shape_str}\n"
+        f"fp16/bf16 = SDPA flash backend ; fp8 = Transformer Engine "
+        f"DotProductAttention + fp8_autocast(E4M3)",
+        fontsize=10)
+    _save_fig(fig, out_png, pad_inches=0.1)
+    return True
+
+
 def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
     """LLM-shape matmul energy per preset as a function of token count T (= M).
 
@@ -3780,6 +3863,12 @@ def main() -> int:
             out_dir / f"{stem}_03_fused_vs_standalone_bar.png", gpu)
         plot_attention_decomposition(fused_decomp, df,
             out_dir / f"{stem}_03_attention_decomposition.png", gpu)
+        # Cross-dtype FlashAttention compare — independent of decomposition,
+        # fires whenever any `attention_flash` rows exist (fp16 / bf16 /
+        # fp8). Surfaces the fp8 attention energy that has no baseline
+        # subtraction available.
+        plot_fused_attention_dtype_compare(df,
+            out_dir / f"{stem}_03_attention_dtype_compare.png", gpu)
         # Tidy console summary so user sees ratios without opening CSV.
         print("\n== Fused-vs-Standalone decomposition (G11 / P1.4) ==")
         with pd.option_context("display.width", 160,
