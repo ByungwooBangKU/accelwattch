@@ -936,6 +936,11 @@ def llm_matmul_footprint_bytes(preset: str, T: int, dtype_label: str,
 # is REVIEW.md G12 / P2.4. See README §3.7.
 # ============================================================================
 
+# One-shot guard so the FP8 DPA verification hint prints once per process,
+# not on every rebaseline / per-cell rebuild.
+_FP8_DPA_VERIFY_HINTED: dict = {}
+
+
 FUSED_VARIANTS = (
     "attention_flash",        # Q@K + softmax + scale + (P@V) — full SDPA flash kernel
     "attention_qkv_matmul",   # Q@K + (Q@K)@V only (softmax replaced by identity) — subtraction baseline
@@ -1092,11 +1097,35 @@ def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
                 f"({type(e).__name__}: {e}); your TE version may have a "
                 f"different API. Upgrade TE or skip fp8 attention.") from e
 
-    fp8_recipe = te_recipe.DelayedScaling(
+    # FP8 attention recipe — `fp8_dpa=True` is REQUIRED to select cuDNN
+    # FusedAttention sub-backend 2 (the FP8 DPA path). Without it the
+    # default DelayedScaling does NOT route attention's two GEMMs through
+    # FP8 — the dtype label would be misleading. fp8_dpa landed in TE
+    # 1.x ; older versions silently ignore the kwarg, so we try-except.
+    #
+    # Verification (operator should run once on H100) :
+    #   NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 NVTE_FUSED_ATTN=1 \
+    #     python3 gpu_power_bench.py --fused-dtypes fp8 ...
+    # Look for "FusedAttention sub-backend 2" / "FP8 DPA" in the log.
+    # `NVTE_FUSED_ATTN_BACKEND=2` can force the FP8 backend if multiple
+    # are available.
+    _recipe_kwargs = dict(
         fp8_format=te_recipe.Format.E4M3,
         amax_history_len=16,
         amax_compute_algo="max",
     )
+    try:
+        fp8_recipe = te_recipe.DelayedScaling(fp8_dpa=True, **_recipe_kwargs)
+    except TypeError as e:
+        # TE < 1.x : fp8_dpa kwarg not yet present. Fall back gracefully
+        # but warn loudly that FP8 DPA backend may NOT be selected.
+        print(f"[fused-attn-fp8] WARN te_recipe.DelayedScaling rejected "
+              f"`fp8_dpa=True` ({e}). FP8 DPA cuDNN sub-backend 2 may NOT "
+              f"be active — measurement could be FP16/BF16 attention "
+              f"masquerading as fp8. Upgrade Transformer Engine >= 1.x "
+              f"to enable explicit FP8 DPA. Recipe falling back to "
+              f"DelayedScaling defaults.")
+        fp8_recipe = te_recipe.DelayedScaling(**_recipe_kwargs)
 
     # Warmup 5× — same Blackwell + small-N safeguard as matmul_fp8_te.
     # If TE's amax-buffer dance is going to trip the CUDA context, surface
@@ -1115,6 +1144,19 @@ def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
                 f"D={D_head}). CUDA context unrecoverable in this process. "
                 f"Original: {e}") from e
         raise
+
+    # One-time verification hint — operator should run once with NVTE_DEBUG
+    # to confirm FP8 DPA sub-backend 2 was actually selected. We can't
+    # introspect that ourselves from Python (TE doesn't expose it).
+    if not _FP8_DPA_VERIFY_HINTED.get("hinted"):
+        print(f"[fused-attn-fp8] To VERIFY FP8 DPA backend was selected "
+              f"(cuDNN sub-backend 2), re-run once with :\n"
+              f"   NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 NVTE_FUSED_ATTN=1 \\\n"
+              f"     ./run_bench.sh --suite quick --fused-dtypes fp8 ...\n"
+              f" and grep the log for 'sub-backend 2' / 'FP8 DPA'. If "
+              f"sub-backend 2 is NOT chosen, force it with "
+              f"NVTE_FUSED_ATTN_BACKEND=2.")
+        _FP8_DPA_VERIFY_HINTED["hinted"] = True
 
     def f():
         with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
