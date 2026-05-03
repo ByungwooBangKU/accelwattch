@@ -3045,7 +3045,15 @@ def plot_fused_attention_dtype_compare(df: pd.DataFrame, out_png: Path,
             if ref_dtype else float("nan")
 
     plt = _get_mpl()
-    fig, ax = plt.subplots(figsize=(max(6, 1.8 * len(grouped) + 2), 6.5))
+    # 2-row layout — main bar chart + caveat row that warns about the
+    # backend confounder. fp16/bf16 use PyTorch SDPA flash, fp8 uses TE
+    # DotProductAttention. Comparing across dtypes therefore conflates
+    # dtype effect with backend effect ; explicit warning so the
+    # operator doesn't read the bar diff as pure-dtype savings.
+    fig, (ax, ax_caveat) = plt.subplots(
+        2, 1, figsize=(max(7, 1.8 * len(grouped) + 2.5), 7.5),
+        gridspec_kw={"height_ratios": [8, 1.5], "hspace": 0.32})
+    ax_caveat.set_axis_off()
     xs = np.arange(len(grouped))
     j_vals = (grouped["j_per_call"].values) * 1e3   # mJ
     colors = {"fp16": "#1f77b4", "bf16": "#9467bd", "fp8": "#d62728"}
@@ -3079,11 +3087,27 @@ def plot_fused_attention_dtype_compare(df: pd.DataFrame, out_png: Path,
     shape_str = grouped["shape"].iloc[0] if "shape" in grouped.columns else ""
     ax.set_title(
         f"FlashAttention energy by dtype — {gpu}\n"
-        f"shape : {shape_str}\n"
-        f"fp16/bf16 = SDPA flash backend ; fp8 = Transformer Engine "
-        f"DotProductAttention + fp8_autocast(E4M3)",
+        f"shape : {shape_str}",
         fontsize=10)
-    _save_fig(fig, out_png, pad_inches=0.1)
+    # Backend-confounder caveat. Without this, an operator reading
+    # fp16-vs-fp8 bar diff would attribute the entire delta to dtype —
+    # but part of it is "SDPA flash" vs "TE DotProductAttention"
+    # backend overhead. fp8 also requires `fp8_dpa=True` in the
+    # DelayedScaling recipe to actually engage cuDNN sub-backend 2 ;
+    # the bench sets this when supported but TE versions vary.
+    ax_caveat.text(
+        0.5, 0.95,
+        "CAVEAT — backend & FP8 DPA verification :\n"
+        "fp16 / bf16 = PyTorch SDPA flash backend ;  "
+        "fp8 = TE DotProductAttention + fp8_autocast(E4M3, fp8_dpa=True)\n"
+        "Bar-to-bar diff conflates DTYPE EFFECT + BACKEND EFFECT. "
+        "For pure-dtype comparison, run all dtypes through TE.\n"
+        "Verify FP8 DPA backend was actually selected with "
+        "`NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 NVTE_FUSED_ATTN=1` and grep "
+        "logs for 'sub-backend 2'.",
+        ha="center", va="top", fontsize=8.5, color="#333", linespacing=1.4,
+        bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
+    _save_fig(fig, out_png, pad_inches=0.05)
     return True
 
 
