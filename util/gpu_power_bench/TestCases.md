@@ -241,7 +241,7 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "fused contribution not sta
 | `--mlp-shape` | `2048,2880,2880` | GPT-OSS per-expert |
 | `--fused-causal` | off | causal mask 강제. softmax 항 절반 cost (follow-up variant) |
 | `--fused-fusion-backend` | `auto` | `auto` (compile→TE fallback) / `compile` / `te` / `eager` (검증용) |
-| `--dtypes` | `fp16 bf16` | fp8 fused 는 G12 follow-up 까지 미포함 |
+| `--fused-dtypes` | `fp16 bf16 fp8` (의 교집합) | **fp8 은 `attention_flash` 만** (TE `DotProductAttention` + `fp8_autocast(E4M3)`). 다른 fused variant (qkv_matmul baseline / linear_gelu / ln_linear) 는 fp16/bf16 만. fp8 MLP 는 G12 / P2.4b follow-up. |
 
 #### 산출물
 
@@ -259,7 +259,7 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "fused contribution not sta
 2. 차감 noise propagation — residual CI 0 포함 시 honest "not statistically distinguishable" 라벨.
 3. Online softmax rescale 항은 standalone 엔 부재 — residual 에 들어가지만 분리 불가능.
 4. Sliding-window layer (N_kv=128) 미측정 — full-attn 만.
-5. fp8 fused 미포함 — fp16/bf16 만.
+5. fp8 fused 부분 지원 — `attention_flash` 만 fp8 (TE DotProductAttention + fp8_autocast). decomposition 은 fp16/bf16 만 (fp8 baseline 미구현). cross-dtype 비교는 `_03_attention_dtype_compare.png` 사용.
 
 ---
 

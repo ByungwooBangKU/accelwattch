@@ -394,7 +394,11 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 
 ---
 
-### G12. GPT-OSS-aligned activation/norm (SiLU/SwiGLU + RMSNorm) 미측정   *(scope gap, Phase 2 of G11)*
+### G12. GPT-OSS-aligned activation/norm (SiLU/SwiGLU + RMSNorm) + fp8 fused 미측정   *(scope gap, Phase 2 of G11)*
+
+> **2026-05 update — fp8 attention 부분 DONE (P2.4a)** :
+> `attention_flash` 의 fp8 path 추가 (Transformer Engine `DotProductAttention` + `fp8_autocast(E4M3)`). cross-dtype 비교 plot `_03_attention_dtype_compare.png` 신규. 다만 fp8 의 baseline (`attention_qkv_matmul` fp8) 은 TE 가 public batched-fp8-gemm API 를 노출 안 해서 미구현 — fp8 attention 은 **decomposition 없이 total energy** 로만 비교됨. fp8 MLP fused (linear_gelu_fp8, ln_linear_fp8) + GPT-OSS-aligned ops (SiLU/SwiGLU/RMSNorm) 은 여전히 P2.4 follow-up.
+
 
 **현황** : G11 Phase 1 은 사용자 명시 ops `gelu` / `layernorm` 의 fused variant 만 추가. 그런데 GPT-OSS 120B 실제로는 :
 * activation : **SiLU** in **SwiGLU** (`down_proj(silu(gate_proj(x)) * up_proj(x))`)
@@ -441,7 +445,8 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 | **P2.1** ✅ | G4: matmul MECE decomposition | **DONE — PR A**. `plot_energy_decomposition_matmul()` 가 5 variants 의 (A: L2-resident, C: DRAM) 2-component stacked bar 출력. fp8 cast 항 제외 (matmul fp8 은 GPU 마다 의미 다름). caveat box 에 logical-working-set 한계 명시. | ~1 일 |
 | **P2.2** ✅ | G7: leakage(T) curve fit | **DONE — PR B**. `fit_leakage_temperature()` + `plot_leakage_temperature()` — Arrhenius-like exponential `P(T)=a+b·exp(c·T)` + linear baseline. parameters (a/b/c/R²) 자동으로 SoC summary CSV 에. | ~1.5 일 |
 | **P2.3** ✅ | G8: P_static drift correlation | **DONE — PR B**. `plot_pstatic_drift_vs_temp()` — 별도 `_03_baseline_pstatic_vs_temp.png` 로 P_static(t) trace + P vs T scatter + linear fit + Pearson r + verdict ("thermal-driven / uncorrelated / mixed"). | 0.5 일 |
-| **P2.4** | G12: GPT-OSS-aligned activation/norm | P1.4 (G11) 의 phase 2 — `silu` / `rmsnorm` standalone variant + `swiglu_mlp` (3-matmul SwiGLU expert) / `rmsnorm_linear` fused variant 추가. P1.4 결과 (gelu/layernorm 기반) 와 비교 후 진행. | ~2 일 |
+| **P2.4a** ✅ | G12 partial: fp8 attention_flash | **DONE**. `_make_attention_flash_fp8()` via Transformer Engine `DotProductAttention` + `fp8_autocast(E4M3)`. `--fused-dtypes fp8` 로 opt-in. `_03_attention_dtype_compare.png` 로 fp16/bf16/fp8 cross-compare. baseline (`attention_qkv_matmul` fp8) 은 미포함 — fp8 attention 은 total energy 비교만. | ~0.5 일 |
+| **P2.4b** | G12: fp8 MLP fused + SiLU/SwiGLU + RMSNorm | `linear_gelu_fp8` / `ln_linear_fp8` (te.Linear + fp8_autocast 로 baseline 가능), `silu` / `rmsnorm` standalone, `swiglu_mlp` (3-matmul SwiGLU expert) / `rmsnorm_linear` fused. | ~2 일 |
 
 ### P3 — Nice-to-have
 
