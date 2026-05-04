@@ -2366,11 +2366,12 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
 
 
 def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
-                                     gpu: str) -> bool:
+                                     gpu: str,
+                                     variants: tuple[str, ...] | None = None
+                                     ) -> bool:
     """MECE energy breakdown for MATMUL variants at l2_hit_0.
 
-    Unlike the elementwise version (PR #58) which has 3 components
-    (resident / fp8-cast-overhead / DRAM), matmul has only 2 :
+    Two components per bar (matches README §3.7 docs) :
 
         Total      = J(matmul, variant, l2_hit_0)
         ──────────────────────────────────────────────
@@ -2385,27 +2386,28 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
 
         Identity:  A + C ≡ J(matmul, variant, l2_hit_0)   ← MECE
 
-    Why no "B" cast-overhead term :
-      * On H100, matmul_fp8_te is NATIVE (no emulation) → fp8 vs fp16
-        delta is a *hardware advantage*, not an overhead. Calling it
-        "cast" would be misleading.
-      * On A100, fp8_te falls back to FP16 TC → fp8 vs fp16 delta ≈ 0.
-        Again no cast overhead.
-      * Each variant gets its own bar (5 bars for 5 variants), each
-        decomposed into its own A + C. Comparison across variants is
-        the point — see Tensor Core gap (fp32_simt vs fp16_tc) and
-        FP8 advantage (fp16_tc vs fp8_te) by reading off the bar
-        heights.
+    No "B cast overhead" component — fp8 vs fp16 is a *hardware*
+    advantage on H100 (native FP8 TC) and ~0 on A100 (FP16 fallback);
+    calling it "cast" would be misleading. The fp8 advantage is shown
+    via a green annotation alongside the fp8_te bar instead.
+
+    `variants` (optional) — render only the listed variants. Used by
+    the TC-zoom plot (`mece_tc_zoom.png`) to drop fp32_simt so the
+    Tensor Core variants aren't squashed against the (~10×) larger
+    fp32_simt bar.
+
+    Y-axis is ADAPTIVE — matmul pJ/FLOP scale (~0.1..30 pJ on H100)
+    is much smaller than elementwise pJ/elem (~25..1500 pJ), so a
+    fixed cap squashes Tensor Core variants to invisible.
 
     CRITICAL CAVEAT — matmul cache regime is approximate :
       `classify_cache_regime()` uses *logical* working set
       (3·K²·bpe). cuBLAS / TE matmul kernels do tile reuse, so the
       ACTUAL DRAM traffic is much less than logical (each input
       element is reused O(K) times within an SM tile cache). That
-      means C is a noisy upper bound on real DRAM cost. The plot's
-      caveat box flags this.
-
-    Closes G4 (P2.1) from REVIEW.md §7.
+      means C can be a noisy upper bound on real DRAM cost — and
+      for some shapes l2_hit_0 slope can even drop BELOW l2_hit_100,
+      yielding C<0. The plot annotates such cases instead of clamping.
     """
     if by_regime is None or by_regime.empty:
         return False
@@ -2415,63 +2417,57 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     mm["cache_regime"] = mm["cache_regime"].replace(LEGACY_REGIME_MAP)
 
     slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm.columns else "slope_dyn"
+    has_med = "median_j_per_unit" in mm.columns
 
     def _slope(variant: str, regime: str):
+        """Return the per-variant per-regime slope. Falls back to
+        median_j_per_unit when WLS slope is NaN/<=0 — common at small
+        TC matmul sizes where dyn_energy_j gets clipped to 0 by NVML
+        noise floor and slope_dyn_wls becomes unstable. The fallback
+        is documented in summarize_by_regime()."""
         sub = mm[(mm["variant"] == variant) & (mm["cache_regime"] == regime)]
         if sub.empty:
             return None
         v = sub[slope_col].iloc[0]
+        if (pd.isna(v) or v <= 0) and has_med:
+            v = sub["median_j_per_unit"].iloc[0]
         if pd.isna(v) or v <= 0:
             return None
         return float(v)
 
-    # 5 variants in canonical order. fp8_te gets a 3-component breakdown
-    # (A_fp16_baseline + B_fp8_overhead + C_DRAM); the other 4 stay
-    # 2-component (A + C). The B term captures the *emulation /
-    # cast / scaling* delta vs the FP16 TC baseline:
-    #   * On A100  : matmul_fp8_te falls back to FP16 TC (`emulated=1`),
-    #                so B = J(fp8_te) − J(fp16_tc) is the FP16-fallback
-    #                overhead. Typically small but positive.
-    #   * On H100+ : matmul_fp8_te is NATIVE; B can be near 0 or even
-    #                NEGATIVE (fp8 path is more efficient than fp16).
-    #                When B ≤ 0 we render the fp8_te bar as 2-component
-    #                (its own A + C, no B layer) and add a "FP8 native
-    #                advantage" annotation showing the saved energy.
-    variant_order = ["matmul_fp32_simt", "matmul_tf32_tc",
-                     "matmul_fp16_tc", "matmul_bf16_tc",
-                     "matmul_fp8_te"]
+    full_order = ["matmul_fp32_simt", "matmul_tf32_tc",
+                  "matmul_fp16_tc",   "matmul_bf16_tc",
+                  "matmul_fp8_te"]
+    if variants is not None:
+        variant_order = [v for v in full_order if v in variants]
+    else:
+        variant_order = full_order
+
     bars = []
-    fp16_baseline_l2 = _slope("matmul_fp16_tc", "l2_hit_100")  # may be None
+    fp16_baseline_l2 = _slope("matmul_fp16_tc", "l2_hit_100")  # for fp8 advantage tag
     for variant in variant_order:
         if variant not in mm["variant"].values:
             continue
-        A_self = _slope(variant, "l2_hit_100")
+        A = _slope(variant, "l2_hit_100")
         T = _slope(variant, "l2_hit_0")
-        if A_self is None or T is None:
+        if A is None or T is None:
             continue
         emu_row = mm[mm["variant"] == variant]
         emu = bool(int(emu_row["emulated"].iloc[0])) if "emulated" in emu_row.columns else False
-        # 3-component path only for fp8_te WHEN the fp16 baseline exists
-        # AND emulation overhead is positive. Otherwise fall back to 2-
-        # component to keep the stacked bar honest.
+        # MECE : A + C ≡ T. If T < A (tile-reuse / NVML-noise), C goes
+        # negative — preserve the identity, surface as annotation later.
+        C = T - A
+        # FP8 advantage : compare native fp8_te vs fp16_tc baseline
+        # (annotation only — NOT a stack component).
+        fp8_advantage_pj = 0.0
         is_fp8 = (variant == "matmul_fp8_te")
-        if is_fp8 and fp16_baseline_l2 is not None:
-            A = fp16_baseline_l2
-            B = A_self - fp16_baseline_l2  # may be ≤ 0 on Hopper native
-        else:
-            A = A_self
-            B = 0.0
-        if B < 0:
-            # Hopper native fp8 — render as 2-component, save B for annotation.
-            B_advantage = -B  # positive number; how much fp8 saved vs fp16
-            A = A_self  # use fp8's own L2-resident
-            B = 0.0
-        else:
-            B_advantage = 0.0
-        C = T - A - B
+        if is_fp8 and fp16_baseline_l2 is not None and A < fp16_baseline_l2:
+            fp8_advantage_pj = (fp16_baseline_l2 - A) * 1e12
         bars.append({
-            "variant": variant, "A": A, "B": B, "C": C, "total": T,
-            "emulated": emu, "is_fp8": is_fp8, "B_advantage": B_advantage,
+            "variant": variant, "A": A, "C": C, "total": T,
+            "emulated": emu, "is_fp8": is_fp8,
+            "fp8_advantage_pj": fp8_advantage_pj,
+            "negative_C": C < 0,
         })
     if not bars:
         return False
@@ -2494,51 +2490,37 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
 
-    # Convert J/FLOP to pJ/FLOP for display
-    A_vals = [b["A"] * 1e12 for b in bars]
-    B_vals = [b["B"] * 1e12 for b in bars]
-    C_vals = [b["C"] * 1e12 for b in bars]
-    T_vals = [b["total"] * 1e12 for b in bars]
+    # Convert J/FLOP to pJ/FLOP for display. C may be NEGATIVE on
+    # tile-reuse-dominant shapes (l2_hit_0 slope < l2_hit_100 slope) —
+    # stack uses C+ (clamped at 0) for visual sanity, signed C surfaces
+    # via annotation.
+    A_vals        = [b["A"] * 1e12 for b in bars]
+    C_vals_signed = [b["C"] * 1e12 for b in bars]
+    C_vals_pos    = [max(0.0, v) for v in C_vals_signed]
+    T_vals        = [b["total"] * 1e12 for b in bars]
 
-    # Semantic A/B/C palette — same colors as the elementwise MECE plot.
-    # Previously each bar used its variant color (PALETTE_MATMUL_VARIANTS),
-    # which made fp8_te indistinguishable (A solid red + C hatched red,
-    # both = #d62728). Now A/B/C are immediately distinct on every bar ;
-    # variant identity is in the x-tick label.
+    # Semantic A/C palette — matches elementwise MECE colors.
+    # No "B" — see docstring (fp8 vs fp16 is hardware advantage on H100,
+    # not a cast overhead, per README). FP8 advantage shows as separate
+    # green annotation, not a stack component.
     COLOR_A = "#2ca02c"   # green   — L2-resident workload
-    COLOR_B = "#ff7f0e"   # orange  — fp8 cast / emulation overhead
-    COLOR_C = "#1f77b4"   # blue    — DRAM round-trip
+    COLOR_C = "#1f77b4"   # blue    — DRAM round-trip (marginal)
 
-    # Stack order : A (solid green) → B (solid orange) → C (solid blue)
     legend_a_used = False
-    legend_b_used = False
     legend_c_used = False
     for i, b in enumerate(bars):
-        # A
         ax.bar(xs[i], A_vals[i], color=COLOR_A, edgecolor="white",
-               label=("A) L2-resident workload (compute + L2 + launch)\n"
-                      "    fp8: uses fp16 baseline; non-fp8: uses own l2_hit_100")
-                     if not legend_a_used else None,
+               label=("A) L2-resident workload (compute + L2 + launch)"
+                      if not legend_a_used else None),
                alpha=0.95)
         legend_a_used = True
-        # B — cast / emulation overhead, only positive layer (Hopper native
-        # fp8's negative case rendered as 2-component instead).
-        if B_vals[i] > 0:
-            ax.bar(xs[i], B_vals[i], bottom=A_vals[i],
-                   color=COLOR_B, edgecolor="white",
-                   label=("B) FP8 cast / emulation overhead\n"
-                          "    = J(fp8_te) − J(fp16_tc) at l2_hit_100\n"
-                          "    (positive = emulation / cast cost)")
-                         if not legend_b_used else None,
+        if C_vals_pos[i] > 0:
+            ax.bar(xs[i], C_vals_pos[i], bottom=A_vals[i],
+                   color=COLOR_C, edgecolor="white",
+                   label=("C) DRAM round-trip (marginal HBM cost)"
+                          if not legend_c_used else None),
                    alpha=0.95)
-            legend_b_used = True
-        # C — DRAM
-        ax.bar(xs[i], C_vals[i], bottom=A_vals[i] + B_vals[i],
-               color=COLOR_C, edgecolor="white",
-               label=("C) DRAM round-trip (marginal HBM cost)"
-                      if not legend_c_used else None),
-               alpha=0.95)
-        legend_c_used = True
+            legend_c_used = True
 
     def _fmt_pj(v):
         """Format pJ value with reasonable precision for matmul (typ 0.01-100)."""
@@ -2554,79 +2536,69 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
             return f"{v:.3f}"
         return f"{v:.2e}"
 
-    # Annotations : total above + per-component value+pct.
-    # Inline label when component pct is large enough; otherwise a
-    # leader line points to a label outside the bar (right side).
-    # On log y-scale we use offset_points for the outside labels so
-    # vertical spacing is uniform regardless of magnitude.
+    # Annotations : Σ above + per-component value + pct + flags.
     INLINE_PCT_THRESHOLD = 8.0
-    LEADER_X_OFFSET = 0.42
     for i, b in enumerate(bars):
         total = b["total"] if b["total"] > 0 else 1
         a_pct = 100.0 * b["A"] / total
-        b_pct = 100.0 * b["B"] / total
         c_pct = 100.0 * b["C"] / total
-        # Total above the stack — but only when it fits inside the
-        # fixed y-axis cap. For bars that exceed the cap, the
-        # "↑ X pJ (clipped at 1400)" annotation below already
-        # surfaces the total, so showing Σ above-frame would be both
-        # redundant and visually messy (label floating above the chart).
-        if T_vals[i] <= 1400.0:
-            ax.text(xs[i], T_vals[i] * 1.04,
-                    f"Σ = {_fmt_pj(T_vals[i])} pJ/FLOP",
-                    ha="center", va="bottom", fontsize=9.5, fontweight="bold")
-
-        # Geometric midpoints work better on a log axis than arithmetic.
-        def _gmid(top, bot):
-            if top <= 0 or bot <= 0:
-                return (top + bot) / 2.0
-            import math
-            return math.exp((math.log(top) + math.log(bot)) / 2.0)
-
-        a_top = A_vals[i]
-        b_top = A_vals[i] + B_vals[i]
-        c_top = A_vals[i] + B_vals[i] + C_vals[i]
-        segments = [
-            ("A", A_vals[i], a_pct,
-             _gmid(a_top, max(a_top * 1e-6, 1e-9)) if a_top > 0 else 0,
-             "white"),
-            ("B", B_vals[i], b_pct, _gmid(b_top, a_top) if B_vals[i] > 0 else 0,
-             "white"),
-            ("C", C_vals[i], c_pct, _gmid(c_top, b_top) if C_vals[i] > 0 else 0,
-             "black"),
-        ]
-        outside_offset_points = -10.0  # cumulative pt offset for leader labels
-        for name, value_pj, pct, mid_y, txt_color in segments:
-            if value_pj <= 0:
-                continue
-            label = f"{name}: {_fmt_pj(value_pj)} pJ\n({pct:.1f}%)"
-            if pct >= INLINE_PCT_THRESHOLD and mid_y > 0:
-                ax.text(xs[i], mid_y, label,
-                        ha="center", va="center", fontsize=8.5,
-                        color=txt_color, fontweight="bold", linespacing=1.1)
-            else:
-                # Outside leader. Use display coords for the text by
-                # offsetting from the bar-edge anchor in points.
-                ax.annotate(
-                    label,
-                    xy=(xs[i] + 0.30, mid_y if mid_y > 0 else value_pj),
-                    xytext=(40, outside_offset_points),
-                    textcoords="offset points",
-                    fontsize=8, ha="left", va="center", color="#222",
-                    arrowprops=dict(arrowstyle="-", color="#888",
-                                    lw=0.8, alpha=0.7),
-                    bbox=dict(facecolor="white", edgecolor="#aaaaaa",
-                              alpha=0.92, pad=2))
-                outside_offset_points -= 30.0  # stack subsequent labels
-        # FP8 native advantage annotation : when B was negative, surface
-        # the saved energy as a positive number so reader sees "fp8 is
-        # cheaper by X pJ/FLOP than fp16 baseline".
-        if b["is_fp8"] and b["B_advantage"] > 0:
-            adv_pj = b["B_advantage"] * 1e12
+        visible_top = A_vals[i] + C_vals_pos[i]
+        ax.text(xs[i], visible_top * 1.04,
+                f"Σ = {_fmt_pj(T_vals[i])} pJ/FLOP",
+                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
+        outside_offset_points = -10.0
+        # A
+        a_mid = A_vals[i] / 2 if A_vals[i] > 0 else 0
+        a_label = f"A: {_fmt_pj(A_vals[i])} pJ\n({a_pct:.1f}%)"
+        if a_pct >= INLINE_PCT_THRESHOLD and a_mid > 0:
+            ax.text(xs[i], a_mid, a_label, ha="center", va="center",
+                    fontsize=8.5, color="white", fontweight="bold",
+                    linespacing=1.1)
+        elif A_vals[i] > 0:
             ax.annotate(
-                f"FP8 native advantage:\n−{_fmt_pj(adv_pj)} pJ/FLOP\nvs fp16_tc baseline",
-                xy=(xs[i], T_vals[i]),
-                xytext=(0, 40), textcoords="offset points",
+                a_label,
+                xy=(xs[i] + 0.30, a_mid),
+                xytext=(40, outside_offset_points), textcoords="offset points",
+                fontsize=8, ha="left", va="center", color="#222",
+                arrowprops=dict(arrowstyle="-", color="#888", lw=0.8, alpha=0.7),
+                bbox=dict(facecolor="white", edgecolor="#aaaaaa", alpha=0.92, pad=2))
+            outside_offset_points -= 30.0
+        # C (positive)
+        if C_vals_pos[i] > 0:
+            c_mid = A_vals[i] + C_vals_pos[i] / 2
+            c_label = f"C: {_fmt_pj(C_vals_signed[i])} pJ\n({c_pct:.1f}%)"
+            if c_pct >= INLINE_PCT_THRESHOLD:
+                ax.text(xs[i], c_mid, c_label, ha="center", va="center",
+                        fontsize=8.5, color="white", fontweight="bold",
+                        linespacing=1.1)
+            else:
+                ax.annotate(
+                    c_label,
+                    xy=(xs[i] + 0.30, c_mid),
+                    xytext=(40, outside_offset_points), textcoords="offset points",
+                    fontsize=8, ha="left", va="center", color="#222",
+                    arrowprops=dict(arrowstyle="-", color="#888", lw=0.8, alpha=0.7),
+                    bbox=dict(facecolor="white", edgecolor="#aaaaaa", alpha=0.92, pad=2))
+                outside_offset_points -= 30.0
+        # C < 0 — explicit annotation (do NOT silently clamp without notice).
+        if b["negative_C"]:
+            ax.annotate(
+                f"⚠ C = {_fmt_pj(C_vals_signed[i])} pJ < 0\n"
+                f"l2_hit_0 slope < l2_hit_100\n"
+                f"(tile reuse / NVML noise) :\n"
+                f"Σ ≈ A ; do NOT read as\n"
+                f"'negative DRAM energy'",
+                xy=(xs[i], A_vals[i]),
+                xytext=(0, 30), textcoords="offset points",
+                ha="center", fontsize=7.5, color="#b03030",
+                fontweight="bold", linespacing=1.15,
+                bbox=dict(facecolor="#fff0f0", edgecolor="#b03030", pad=2))
+        # FP8 native advantage — annotation only, NOT a stack component.
+        if b["is_fp8"] and b["fp8_advantage_pj"] > 0:
+            ax.annotate(
+                f"FP8 native advantage:\n−{_fmt_pj(b['fp8_advantage_pj'])} pJ/FLOP\nvs fp16_tc baseline",
+                xy=(xs[i], visible_top),
+                xytext=(0, 38), textcoords="offset points",
                 ha="center", fontsize=8, color="#2ca02c", fontweight="bold",
                 bbox=dict(facecolor="#e6f4ea", edgecolor="#2ca02c", pad=3))
 
@@ -2637,35 +2609,29 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
     ax.set_xticks(xs)
     ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=10)
     ax.set_ylabel("pJ / FLOP   (dynamic, at l2_hit_0)", fontsize=11)
-    # Linear y-axis with FIXED upper bound = 1400 pJ/FLOP per user request.
-    # This caps any single-cell outlier (e.g. fp32_simt thermal-throttled
-    # at 1800+ pJ) from blowing up the scale and squashing the smaller
-    # bars. Bars exceeding 1400 are clipped at the top with a visible
-    # "↑ exceeds 1400" annotation so the operator notices truncation.
-    Y_MAX_FIXED = 1400.0
-    ax.set_ylim(0, Y_MAX_FIXED)
-    if T_vals:
-        for i, t in enumerate(T_vals):
-            if t > Y_MAX_FIXED:
-                ax.annotate(
-                    f"↑ {_fmt_pj(t)} pJ\n(clipped at {Y_MAX_FIXED:.0f})",
-                    xy=(xs[i], Y_MAX_FIXED * 0.99),
-                    ha="center", va="top", fontsize=8, color="#b03030",
-                    fontweight="bold", linespacing=1.1,
-                    bbox=dict(facecolor="#fff0f0", edgecolor="#b03030",
-                              alpha=0.92, pad=2))
+    # Adaptive y-axis : matmul pJ/FLOP scale (~0.1..30 pJ on H100 TC,
+    # ~10..30 pJ on fp32_simt CUDA-core) is much smaller than elementwise
+    # pJ/elem (~25..1500 pJ). A fixed cap squashed Tensor Core variants
+    # to invisible. Use max(visible_top) × 1.30 so the Σ label clears
+    # the tallest bar.
+    visible_tops = [A_vals[i] + C_vals_pos[i] for i in range(len(bars))]
+    finite_tops = [v for v in visible_tops if np.isfinite(v) and v > 0]
+    if finite_tops:
+        ax.set_ylim(0, max(finite_tops) * 1.30)
+    zoom_tag = ("  (TC zoom — fp32_simt excluded)"
+                if variants is not None and "matmul_fp32_simt" not in variants
+                else "")
     ax.set_title(
-        f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}\n"
-        "fp8_te : 3 components (A: fp16 baseline, B: cast/emu overhead, C: DRAM)\n"
-        "others (4 variants) : 2 components (A + C)\n"
-        "B = J(fp8_te) − J(fp16_tc) at l2_hit_100. When B ≤ 0 (Hopper native), "
-        "B is collapsed and an 'FP8 native advantage' tag shows saved energy.\n"
-        "Identity (per variant) :  A + B + C ≡ J(variant, l2_hit_0)   ← MECE",
+        f"MECE energy decomposition — matmul @ l2_hit_0 — {gpu}{zoom_tag}\n"
+        "A = J(variant, l2_hit_100)   ←  compute + L2 + launch (NOT decomposable)\n"
+        "C = J(variant, l2_hit_0) − J(variant, l2_hit_100)   ←  DRAM marginal\n"
+        "Identity (per variant) :   A + C  ≡  J(variant, l2_hit_0)   ← MECE\n"
+        "(no `B` cast/emu term — fp8 vs fp16 is hardware advantage on H100, ~0 on A100)",
         fontsize=10)
-    ax.grid(True, axis="y", alpha=0.3, which="both")
-    # Reverse legend so top entry = top of stack (C → B → A).
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles[::-1], labels[::-1],
+    ax.grid(True, axis="y", alpha=0.3)
+    # Legend : reverse so top entry = top of stack (C → A).
+    handles, labels_l = ax.get_legend_handles_labels()
+    ax.legend(handles[::-1], labels_l[::-1],
               loc="upper left", fontsize=9, ncol=1,
               bbox_to_anchor=(1.01, 1.0))
 
@@ -3863,11 +3829,18 @@ def main() -> int:
     plot_energy_decomposition(
         by_regime,
         out_dir / f"{stem}_03_energy_decomposition_mece.png", gpu)
-    # MECE for matmul (P2.1 / G4) — 2 components (no fp8 cast term;
-    # matmul fp8_te is native on H100, FP16-fallback on A100).
+    # MECE for matmul (P2.1 / G4) — 2 components (A + C). README §3.7
+    # docs match. Two PNGs : full 5-variant + TC-only zoom (drops
+    # fp32_simt so Tensor Core variants aren't squashed).
     plot_energy_decomposition_matmul(
         by_regime,
         out_dir / f"{stem}_03_energy_decomposition_matmul_mece.png", gpu)
+    plot_energy_decomposition_matmul(
+        by_regime,
+        out_dir / f"{stem}_03_energy_decomposition_matmul_mece_tc_zoom.png",
+        gpu,
+        variants=("matmul_tf32_tc", "matmul_fp16_tc",
+                  "matmul_bf16_tc", "matmul_fp8_te"))
     # Per-K J/FLOP curve for every matmul variant (P1.2 / G3) — exposes
     # Tensor Core efficiency ramp that single-slope summary hides.
     if not matmul_per_K.empty:
