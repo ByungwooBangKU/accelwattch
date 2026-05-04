@@ -80,6 +80,20 @@ class BenchSpec:
     #   "dram_stream"  — working set ≥ 2·L2, ≈ 0% L2 hit
     #   "unknown"      — L2 size unavailable (legacy rows / non-CUDA)
     cache_regime: str = "unknown"
+    # Fine-grained classification of WHAT the measured energy actually
+    # represents. `emulated` is a True/False flag ; this string carries
+    # more nuance for downstream plot/CSV. Values :
+    #   "native_or_standard"           — the obvious case (fp16 mul, bf16 matmul, etc.)
+    #   "emulated_cast_compute_cast"   — fp8 elementwise : FP8 storage,
+    #                                    FP16 compute via cast-compute-cast.
+    #                                    NOT native FP8 op energy.
+    #   "native_or_te_fp8_tensorcore"  — H100 native FP8 path via TE
+    #                                    (matmul_fp8_te / attention_flash fp8).
+    #   "te_fp16_fallback"             — TE on pre-Hopper : silently runs
+    #                                    FP16 TC. NOT a real FP8 measurement.
+    # Used by analyze.py to decide hatch patterns, "fp8 native" headlines,
+    # and exclude emulated rows from FP8 energy claims.
+    path_semantics: str = "native_or_standard"
     notes: str = ""
 
 
@@ -485,12 +499,17 @@ def build(op: str, dtype_label: str, n_elements: int,
     l2 = get_l2_bytes(dev_idx)
     ws = _elementwise_working_set(op, actual_n, _dtype_bytes(dtype_label))
     regime = classify_cache_regime(ws, l2)
+    # Path semantics : fp8 elementwise is ALWAYS cast-compute-cast in
+    # PyTorch (no native FP8 elementwise kernel). Other dtypes run their
+    # natural path.
+    path_semantics = ("emulated_cast_compute_cast" if dtype_label == "fp8"
+                      else "native_or_standard")
     return BenchSpec(
         name=name, op=op, dtype_label=dtype_label,
         shape=shape, n_elements=actual_n,
         flops_per_call=flops, run=fn,
         compute_unit=compute_unit, emulated=emulated,
-        cache_regime=regime, notes=notes,
+        cache_regime=regime, path_semantics=path_semantics, notes=notes,
     )
 
 
@@ -710,12 +729,21 @@ def build_matmul(K_size: int, dtype_label: str, mode: str,
     ws_bytes = (M * K + K * N + M * N) * _dtype_bytes(dtype_label)
     dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
     regime = classify_cache_regime(ws_bytes, get_l2_bytes(dev_idx))
+    # Path semantics for matmul :
+    #   fp8_te native (Hopper, cc≥9)   → "native_or_te_fp8_tensorcore"
+    #   fp8_te fallback (pre-Hopper)   → "te_fp16_fallback"
+    #   other matmul variants          → "native_or_standard"
+    if (dtype_label, mode) == ("fp8", "te"):
+        path_semantics = ("te_fp16_fallback" if emulated
+                          else "native_or_te_fp8_tensorcore")
+    else:
+        path_semantics = "native_or_standard"
     return BenchSpec(
         name=name, op="matmul", dtype_label=dtype_label,
         shape=(M, N, K), n_elements=n_out,
         flops_per_call=flops, run=fn,
         compute_unit=compute_unit, emulated=emulated,
-        cache_regime=regime, notes=notes,
+        cache_regime=regime, path_semantics=path_semantics, notes=notes,
     )
 
 
@@ -889,12 +917,17 @@ def build_llm_matmul(preset: str, T: int, dtype_label: str, mode: str,
     dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
     regime = classify_cache_regime(ws_bytes, get_l2_bytes(dev_idx))
     notes = (notes + f" | llm_preset={preset} shape=({M}x{K})@({K}x{N})").strip(" |")
+    if (dtype_label, mode) == ("fp8", "te"):
+        path_semantics = ("te_fp16_fallback" if emulated
+                          else "native_or_te_fp8_tensorcore")
+    else:
+        path_semantics = "native_or_standard"
     return BenchSpec(
         name=name, op="matmul_llm", dtype_label=dtype_label,
         shape=(M, K, N), n_elements=n_out,
         flops_per_call=flops, run=fn,
         compute_unit=compute_unit, emulated=emulated,
-        cache_regime=regime, notes=notes,
+        cache_regime=regime, path_semantics=path_semantics, notes=notes,
     )
 
 
@@ -1416,10 +1449,21 @@ def build_fused(variant: str, dtype_label: str,
     dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
     regime = classify_cache_regime(ws, get_l2_bytes(dev_idx))
 
+    # Path semantics for fused : fp8 attention via TE = native (or
+    # fallback on pre-Hopper). Other dtypes / non-attention variants
+    # = standard. Linear+gelu / ln+linear that fall back to eager are
+    # NOT "emulated cast" — the activation/norm just isn't fused. We
+    # leave those as native_or_standard ; the `emulated` flag already
+    # marks them for plot hatching.
+    if "attention" in variant and dtype_label == "fp8":
+        path_semantics = ("te_fp16_fallback" if emulated
+                          else "native_or_te_fp8_tensorcore")
+    else:
+        path_semantics = "native_or_standard"
     return BenchSpec(
         name=name, op=variant, dtype_label=dtype_label,
         shape=tuple(shape), n_elements=int(n_out),
         flops_per_call=int(flops), run=fn,
         compute_unit=compute_unit, emulated=emulated,
-        cache_regime=regime, notes=notes,
+        cache_regime=regime, path_semantics=path_semantics, notes=notes,
     )

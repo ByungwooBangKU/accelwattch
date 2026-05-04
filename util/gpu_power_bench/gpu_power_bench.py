@@ -1151,6 +1151,10 @@ def main() -> int:
                 # 1 if this is NOT the HW path a naive reader would assume
                 # (fp8 elementwise anywhere, fp8_te on pre-Hopper, etc.)
                 "emulated": int(bool(spec.emulated)),
+                # Fine-grained classification — see BenchSpec.path_semantics docstring.
+                #   native_or_standard / emulated_cast_compute_cast /
+                #   native_or_te_fp8_tensorcore / te_fp16_fallback
+                "path_semantics": spec.path_semantics,
                 # Cache-locality regime classified from working-set vs L2.
                 # "l2_resident" / "l2_partial" / "dram_stream" / "unknown"
                 "cache_regime": spec.cache_regime,
