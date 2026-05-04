@@ -2747,7 +2747,41 @@ def summarize_fused_decomposition(df: pd.DataFrame) -> pd.DataFrame:
         for dtype in sorted(fused["dtype"].unique()):
             sf = fused[(fused["op"] == full_var) & (fused["dtype"] == dtype)]
             sb = fused[(fused["op"] == base_var) & (fused["dtype"] == dtype)]
-            if sf.empty or sb.empty:
+            # Status-aware emit. Previously we silently skipped pairs
+            # missing either side ; now emit a placeholder row with
+            # `decomposition_status` so the plot can render an explicit
+            # "N/A baseline" bar (vs hiding the dtype entirely, which
+            # confused operators on fp8 attention).
+            if sf.empty:
+                continue   # no full = nothing measured ; truly skip
+            if sb.empty:
+                # Full present, baseline missing — most commonly fp8
+                # attention (no `attention_qkv_matmul` fp8 baseline yet).
+                J_full = float(sf["j_per_call_dyn"].iloc[0])
+                n_elem = (int(sf["n_elem_n"].iloc[0])
+                          if not pd.isna(sf["n_elem_n"].iloc[0]) else 0)
+                fusion_emu = (int(sf["emulated"].astype(int).iloc[0])
+                              if "emulated" in sf.columns else 0)
+                rows.append({
+                    "op_group": op_group,
+                    "dtype": dtype,
+                    "full_variant": full_var,
+                    "baseline_variant": base_var,
+                    "decomposition_status": "missing_baseline",
+                    "j_per_call_full":     J_full,
+                    "j_per_call_baseline": float("nan"),
+                    "j_per_call_residual": float("nan"),
+                    "residual_pct_of_full":     float("nan"),
+                    "residual_pct_noise_floor": _FUSED_NOISE_FLOOR_PCT,
+                    "stat_significant":         0,
+                    "n_elements_full":          n_elem,
+                    "j_per_element_residual":   float("nan"),
+                    "j_per_element_standalone": float("nan"),
+                    "ratio_residual_to_standalone": float("nan"),
+                    "fusion_emulated": fusion_emu,
+                    "shape_full": (str(sf["shape"].iloc[0])
+                                   if "shape" in sf.columns else ""),
+                })
                 continue
             J_full = float(sf["j_per_call_dyn"].iloc[0])
             J_base = float(sb["j_per_call_dyn"].iloc[0])
@@ -2767,6 +2801,7 @@ def summarize_fused_decomposition(df: pd.DataFrame) -> pd.DataFrame:
                 "dtype": dtype,
                 "full_variant": full_var,
                 "baseline_variant": base_var,
+                "decomposition_status": "ok",
                 "j_per_call_full":     J_full,
                 "j_per_call_baseline": J_base,
                 "j_per_call_residual": J_res,
@@ -2892,8 +2927,35 @@ def plot_attention_decomposition(decomp_df: pd.DataFrame, df: pd.DataFrame,
     #
     # Either way the visible bar height = ACTUAL fused flash energy, so
     # cross-bar comparison stays honest.
+    # decomposition_status from summarize_fused_decomposition() : "ok"
+    # for fp16/bf16 (both full + baseline measured) ; "missing_baseline"
+    # for fp8 (no `attention_qkv_matmul` fp8 baseline yet — TE doesn't
+    # expose batched-fp8-gemm public API). Missing-baseline rows render
+    # as gray "N/A baseline" bars rather than being silently hidden.
+    statuses = (sm["decomposition_status"].values
+                if "decomposition_status" in sm.columns
+                else ["ok"] * len(sm))
     for i in range(len(sm)):
         q, s, t = qkv_vals[i], sm_vals[i], full_vals[i]
+        status = statuses[i] if i < len(statuses) else "ok"
+        if status == "missing_baseline":
+            # Render the FULL bar in gray + explicit "N/A baseline" badge.
+            ax.bar(xs[i], t, color="#999999", edgecolor="#555555", alpha=0.7,
+                   hatch="xx",
+                   label=("flash total (no baseline → no decomposition)"
+                          if i == 0 else None))
+            ax.text(xs[i], t / 2,
+                    f"flash\n{t:.2f} mJ\n(N/A baseline)",
+                    ha="center", va="center", fontsize=8.5,
+                    color="white", fontweight="bold", linespacing=1.15)
+            ax.annotate(
+                "decomposition\nUNAVAILABLE\n(no fp8 baseline)",
+                xy=(xs[i], t * 1.02),
+                xytext=(0, 14), textcoords="offset points",
+                ha="center", fontsize=8, color="#b03030",
+                fontweight="bold", linespacing=1.15,
+                bbox=dict(facecolor="#fff0f0", edgecolor="#b03030", pad=2))
+            continue
         if s >= 0:
             # textbook stacked decomposition
             ax.bar(xs[i], q, color="#1f77b4", edgecolor="white", alpha=0.85,
