@@ -197,6 +197,19 @@ SUITES: dict[str, dict] = {
         "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "soc"),
         "rebaseline_every": 20,
     },
+    "fp8-mece": {
+        # FP8-focused MECE characterisation. Long --window-ms because
+        # FP8 dynamic energy is small and sensitive to NVML noise floor.
+        # Includes fused so attention_flash fp8 is captured. Recommended
+        # to wrap with `NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 NVTE_FUSED_ATTN=1
+        # NVTE_FUSED_ATTN_BACKEND=2` to verify FP8 DPA cuDNN sub-backend 2.
+        "_doc":             "FP8-focused MECE (long window + rebaseline + fused, ~50 min)",
+        "cases":            ("elementwise", "matmul", "dram"),
+        "rebaseline_every": 20,
+        "window_ms":        6000.0,
+        "include_fused":    True,
+        "fused_dtypes":     ("fp16", "bf16", "fp8"),
+    },
 }
 
 
