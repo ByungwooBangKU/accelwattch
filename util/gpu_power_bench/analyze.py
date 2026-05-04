@@ -3193,6 +3193,110 @@ def plot_fused_attention_dtype_compare(df: pd.DataFrame, out_png: Path,
     return True
 
 
+def plot_attention_te_dtype_compare(df: pd.DataFrame, out_png: Path,
+                                     gpu: str) -> bool:
+    """Backend-controlled cross-dtype FlashAttention compare — TE-DPA only.
+
+    Removes the SDPA-vs-TE backend confounder from
+    `_03_attention_dtype_compare.png`. All bars here are measured through
+    Transformer Engine `DotProductAttention` :
+      * fp16, bf16  → from `attention_flash_te` rows
+      * fp8         → from `attention_flash` rows (identical to
+                      `attention_flash_te` fp8, since plan-builder
+                      dedupes the duplicate measurement)
+
+    Hatched marker if `path_semantics == "te_fp16_fallback"` (pre-Hopper
+    fallback) or `emulated == 1`.
+
+    Returns False if no `attention_flash_te` rows exist (chunk-3 not
+    enabled or sweep didn't include the new variant).
+    """
+    if df is None or df.empty:
+        return False
+    # Pull TE-DPA rows : `attention_flash_te` for any dtype (fp16/bf16/fp8),
+    # plus `attention_flash` for fp8 (identical TE backend, plan-builder
+    # records this row not the duplicate _te one).
+    is_te = ((df["category"] == "fused")
+             & (((df["op"] == "attention_flash_te"))
+                | ((df["op"] == "attention_flash") & (df["dtype"] == "fp8"))))
+    af = df[is_te].copy()
+    if af.empty or set(af["dtype"]) - {"fp8"} == set() and len(af) <= 1:
+        # only fp8 (or empty) → no backend-controlled comparison
+        return False
+    af["dyn_J_n"]   = pd.to_numeric(af["dyn_energy_j"], errors="coerce")
+    af["iters_n"]   = pd.to_numeric(af["iters"],       errors="coerce")
+    af["j_per_call_dyn"] = af["dyn_J_n"] / af["iters_n"]
+    af["emulated_n"] = pd.to_numeric(af.get("emulated", 0),
+                                     errors="coerce").fillna(0).astype(int)
+    grouped = (af.groupby("dtype", sort=False)
+                 .agg(j_per_call=("j_per_call_dyn", "mean"),
+                      n=("j_per_call_dyn", "size"),
+                      emulated=("emulated_n", "max"),
+                      shape=("shape", "first"))
+                 .reset_index())
+    if grouped.empty:
+        return False
+    order = [d for d in ("fp16", "bf16", "fp8") if d in grouped["dtype"].values]
+    grouped = grouped.set_index("dtype").reindex(order).reset_index()
+    ref_dtype = "bf16" if "bf16" in order else ("fp16" if "fp16" in order else None)
+    j_ref = (float(grouped[grouped["dtype"] == ref_dtype]["j_per_call"].iloc[0])
+             if ref_dtype else float("nan"))
+
+    plt = _get_mpl()
+    fig, (ax, ax_caveat) = plt.subplots(
+        2, 1, figsize=(max(7, 1.8 * len(grouped) + 2.5), 7.5),
+        gridspec_kw={"height_ratios": [8, 1.5], "hspace": 0.32})
+    ax_caveat.set_axis_off()
+
+    xs = np.arange(len(grouped))
+    j_vals = (grouped["j_per_call"].values) * 1e3
+    # Same color scheme as the SDPA-mixed compare plot for visual familiarity.
+    colors = {"fp16": "#1f77b4", "bf16": "#9467bd", "fp8": "#d62728"}
+    bar_colors = [colors.get(d, "#666666") for d in grouped["dtype"]]
+    bars = ax.bar(xs, j_vals, color=bar_colors, edgecolor="white",
+                  alpha=0.92,
+                  hatch=["//" if e else None for e in grouped["emulated"]])
+    for i, (rect, d, j_per_mJ, emu) in enumerate(zip(
+            bars, grouped["dtype"], j_vals, grouped["emulated"])):
+        ratio_txt = ""
+        if not pd.isna(j_ref) and j_ref > 0 and ref_dtype:
+            r = (j_per_mJ / 1e3) / j_ref
+            if d == ref_dtype:
+                ratio_txt = "  (ref)"
+            else:
+                pct_save = (1.0 - r) * 100.0
+                ratio_txt = f"\n{r:.2f}× of {ref_dtype}\n({pct_save:+.1f} % saved)"
+        emu_txt = "\n(EMU — pre-Hopper FP16 fallback)" if int(emu) else ""
+        ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+                f"{j_per_mJ:.2f} mJ{ratio_txt}{emu_txt}",
+                ha="center", va="bottom", fontsize=9, linespacing=1.15)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(grouped["dtype"].values, fontsize=11)
+    ax.set_ylabel("Energy per attention call  (mJ)")
+    ax.grid(True, axis="y", alpha=0.3)
+    finite = j_vals[~np.isnan(j_vals)]
+    if finite.size:
+        ax.set_ylim(0, float(np.max(finite)) * 1.40)
+    shape_str = grouped["shape"].iloc[0] if "shape" in grouped.columns else ""
+    ax.set_title(
+        f"FlashAttention energy by dtype — TE-DPA backend (controlled) — {gpu}\n"
+        f"shape : {shape_str}",
+        fontsize=10)
+    ax_caveat.text(
+        0.5, 0.95,
+        "Backend CONTROLLED comparison :\n"
+        "All bars = Transformer Engine DotProductAttention (same backend).\n"
+        "fp8 additionally uses fp8_autocast(E4M3, fp8_dpa=True) — verify\n"
+        "FP8 DPA cuDNN sub-backend 2 actually engaged via NVTE_DEBUG=1\n"
+        "NVTE_DEBUG_LEVEL=2 NVTE_FUSED_ATTN=1 (grep `sub-backend 2`).\n"
+        "Cross-reference `_03_attention_dtype_compare.png` (SDPA-fp16/bf16 vs\n"
+        "TE-fp8) — the diff between the two plots is the SDPA-vs-TE backend effect.",
+        ha="center", va="top", fontsize=8.5, color="#333", linespacing=1.4,
+        bbox=dict(facecolor="#e0f0e0", edgecolor="#2ca02c", pad=6))
+    _save_fig(fig, out_png, pad_inches=0.05)
+    return True
+
+
 def plot_llm_matmul(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
     """LLM-shape matmul energy per preset as a function of token count T (= M).
 
@@ -4074,6 +4178,11 @@ def main() -> int:
         # subtraction available.
         plot_fused_attention_dtype_compare(df,
             out_dir / f"{stem}_03_attention_dtype_compare.png", gpu)
+        # Backend-controlled compare (chunk 3) — fires only when the
+        # sweep included `attention_flash_te` rows. Drops the SDPA-vs-
+        # TE confounder by routing all dtypes through TE-DPA.
+        plot_attention_te_dtype_compare(df,
+            out_dir / f"{stem}_03_attention_te_dtype_compare.png", gpu)
         # Tidy console summary so user sees ratios without opening CSV.
         print("\n== Fused-vs-Standalone decomposition (G11 / P1.4) ==")
         with pd.option_context("display.width", 160,

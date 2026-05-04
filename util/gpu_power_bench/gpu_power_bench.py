@@ -898,14 +898,17 @@ def main() -> int:
         n_fused_cells = 0
         for dtype in fused_dtypes:
             for variant in bm.FUSED_VARIANTS:
-                # fp8 only supports attention_flash for now ; quietly skip
-                # other variants for fp8 so the user can pass `--dtypes
-                # fp16 bf16 fp8` without manual filtering.
-                if dtype == "fp8" and variant != "attention_flash":
+                # fp8 only supports attention_flash for now (other fused
+                # variants don't have an fp8 path yet — see G12/P2.4b).
+                # `attention_flash_te` for fp8 is identical to
+                # `attention_flash` for fp8 (both go through TE), so skip
+                # the duplicate to avoid double-measurement.
+                if dtype == "fp8" and variant not in ("attention_flash",):
                     continue
                 # The "load value" here is the fixed shape — encoded as a
                 # human-readable summary so each cell is uniquely keyed.
-                if variant in ("attention_flash", "attention_qkv_matmul"):
+                if variant in ("attention_flash", "attention_flash_te",
+                               "attention_qkv_matmul"):
                     load_value = (f"B{attn_shape[0]}_Hq{attn_shape[1]}_"
                                   f"Hkv{attn_shape[2]}_Nq{attn_shape[3]}_"
                                   f"Nkv{attn_shape[4]}_D{attn_shape[5]}")

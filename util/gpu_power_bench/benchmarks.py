@@ -975,7 +975,13 @@ _FP8_DPA_VERIFY_HINTED: dict = {}
 
 
 FUSED_VARIANTS = (
-    "attention_flash",        # Q@K + softmax + scale + (P@V) — full SDPA flash kernel
+    "attention_flash",        # SDPA flash kernel (fp16/bf16) ; fp8 routes to TE
+                              # via _make_attention_flash_fp8 (legacy convenience)
+    "attention_flash_te",     # ALWAYS Transformer Engine DotProductAttention.
+                              # Used to remove the SDPA-vs-TE backend confounder
+                              # in the cross-dtype attention compare. fp8 here
+                              # is identical to `attention_flash` fp8 — plan-
+                              # builder skips it to avoid duplicate measurement.
     "attention_qkv_matmul",   # Q@K + (Q@K)@V only (softmax replaced by identity) — subtraction baseline
     "linear_gelu",            # gelu(linear(x)+b) — torch.compile epilogue fusion
     "linear_baseline_gelu",   # linear(x)+b only — same shape, no activation — subtraction baseline
@@ -1204,6 +1210,81 @@ def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
     return f, emulated, fp8_dpa_recipe_accepted
 
 
+def _make_attention_flash_te_halfprec(B: int, H_q: int, H_kv: int,
+                                       N_q: int, N_kv: int, D_head: int,
+                                       dtype: torch.dtype, device,
+                                       causal: bool = False
+                                       ) -> Callable[[], None]:
+    """fp16 / bf16 attention via Transformer Engine `DotProductAttention`
+    WITHOUT `fp8_autocast`. Same TE backend as the fp8 path so the
+    `attention_flash_te` family across (fp16, bf16, fp8) constitutes a
+    backend-controlled pure-dtype comparison.
+
+    Existing `attention_flash` for fp16/bf16 uses PyTorch SDPA's flash
+    backend (fast but different code path), and existing `attention_flash`
+    for fp8 already uses TE. So adding this halfprec TE variant gives
+    operators :
+      * SDPA (fp16) vs TE (fp16) → backend effect (this plot)
+      * TE (fp16) vs TE (fp8)    → pure dtype effect (no backend mix)
+    """
+    _install_hint = ("Run ./install_transformer_engine.sh — same script "
+                     "used by matmul_fp8_te.")
+    try:
+        import transformer_engine.pytorch as te
+    except (ImportError, OSError, RuntimeError) as e:
+        raise RuntimeError(
+            f"transformer_engine not usable for attention_flash_te "
+            f"({type(e).__name__}: {e}). {_install_hint}") from e
+
+    DPA = getattr(te, "DotProductAttention", None)
+    if DPA is None:
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention as DPA
+        except (ImportError, AttributeError) as e:
+            raise RuntimeError(
+                f"te.DotProductAttention unavailable (TE version too old). "
+                f"Upgrade TE >= 1.0. ({type(e).__name__}: {e})") from e
+
+    # bshd layout (TE preferred).
+    q = torch.randn(B, N_q,  H_q,  D_head, dtype=dtype, device=device)
+    k = torch.randn(B, N_kv, H_kv, D_head, dtype=dtype, device=device)
+    v = torch.randn(B, N_kv, H_kv, D_head, dtype=dtype, device=device)
+
+    try:
+        dpa = DPA(
+            num_attention_heads=H_q,
+            kv_channels=D_head,
+            num_gqa_groups=H_kv,
+            attention_dropout=0.0,
+            qkv_format="bshd",
+            attn_mask_type="causal" if causal else "no_mask",
+        ).to(device)
+    except TypeError:
+        dpa = DPA(
+            num_attention_heads=H_q,
+            kv_channels=D_head,
+            attention_dropout=0.0,
+        ).to(device)
+
+    # Warmup 5× — no fp8_autocast, just plain half-precision through TE.
+    try:
+        for _ in range(5):
+            dpa(q, k, v)
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        msg = str(e)
+        if "illegal memory access" in msg or "CUDA error" in msg:
+            raise RuntimeError(
+                f"te.DotProductAttention halfprec warmup failed on shape "
+                f"(B={B}, H_q={H_q}, H_kv={H_kv}, N_q={N_q}, N_kv={N_kv}, "
+                f"D={D_head}). Original: {e}") from e
+        raise
+
+    def f():
+        dpa(q, k, v)
+    return f
+
+
 def _make_attention_qkv_matmul(B: int, H_q: int, H_kv: int, N_q: int, N_kv: int,
                                D_head: int, dtype: torch.dtype, device,
                                causal: bool = False) -> Callable[[], None]:
@@ -1383,17 +1464,18 @@ def build_fused(variant: str, dtype_label: str,
     backend_used = "tc"  # default for fused — output reaches Tensor Cores
     emulated = False
 
-    if variant in ("attention_flash", "attention_qkv_matmul"):
+    if variant in ("attention_flash", "attention_flash_te", "attention_qkv_matmul"):
         B, H_q, H_kv, N_q, N_kv, D_head = attn_shape
         if H_q % H_kv != 0:
             raise ValueError(f"attention: H_q ({H_q}) must be divisible by H_kv ({H_kv})")
         if dtype_label == "fp8":
-            # FP8 path : TE DotProductAttention + fp8_autocast
+            # FP8 path : TE DotProductAttention + fp8_autocast.
+            # Same builder is used for both `attention_flash` and
+            # `attention_flash_te` — fp8 always goes through TE so the
+            # two variants are identical at fp8. plan-builder skips
+            # the duplicate.
             fn, emulated, fp8_dpa_accepted = _make_attention_flash_fp8(
                 B, H_q, H_kv, N_q, N_kv, D_head, device, causal=causal)
-            # Surface the DPA recipe acceptance in notes so it lands in
-            # the CSV — operator can grep `fp8_dpa_requested=true|false`
-            # without parsing TE logs.
             notes_extra = (f" ; fp8_dpa_requested={'true' if fp8_dpa_accepted else 'false'}"
                            f" (verify cuDNN sub-backend 2 selection with "
                            f"NVTE_DEBUG=1 NVTE_FUSED_ATTN_BACKEND=2)")
@@ -1402,6 +1484,14 @@ def build_fused(variant: str, dtype_label: str,
             if emulated:
                 notes += " (pre-Hopper FP16 fallback)"
             notes += notes_extra
+        elif variant == "attention_flash_te":
+            # NEW : fp16/bf16 routed through TE DotProductAttention (no
+            # fp8_autocast) — backend-controlled pure-dtype comparison
+            # against the fp8 row of the same variant.
+            fn = _make_attention_flash_te_halfprec(
+                B, H_q, H_kv, N_q, N_kv, D_head, dtype, device, causal=causal)
+            notes = ("FlashAttention via Transformer Engine DPA "
+                     "(backend-controlled vs SDPA `attention_flash`)")
         else:
             builder = (_make_attention_flash if variant == "attention_flash"
                        else _make_attention_qkv_matmul)
