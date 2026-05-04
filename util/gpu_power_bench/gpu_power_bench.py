@@ -754,21 +754,29 @@ def main() -> int:
                     "build": (lambda K=K, d=dtype_label, m=mode:
                               bm.build_matmul(K, d, m, device="cuda")),
                 })
-    # DRAM bandwidth probes — opt-in. Pure-streaming kernels at large N
-    # so the dyn energy is dominated by HBM traffic. analyze.py converts
-    # these into pJ/bit. We pick load sizes deep in the l2_hit_0 regime
-    # (working set ≥ 8·L2) so cache reuse is essentially zero.
+    # DRAM bandwidth probes — opt-in. Pure-streaming kernels at deep
+    # l2_hit_0 PLUS small l2_hit_100 baseline points. Both regimes are
+    # required so analyze.compute_dram_marginal() can subtract the L2-
+    # resident slope from the DRAM-streaming slope and report the
+    # incremental L2→HBM cost proxy. Without the small-N baseline,
+    # STREAM kernels have no marginal row in `_dram_marginal.csv`.
     if "dram" in cases:
         if args.dram_bw_loads is not None:
             stream_loads = args.dram_bw_loads
         elif l2_bytes > 0:
-            # Targets ws ∈ {8, 16, 32, 64} × L2 — solidly l2_hit_0.
+            # Targets : 2 deep l2_hit_100 baselines (ws = L2/16, L2/8) +
+            # 4 l2_hit_0 streaming points (ws = 8/16/32/64 × L2).
             # Use rw=2 / 2-byte dtype for sizing (the probe whose ws/N is
             # smallest, so the others are even more deeply DRAM-bound).
             base = max(1 << 14, int(l2_bytes / (2 * 2)))
-            stream_loads = [8 * base, 16 * base, 32 * base, 64 * base]
+            stream_loads = [
+                base // 16,                           # l2_hit_100 baseline
+                base // 8,                            # l2_hit_100 baseline
+                8 * base, 16 * base, 32 * base, 64 * base,  # l2_hit_0
+            ]
         else:
-            stream_loads = [1 << 27, 1 << 28, 1 << 29, 1 << 30]
+            stream_loads = [1 << 22, 1 << 23,
+                            1 << 27, 1 << 28, 1 << 29, 1 << 30]
         # Apply the same memory budget filter used for the elementwise sweep.
         stream_loads = _filter_loads(stream_loads,
                                      ["stream_copy", "stream_scale", "stream_triad",

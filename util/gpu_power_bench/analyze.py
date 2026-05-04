@@ -288,6 +288,14 @@ def bootstrap_slope_ci(x: np.ndarray, y: np.ndarray,
 # return a *copy* so callers don't have to remember.
 # ---------------------------------------------------------------------------
 
+# category names that count as "elementwise-shaped traffic" for the
+# pJ/bit / marginal / R-W-split analyses. The driver writes STREAM
+# probes as `category="elementwise"` today, but TestCases A.2 docs and
+# future driver work may move them to `category="stream"`. Accept both
+# so the analysis never silently drops STREAM rows.
+DRAM_TRAFFIC_CATEGORIES = ("elementwise", "stream")
+
+
 def add_traffic_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Augment a per-cell df with three derived columns:
 
@@ -313,7 +321,7 @@ def add_traffic_metrics(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     def _bytes_per_call(r) -> float:
-        if r.get("category") not in (None, "elementwise"):
+        if r.get("category") not in (None,) + DRAM_TRAFFIC_CATEGORIES:
             return float("nan")
         rw = RW_PER_CALL.get(r.get("op", ""))
         if rw is None:
@@ -3180,7 +3188,7 @@ def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
     """
     if "pj_per_bit_traffic" not in df.columns:
         return
-    ew = df[(df.get("category") == "elementwise")].copy()
+    ew = df[df["category"].isin(DRAM_TRAFFIC_CATEGORIES)].copy()
     if ew.empty or ew["pj_per_bit_traffic"].notna().sum() == 0:
         return
     plt = _get_mpl()
@@ -3200,9 +3208,17 @@ def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
     op_color = {op: palette_cmap(i % 10) for i, op in enumerate(ops)}
     regime_x = {r: i for i, r in enumerate(regime_order)}
 
+    # ops where pJ/bit ≈ DRAM bit-energy is reasonable (1-pass, compute-light)
+    SIMPLE_OPS = {"mul", "add", "stream_copy", "stream_scale",
+                  "stream_triad", "stream_read", "stream_write"}
+    # ops where pJ/bit is INFLATED by multi-pass / compute (DRAM-only
+    # reference lines are NOT comparable for these markers)
+    REDUCTION_OPS = {"softmax", "layernorm"}
+
     # --- Panel A : pJ/bit strip, regime on x ---
     fig_a, ax_a = plt.subplots(figsize=(15, 7))
     for op in ops:
+        is_reduction = op in REDUCTION_OPS or op == "gelu"
         for dt, marker in (("fp16", "o"), ("fp8", "s"),
                            ("bf16", "^"), ("fp32", "D"), ("tf32", "v")):
             g = ew[(ew["op"] == op) & (ew["dtype"] == dt)]
@@ -3211,45 +3227,49 @@ def plot_dram_energy(df: pd.DataFrame, out_dir: Path, stem: str, gpu: str,
             xs = g["cache_regime"].map(regime_x).astype(float) \
                 + (0.04 * (hash(op + dt) % 7 - 3))
             ys = g["pj_per_bit_traffic"]
+            # fp8-emulated rows : hatched edge so the operator can't
+            # confuse cast-compute-cast pJ/bit with a native FP8 number
+            emu_mask = pd.to_numeric(g.get("emulated", 0), errors="coerce").fillna(0) > 0
+            edge = "#d62728" if is_reduction else "white"
+            label_tag = (" (reduction — pJ/bit inflated, NOT comparable to HBM ref)"
+                         if is_reduction else "")
             ax_a.scatter(xs, ys, s=44, color=op_color[op], marker=marker,
-                         alpha=0.85, edgecolors="white", label=f"{op} {dt}")
-    # Reference lines (only meaningful in the DRAM-streaming regime — but
-    # we draw them across the whole panel for context). Two lines from
-    # DRAM_REFERENCES_PJBIT can share a y-value (HBM2 and DDR4 are both
-    # 7.0 pJ/bit), so we stagger labels horizontally in 3 columns and
-    # paint a white background bbox so the dashed line doesn't bleed
-    # through the glyphs.
-    ref_colors = ["#888888", "#666666", "#444444", "#aa5555", "#55aaaa"]
+                         alpha=0.85,
+                         edgecolors=edge,
+                         linewidths=1.2 if is_reduction else 0.6,
+                         hatch="//" if emu_mask.any() else None,
+                         label=f"{op} {dt}{label_tag}")
+    # Literature reference lines — ONLY drawn in the l2_hit_0 column
+    # where they're meaningful. Previously these spanned the whole
+    # panel which suggested HBM ref applies to l2_hit_100 too.
     n_regimes = len(regime_order)
-    label_xs = [n_regimes - 1 + 0.05,    # just right of last regime tick
-                -0.55,                   # well left of first regime tick
-                (n_regimes - 1) / 2.0]   # middle, between regime ticks
-    label_has = ["left", "right", "center"]
+    l2_hit_0_x = regime_x.get("l2_hit_0", n_regimes - 1)
+    ref_colors = ["#888888", "#666666", "#444444", "#aa5555", "#55aaaa"]
+    label_xs = [l2_hit_0_x + 0.55, l2_hit_0_x + 0.55, l2_hit_0_x + 0.55]
     label_bbox = dict(facecolor="white", edgecolor="none", pad=1.5, alpha=0.85)
     for i, ((label, val), c) in enumerate(
             zip(DRAM_REFERENCES_PJBIT.items(), ref_colors)):
-        ax_a.axhline(val, color=c, ls="--", lw=1, alpha=0.7)
-        col = i % len(label_xs)
-        ax_a.text(label_xs[col], val, f" {label} ≈ {val} pJ/bit ",
-                  fontsize=8, color=c,
-                  va="center", ha=label_has[col],
+        # Only draw a tick at the l2_hit_0 column (data x = -0.4..+0.4
+        # of the column), not full-width axhline.
+        ax_a.hlines(val, l2_hit_0_x - 0.4, l2_hit_0_x + 0.4,
+                    colors=c, linestyles="--", lw=1, alpha=0.8)
+        ax_a.text(label_xs[i % 3], val, f" {label} ≈ {val} pJ/bit ",
+                  fontsize=8, color=c, va="center", ha="left",
                   bbox=label_bbox)
     ax_a.set_xticks(list(regime_x.values()))
     ax_a.set_xticklabels([f"{r}\n({REGIME_HIT_PCT[r]} L2 hit)" for r in regime_order],
                          fontsize=11)
-    # Linear scale (was log). At log scale the literature reference lines
-    # crowd into a narrow band near the bottom of the panel and the
-    # measured points spread thinly, which made the comparison hard to
-    # read. Linear gives the eye a fair side-by-side; outlier high-FLOP
-    # ops (gelu / softmax / layernorm) just push the upper bound a bit.
     ax_a.set_yscale("linear")
-    # Pad x range so the left/right label columns aren't clipped.
-    ax_a.set_xlim(-0.85, n_regimes - 1 + 1.05)
-    ax_a.set_ylabel("pJ / bit  (working-set traffic)")
-    ax_a.set_title(f"DRAM energy — per-cell pJ/bit by cache regime — {gpu}\n"
-                   "l2_hit_0 ≈ DRAM cost; dashed = literature reference (full stack)\n"
-                   "marginal pJ/bit (l2_hit_0 − l2_hit_100) is the cleaner DRAM-only "
-                   "estimate — see dram_energy_marginal.png and README §3.5")
+    ax_a.set_xlim(-0.55, n_regimes - 1 + 1.30)
+    ax_a.set_ylabel("pJ / bit  (per-cell dyn energy ÷ logical traffic bits)")
+    ax_a.set_title(
+        f"Per-cell dynamic energy normalized by LOGICAL traffic — {gpu}\n"
+        "Direct HBM-reference comparison is meaningful ONLY at l2_hit_0 "
+        "AND for simple memory-bound ops (mul / add / stream_*).\n"
+        "Reduction ops (softmax / layernorm / gelu) are RED-RIMMED — their "
+        "pJ/bit is inflated by multi-pass + compute (NOT DRAM-only).\n"
+        "fp8 hatched markers = cast-compute-cast emulated traffic, not native FP8.",
+        fontsize=10)
     ax_a.grid(True, axis="y", alpha=0.3)
     ax_a.legend(fontsize=8, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     _save_fig(fig_a, out_dir / f"{stem}_02_dram_energy_pjbit.png")
@@ -3308,8 +3328,8 @@ def compute_dram_rw_split(df: pd.DataFrame) -> pd.DataFrame:
     """
     if "pj_per_bit_traffic" not in df.columns:
         return pd.DataFrame()
-    drm = df[(df.get("category") == "elementwise") &
-             (df["op"].isin(STREAM_RW_RATIO))].copy()
+    drm = df[df["category"].isin(DRAM_TRAFFIC_CATEGORIES) &
+             df["op"].isin(STREAM_RW_RATIO)].copy()
     if drm.empty:
         return pd.DataFrame()
     drm["cache_regime"] = drm["cache_regime"].replace(LEGACY_REGIME_MAP)
@@ -3353,52 +3373,91 @@ def compute_dram_rw_split(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_dram_marginal(df: pd.DataFrame) -> pd.DataFrame:
-    """Marginal DRAM cost — the extra pJ/bit a kernel pays when its
-    working set spills out of L2 into HBM. For each (op, dtype) that has
-    cells in BOTH the l2_hit_100 and l2_hit_0 regimes we report:
+    """Incremental L2→HBM cost proxy — the extra pJ per logical-bit a
+    kernel pays when its working set spills out of L2 into HBM. For each
+    (op, dtype) that has cells in BOTH l2_hit_100 and l2_hit_0 regimes
+    we now use a regression per regime (consistent with the rest of the
+    suite which uses E_dyn ~ load slopes) :
 
-        J_per_byte(l2_hit_100)        # baseline: SM compute + L2 traffic
-        J_per_byte(l2_hit_0)          # SM compute + L2 transit + HBM stream
-        marginal_pJ_per_bit = (J_dram - J_l2) × 1e12 / 8
+        slope_l2     = WLS slope of (E_dyn vs traffic_bits) at l2_hit_100
+        slope_dram   = WLS slope of (E_dyn vs traffic_bits) at l2_hit_0
+        marginal     = (slope_dram − slope_l2) × 1e12   pJ/bit
 
-    The marginal number is closer to the *literature* "DRAM-only"
-    energy because the on-chip components (SM compute, L2 lookup, NoC
-    routing) cancel between the two regimes. README §3.5.
+    Why slope, not median(j/byte) per cell ?
+      Per-cell ratios at small N are noisy (kernel-launch overhead
+      dominates a small E_dyn). The rest of the codebase uses regression
+      slopes for the same E_dyn ~ load relationship — using a different
+      method here was an inconsistency.
 
-    Cells where dyn_energy_j was clipped to 0 (P_static drift) are
-    excluded — they'd silently set the L2 baseline to 0 and inflate
-    the marginal.
+    Why "incremental L2→HBM proxy", not "DRAM-only" ?
+      `marginal` only equals literature DRAM bit energy when SM-compute
+      / launch / occupancy / DVFS / kernel pass-count are IDENTICAL
+      between the two regimes. That holds reasonably for mul / add /
+      stream_*, but NOT for softmax / layernorm / gelu (multi-pass
+      reduction, compute-heavy). The output column
+      `is_simple_memory_bound` flags rows where the proxy is reliable.
+
+    Cells where dyn_energy_j was clipped to 0 are excluded.
     """
     if ("pj_per_bit_traffic" not in df.columns
             or "bytes_traffic" not in df.columns):
         return pd.DataFrame()
-    ew = df[df.get("category") == "elementwise"].copy()
+    ew = df[df["category"].isin(DRAM_TRAFFIC_CATEGORIES)].copy()
     if ew.empty:
         return pd.DataFrame()
     ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
-    ew["dyn_energy_j"] = pd.to_numeric(ew["dyn_energy_j"], errors="coerce")
+    ew["dyn_energy_j"]  = pd.to_numeric(ew["dyn_energy_j"], errors="coerce")
     ew["bytes_traffic"] = pd.to_numeric(ew["bytes_traffic"], errors="coerce")
     ew = ew[(ew["dyn_energy_j"] > 0) & (ew["bytes_traffic"] > 0)]
     if ew.empty:
         return pd.DataFrame()
-    ew["j_per_byte"] = ew["dyn_energy_j"] / ew["bytes_traffic"]
+
+    # Simple memory-bound op set : marginal ≈ DRAM bit energy is only
+    # justified for these. Reduction / compute-heavy ops have multi-pass
+    # / non-identical kernel behavior between regimes that breaks the
+    # cancellation argument.
+    SIMPLE_OPS = {"mul", "add", "stream_copy", "stream_scale",
+                  "stream_triad", "stream_read", "stream_write"}
+
+    def _slope_per_bit(g):
+        """Regression slope of E_dyn (J) vs traffic (bits). Returns
+        slope (J/bit), R², and n_points. Uses WLS when available."""
+        x_bits = g["bytes_traffic"].to_numpy(float) * 8.0
+        y_j    = g["dyn_energy_j"].to_numpy(float)
+        m = (x_bits > 0) & (y_j > 0) & np.isfinite(x_bits) & np.isfinite(y_j)
+        x_bits, y_j = x_bits[m], y_j[m]
+        if len(x_bits) >= 2:
+            try:
+                slope, _intercept, r2 = linear_fit_wls(x_bits, y_j)
+            except Exception:
+                slope, _intercept, r2 = linear_fit(x_bits, y_j)
+            return float(slope), float(r2), int(len(x_bits))
+        if len(x_bits) == 1:
+            # single-point fallback : just j/bit
+            return float(y_j[0] / x_bits[0]), float("nan"), 1
+        return float("nan"), float("nan"), 0
 
     rows: list[dict] = []
     for (op, dt), g in ew.groupby(["op", "dtype"]):
-        l2 = g[g["cache_regime"] == "l2_hit_100"]["j_per_byte"]
-        dr = g[g["cache_regime"] == "l2_hit_0"]["j_per_byte"]
-        if l2.empty or dr.empty:
+        g_l2 = g[g["cache_regime"] == "l2_hit_100"]
+        g_dr = g[g["cache_regime"] == "l2_hit_0"]
+        if g_l2.empty or g_dr.empty:
             continue
-        l2_med = float(l2.median()); dr_med = float(dr.median())
-        delta = dr_med - l2_med
+        s_l2, r2_l2, n_l2 = _slope_per_bit(g_l2)
+        s_dr, r2_dr, n_dr = _slope_per_bit(g_dr)
+        if not (np.isfinite(s_l2) and np.isfinite(s_dr)):
+            continue
+        marginal_pj = (s_dr - s_l2) * 1e12
+        direct_pj   = s_dr * 1e12
         rows.append(dict(
             op=op, dtype=dt,
-            l2_J_per_byte=l2_med,
-            dram_J_per_byte=dr_med,
-            marginal_pJ_per_bit=delta * 1e12 / 8.0,
-            direct_dram_pJ_per_bit=dr_med * 1e12 / 8.0,
-            n_l2_cells=len(l2),
-            n_dram_cells=len(dr),
+            l2_slope_J_per_bit=s_l2,
+            dram_slope_J_per_bit=s_dr,
+            marginal_pJ_per_bit=marginal_pj,
+            direct_dram_pJ_per_bit=direct_pj,
+            R2_l2=r2_l2, R2_dram=r2_dr,
+            n_l2_cells=n_l2, n_dram_cells=n_dr,
+            is_simple_memory_bound=int(op in SIMPLE_OPS),
         ))
     return pd.DataFrame(rows).sort_values(["op", "dtype"]).reset_index(drop=True)
 
@@ -3468,49 +3527,63 @@ def plot_dram_rw_split(rw_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
 
 
 def plot_dram_marginal(marg_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
-    """Bar chart contrasting two DRAM-cost interpretations:
+    """Bar chart : direct full-stack pJ/bit vs incremental L2→HBM proxy.
 
-      direct  = pJ/bit at l2_hit_0 (= board-level full-stack)
-      marginal = (J_dram − J_l2) per byte → cancels SM-compute and L2
-                  routing; closer to "DRAM cells + PHY + controller"
-                  literature definition
+      direct   = slope(E_dyn vs traffic_bits | l2_hit_0)
+                  = "board-level full-stack pJ/bit at l2_hit_0"
+      marginal = direct − slope(... | l2_hit_100)
+                  = "incremental L2→HBM cost proxy"
+                  (NOT pure DRAM-only ; only valid when SM compute /
+                   launch / DVFS / kernel pass-count are identical
+                   between regimes, i.e. for SIMPLE memory-bound ops)
 
-    Marginal is usually 1–2 pJ/bit *lower* than direct because the SM
-    compute and L2 transit baseline are subtracted. If marginal is
-    *negative* on some op, P_static is wrong (the l2_hit_100 measurement
-    is artificially high, pushing direct-l2 above direct-dram).
+    `is_simple_memory_bound` column from compute_dram_marginal() flags
+    rows where literature HBM comparison is honest. Other rows
+    (softmax / layernorm / gelu) are rendered with red rim + warn label.
+
+    Negative marginal can have multiple causes (NOT only P_static drift).
     """
     if marg_df.empty:
         return
     plt = _get_mpl()
-    fig, ax = plt.subplots(figsize=(15, 7))
+    # 2-row : main chart + caveat row.
+    fig, (ax, ax_caveat) = plt.subplots(
+        2, 1, figsize=(max(12, 1.3 * len(marg_df) + 4), 8.5),
+        gridspec_kw={"height_ratios": [8.5, 2.0], "hspace": 0.45})
+    ax_caveat.set_axis_off()
+
     keys = [f"{r['op']}·{r['dtype']}" for _, r in marg_df.iterrows()]
     xs = np.arange(len(keys))
     w = 0.4
+    is_simple = (marg_df.get("is_simple_memory_bound", pd.Series([1] * len(marg_df)))
+                  .astype(int).values)
+    edge_d = ["white" if s else "#d62728" for s in is_simple]
+    edge_m = ["white" if s else "#d62728" for s in is_simple]
+    lw_d   = [0.6   if s else 1.6        for s in is_simple]
     bars_d = ax.bar(xs - w/2, marg_df["direct_dram_pJ_per_bit"], w,
-                    color="#999999", alpha=0.85, edgecolor="white",
+                    color="#999999", alpha=0.85,
+                    edgecolor=edge_d, linewidth=lw_d,
                     label="direct (full stack at l2_hit_0)")
     bars_m = ax.bar(xs + w/2, marg_df["marginal_pJ_per_bit"], w,
-                    color="#1f77b4", alpha=0.9, edgecolor="white",
-                    label="marginal (DRAM-only ≈ direct − l2_hit_100)")
+                    color="#1f77b4", alpha=0.9,
+                    edgecolor=edge_m, linewidth=lw_d,
+                    label="incremental L2→HBM proxy (slope_dram − slope_l2)")
     for rect, v in zip(bars_d, marg_df["direct_dram_pJ_per_bit"]):
         if pd.notna(v):
-            ax.text(rect.get_x()+rect.get_width()/2, rect.get_height(),
+            ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
                     f"{v:.2f}", ha="center", va="bottom", fontsize=8)
-    for rect, v in zip(bars_m, marg_df["marginal_pJ_per_bit"]):
+    for rect, v, simple in zip(bars_m, marg_df["marginal_pJ_per_bit"], is_simple):
         if pd.notna(v):
             colour = "#d62728" if v < 0 else "black"
-            ax.text(rect.get_x()+rect.get_width()/2, rect.get_height(),
-                    f"{v:.2f}", ha="center", va="bottom", fontsize=8,
+            tag = "" if simple else "  ↯non-simple"
+            ax.text(rect.get_x() + rect.get_width()/2, rect.get_height(),
+                    f"{v:.2f}{tag}", ha="center", va="bottom", fontsize=8,
                     color=colour, fontweight="bold" if v < 0 else "normal")
     ax.set_xticks(xs)
     ax.set_xticklabels(keys, rotation=30, ha="right", fontsize=9)
     ax.set_ylabel("pJ / bit")
-    # Reference lines for the marginal interpretation. The full literature
-    # set spans HBM2 (~7) → HBM2E (~5) → HBM3 (~3.9) → DRAM core (~2.5).
-    # Show the band that brackets typical Hopper/Ampere measurements so a
-    # reader can immediately see whether their marginal lands in the
-    # expected window for THEIR HBM generation.
+    # Reference lines : HBM2E / HBM3 / Horowitz DRAM-core. Comparison is
+    # honest ONLY against simple-op marginals — caveat box flags this.
     ax.axhline(5.0, color="#aa5555", ls="--", lw=1, alpha=0.7)
     ax.text(len(keys) - 0.5, 5.0, " HBM2E (A100) ≈ 5.0", fontsize=8,
             color="#aa5555", va="center")
@@ -3521,12 +3594,28 @@ def plot_dram_marginal(marg_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
     ax.text(len(keys) - 0.5, 2.5, " Horowitz '14 DRAM core ≈ 2.5", fontsize=8,
             color="#888888", va="center")
     ax.grid(True, axis="y", alpha=0.3)
-    ax.set_title(f"DRAM energy: direct vs marginal — {gpu}\n"
-                 "marginal cancels SM/L2 baseline → closer to literature DRAM-stack value\n"
-                 "(red, bold values: marginal < 0 — likely P_static drift problem)",
-                 fontsize=11)
-    ax.legend(loc="upper left")
-    _save_fig(fig, out_png)
+    ax.set_title(
+        f"L2→HBM incremental energy proxy — {gpu}\n"
+        "Computed via slope(E_dyn vs traffic_bits) at each regime, then\n"
+        "marginal = slope_dram − slope_l2.  HBM literature comparison is\n"
+        "honest ONLY for simple memory-bound ops (mul / add / stream_*).\n"
+        "Red-rimmed bars = reduction / compute-heavy ops (multi-pass,\n"
+        "NON-cancellable SM compute) — interpret with extra caveats.",
+        fontsize=10)
+    ax.legend(loc="upper left", fontsize=9)
+
+    ax_caveat.text(
+        0.5, 0.95,
+        "Negative marginal can come from any of :\n"
+        "  • P_static drift (initial baseline overstates idle → l2_hit_100 inflated)\n"
+        "  • cache_regime misclassification (logical WS ≠ actual L2 hit)\n"
+        "  • small-N / NVML noise floor (kernel-launch overhead dominates)\n"
+        "  • thermal / DVFS drift between regimes\n"
+        "  • non-identical kernel behavior across regimes (occupancy, autotune)\n"
+        "Mitigations : `--rebaseline-every 20` ; longer `--window-ms` ; check baseline plot.",
+        ha="center", va="top", fontsize=8.5, color="#333", linespacing=1.4,
+        bbox=dict(facecolor="#fff2cc", edgecolor="#d6a800", pad=6))
+    _save_fig(fig, out_png, pad_inches=0.05)
 
 
 def plot_timeline(samples_csv: Path, out_png: Path, gpu: str) -> None:
@@ -3914,15 +4003,28 @@ def main() -> int:
         neg = marg_df[marg_df["marginal_pJ_per_bit"] < 0]
         if not neg.empty:
             print(f"\n[warn] {len(neg)} kernel(s) have NEGATIVE marginal — "
-                  f"P_static is probably wrong (l2_hit_100 measurement "
-                  f"sits above l2_hit_0 in raw J). Re-run with "
-                  f"--rebaseline-every 20.")
+                  f"likely measurement artifact. Possible causes :")
+            print(f"          1. P_static drift (initial baseline overstates idle "
+                  f"→ l2_hit_100 inflated)")
+            print(f"          2. cache_regime misclassification (logical WS ≠ "
+                  f"actual L2 hit)")
+            print(f"          3. small-N / NVML noise floor (kernel-launch "
+                  f"overhead dominates a small E_dyn)")
+            print(f"          4. thermal / DVFS drift between regimes")
+            print(f"          5. non-identical kernel behavior across regimes "
+                  f"(occupancy / autotune / pass-count)")
+            print(f"          Mitigations : `--rebaseline-every 20` ; longer "
+                  f"`--window-ms` ; check baseline plot.")
+            for _, r in neg.iterrows():
+                print(f"          → {r['op']}·{r['dtype']}: marginal "
+                      f"{r['marginal_pJ_per_bit']:+.2f} pJ/bit "
+                      f"(direct={r['direct_dram_pJ_per_bit']:.2f})")
     # LLM-shape matmul — 2 separate PNGs (J/FLOP-vs-T + per-call energy).
     plot_llm_matmul(plot_df, out_dir, stem, gpu)
 
     # --- console summary: pJ/bit at l2_hit_0 (DRAM streaming) -------------
     if "pj_per_bit_traffic" in df.columns:
-        dram = df[(df.get("category") == "elementwise")
+        dram = df[df["category"].isin(DRAM_TRAFFIC_CATEGORIES)
                   & (df["cache_regime"].replace({
                       "l2_resident":"l2_hit_100","l2_partial":"l2_hit_50",
                       "dram_stream":"l2_hit_0"}) == "l2_hit_0")]
