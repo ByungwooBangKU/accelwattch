@@ -2239,12 +2239,15 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     C_vals = [b["C"] * 1e12 for b in bars]
 
     ax.bar(xs, A_vals, color="#2ca02c", edgecolor="white",
-           label="A) L2-resident workload\n(compute + L2 + launch)")
+           label="A) L2-resident workload  (compute + L2 + launch)\n"
+                 "    = J(fp16, l2_hit_100)  for both fp16 & fp8 bars")
     ax.bar(xs, B_vals, bottom=A_vals, color="#ff7f0e", edgecolor="white",
-           label="B) FP8 cast overhead\n(cast-compute-cast)")
+           label="B) FP8 emulation/cast overhead  @ L2-resident\n"
+                 "    = J(fp8, l2_hit_100) − J(fp16, l2_hit_100)")
     A_plus_B = [a + b for a, b in zip(A_vals, B_vals)]
     ax.bar(xs, C_vals, bottom=A_plus_B, color="#d62728", edgecolor="white",
-           label="C) DRAM round-trip\n(marginal HBM cost)")
+           label="C) Off-chip (L2→HBM) round-trip marginal\n"
+                 "    = J(dtype, l2_hit_0) − J(dtype, l2_hit_100)")
 
     def _fmt_pj(v):
         """Format pJ value with reasonable precision."""
@@ -2346,8 +2349,8 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     ax.set_title(
         f"MECE energy decomposition — elementwise @ l2_hit_0 — {gpu}\n"
         "A + B + C  ≡  J(op, dtype, l2_hit_0)   (algebraic identity → no overlap, no missing piece)\n"
-        "A = J(op, fp16, l2_hit_100) ;  B = J(op, fp8, l2_hit_100) − J(op, fp16, l2_hit_100) ;  "
-        "C = J(op, dtype, l2_hit_0) − J(op, dtype, l2_hit_100)",
+        "A = L2-resident workload @ l2_hit_100      ;  B = FP8 emulation/cast overhead @ L2-resident\n"
+        "C = off-chip (L2→HBM) round-trip marginal  ;  same-dtype : C(dtype) = J(dtype, l2_hit_0) − J(dtype, l2_hit_100)",
         fontsize=10)
     ax.grid(True, axis="y", alpha=0.3)
     # Legend ordering : reverse so that the TOP entry of the legend
@@ -2359,14 +2362,18 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
               loc="upper left", fontsize=9, ncol=1,
               bbox_to_anchor=(1.01, 1.0))
 
-    # Caveat — explicit `\n` (4 lines) for layout stability.
+    # Caveat — semantic tightening : math is correct (A+B+C ≡ T), but
+    # both B and C are *regime-anchored* quantities, not pure
+    # interpretive concepts. Make this explicit.
     ax_caveat.text(
         0.5, 0.5,
-        "Note : component A (resident workload) bundles compute + L2 transit + kernel-launch overhead.\n"
-        "No NVML measurement in this suite isolates pure compute, so A intentionally remains one bucket.\n"
-        "Further breakdown would require an estimate (e.g. FLOP × J_per_FLOP_reference)\n"
-        "which is NOT MECE.",
-        ha="center", va="center", fontsize=9, color="#333", linespacing=1.4,
+        "A bundles compute + L2 transit + kernel-launch (no NVML measurement isolates pure compute).\n"
+        "B is the FP8 cast/emulation overhead OBSERVED AT L2-RESIDENT REGIME — additional cast-path\n"
+        "memory effects that appear only when the working set spills to HBM are folded into C, not B.\n"
+        "C is OFF-CHIP (L2→HBM) ROUND-TRIP MARGINAL, not pure DRAM-cell energy : also includes memory-\n"
+        "controller / NoC / PHY contributions and any kernel-behavior change between regimes.\n"
+        "fp8 here is the IMPLEMENTED cast-compute-cast emulation path — NOT native FP8 silicon.",
+        ha="center", va="center", fontsize=8.5, color="#333", linespacing=1.45,
         bbox=dict(facecolor="#f0f0f0", edgecolor="#bbbbbb", pad=6))
 
     _save_fig(fig, out_png)
