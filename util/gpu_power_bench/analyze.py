@@ -2191,16 +2191,34 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
 
     slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
+    has_median = "median_j_per_unit" in ew.columns
 
     def _slope(op: str, dtype: str, regime: str):
+        """Return positive J/element for (op, dtype, regime) or None.
+
+        Primary source : slope_dyn_wls. When the regime-local fit is
+        unstable (NaN / non-positive slope — happens when dyn_energy at
+        small-N L2-resident cells is near the NVML noise floor and the
+        WLS line goes negative even though every individual cell is
+        positive), fall back to median_j_per_unit which is computed
+        directly from per-cell J/element and is sign-stable. The
+        returned value carries no flag — bars using the fallback are
+        marked separately via _used_fallback below.
+        """
         sub = ew[(ew["op"] == op) & (ew["dtype"] == dtype)
                  & (ew["cache_regime"] == regime)]
         if sub.empty:
-            return None
+            return None, False
         v = sub[slope_col].iloc[0]
-        if pd.isna(v) or v <= 0:
-            return None
-        return float(v)
+        if pd.notna(v) and v > 0:
+            return float(v), False
+        # Fallback : median_j_per_unit. Positive by construction unless
+        # every cell in this regime was clipped to zero.
+        if has_median:
+            m = sub["median_j_per_unit"].iloc[0]
+            if pd.notna(m) and m > 0:
+                return float(m), True
+        return None, False
 
     # Build decomposition rows for every (op, dtype) pair that has the
     # measurements we need. Skip silently when a piece is missing — the
@@ -2216,36 +2234,35 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         if op not in ew["op"].values:
             continue
         for dtype in ("fp16", "fp8"):
-            j_self_l2  = _slope(op, dtype, "l2_hit_100")
-            j_self_dr  = _slope(op, dtype, "l2_hit_0")
+            j_self_l2,  fb_self_l2 = _slope(op, dtype, "l2_hit_100")
+            j_self_dr,  fb_self_dr = _slope(op, dtype, "l2_hit_0")
             if j_self_l2 is None or j_self_dr is None:
                 continue
-            j_fp16_l2 = _slope(op, "fp16", "l2_hit_100") if dtype == "fp8" else None
-            # Component A — "resident workload" (compute + L2 + launch)
-            # For fp16 : just j_self_l2.
-            # For fp8 : the fp16 baseline of the same op (so cast overhead
-            # is attributed cleanly to component B).
             if dtype == "fp8":
+                j_fp16_l2, fb_fp16_l2 = _slope(op, "fp16", "l2_hit_100")
                 if j_fp16_l2 is None:
                     # Without an fp16 baseline we can't separate cast
                     # cleanly — skip rather than misattribute.
                     continue
                 A = j_fp16_l2
                 B = j_self_l2 - j_fp16_l2     # cast overhead
+                fallback_used = fb_self_l2 or fb_self_dr or fb_fp16_l2
             else:
                 A = j_self_l2
                 B = 0.0
+                fallback_used = fb_self_l2 or fb_self_dr
             C = j_self_dr - j_self_l2          # DRAM round-trip
             total = A + B + C                  # = j_self_dr  (identity)
             bars.append({
-                "label": f"{op}_{dtype}",
-                "op":    op,
-                "dtype": dtype,
-                "A":     A,
-                "B":     B,
-                "C":     C,
-                "total": total,
-                "j_self_dr": j_self_dr,         # for sanity check
+                "label":     f"{op}_{dtype}",
+                "op":        op,
+                "dtype":     dtype,
+                "A":         A,
+                "B":         B,
+                "C":         C,
+                "total":     total,
+                "j_self_dr": j_self_dr,
+                "fallback":  fallback_used,
             })
     if not bars:
         return False
@@ -2312,9 +2329,12 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         b_pct = 100.0 * b["B"] / b["total"] if b["total"] > 0 else 0
         c_pct = 100.0 * b["C"] / b["total"] if b["total"] > 0 else 0
 
-        # Total above the stack
+        # Total above the stack. Trailing `*` marks bars where any
+        # underlying slope fell back to median_j_per_unit (regime fit
+        # was unstable due to small-N noise floor — see _slope() above).
+        sigma_suffix = " *" if b.get("fallback") else ""
         ax.text(xs[i], total_pj * 1.02,
-                f"Σ = {_fmt_pj(total_pj)} pJ/elem",
+                f"Σ = {_fmt_pj(total_pj)} pJ/elem{sigma_suffix}",
                 ha="center", va="bottom", fontsize=SIGMA_FS, fontweight="bold")
 
         segments = [
@@ -2393,8 +2413,14 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     # Caveat — semantic tightening : math is correct (A+B+C ≡ T), but
     # both B and C are *regime-anchored* quantities, not pure
     # interpretive concepts. Make this explicit.
+    any_fallback = any(b.get("fallback") for b in bars)
+    fallback_line = (
+        "Σ marked with `*` : a regime-local slope_dyn_wls was unstable (NaN / non-positive\n"
+        "from small-N noise floor); the bar uses median_j_per_unit instead. Magnitude correct,\n"
+        "fit confidence reduced.\n") if any_fallback else ""
     ax_caveat.text(
         0.5, 0.5,
+        f"{fallback_line}"
         "A bundles compute + L2 transit + kernel-launch (no NVML measurement isolates pure compute).\n"
         "B is the FP8 cast/emulation overhead OBSERVED AT L2-RESIDENT REGIME — additional cast-path\n"
         "memory effects that appear only when the working set spills to HBM are folded into C, not B.\n"
@@ -3646,11 +3672,30 @@ def plot_fp8_mece_dashboard(df: pd.DataFrame, by_regime: pd.DataFrame,
     # Panel 2 : elementwise fp8 decomposition
     ax = axes[1]
     rendered_2 = False
+    panel2_any_fallback = False
     if by_regime is not None and not by_regime.empty:
         ew = by_regime[by_regime["category"] == "elementwise"].copy()
         if not ew.empty:
             ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
             slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
+            has_median_p2 = "median_j_per_unit" in ew.columns
+
+            def _row_jpe(row_df):
+                """Return (j_per_element_pJ, used_fallback) or (None, _).
+                Falls back to median_j_per_unit when WLS slope is NaN or
+                non-positive (small-N noise floor → unstable fit).
+                """
+                if row_df.empty:
+                    return None, False
+                v = row_df[slope_col].iloc[0]
+                if pd.notna(v) and v > 0:
+                    return float(v) * 1e12, False
+                if has_median_p2:
+                    m = row_df["median_j_per_unit"].iloc[0]
+                    if pd.notna(m) and m > 0:
+                        return float(m) * 1e12, True
+                return None, False
+
             ops = ["softmax", "gelu", "layernorm"]
             xs = np.arange(len(ops))
             for i, op in enumerate(ops):
@@ -3660,11 +3705,14 @@ def plot_fp8_mece_dashboard(df: pd.DataFrame, by_regime: pd.DataFrame,
                               & (ew["cache_regime"] == "l2_hit_100")]
                 fp8_dr  = ew[(ew["op"] == op) & (ew["dtype"] == "fp8")
                               & (ew["cache_regime"] == "l2_hit_0")]
-                if fp16_l2.empty or fp8_l2.empty or fp8_dr.empty:
+                A_val,  fb_a = _row_jpe(fp16_l2)
+                f8l_val, fb_b = _row_jpe(fp8_l2)
+                T_val,   fb_t = _row_jpe(fp8_dr)
+                if A_val is None or f8l_val is None or T_val is None:
                     continue
-                A = float(fp16_l2[slope_col].iloc[0]) * 1e12
-                B = float(fp8_l2[slope_col].iloc[0])  * 1e12 - A
-                T = float(fp8_dr[slope_col].iloc[0])  * 1e12
+                A = A_val
+                B = f8l_val - A_val
+                T = T_val
                 C = T - A - B
                 ax.bar([i], [A], color="#2ca02c",
                        label="A) L2-resident (fp16 baseline)" if i == 0 else None)
@@ -3672,12 +3720,21 @@ def plot_fp8_mece_dashboard(df: pd.DataFrame, by_regime: pd.DataFrame,
                        label="B) FP8 emu/cast overhead @ L2-resident" if i == 0 else None)
                 ax.bar([i], [max(0, C)], bottom=[A + max(0, B)], color="#1f77b4",
                        label="C) Off-chip L2→HBM marginal" if i == 0 else None)
-                ax.text(i, T, f"Σ={T:.1f}", ha="center", va="bottom", fontsize=8)
+                fb_marker = " *" if (fb_a or fb_b or fb_t) else ""
+                ax.text(i, T, f"Σ={T:.1f}{fb_marker}", ha="center", va="bottom", fontsize=8)
+                if fb_a or fb_b or fb_t:
+                    panel2_any_fallback = True
                 rendered_2 = True
             ax.set_xticks(xs); ax.set_xticklabels([f"{op}_fp8" for op in ops], fontsize=9)
             ax.set_ylabel("pJ / element")
             if rendered_2:
                 ax.legend(fontsize=7, loc="upper left")
+            if panel2_any_fallback:
+                ax.text(0.99, 0.99, "* = median fallback (WLS slope unstable)",
+                        ha="right", va="top", transform=ax.transAxes,
+                        fontsize=7, color="#666", style="italic",
+                        bbox=dict(facecolor="white", edgecolor="#ccc",
+                                   alpha=0.85, pad=2))
     ax.set_title("elementwise fp8 — A + B + C MECE  (B = cast overhead, "
                  "fp8 = emulated cast-compute-cast)", fontsize=10)
     if not rendered_2:
