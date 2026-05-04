@@ -1056,12 +1056,17 @@ def _make_attention_flash(B: int, H_q: int, H_kv: int, N_q: int, N_kv: int,
 def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
                                N_q: int, N_kv: int, D_head: int,
                                device, causal: bool = False
-                               ) -> tuple[Callable[[], None], bool]:
+                               ) -> tuple[Callable[[], None], bool, bool]:
     """FP8 fused attention via Transformer Engine + `fp8_autocast`.
 
-    Returns (run_fn, emulated_flag). emulated=True when the GPU is pre-Hopper
-    (no native FP8 attention) and TE silently falls back to a half-precision
-    code path — same convention as `_make_matmul_fp8_te`.
+    Returns (run_fn, emulated_flag, fp8_dpa_recipe_accepted) :
+      * emulated_flag : True when GPU is pre-Hopper (no native FP8 attn)
+        and TE silently falls back to a half-precision code path.
+      * fp8_dpa_recipe_accepted : True when TE's DelayedScaling accepted
+        `fp8_dpa=True` (i.e. TE >= 1.x — the FP8 DPA cuDNN sub-backend 2
+        is REQUESTED). False means TE rejected the kwarg → recipe fell
+        back to defaults and FP8 DPA backend is NOT guaranteed (operator
+        should re-run with NVTE_DEBUG=1 to verify backend selection).
 
     Implementation : `te.DotProductAttention` accepts (Q, K, V) tensors in
     `bshd` (Batch-Seq-Head-Dim) layout and dispatches to cuDNN / FlashAttention
@@ -1149,6 +1154,7 @@ def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
     )
     try:
         fp8_recipe = te_recipe.DelayedScaling(fp8_dpa=True, **_recipe_kwargs)
+        fp8_dpa_recipe_accepted = True
     except TypeError as e:
         # TE < 1.x : fp8_dpa kwarg not yet present. Fall back gracefully
         # but warn loudly that FP8 DPA backend may NOT be selected.
@@ -1159,6 +1165,7 @@ def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
               f"to enable explicit FP8 DPA. Recipe falling back to "
               f"DelayedScaling defaults.")
         fp8_recipe = te_recipe.DelayedScaling(**_recipe_kwargs)
+        fp8_dpa_recipe_accepted = False
 
     # Warmup 5× — same Blackwell + small-N safeguard as matmul_fp8_te.
     # If TE's amax-buffer dance is going to trip the CUDA context, surface
@@ -1194,7 +1201,7 @@ def _make_attention_flash_fp8(B: int, H_q: int, H_kv: int,
     def f():
         with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
             dpa(q, k, v)
-    return f, emulated
+    return f, emulated, fp8_dpa_recipe_accepted
 
 
 def _make_attention_qkv_matmul(B: int, H_q: int, H_kv: int, N_q: int, N_kv: int,
@@ -1382,12 +1389,19 @@ def build_fused(variant: str, dtype_label: str,
             raise ValueError(f"attention: H_q ({H_q}) must be divisible by H_kv ({H_kv})")
         if dtype_label == "fp8":
             # FP8 path : TE DotProductAttention + fp8_autocast
-            fn, emulated = _make_attention_flash_fp8(
+            fn, emulated, fp8_dpa_accepted = _make_attention_flash_fp8(
                 B, H_q, H_kv, N_q, N_kv, D_head, device, causal=causal)
+            # Surface the DPA recipe acceptance in notes so it lands in
+            # the CSV — operator can grep `fp8_dpa_requested=true|false`
+            # without parsing TE logs.
+            notes_extra = (f" ; fp8_dpa_requested={'true' if fp8_dpa_accepted else 'false'}"
+                           f" (verify cuDNN sub-backend 2 selection with "
+                           f"NVTE_DEBUG=1 NVTE_FUSED_ATTN_BACKEND=2)")
             notes = ("fp8 FlashAttention via te.DotProductAttention + "
                      "fp8_autocast(E4M3)")
             if emulated:
                 notes += " (pre-Hopper FP16 fallback)"
+            notes += notes_extra
         else:
             builder = (_make_attention_flash if variant == "attention_flash"
                        else _make_attention_qkv_matmul)

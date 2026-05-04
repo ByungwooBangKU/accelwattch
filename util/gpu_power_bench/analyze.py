@@ -296,6 +296,34 @@ def bootstrap_slope_ci(x: np.ndarray, y: np.ndarray,
 DRAM_TRAFFIC_CATEGORIES = ("elementwise", "stream")
 
 
+# ---------------------------------------------------------------------------
+# Plot skip-reason logger — every time analyze.py decides to omit a row,
+# variant, or whole plot from a figure, the reason should be recorded so
+# the operator can diagnose "why is bar X missing" without re-running.
+# Exported as `<stem>_plot_skip_reasons.csv` at the end of main().
+# ---------------------------------------------------------------------------
+
+class _PlotSkipLog:
+    """Process-level singleton that collects plot-skip events."""
+
+    _events: list[dict] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._events = []
+
+    @classmethod
+    def record(cls, plot: str, variant: str, reason: str,
+               dtype: str = "", details: str = "") -> None:
+        cls._events.append({"plot": plot, "variant": variant, "dtype": dtype,
+                            "reason": reason, "details": details})
+
+    @classmethod
+    def to_dataframe(cls) -> pd.DataFrame:
+        return pd.DataFrame(cls._events) if cls._events else pd.DataFrame(
+            columns=["plot", "variant", "dtype", "reason", "details"])
+
+
 def add_traffic_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Augment a per-cell df with three derived columns:
 
@@ -2466,6 +2494,13 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
         A = _slope(variant, "l2_hit_100")
         T = _slope(variant, "l2_hit_0")
         if A is None or T is None:
+            missing = []
+            if A is None: missing.append("l2_hit_100")
+            if T is None: missing.append("l2_hit_0")
+            _PlotSkipLog.record(
+                plot="energy_decomposition_matmul_mece", variant=variant,
+                reason="missing_regime",
+                details=f"no valid slope at {' & '.join(missing)}")
             continue
         emu_row = mm[mm["variant"] == variant]
         emu = bool(int(emu_row["emulated"].iloc[0])) if "emulated" in emu_row.columns else False
@@ -2757,6 +2792,10 @@ def summarize_fused_decomposition(df: pd.DataFrame) -> pd.DataFrame:
             if sb.empty:
                 # Full present, baseline missing — most commonly fp8
                 # attention (no `attention_qkv_matmul` fp8 baseline yet).
+                _PlotSkipLog.record(
+                    plot="attention_decomposition", variant=full_var, dtype=dtype,
+                    reason="missing_baseline",
+                    details=f"no `{base_var}` row at this dtype")
                 J_full = float(sf["j_per_call_dyn"].iloc[0])
                 n_elem = (int(sf["n_elem_n"].iloc[0])
                           if not pd.isna(sf["n_elem_n"].iloc[0]) else 0)
@@ -3511,10 +3550,21 @@ def compute_dram_marginal(df: pd.DataFrame) -> pd.DataFrame:
         g_l2 = g[g["cache_regime"] == "l2_hit_100"]
         g_dr = g[g["cache_regime"] == "l2_hit_0"]
         if g_l2.empty or g_dr.empty:
+            missing = []
+            if g_l2.empty: missing.append("l2_hit_100")
+            if g_dr.empty: missing.append("l2_hit_0")
+            _PlotSkipLog.record(
+                plot="dram_energy_marginal", variant=op, dtype=dt,
+                reason="missing_regime",
+                details=f"no cells at {' & '.join(missing)}")
             continue
         s_l2, r2_l2, n_l2 = _slope_per_bit(g_l2)
         s_dr, r2_dr, n_dr = _slope_per_bit(g_dr)
         if not (np.isfinite(s_l2) and np.isfinite(s_dr)):
+            _PlotSkipLog.record(
+                plot="dram_energy_marginal", variant=op, dtype=dt,
+                reason="insufficient_valid_points",
+                details=f"slope NaN (n_l2={n_l2}, n_dr={n_dr})")
             continue
         marginal_pj = (s_dr - s_l2) * 1e12
         direct_pj   = s_dr * 1e12
@@ -4144,6 +4194,19 @@ def main() -> int:
     print("               This is the power-modeling coefficient for this op+GPU.")
     print("  R2_dyn     — linearity of E_dyn ~ load.  ≥0.99 = model assumption holds.")
     print("  Lower R² → restrict your fit to loads in the linear regime, then re-run.")
+
+    # Plot skip-reason sidecar — every place analyze.py omitted a row
+    # from a figure is recorded here so the operator can answer
+    # "why is bar X missing" without re-running. C2.1 of the FP8/MECE
+    # robustness chunk.
+    skip_df = _PlotSkipLog.to_dataframe()
+    if not skip_df.empty:
+        skip_path = out_dir / f"{stem}_plot_skip_reasons.csv"
+        skip_df.to_csv(skip_path, index=False)
+        print(f"[save] {skip_path}")
+        print(f"\n== Plot skip reasons ({len(skip_df)} events) ==")
+        with pd.option_context("display.width", 160):
+            print(skip_df.to_string(index=False))
     return 0
 
 
