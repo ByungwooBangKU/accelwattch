@@ -557,7 +557,8 @@ def wait_for_pstate_idle(handle, threshold_mhz: int = 500,
 
 
 def force_p8_for_measurement(handle, base_clock_mhz: int = 210,
-                              verbose: bool = True):
+                              verbose: bool = True,
+                              use_sudo: bool = False):
     """Aggressively try to drive the GPU into P8 (low SM clock) so the
     upcoming `measure_static_power()` actually captures *cold idle*,
     not P0-locked boost-clock idle.
@@ -578,6 +579,9 @@ def force_p8_for_measurement(handle, base_clock_mhz: int = 210,
          "boost clock retention" hold. Doesn't lock low, just tells the
          driver "stop holding the boost". Then natural P-state transition
          takes effect (usually within 1-2 s of zero util).
+         With `use_sudo=True`, the command is run as `sudo -n ...`, so it
+         never prompts inside a long benchmark; pre-authenticate with
+         `sudo -v` before launching.
          `restore` = no-op (subprocess already handed control back).
 
       3. Give up — return success=False, caller will rely on the fallback
@@ -619,12 +623,17 @@ def force_p8_for_measurement(handle, base_clock_mhz: int = 210,
     # --- Attempt 2 : nvidia-smi -rgc ---------------------------------------
     try:
         import subprocess
+        cmd = ["nvidia-smi", "-i", str(idx), "-rgc"]
+        shown_cmd = f"nvidia-smi -i {idx} -rgc"
+        if use_sudo:
+            cmd = ["sudo", "-n", *cmd]
+            shown_cmd = f"sudo -n {shown_cmd}"
         result = subprocess.run(
-            ["nvidia-smi", "-i", str(idx), "-rgc"],
+            cmd,
             capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             if verbose:
-                print(f"[force-p8] `nvidia-smi -i {idx} -rgc` OK — "
+                print(f"[force-p8] `{shown_cmd}` OK — "
                       f"boost-clock retention released")
             return {"success": True, "method": "nvidia_smi_rgc",
                     "restore": None}
@@ -632,7 +641,7 @@ def force_p8_for_measurement(handle, base_clock_mhz: int = 210,
             if verbose:
                 err = (result.stderr or result.stdout or "").strip().splitlines()
                 first = err[0] if err else "(no stderr)"
-                print(f"[force-p8] `nvidia-smi -i {idx} -rgc` failed (rc={result.returncode}): "
+                print(f"[force-p8] `{shown_cmd}` failed (rc={result.returncode}): "
                       f"{first[:120]}")
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
         if verbose:
@@ -644,8 +653,8 @@ def force_p8_for_measurement(handle, base_clock_mhz: int = 210,
               f"will reflect whatever P-state the GPU is in. If the GPU is "
               f"stuck in P0 (boost-clock idle), the measurement will be "
               f"30..50 W INFLATED vs true P8 idle (~70W on H100). "
-              f"Mitigation : `sudo nvidia-smi -i {idx} -pm 1 && "
-              f"sudo nvidia-smi -i {idx} -rgc` "
-              f"before sweep, or run as root, or `--pstate-idle-wait 120` "
-              f"to allow longer hysteresis ride-out.")
+              f"Mitigation : pre-authenticate with `sudo -v`, then run with "
+              f"`--sudo-pstate`; or run `sudo nvidia-smi -i {idx} -rgc` "
+              f"before sweep; or use `--pstate-idle-wait 120` to allow "
+              f"longer hysteresis ride-out.")
     return {"success": False, "method": "none", "restore": None}

@@ -658,8 +658,15 @@ def main() -> int:
                          "P0 even after temp drops, inflating P_static by "
                          "30..50 W and triggering the '0/N samples reached "
                          "P8' warning. Recommended: 30s on H100, longer if "
-                         "boost-clock lock survives. `nvidia-smi -rgc` before "
-                         "sweep is a stronger but root-only alternative.")
+                         "boost-clock lock survives. Use --sudo-pstate when "
+                         "the selected GPU allows sudo clock resets.")
+    ap.add_argument("--sudo-pstate", action="store_true",
+                    help="allow selected-GPU P-state reset helpers to run "
+                         "`sudo -n nvidia-smi -i <selected_gpu> -rgc` during "
+                         "baseline/rebaseline. This does not run the benchmark "
+                         "as root. run_bench.sh asks for sudo once and keeps "
+                         "the timestamp alive; if calling this Python file "
+                         "directly, run `sudo -v` first.")
     ap.add_argument("--rebaseline-every", type=int, default=0,
                     help="re-measure idle / static power every N cells "
                          "(0 = once at start, no drift correction). 20 is a "
@@ -1021,8 +1028,11 @@ def main() -> int:
     # static measurement actually captures cold-idle, not P0-locked boost
     # idle. The restore() callback unlocks clocks AFTER the measurement,
     # so the workload phase keeps full DVFS.
-    p8_ctx = force_p8_for_measurement(handle) if args.pstate_idle_wait > 0 else \
-             {"success": False, "method": "skipped", "restore": None}
+    if args.pstate_idle_wait > 0:
+        p8_ctx = force_p8_for_measurement(
+            handle, use_sudo=args.sudo_pstate)
+    else:
+        p8_ctx = {"success": False, "method": "skipped", "restore": None}
     print(f"[baseline] measuring static power for {args.static_seconds:.1f}s …")
     baseline = measure_static_power(handle, seconds=args.static_seconds,
                                     hz=args.poll_hz,
@@ -1432,7 +1442,8 @@ def main() -> int:
                                          verbose=False)
                 # Force P8 around each rebaseline too — quiet (verbose=False)
                 # so a 130-cell sweep doesn't print 6 force-p8 noise blocks.
-                rb_p8 = (force_p8_for_measurement(handle, verbose=False)
+                rb_p8 = (force_p8_for_measurement(handle, verbose=False,
+                                                  use_sudo=args.sudo_pstate)
                           if args.pstate_idle_wait > 0
                           else {"success": False, "restore": None})
                 rb = measure_static_power(handle,

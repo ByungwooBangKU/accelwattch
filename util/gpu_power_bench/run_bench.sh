@@ -85,6 +85,7 @@ DEVICES=""
 SEQUENTIAL=0
 BASE_TAG=""
 SINGLE_DEVICE="0"
+SUDO_PSTATE=0
 FORWARD=()
 
 AUTO_ANALYZE=1   # default ON for single-GPU; multi-GPU paths disable it below.
@@ -97,6 +98,7 @@ while [[ $# -gt 0 ]]; do
         --devices=*)        DEVICES="${1#*=}"; shift ;;
         --sequential)       SEQUENTIAL=1; shift ;;
         --no-auto-analyze)  AUTO_ANALYZE=0; shift ;;
+        --sudo-pstate)      SUDO_PSTATE=1; FORWARD+=("$1"); shift ;;
         --tag)              BASE_TAG="$2"; FORWARD+=("--tag" "$2"); shift 2 ;;
         --tag=*)            BASE_TAG="${1#*=}"; FORWARD+=("$1"); shift ;;
         --device)           SINGLE_DEVICE="$2"; FORWARD+=("--device" "$2"); shift 2 ;;
@@ -114,6 +116,38 @@ if [[ -n "$DEVICES" ]]; then
     IFS=',' read -ra DEVS <<< "$DEVICES"
 elif [[ -n "$NUM_GPUS" ]]; then
     for ((i=0; i<NUM_GPUS; i++)); do DEVS+=("$i"); done
+fi
+
+SUDO_KEEPALIVE_PID=""
+cleanup_sudo_keepalive() {
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+        wait "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    fi
+}
+
+start_sudo_keepalive() {
+    command -v sudo >/dev/null || {
+        echo "error: --sudo-pstate requested but sudo is not available" >&2
+        exit 1
+    }
+    echo "[sudo-pstate] requesting sudo once for selected-GPU clock reset helpers"
+    sudo -v || {
+        echo "error: sudo authentication failed; rerun without --sudo-pstate or ask the admin" >&2
+        exit 1
+    }
+    (
+        while true; do
+            sudo -n -v >/dev/null 2>&1 || exit
+            sleep 60
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
+    trap cleanup_sudo_keepalive EXIT
+}
+
+if (( SUDO_PSTATE == 1 )); then
+    start_sudo_keepalive
 fi
 
 enable_persistence_for_devices() {
