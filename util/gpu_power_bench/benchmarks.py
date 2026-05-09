@@ -1631,12 +1631,71 @@ def _cuda_target_include_paths() -> list[str]:
     return out
 
 
+def _cuda_target_library_paths() -> list[str]:
+    """Return CUDA library dirs needed by conda-packaged toolkits.
+
+    Some conda CUDA installs expose the usable runtime library under
+    targets/x86_64-linux/lib while the top-level lib/libcudart.so symlink can
+    be absent or stale.  torch's extension linker still adds the top-level lib
+    dir, so prepend the target-specific lib dir through LIBRARY_PATH before
+    building the L2 extension.
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    roots = []
+    for key in ("CUDA_HOME", "CUDA_PATH", "CONDA_PREFIX"):
+        value = os.environ.get(key)
+        if value:
+            roots.append(value)
+    roots.append(sys.prefix)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        candidates = [
+            Path(root) / "targets" / "x86_64-linux" / "lib",
+            Path(root) / "lib64",
+            Path(root) / "lib",
+        ]
+        for path in candidates:
+            if not (
+                (path / "libcudart.so").exists()
+                or (path / "libcudart.so.12").exists()
+                or (path / "libcudart_static.a").exists()
+            ):
+                continue
+            s = str(path)
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
+
+
+def _prepend_env_path(name: str, paths: list[str]) -> None:
+    """Prepend unique paths to a colon-separated environment variable."""
+    import os
+
+    existing = [p for p in os.environ.get(name, "").split(os.pathsep) if p]
+    merged: list[str] = []
+    seen: set[str] = set()
+    for path in [*paths, *existing]:
+        if path and path not in seen:
+            merged.append(path)
+            seen.add(path)
+    if merged:
+        os.environ[name] = os.pathsep.join(merged)
+
+
 def _l2_extension():
     """Compile/load the CUDA extension used by build_l2_probe()."""
     global _L2_EXT
     if _L2_EXT is not None:
         return _L2_EXT
     from torch.utils.cpp_extension import load_inline
+
+    _prepend_env_path("LIBRARY_PATH", _cuda_target_library_paths())
 
     cpp_src = r'''
 #include <torch/extension.h>

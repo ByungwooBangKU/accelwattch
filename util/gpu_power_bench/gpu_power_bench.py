@@ -1802,11 +1802,13 @@ def main() -> int:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     suffix = f"_{args.tag}" if args.tag else ""
     csv_path = out_dir / f"gpu_power_bench_{gpu_slug}_{stamp}{suffix}.csv"
+    csv_saved = False
     if rows:
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader()
             w.writerows(rows)
+        csv_saved = True
         if fatal_error:
             print(f"\n[save] {csv_path}  ({len(rows)} rows — partial; "
                   f"sweep aborted by '{fatal_error}')")
@@ -2144,10 +2146,13 @@ def main() -> int:
             try: pynvml.nvmlShutdown()
             except Exception: pass
 
-    print("\nnext: python3 analyze.py {}  # generate linearity plots".format(csv_path))
-    # Machine-readable last line — run_bench.sh greps this to chain
-    # `analyze.py <csv>` automatically. Keep the prefix exact.
-    print(f"[OUTPUT_CSV] {csv_path}")
+    if csv_saved:
+        print("\nnext: python3 analyze.py {}  # generate linearity plots".format(csv_path))
+        # Machine-readable last line — run_bench.sh greps this to chain
+        # `analyze.py <csv>` automatically. Keep the prefix exact.
+        print(f"[OUTPUT_CSV] {csv_path}")
+    else:
+        print("\n[info] no benchmark CSV emitted; analysis plots are only available for per-cell sweeps")
     return 0
 
 

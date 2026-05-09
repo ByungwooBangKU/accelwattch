@@ -287,13 +287,18 @@ if [[ ${#DEVS[@]} -eq 0 ]]; then
         # gpu_power_bench.py writes a "[OUTPUT_CSV] <path>" line at the end
         # — pluck it out so we don't have to glob. Log is preserved either
         # way for later inspection.
-        csv_line=$(grep -E '^\[OUTPUT_CSV\] ' "$sweep_log" | tail -n 1)
+        csv_line=$({ grep -E '^\[OUTPUT_CSV\] ' "$sweep_log" || true; } | tail -n 1)
         if [[ -z "$csv_line" ]]; then
             echo "[warn] sweep finished but no [OUTPUT_CSV] marker found — skip auto-analyze" >&2
             echo "[info] log: $sweep_log"
             exit 0
         fi
         csv_path="${csv_line#\[OUTPUT_CSV\] }"
+        if [[ ! -f "$csv_path" ]]; then
+            echo "[warn] [OUTPUT_CSV] marker points to a missing file — skip auto-analyze: $csv_path" >&2
+            echo "[info] log: $sweep_log"
+            exit 0
+        fi
         echo
         echo "[auto-analyze] running analyze.py on $csv_path"
         echo "                (skip with --no-auto-analyze; or run later: python3 analyze.py <csv>)"
@@ -402,7 +407,7 @@ else
                 echo "[skip-analyze] gpu${dev}: log missing — sweep died early"
                 continue
             fi
-            csv_line=$(grep -E '^\[OUTPUT_CSV\] ' "$gpulog" | tail -n 1)
+            csv_line=$({ grep -E '^\[OUTPUT_CSV\] ' "$gpulog" || true; } | tail -n 1)
             if [[ -z "$csv_line" ]]; then
                 echo "[skip-analyze] gpu${dev}: no [OUTPUT_CSV] marker (sweep failed?)"
                 continue
