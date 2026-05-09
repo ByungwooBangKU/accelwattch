@@ -24,7 +24,7 @@
 
 - `gpu_power_bench.py`의 기본 profile은 `--gpu-profile h100_sxm`이다.
 - GPU profile은 `gpu_profiles.py`가 단일 기준이며 RTX 3090/A100 SXM/H100 SXM의 default dtype, L2 window, headline 가능 여부를 정의한다.
-- `--suite full`과 `--suite all`은 모두 `elementwise/matmul/llm-matmul/dram/l2/soc`를 포함하는 전체 suite다. L2만 다시 돌릴 때만 `--suite l2` 또는 `--cases l2`를 쓴다.
+- `--suite full`과 `--suite all`은 모두 `elementwise/matmul/llm-matmul/dram/l2/soc`와 fused residual을 포함하는 전체 suite다. L2만 다시 돌릴 때만 `--suite l2` 또는 `--cases l2`를 쓴다.
 - 각 run은 `_gpu_spec_snapshot.csv`와 row-level `headline_status`/`headline_reason`을 남긴다.
 - `component_validation_report.py`는 table output과 image report output을 분리하고, PNG는 `00_`부터 category 순번으로 저장한다.
 - report는 `pass/low_conf/not_headline/not_applicable/missing/fail`로 수치를 분류한다.
@@ -83,7 +83,7 @@ PY
 | Tensor Core compute | `tf32:tc`, `fp16:tc`, `bf16:tc`, `fp8:te` | dtype별 GEMM execution path |
 | Native FP8 TC | `fp8:te` via Transformer Engine | H100에서만 headline 가능 |
 | Elementwise/nonlinear | `mul/add/softmax/gelu/layernorm` | standalone op energy, memory traffic 포함 |
-| Fused nonlinear | `--include-fused` | FlashAttention/linear+gelu/ln+linear residual decomposition |
+| Fused nonlinear | `--suite full/all` 기본 포함, 또는 `--include-fused` | FlashAttention/linear+gelu/ln+linear residual decomposition |
 | HBM traffic | `stream_read/write/copy/scale/triad`, DRAM marginal analysis | board-level HBM path pJ/bit |
 | L2 hit path | `--cases l2` custom CUDA extension | L2-hit traffic path pJ/bit, isolated SRAM bit-cell 아님 |
 | Drift/noise quality | baseline/rebaseline CSV, bootstrap CI, clip-bias, R2 | coefficient quality gate |
@@ -302,7 +302,9 @@ python3 preflight.py
   --tag a100_sxm_l2
 ```
 
-6. Fused nonlinear residuals:
+6. Fused nonlinear residuals focused rerun:
+
+`--suite full/all`에는 fused가 기본 포함된다. 아래 명령은 full run 후 fused 의존성 또는 dtype별 residual만 좁혀 다시 확인할 때 사용한다.
 
 ```bash
 ./run_bench.sh \
@@ -381,7 +383,9 @@ python3 preflight.py
   --tag h100_sxm_l2
 ```
 
-6. Fused nonlinear residuals:
+6. Fused nonlinear residuals focused rerun:
+
+`--suite full/all`에는 fused가 기본 포함된다. 아래 명령은 full run 후 H100 fp8 attention fused 경로만 좁혀 다시 확인할 때 사용한다.
 
 ```bash
 ./run_bench.sh \

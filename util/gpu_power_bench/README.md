@@ -542,7 +542,7 @@ build cost 자체는 다음 phase 의 warmup 으로 자연 흡수. SoC envelope 
 | SoC envelope `phase_static` | ✓ (sample 필터는 phase_static 내부엔 없지만, build deferral 로 해결) | ✓ |
 | Per-cell sweep cell | (의도적으로 P0 — 측정 대상이 활성 커널) | (해당 없음) |
 
-### 3.7 Fused vs Standalone 측정 (`--include-fused`, opt-in)   *(planned — REVIEW.md G11 / P1.4)*
+### 3.7 Fused vs Standalone 측정 (`--suite full/all` 기본 포함, `--include-fused` 수동 추가)
 
 #### 3.7.1 동기
 
@@ -559,7 +559,7 @@ build cost 자체는 다음 phase 의 warmup 으로 자연 흡수. SoC envelope 
 | Group | Variant | 정의 |
 |-------|---------|------|
 | **Fused (전체)** | `attention_flash` | `F.scaled_dot_product_attention` (FlashAttention-2 backend). softmax 가 안에 있음 |
-| | `linear_gelu` | `torch.compile` 로 fuse 한 `gelu(linear(x))`. inductor 가 epilogue fusion 안 하면 TransformerEngine `LayerNormMLP` 로 fallback |
+| | `linear_gelu` | `torch.compile` 로 fuse 한 `gelu(linear(x))`. inductor 가 epilogue fusion 안 하면 eager fallback으로 실행되며 emulated로 표시 |
 | | `ln_linear` | `torch.compile` 로 fuse 한 `linear(layer_norm(x))` (pre-norm) |
 | **Subtract baseline** | `attention_qkv_matmul` | `Q @ Kᵀ` + `P @ V` 두 matmul 만 (softmax 자리에 identity), 같은 (B,H,N,D) |
 | | `linear_baseline_gelu` | pure `linear(x, W, b)`, `linear_gelu` 와 동일 shape |
@@ -607,9 +607,9 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "유의미한 fused 항 검
 
 | 항목 | 결정 | 근거 |
 |------|------|------|
-| Fusion 메커니즘 | `torch.compile` 우선, 안 fuse 되면 TransformerEngine fallback, 둘 다 fail 시 variant skip + warn | TE 는 fp8_te 경로에서 이미 import — 추가 의존성 부담 0 |
+| Fusion 메커니즘 | MLP/LN fused 계열은 `torch.compile` 우선, 실패 시 eager fallback + emulated 표시. fp8 attention은 TransformerEngine 경로 사용 | full/all에서는 fused cell이 기본 포함되므로 실패 시 설치/호환성 안내를 출력 |
 | Causal mask | non-causal default | softmax 항의 *upper bound* 측정. causal 은 절반 cost — follow-up |
-| Sweep 통합 | **opt-in `--include-fused`** | 6 variant × 5 cache regime = 30 신규 cell, sweep ~30% 증가. 기본 sweep 영향 없음 |
+| Sweep 통합 | `--suite full` / `--suite all` 에 기본 포함. 다른 suite/cases 조합에서는 `--include-fused` 로 수동 추가 | 전체 component validation에서 fused residual을 기본 산출. 의존성 문제를 분리 디버깅할 때만 `--no-fused` 사용 |
 | Default 수치 검증 방법 | 합성 + 실측 양쪽. residual 음수 → 측정 invalid 로 ERROR | 차감 noise propagation 은 bootstrap CI 로 정량 |
 
 #### 3.7.5 산출물
@@ -626,7 +626,7 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "유의미한 fused 항 검
 
 #### 3.7.6 한계 (구현 전 합의 완료)
 
-1. **Fusion 보장 환경 의존** : torch.inductor epilogue fusion 은 PyTorch 버전 / shape / dtype 에 따라 안 될 수 있음. PoC 단계에서 graph 캡처로 검증 후 fail 시 TE fallback.
+1. **Fusion 보장 환경 의존** : torch.inductor epilogue fusion 은 PyTorch 버전 / shape / dtype 에 따라 안 될 수 있음. compile 실패 시 eager fallback으로 실행하고 emulated로 표시한다.
 2. **차감 noise propagation** : `J_full ≈ J_baseline` 이면 residual ≈ 0, 측정 noise 만 보임. 95% CI 0 포함 시 honest 라벨 "fused contribution not statistically distinguishable from zero".
 3. **Online softmax rescale 항** 은 standalone 엔 부재 — residual 에 들어가지만 알고리즘 자체로부터 분리 불가능 (B+C 의 본질적 한계). plot caption 에 명시.
 4. **GPT-OSS sliding-window layer (N_kv=128) 미측정** — full-attention 만. SWA layer 의 softmax 항은 N_kv 가 작아 cost 가 크게 다름 → 별도 variant 로 추가 검토 가능.
@@ -1203,20 +1203,21 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
 | `dram` | `dram` | — | ~10 분 |
 | `llm` | `llm-matmul` | — | ~25 분 |
 | `soc` | `soc` | — | **~5 분** (SoC envelope only) |
-| `full` | `elementwise + matmul + llm-matmul + dram + l2 + soc` | `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
-| `all` | `full` alias | `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
+| `full` | `elementwise + matmul + llm-matmul + dram + l2 + soc + fused` | fused 기본 포함, `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
+| `all` | `full` alias | fused 기본 포함, `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
 
 ```bash
 # 가장 자주 쓰는 길 — 5분 smoke → publication-quality full/all
 ./run_bench.sh --suite smoke --tag h100_smoke
 ./run_bench.sh --suite all   --tag h100
+./run_bench.sh --suite full --no-fused --tag h100_base  # fused dependency debug용 opt-out
 
 # 특정 case 만 자유 조합
 ./run_bench.sh --cases dram soc --device 0 --tag h100_mem
 ./run_bench.sh --cases soc      --device 1 --tag h100_g1   # 옛 run_soc_bench 와 동등
 
 # Suite + 추가 override
-./run_bench.sh --suite full --tag h100 --cases matmul   # full 에서 matmul 만
+./run_bench.sh --suite full --tag h100 --cases matmul   # full tuning값으로 matmul만; fused도 원하면 --include-fused 추가
 
 # 다중 GPU + SoC (각 GPU 마다 sweep + SoC envelope)
 ./run_bench.sh --suite all --num-gpus 8 --tag h100

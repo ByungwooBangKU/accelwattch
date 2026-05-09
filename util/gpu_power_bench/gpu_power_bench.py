@@ -194,19 +194,20 @@ SUITES: dict[str, dict] = {
         "cases": ("soc",),
     },
     "full": {
-        # All built-in experiment cases, plus drift correction.  Fused
-        # variants remain controlled by --include-fused because they are an
-        # extra compare axis rather than a top-level case.
-        "_doc":             "all cases including L2 + SoC + periodic re-baseline",
+        # All built-in experiment cases, plus fused variants and drift
+        # correction.  Users may pass --no-fused for dependency debugging.
+        "_doc":             "all cases including L2 + SoC + fused + periodic re-baseline",
         "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc"),
+        "include_fused":    True,
         "rebaseline_every": 20,
         "window_ms":        6000.0,
     },
     "all": {
         # Alias of full kept for users who expect "all" to mean literally
         # every built-in case.
-        "_doc":             "alias of full: all cases including L2 + SoC",
+        "_doc":             "alias of full: all cases including L2 + SoC + fused",
         "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc"),
+        "include_fused":    True,
         "rebaseline_every": 20,
         "window_ms":        6000.0,
     },
@@ -405,6 +406,23 @@ def _gpu_spec_snapshot(profile_key: str, profile: dict, observed_profile: str,
     }
 
 
+def _print_fused_failure_hint(err_msg: str) -> None:
+    msg = err_msg.lower()
+    print("  [fused] fused cell skipped. For full H100 component validation, "
+          "fused support should be installed and working.")
+    print("  [fused] check/install:")
+    print("  [fused]   cd util/gpu_power_bench")
+    print("  [fused]   ./install_transformer_engine.sh")
+    print("  [fused]   python3 preflight.py --device 0")
+    if any(x in msg for x in ("transformer_engine", "fp8", "dotproductattention", "nvte")):
+        print("  [fused] Transformer Engine is required for fp8 fused attention "
+              "and TE attention paths.")
+    if any(x in msg for x in ("flash", "scaled_dot_product", "sdpa", "cudnn")):
+        print("  [fused] PyTorch SDPA/FlashAttention backend was not usable. "
+              "Check torch/CUDA/cuDNN compatibility.")
+    print("  [fused] To bypass fused only for debugging, rerun with --no-fused.")
+
+
 def pick_iters(spec: bm.BenchSpec, target_ms: float, ms_per_call: float) -> int:
     """Choose iter count so one measurement window is roughly target_ms long.
 
@@ -485,6 +503,8 @@ def main() -> int:
     user_set_dtypes = any(a == "--dtypes" or a.startswith("--dtypes=") for a in argv)
     user_set_l2_windows = any(a == "--l2-window-mb" or a.startswith("--l2-window-mb=") for a in argv)
     user_set_l2_delta = any(a == "--l2-delta-kb" or a.startswith("--l2-delta-kb=") for a in argv)
+    user_set_cases = any(a == "--cases" or a.startswith("--cases=") for a in argv)
+    user_set_fused = any(a in ("--include-fused", "--no-fused") for a in argv)
 
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -516,9 +536,12 @@ def main() -> int:
                     metavar="CASE",
                     help="explicit list of test cases to run. Choices: "
                          + " / ".join(ALL_CASES) + ". When set, overrides "
-                         "legacy --no-* flags. When unset, derived from "
-                         "legacy flags (--no-elementwise / --no-matmul / "
-                         "--llm-shapes / --dram-bw-test) for back-compat.")
+                         "suite cases and legacy --no-* flags. If used with "
+                         "--suite full/all, fused is disabled unless "
+                         "--include-fused is also explicit. When unset, "
+                         "derived from legacy flags (--no-elementwise / "
+                         "--no-matmul / --llm-shapes / --dram-bw-test) for "
+                         "back-compat.")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--gpu-profile", choices=gp.profile_choices(),
                     default=gp.DEFAULT_GPU_PROFILE,
@@ -680,7 +703,7 @@ def main() -> int:
                             action="store_false",
                             help="do not request persisting-L2 metadata")
     ap.set_defaults(l2_use_persisting=False)
-    # ---- Fused vs Standalone (G11 / P1.4 — opt-in) -----------------------
+    # ---- Fused vs Standalone (G11 / P1.4) --------------------------------
     # 6 new variants : attention_flash + attention_qkv_matmul (subtraction
     # baseline), linear_gelu + linear_baseline_gelu, ln_linear +
     # linear_baseline_ln. Each variant runs as a SINGLE cell at fixed
@@ -688,9 +711,13 @@ def main() -> int:
     # GPT-OSS 120B defaults). analyze.py pairs full ↔ baseline by op
     # group and computes residual + bootstrap CI. See README §3.7.
     ap.add_argument("--include-fused", action="store_true",
-                    help="opt-in: add the 6 fused-vs-standalone variants. "
-                         "Doubles the elementwise CSV row count by ~30%%. "
-                         "See README §3.7 / TestCases A.5 / REVIEW.md G11.")
+                    help="add the fused-vs-standalone variants. Enabled by "
+                         "--suite full/all. See README §3.7 / TestCases A.5 "
+                         "/ REVIEW.md G11.")
+    ap.add_argument("--no-fused", dest="include_fused", action="store_false",
+                    help="disable fused variants even if the selected suite "
+                         "enables them. Use only for dependency debugging.")
+    ap.set_defaults(include_fused=False)
     ap.add_argument("--attn-shape", type=str, default="1,64,8,2048,2048,64",
                     help="attention_flash / attention_qkv_matmul shape — "
                          "B,H_q,H_kv,N_q,N_kv,D_head. Default = GPT-OSS 120B "
@@ -709,9 +736,10 @@ def main() -> int:
                          "with a warning. 'eager' disables fusion entirely "
                          "(diagnostic only — residuals will inflate).")
     ap.add_argument("--fused-dtypes", nargs="+", default=None,
-                    help="dtypes for fused variants. Default = intersection "
-                         "of --dtypes with {fp16, bf16, fp8}. fp8 only "
-                         "applies to attention_flash (via Transformer "
+                    help="dtypes for fused variants. Default = profile fused "
+                         "dtypes, or the intersection of --dtypes with "
+                         "{fp16, bf16, fp8} when --dtypes is explicit. fp8 "
+                         "only applies to attention_flash (via Transformer "
                          "Engine + fp8_autocast) — all other fused "
                          "variants (qkv_matmul baseline, linear_gelu, "
                          "ln_linear) remain fp16/bf16. fp8 MLP fused is "
@@ -752,6 +780,10 @@ def main() -> int:
         sd = SUITES[args.suite]
         flags = ", ".join(f"{k}={v}" for k, v in sd.items() if not k.startswith("_"))
         print(f"[suite] '{args.suite}' → {flags or '(no overrides — legacy default)'}")
+        if user_set_cases and not user_set_fused and args.include_fused:
+            args.include_fused = False
+            print("[suite] explicit --cases overrides the suite fused default; "
+                  "add --include-fused to keep fused variants.")
 
     profile_key = args.gpu_profile if args.gpu_profile != "auto" else gp.DEFAULT_GPU_PROFILE
     profile = gp.GPU_PROFILES[profile_key]
@@ -1160,9 +1192,10 @@ def main() -> int:
                 print(f"[memcheck]   {preset:>8s} @ T={T:<6d} {dt:>4s}  "
                       f"≈ {fp/(1<<30):.2f} GB")
 
-    # Fused vs Standalone (G11 / P1.4) — opt-in. Each variant runs as
-    # a single cell at fixed shape (no load sweep). Shape comes from
-    # CLI (--attn-shape / --mlp-shape, GPT-OSS 120B defaults).
+    # Fused vs Standalone (G11 / P1.4). full/all suites enable this by
+    # default; non-full suites can still opt in with --include-fused. Each
+    # variant runs as a single cell at fixed shape (no load sweep). Shape
+    # comes from CLI (--attn-shape / --mlp-shape, GPT-OSS 120B defaults).
     if args.include_fused:
         try:
             attn_shape = tuple(int(x) for x in args.attn_shape.split(","))
@@ -1184,6 +1217,8 @@ def main() -> int:
         # remain fp16/bf16-only ; G12/P2.4 follow-up will add fp8 paths.
         if args.fused_dtypes is not None:
             fused_dtypes = list(args.fused_dtypes)
+        elif not user_set_dtypes:
+            fused_dtypes = gp.profile_fused_dtypes(profile_key)
         else:
             fused_dtypes = [d for d in args.dtypes if d in ("fp16", "bf16", "fp8")]
             if not fused_dtypes:
@@ -1267,6 +1302,7 @@ def main() -> int:
     # CUDA fault repeats deterministically and we'd just waste time.
     broken_variants: set[tuple[str, str, str, str]] = set()
     fatal_error: str | None = None
+    fused_hint_printed = False
     try:
         for i, plan in enumerate(plans, 1):
             # Skip cells from variants we've already proven broken in this run.
@@ -1354,14 +1390,20 @@ def main() -> int:
                 if fatal:
                     print(f"  !! FATAL CUDA error during build at {label} "
                           f"{plan['load_name']}={plan['load_value']}: {err_msg}")
+                    if plan.get("category") == "fused" and not fused_hint_printed:
+                        _print_fused_failure_hint(err_msg)
+                        fused_hint_printed = True
                     print(f"  !! CUDA context is now unrecoverable — "
                           f"flushing {len(rows)} completed cells to CSV "
                           f"and exiting early. Re-run without the offending "
                           f"variant (e.g. --matmul-variants without fp8:te, "
-                          f"or skip --llm-shapes).")
+                          f"--no-fused, or skip --llm-shapes).")
                     fatal_error = err_msg
                     break
                 print(f"  ! build failed: {err_msg}  — skipped")
+                if plan.get("category") == "fused" and not fused_hint_printed:
+                    _print_fused_failure_hint(err_msg)
+                    fused_hint_printed = True
                 continue
             tag = spec.compute_unit + ("  [EMULATED]" if spec.emulated else "")
             print(f"  compute_unit: {tag}")
@@ -1414,15 +1456,21 @@ def main() -> int:
                 if fatal:
                     print(f"  !! FATAL CUDA error at {label} "
                           f"{plan['load_name']}={plan['load_value']}: {err_msg}")
+                    if plan.get("category") == "fused" and not fused_hint_printed:
+                        _print_fused_failure_hint(err_msg)
+                        fused_hint_printed = True
                     print(f"  !! CUDA context is now unrecoverable — "
                           f"flushing {len(rows)} completed cells to CSV "
                           f"and exiting early. Re-run without the offending "
                           f"variant (e.g. --no-matmul / drop --llm-shapes / "
-                          f"--matmul-variants without fp8:te).")
+                          f"--matmul-variants without fp8:te / --no-fused).")
                     fatal_error = err_msg
                     break  # exit the for-loop; the finally: + post-loop save
                            # still write whatever we accumulated.
                 print(f"  ! run failed: {err_msg}")
+                if plan.get("category") == "fused" and not fused_hint_printed:
+                    _print_fused_failure_hint(err_msg)
+                    fused_hint_printed = True
                 del spec
                 try:
                     torch.cuda.empty_cache()
