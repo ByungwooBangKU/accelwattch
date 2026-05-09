@@ -470,7 +470,11 @@ def _apply_effective_l2_cache_regime(spec: bm.BenchSpec, l2_bytes: int,
     if spec.cache_regime != "unknown" or l2_bytes <= 0:
         return
     try:
-        if spec.op in bm.FLOP_PER_ELEMENT:
+        if spec.path_semantics == "l2_hit_path_probe" or spec.compute_unit == "L2/cache path":
+            ws = int(spec.extra.get("working_set_bytes", 0) or 0)
+            if ws <= 0:
+                return
+        elif spec.op in bm.FLOP_PER_ELEMENT:
             ws = bm._elementwise_working_set(  # noqa: SLF001 - local benchmark metadata helper.
                 spec.op, spec.n_elements, bm._dtype_bytes(spec.dtype_label))
         elif spec.op in ("matmul", "matmul_llm") and len(spec.shape) == 3:

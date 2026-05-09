@@ -75,9 +75,11 @@ class BenchSpec:
     # Cache/locality regime — classified from working-set vs L2 size. Lets the
     # analyser separate L2-bound from DRAM-bound points instead of forcing a
     # single regression line across a regime change.
-    #   "l2_resident"  — working set ≤ L2/2, ≈ 100% L2 hit after iter 1
-    #   "l2_partial"   — working set within [L2/2, 2·L2], thrashing / ~50%
-    #   "dram_stream"  — working set ≥ 2·L2, ≈ 0% L2 hit
+    #   "l2_hit_100"   — working set ≤ L2/4, comfortably L2-resident
+    #   "l2_hit_75"    — L2/4 < working set ≤ L2/2
+    #   "l2_hit_50"    — L2/2 < working set ≤ 2·L2
+    #   "l2_hit_25"    — 2·L2 < working set ≤ 4·L2
+    #   "l2_hit_0"     — working set > 4·L2, DRAM streaming
     #   "unknown"      — L2 size unavailable (legacy rows / non-CUDA)
     cache_regime: str = "unknown"
     # Fine-grained classification of WHAT the measured energy actually
@@ -1587,6 +1589,48 @@ _L2_OPS = ("reg_spin", "l2_read_hit", "l2_write_hit", "l2_copy_hit", "l2_sliding
 _L2_EXT = None
 
 
+def _cuda_target_include_paths() -> list[str]:
+    """Return extra CUDA include dirs needed by conda-packaged toolkits.
+
+    Recent conda CUDA packages can place CCCL headers such as `nv/target`
+    under targets/x86_64-linux/include instead of the top-level include dir.
+    torch.utils.cpp_extension adds CUDA_HOME/include, but not always this
+    target-specific path.
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    roots = []
+    for key in ("CUDA_HOME", "CUDA_PATH", "CONDA_PREFIX"):
+        value = os.environ.get(key)
+        if value:
+            roots.append(value)
+    roots.append(sys.prefix)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        target_include = Path(root) / "targets" / "x86_64-linux" / "include"
+        candidates = [
+            target_include,
+            target_include / "cccl",
+        ]
+        for path in candidates:
+            has_cuda_cccl = (
+                (path / "nv" / "target").exists()
+                or (path / "thrust" / "complex.h").exists()
+                or (path / "cub" / "cub.cuh").exists()
+            )
+            if not has_cuda_cccl:
+                continue
+            s = str(path)
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
+
+
 def _l2_extension():
     """Compile/load the CUDA extension used by build_l2_probe()."""
     global _L2_EXT
@@ -1760,6 +1804,7 @@ void l2_reset_persisting_launcher() {
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src],
         functions=None,
+        extra_include_paths=_cuda_target_include_paths(),
         extra_cuda_cflags=["-O3", "--use_fast_math"],
         verbose=False,
     )
