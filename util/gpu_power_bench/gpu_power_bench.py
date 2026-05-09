@@ -40,6 +40,7 @@ import pynvml
 import torch
 
 import benchmarks as bm
+import gpu_profiles as gp
 from power_monitor import (PowerSampler, measure_static_power,
                             wait_for_cooldown, wait_for_pstate_idle,
                             force_p8_for_measurement,
@@ -342,6 +343,65 @@ def _slugify(name: str) -> str:
     return s or "gpu"
 
 
+def _nvml_value(fn, default=""):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _gpu_spec_snapshot(profile_key: str, profile: dict, observed_profile: str,
+                       profile_status: str, profile_reason: str,
+                       gpu_name: str, cc: tuple[int, int], device: int,
+                       handle, hbm_bytes: int, l2_bytes: int) -> dict:
+    power_limit_w = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0, "")
+    power_min_w = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetPowerManagementLimitConstraints(handle)[0] / 1000.0, "")
+    power_max_w = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetPowerManagementLimitConstraints(handle)[1] / 1000.0, "")
+    sm_max_mhz = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM), "")
+    mem_max_mhz = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM), "")
+    mig_current = ""
+    mig_pending = ""
+    mig_mode = _nvml_value(lambda: pynvml.nvmlDeviceGetMigMode(handle), None)
+    if isinstance(mig_mode, tuple) and len(mig_mode) >= 2:
+        mig_current, mig_pending = mig_mode[0], mig_mode[1]
+
+    observed_cc = f"{cc[0]}.{cc[1]}"
+    return {
+        "gpu_profile": profile_key,
+        "gpu_profile_label": profile.get("label", ""),
+        "gpu_profile_status": profile_status,
+        "gpu_profile_reason": profile_reason,
+        "observed_profile": observed_profile,
+        "gpu": gpu_name,
+        "device": device,
+        "compute_cap": observed_cc,
+        "expected_compute_cap": profile.get("expected_cc", ""),
+        "arch_expected": profile.get("arch", ""),
+        "memory_type_expected": profile.get("memory_type", ""),
+        "memory_capacity_expected_gb": profile.get("memory_capacity_gb", ""),
+        "memory_total_gb": f"{hbm_bytes/(1<<30):.3f}" if hbm_bytes else "",
+        "peak_bw_expected_gbps": profile.get("peak_bw_gbps", ""),
+        "l2_expected_mb": profile.get("l2_mb", ""),
+        "l2_reported_mb": f"{l2_bytes/(1<<20):.3f}" if l2_bytes else "",
+        "power_envelope_expected_w": profile.get("power_envelope_w", ""),
+        "power_limit_w": f"{power_limit_w:.3f}" if isinstance(power_limit_w, (int, float)) else "",
+        "power_limit_min_w": f"{power_min_w:.3f}" if isinstance(power_min_w, (int, float)) else "",
+        "power_limit_max_w": f"{power_max_w:.3f}" if isinstance(power_max_w, (int, float)) else "",
+        "sm_clock_max_mhz": sm_max_mhz,
+        "mem_clock_max_mhz": mem_max_mhz,
+        "mig_mode_current": mig_current,
+        "mig_mode_pending": mig_pending,
+        "native_fp8_headline_allowed": int(gp.native_fp8_headline_allowed(profile_key, observed_cc)),
+        "native_bf16_headline_allowed": int(bool(profile.get("native_bf16", False))),
+        "profile_role": profile.get("role", ""),
+    }
+
+
 def pick_iters(spec: bm.BenchSpec, target_ms: float, ms_per_call: float) -> int:
     """Choose iter count so one measurement window is roughly target_ms long.
 
@@ -418,6 +478,11 @@ def run_measurement(spec: bm.BenchSpec, sampler: PowerSampler,
 
 
 def main() -> int:
+    argv = sys.argv[1:]
+    user_set_dtypes = any(a == "--dtypes" or a.startswith("--dtypes=") for a in argv)
+    user_set_l2_windows = any(a == "--l2-window-mb" or a.startswith("--l2-window-mb=") for a in argv)
+    user_set_l2_delta = any(a == "--l2-delta-kb" or a.startswith("--l2-delta-kb=") for a in argv)
+
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -452,11 +517,18 @@ def main() -> int:
                          "legacy flags (--no-elementwise / --no-matmul / "
                          "--llm-shapes / --dram-bw-test) for back-compat.")
     ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--gpu-profile", choices=gp.profile_choices(),
+                    default=gp.DEFAULT_GPU_PROFILE,
+                    help="experiment profile for GPU-specific defaults and headline gating. "
+                         "Default is h100_sxm because H100 SXM is the primary target.")
+    ap.add_argument("--allow-non-headline", action="store_true",
+                    help="do not filter profile-unsupported dtype/variant choices. "
+                         "Rows still record headline_status=NOT_HEADLINE/PROXY.")
     ap.add_argument("--ops", nargs="+",
                     default=list(bm.OPS),
                     choices=list(bm.OPS))
     ap.add_argument("--dtypes", nargs="+",
-                    default=list(bm.DTYPES),
+                    default=None,
                     choices=list(bm.DTYPES))
     ap.add_argument("--loads", type=int, nargs="+", default=None,
                     help="tensor element counts; default: 256K..256M sweep")
@@ -570,10 +642,10 @@ def main() -> int:
                          "(default: 4 sizes deep into the l2_hit_0 regime)")
     # --- L2/SRAM resident traffic path probe --------------------------------
     ap.add_argument("--l2-window-mb", type=int, nargs="+",
-                    default=[16, 24, 32, 40],
+                    default=None,
                     help="L2 probe working-set windows in MiB. Keep below full "
-                         "L2 to reduce replacement/HBM contamination; H100 "
-                         "default targets 16/24/32/40 MiB.")
+                         "L2 to reduce replacement/HBM contamination. Default "
+                         "comes from --gpu-profile (H100: 16/24/32/40 MiB).")
     ap.add_argument("--l2-repeat-inner", nargs="+", default=["auto"],
                     help="repeat_inner values for the in-kernel loop, or auto. "
                          "auto derives a small R sweep around --l2-target-energy-j "
@@ -584,10 +656,11 @@ def main() -> int:
     ap.add_argument("--l2-k-guess-pj-bit", type=float, default=1.0,
                     help="initial L2-hit path pJ/bit guess for auto R sizing.")
     ap.add_argument("--l2-delta-kb", type=int, nargs="+",
-                    default=[0, 64, 256, 1024, 4096, 8192, 16384],
+                    default=None,
                     help="sliding-window delta sizes in KiB. Delta=0 is the "
                          "L2-resident reference; nonzero deltas are validation, "
-                         "not the primary estimator.")
+                         "not the primary estimator. Default comes from "
+                         "--gpu-profile.")
     ap.add_argument("--l2-cold-pool-gb", type=float, default=4.0,
                     help="cold pool size for l2_sliding_delta (GiB).")
     ap.add_argument("--l2-dtypes", nargs="+", default=["uint32"],
@@ -677,6 +750,15 @@ def main() -> int:
         flags = ", ".join(f"{k}={v}" for k, v in sd.items() if not k.startswith("_"))
         print(f"[suite] '{args.suite}' → {flags or '(no overrides — legacy default)'}")
 
+    profile_key = args.gpu_profile if args.gpu_profile != "auto" else gp.DEFAULT_GPU_PROFILE
+    profile = gp.GPU_PROFILES[profile_key]
+    if args.dtypes is None:
+        args.dtypes = gp.profile_default_dtypes(profile_key)
+    if args.l2_window_mb is None:
+        args.l2_window_mb = gp.profile_l2_windows_mb(profile_key)
+    if args.l2_delta_kb is None:
+        args.l2_delta_kb = gp.profile_l2_delta_kb(profile_key)
+
     # ---- Resolve which test cases to actually run ---------------------
     # Order of precedence:
     #   1. --cases X Y Z          (explicit; overrides legacy flags)
@@ -751,6 +833,48 @@ def main() -> int:
     cc = torch.cuda.get_device_capability(args.device)
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     handle, nvml_resolution = resolve_nvml_handle(args.device)
+    observed_cc = f"{cc[0]}.{cc[1]}"
+    resolved_key, resolved_profile, observed_profile, observed_reason = gp.resolve_gpu_profile(
+        args.gpu_profile, gpu_name, observed_cc)
+    if args.gpu_profile == "auto" and resolved_key != profile_key:
+        profile_key = resolved_key
+        profile = resolved_profile
+        if not user_set_dtypes:
+            args.dtypes = gp.profile_default_dtypes(profile_key)
+        if not user_set_l2_windows:
+            args.l2_window_mb = gp.profile_l2_windows_mb(profile_key)
+        if not user_set_l2_delta:
+            args.l2_delta_kb = gp.profile_l2_delta_kb(profile_key)
+    profile_status, profile_status_reason = gp.profile_cc_status(profile_key, observed_cc)
+    profile_reason = "; ".join(x for x in (observed_reason, profile_status_reason) if x)
+    if profile_reason:
+        print(f"[profile] WARN {profile_reason}")
+
+    kept_dtypes, dropped_dtypes = gp.filter_with_profile(
+        list(args.dtypes), gp.profile_default_dtypes(profile_key),
+        label="--dtypes", allow_non_headline=args.allow_non_headline)
+    if dropped_dtypes:
+        print(f"[profile] dropped non-headline --dtypes for {profile_key}: {dropped_dtypes} "
+              f"(use --allow-non-headline to keep them)")
+    args.dtypes = kept_dtypes
+
+    kept_variants, dropped_variants = gp.filter_with_profile(
+        matmul_variants, gp.profile_matmul_variants(profile_key),
+        label="--matmul-variants", allow_non_headline=args.allow_non_headline)
+    if dropped_variants:
+        dropped_fmt = [f"{d}:{m}" for d, m in dropped_variants]
+        print(f"[profile] dropped non-headline --matmul-variants for {profile_key}: "
+              f"{dropped_fmt} (use --allow-non-headline to keep them)")
+    matmul_variants = kept_variants
+    soc_variant = (args.soc_dtype, args.soc_mode)
+    if "soc" in cases and not args.allow_non_headline:
+        allowed_soc = gp.profile_matmul_variants(profile_key)
+        if soc_variant not in allowed_soc:
+            fallback = ("fp16", "tc") if ("fp16", "tc") in allowed_soc else allowed_soc[0]
+            print(f"[profile] changed non-headline SoC GEMM {args.soc_dtype}:{args.soc_mode} "
+                  f"to {fallback[0]}:{fallback[1]} for {profile_key} "
+                  f"(use --allow-non-headline to keep it)")
+            args.soc_dtype, args.soc_mode = fallback
     if "by index" in nvml_resolution and cvd:
         print(f"[warn] CUDA_VISIBLE_DEVICES={cvd!r} is set but we could not "
               f"resolve the GPU by PCI bus id / UUID — NVML reads may target "
@@ -758,6 +882,8 @@ def main() -> int:
               f"without CUDA_VISIBLE_DEVICES, or upgrade torch.")
     gpu_slug = _slugify(gpu_name)
     print(f"\n[info] GPU={gpu_name}  cc={cc[0]}.{cc[1]}  slug={gpu_slug}")
+    print(f"[profile] requested={args.gpu_profile}  active={profile_key} "
+          f"({gp.profile_label(profile_key)})  status={profile_status}")
     print(f"[info] NVML handle resolved {nvml_resolution}"
           + (f"  (CUDA_VISIBLE_DEVICES={cvd})" if cvd else ""))
     print(f"[info] ops={args.ops}  dtypes={args.dtypes}  loads={loads}")
@@ -828,6 +954,12 @@ def main() -> int:
         print(f"[info] HBM total: {hbm_bytes/(1<<30):.1f} GB "
               f"(per-cell budget: {int(_MEM_SAFETY_FRACTION*100)}% = "
               f"{hbm_bytes*_MEM_SAFETY_FRACTION/(1<<30):.1f} GB)")
+    spec_snapshot = _gpu_spec_snapshot(
+        profile_key, profile, observed_profile, profile_status, profile_reason,
+        gpu_name, cc, args.device, handle, hbm_bytes, l2_bytes)
+    print(f"[profile] expected memory={profile.get('memory_type')} "
+          f"{profile.get('memory_capacity_gb')}GB, expected L2={profile.get('l2_mb')}MB, "
+          f"power envelope={profile.get('power_envelope_w')}W")
     safe_loads = _filter_loads(loads, list(args.ops), list(args.dtypes), hbm_bytes)
     if "elementwise" in cases:
         for dtype in args.dtypes:
@@ -991,6 +1123,13 @@ def main() -> int:
                     print(f"bad --llm-dtypes entry {v!r} (expected dtype:mode)")
                     return 1
                 llm_dtypes.append(tuple(parts))
+        llm_dtypes, dropped_llm_dtypes = gp.filter_with_profile(
+            llm_dtypes, gp.profile_llm_dtypes(profile_key),
+            label="--llm-dtypes", allow_non_headline=args.allow_non_headline)
+        if dropped_llm_dtypes:
+            dropped_fmt = [f"{d}:{m}" for d, m in dropped_llm_dtypes]
+            print(f"[profile] dropped non-headline --llm-dtypes for {profile_key}: "
+                  f"{dropped_fmt} (use --allow-non-headline to keep them)")
         budget = int(hbm_bytes * _MEM_SAFETY_FRACTION) if hbm_bytes > 0 else 0
         dropped_llm: list[tuple[str, int, str, int]] = []
         for dtype_label, mode in llm_dtypes:
@@ -1051,6 +1190,12 @@ def main() -> int:
         if unsupported:
             print(f"[error] fused only supports fp16/bf16/fp8; got {unsupported}.")
             return 1
+        fused_dtypes, dropped_fused_dtypes = gp.filter_with_profile(
+            fused_dtypes, gp.profile_fused_dtypes(profile_key),
+            label="--fused-dtypes", allow_non_headline=args.allow_non_headline)
+        if dropped_fused_dtypes:
+            print(f"[profile] dropped non-headline --fused-dtypes for {profile_key}: "
+                  f"{dropped_fused_dtypes} (use --allow-non-headline to keep them)")
         n_fused_cells = 0
         for dtype in fused_dtypes:
             for variant in bm.FUSED_VARIANTS:
@@ -1302,10 +1447,36 @@ def main() -> int:
 
             total_elements = spec.n_elements * meas["iters"]
             total_flops = spec.flops_per_call * meas["iters"]
+            headline_eligible, headline_status, headline_reason = gp.headline_status(
+                profile_key,
+                category=plan["category"],
+                op=plan["op"],
+                dtype=plan["dtype"],
+                mode=plan["mode"],
+                compute_unit=spec.compute_unit,
+                emulated=bool(spec.emulated),
+                observed_cc=observed_cc,
+            )
 
             row = {
                 "gpu": gpu_name,
                 "compute_cap": f"{cc[0]}.{cc[1]}",
+                "gpu_profile": profile_key,
+                "gpu_profile_status": profile_status,
+                "gpu_profile_reason": profile_reason,
+                "observed_profile": observed_profile,
+                "memory_type_expected": spec_snapshot.get("memory_type_expected", ""),
+                "memory_capacity_expected_gb": spec_snapshot.get("memory_capacity_expected_gb", ""),
+                "memory_total_gb": spec_snapshot.get("memory_total_gb", ""),
+                "peak_bw_expected_gbps": spec_snapshot.get("peak_bw_expected_gbps", ""),
+                "l2_expected_mb": spec_snapshot.get("l2_expected_mb", ""),
+                "l2_reported_mb": spec_snapshot.get("l2_reported_mb", ""),
+                "power_envelope_expected_w": spec_snapshot.get("power_envelope_expected_w", ""),
+                "power_limit_w": spec_snapshot.get("power_limit_w", ""),
+                "native_fp8_headline_allowed": spec_snapshot.get("native_fp8_headline_allowed", ""),
+                "headline_eligible": headline_eligible,
+                "headline_status": headline_status,
+                "headline_reason": headline_reason,
                 "category": plan["category"],
                 "op": plan["op"],
                 "dtype": plan["dtype"],
@@ -1488,6 +1659,14 @@ def main() -> int:
         else:
             print("\n[warn] no rows collected — nothing saved")
             return 2
+
+    spec_path = out_dir / f"gpu_power_bench_{gpu_slug}_{stamp}{suffix}_gpu_spec_snapshot.csv"
+    with open(spec_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "value"])
+        for k, v in spec_snapshot.items():
+            w.writerow([k, v])
+    print(f"[save] {spec_path}")
 
     # ---- clip-bias report ------------------------------------------------
     # Tells the user how often the dyn = max(0, raw) clip fired. Frequent
