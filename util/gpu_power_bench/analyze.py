@@ -4543,6 +4543,10 @@ def _resolve_csv(args) -> Path | None:
         "_samples.csv", "_summary.csv", "_rebaseline.csv",
         "_summary_by_regime.csv",
         "_dram_rw_split.csv", "_dram_marginal.csv",
+        "_02_l2_refill_summary.csv",
+        "_02_l2_refill_fit_points.csv",
+        "_02_l2_refill_validation_summary.csv",
+        "_02_l2_refill_skip_reasons.csv",
     )
     patterns = []
     if args.tag:
@@ -4615,6 +4619,11 @@ def compute_l2_energy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         empty = pd.DataFrame()
         return empty, empty, empty, empty, empty
     l2 = df[df["category"] == "l2"].copy()
+    if "subcase" in l2.columns:
+        l2 = l2[l2["subcase"].fillna("").astype(str) != "refill"].copy()
+    if l2.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, empty
     for c in ["dyn_energy_j", "iters", "working_set_bytes", "repeat_inner",
               "delta_bytes", "estimated_l2_read_bits", "estimated_l2_write_bits",
               "estimated_l2_total_bits", "estimated_hbm_refill_bits"]:
@@ -4839,6 +4848,306 @@ def plot_l2_analysis(summary: pd.DataFrame, perw: pd.DataFrame, pts: pd.DataFram
         ax.grid(True, axis="y", alpha=0.3)
         _save_fig(fig, out_dir / f"{stem}_02_l2_sliding_delta_validation.png")
 
+
+def compute_l2_refill_energy(
+    df: pd.DataFrame,
+    *,
+    counter_df: pd.DataFrame | None = None,
+    hbm_interface_pj_bit: float | None = None,
+    boundary_assumption: str = "",
+    l2_summary: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return refill summary, fit points, validation, and skip tables.
+
+    The fit uses pair-normalized totals: hot/cold rows may have different
+    outer iteration counts, so each pair is reduced to per-outer-call energy
+    first and then re-expanded to the common iteration count. This preserves
+    the slope while preventing mismatched total energies from being subtracted.
+    """
+    empty = pd.DataFrame()
+    if "category" not in df or "op" not in df:
+        return empty, empty, empty, empty
+    refill_ops = {"l2_refill_reg_spin", "l2_prefetch_hot", "l2_prefetch_cold"}
+    l2 = df[(df["category"] == "l2") & (df["op"].isin(refill_ops))].copy()
+    if "subcase" in df.columns:
+        l2 = df[(df["category"] == "l2")
+                & ((df["subcase"].fillna("").astype(str) == "refill")
+                   | (df["op"].isin(refill_ops)))].copy()
+    if l2.empty:
+        return empty, empty, empty, empty
+
+    for c in ["dyn_energy_j", "iters", "working_set_bytes", "repeat_inner",
+              "estimated_hbm_refill_bits", "estimated_prefetch_bits",
+              "estimated_l2_fill_bits", "prefetch_line_bytes",
+              "prefetched_lines", "cold_pool_bytes"]:
+        if c not in l2:
+            l2[c] = np.nan
+        l2[c] = pd.to_numeric(l2[c], errors="coerce")
+    for c in ["pair_id", "ptx_instruction", "path_semantics", "kernel_version"]:
+        if c not in l2:
+            l2[c] = ""
+        l2[c] = l2[c].fillna("").astype(str)
+    missing_pair = l2["pair_id"].str.len() == 0
+    l2.loc[missing_pair, "pair_id"] = (
+        "W" + l2.loc[missing_pair, "working_set_bytes"].fillna(0).astype(int).astype(str)
+        + "_R" + l2.loc[missing_pair, "repeat_inner"].fillna(0).astype(int).astype(str)
+        + "_" + l2.loc[missing_pair, "ptx_instruction"])
+
+    l2["dyn_per_outer_j"] = l2["dyn_energy_j"] / l2["iters"].replace(0, np.nan)
+    l2["hbm_bits_per_outer"] = l2["estimated_hbm_refill_bits"] / l2["iters"].replace(0, np.nan)
+    l2["prefetch_bits_per_outer"] = l2["estimated_prefetch_bits"] / l2["iters"].replace(0, np.nan)
+
+    fit_rows = []
+    skip_rows = []
+    for pair_id, g in l2.groupby("pair_id", dropna=False):
+        hot = g[g["op"] == "l2_prefetch_hot"]
+        cold = g[g["op"] == "l2_prefetch_cold"]
+        reg = g[g["op"] == "l2_refill_reg_spin"]
+        base = g.iloc[0]
+        if hot.empty or cold.empty:
+            missing = []
+            if hot.empty:
+                missing.append("l2_prefetch_hot")
+            if cold.empty:
+                missing.append("l2_prefetch_cold")
+            reason = "missing " + ",".join(missing)
+            skip_rows.append({
+                "pair_id": pair_id, "op": "*", "reason": reason,
+                "details": "hot/cold pair is required for refill delta",
+                "suggested_fix": "rerun --cases l2 --l2-refill-test with complete pair rows",
+            })
+            continue
+        hot_r = hot.iloc[0]
+        cold_r = cold.iloc[0]
+        reg_r = reg.iloc[0] if not reg.empty else None
+        common_iters_f = np.nanmin([hot_r.get("iters", np.nan), cold_r.get("iters", np.nan)])
+        if not np.isfinite(common_iters_f) or common_iters_f <= 0:
+            common_iters = 1
+        else:
+            common_iters = int(common_iters_f)
+        hot_per = float(hot_r.get("dyn_per_outer_j", np.nan))
+        cold_per = float(cold_r.get("dyn_per_outer_j", np.nan))
+        reg_per = float(reg_r.get("dyn_per_outer_j", np.nan)) if reg_r is not None else np.nan
+        bits_per = float(cold_r.get("hbm_bits_per_outer", np.nan))
+        if not np.isfinite(bits_per) or bits_per <= 0:
+            bits_per = float(cold_r.get("prefetch_bits_per_outer", np.nan))
+        e_delta = (cold_per - hot_per) * common_iters
+        x_bits = bits_per * common_iters
+        status = "PASS"
+        reason = ""
+        if not (np.isfinite(e_delta) and np.isfinite(x_bits)):
+            status, reason = "FAIL", "non-finite delta or bits"
+        elif e_delta <= 0:
+            status, reason = "FAIL", "E_cold - E_hot <= 0"
+        elif x_bits <= 0:
+            status, reason = "FAIL", "estimated refill bits <= 0"
+        elif e_delta < 5.0:
+            status, reason = "LOW_CONF", "E_cold - E_hot < 5 J"
+        fit_rows.append({
+            "pair_id": pair_id,
+            "working_set_bytes": cold_r.get("working_set_bytes", base.get("working_set_bytes", np.nan)),
+            "repeat_inner": cold_r.get("repeat_inner", base.get("repeat_inner", np.nan)),
+            "prefetch_line_bytes": cold_r.get("prefetch_line_bytes", base.get("prefetch_line_bytes", np.nan)),
+            "ptx_instruction": cold_r.get("ptx_instruction", base.get("ptx_instruction", "")),
+            "path_semantics": cold_r.get("path_semantics", base.get("path_semantics", "")),
+            "estimated_prefetch_bits": cold_r.get("estimated_prefetch_bits", np.nan),
+            "estimated_hbm_refill_bits": cold_r.get("estimated_hbm_refill_bits", np.nan),
+            "E_reg_j": reg_per * common_iters if np.isfinite(reg_per) else np.nan,
+            "E_hot_j": hot_per * common_iters,
+            "E_cold_j": cold_per * common_iters,
+            "E_cold_minus_hot_j": e_delta,
+            "x_bits_used_for_fit": x_bits,
+            "fit_weight": common_iters,
+            "common_outer_iters": common_iters,
+            "status": status,
+            "skip_reason": reason,
+        })
+        if status == "FAIL":
+            skip_rows.append({
+                "pair_id": pair_id, "op": "l2_prefetch_cold/l2_prefetch_hot",
+                "reason": reason, "details": f"E_delta={e_delta}, x_bits={x_bits}",
+                "suggested_fix": "increase --l2-refill-target-energy-j/repeat_inner, ensure clean P8 baseline, attach counters",
+            })
+
+    fit = pd.DataFrame(fit_rows)
+    skips = pd.DataFrame(skip_rows)
+    if fit.empty:
+        return empty, fit, empty, skips
+    valid = fit[fit["status"].isin(["PASS", "LOW_CONF"])].copy()
+    valid = valid[(pd.to_numeric(valid["x_bits_used_for_fit"], errors="coerce") > 0)
+                  & (pd.to_numeric(valid["E_cold_minus_hot_j"], errors="coerce") > 0)]
+
+    validation_rows = []
+    counter_attached = counter_df is not None and not counter_df.empty
+    if counter_attached and "pair_id" in counter_df.columns:
+        for pair_id, g in counter_df.groupby("pair_id"):
+            row = {"pair_id": pair_id, "status": "INFO", "reason": "counter row attached"}
+            for c in ["ncu_l2_sectors_hot", "ncu_l2_sectors_cold",
+                      "ncu_device_sectors_hot", "ncu_device_sectors_cold",
+                      "logical_to_l2_sector_error_pct",
+                      "cold_device_sector_linearity_r2",
+                      "hot_device_sector_leakage_pct"]:
+                if c in g:
+                    row[c] = pd.to_numeric(g[c], errors="coerce").median()
+            validation_rows.append(row)
+    elif counter_attached:
+        validation_rows.append({
+            "pair_id": "*", "status": "LOW_CONF",
+            "reason": "counter CSV attached but has no pair_id column; skipped join",
+        })
+    validation = pd.DataFrame(validation_rows)
+
+    l2_fill_proxy = np.nan
+    if l2_summary is not None and not l2_summary.empty:
+        row = l2_summary.iloc[0]
+        for c in ("k_l2_write_pj_per_bit", "k_l2_copy_effective_pj_per_bit"):
+            try:
+                v = float(row.get(c, np.nan))
+            except Exception:
+                v = np.nan
+            if np.isfinite(v):
+                l2_fill_proxy = v
+                break
+
+    if len(valid) >= 2 and valid["x_bits_used_for_fit"].nunique() >= 2:
+        x = valid["x_bits_used_for_fit"].to_numpy(float)
+        y = valid["E_cold_minus_hot_j"].to_numpy(float)
+        slope, intercept, r2 = linear_fit(x, y)
+        ci_lo, ci_hi = _bootstrap_slope_ci(x, y)
+    else:
+        slope = intercept = r2 = ci_lo = ci_hi = np.nan
+
+    k_refill = slope * 1e12 if np.isfinite(slope) else np.nan
+    ci_lo_pj = ci_lo * 1e12 if np.isfinite(ci_lo) else np.nan
+    ci_hi_pj = ci_hi * 1e12 if np.isfinite(ci_hi) else np.nan
+    residual = np.nan
+    derived_status = ""
+    if hbm_interface_pj_bit is not None and np.isfinite(k_refill) and np.isfinite(l2_fill_proxy):
+        residual = k_refill - float(hbm_interface_pj_bit) - l2_fill_proxy
+        derived_status = "LOW_CONF" if residual < 0 else "PROXY"
+    elif hbm_interface_pj_bit is not None:
+        derived_status = "MISSING_INPUT"
+
+    status = "PASS"
+    reasons = []
+    if len(valid) < 3:
+        status = "FAIL"; reasons.append("n_points < 3")
+    if not np.isfinite(k_refill) or k_refill <= 0:
+        status = "FAIL"; reasons.append("non-positive or missing slope")
+    if np.isfinite(r2) and r2 < 0.80:
+        status = "FAIL"; reasons.append("R2 < 0.80")
+    elif np.isfinite(r2) and r2 < 0.95 and status != "FAIL":
+        status = "LOW_CONF"; reasons.append("R2 < 0.95")
+    mean_delta = float(valid["E_cold_minus_hot_j"].mean()) if not valid.empty else np.nan
+    if np.isfinite(mean_delta) and mean_delta < 5.0 and status != "FAIL":
+        status = "LOW_CONF"; reasons.append("mean delta < 5 J")
+    if not counter_attached and status != "FAIL":
+        status = "LOW_CONF"; reasons.append("counter CSV not attached")
+    if np.isfinite(ci_lo_pj) and np.isfinite(ci_hi_pj) and np.isfinite(k_refill) and k_refill:
+        ci_width_pct = (ci_hi_pj - ci_lo_pj) / abs(k_refill) * 100.0
+        if ci_width_pct > 50 and status != "FAIL":
+            status = "LOW_CONF"; reasons.append("CI width > 50%")
+    else:
+        ci_width_pct = np.nan
+    if np.isfinite(residual) and residual < 0 and status == "PASS":
+        status = "LOW_CONF"; reasons.append("derived residual < 0")
+
+    summary = pd.DataFrame([{
+        "gpu": l2["gpu"].iloc[0] if "gpu" in l2 and not l2.empty else "",
+        "source_csv": "",
+        "status": status,
+        "headline_source": "counter_validated" if counter_attached else "logical_estimate_PROVISIONAL",
+        "k_hbm_to_l2_refill_path_pj_bit": k_refill,
+        "k_hbm_to_l2_refill_ci_lo": ci_lo_pj,
+        "k_hbm_to_l2_refill_ci_hi": ci_hi_pj,
+        "r2": r2,
+        "n_points": len(valid),
+        "mean_delta_energy_j": mean_delta,
+        "ci_width_pct": ci_width_pct,
+        "hbm_interface_pj_bit_assumption": hbm_interface_pj_bit if hbm_interface_pj_bit is not None else np.nan,
+        "l2_fill_proxy_pj_bit": l2_fill_proxy,
+        "k_soc_hbm_phy_to_l2_fill_proxy_pj_bit": residual,
+        "derived_proxy_status": derived_status,
+        "boundary_assumption": boundary_assumption,
+        "counter_attached": int(counter_attached),
+        "notes": "; ".join(reasons),
+    }])
+    return summary, fit, validation, skips
+
+
+def plot_l2_refill_analysis(summary: pd.DataFrame, fit: pd.DataFrame,
+                            validation: pd.DataFrame, out_dir: Path,
+                            stem: str, gpu: str) -> None:
+    if summary.empty:
+        return
+    plt = _get_mpl()
+    valid = fit[fit["status"].isin(["PASS", "LOW_CONF"])].copy() if not fit.empty else pd.DataFrame()
+    if not valid.empty:
+        x = pd.to_numeric(valid["x_bits_used_for_fit"], errors="coerce")
+        y = pd.to_numeric(valid["E_cold_minus_hot_j"], errors="coerce")
+        ok = x.notna() & y.notna() & (x > 0) & (y > 0)
+        if ok.any():
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.scatter(x[ok] / 1e12, y[ok], s=42, color="#1f77b4")
+            if ok.sum() >= 2 and x[ok].nunique() >= 2:
+                slope, intercept, r2 = linear_fit(x[ok].to_numpy(float), y[ok].to_numpy(float))
+                xx = np.linspace(float(x[ok].min()), float(x[ok].max()), 100)
+                ax.plot(xx / 1e12, intercept + slope * xx, color="#d62728",
+                        label=f"{slope*1e12:.3g} pJ/bit, R²={r2:.3f}")
+                ax.legend(fontsize=8)
+            ax.set_xlabel("logical cold-prefetched bits used for fit (Tbit)")
+            ax.set_ylabel("E_cold - E_hot (J)")
+            ax.set_title(f"HBM-to-L2 refill proxy cold-hot fit — {gpu}\n"
+                         "Measured proxy; counter validation required for headline use.")
+            ax.grid(True, alpha=0.3)
+            _save_fig(fig, out_dir / f"{stem}_02_l2_refill_cold_hot_fit.png")
+
+    row = summary.iloc[0]
+    vals = [
+        row.get("k_hbm_to_l2_refill_path_pj_bit", np.nan),
+        row.get("hbm_interface_pj_bit_assumption", np.nan),
+        row.get("l2_fill_proxy_pj_bit", np.nan),
+        row.get("k_soc_hbm_phy_to_l2_fill_proxy_pj_bit", np.nan),
+    ]
+    labels = ["measured\nHBM-to-L2", "assumed\nHBM interface", "L2 fill\nproxy", "derived\nresidual"]
+    if any(np.isfinite(pd.to_numeric(pd.Series(vals), errors="coerce"))):
+        fig, ax = plt.subplots(figsize=(8, 5))
+        xs = np.arange(len(vals))
+        ax.bar(xs, vals, color=["#1f77b4", "#999999", "#ff7f0e", "#2ca02c"])
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xticks(xs); ax.set_xticklabels(labels)
+        ax.set_ylabel("pJ / bit")
+        ax.set_title("L2 refill path breakdown\n"
+                     "Residual is assumption-dependent, not a direct measurement.")
+        ax.grid(True, axis="y", alpha=0.3)
+        _save_fig(fig, out_dir / f"{stem}_02_l2_refill_path_breakdown.png")
+
+    q_labels = ["status", "counter", "n", "R2", "mean ΔJ", "CI width"]
+    q_vals = [
+        1 if str(row.get("status", "")) == "PASS" else 0,
+        int(row.get("counter_attached", 0) or 0),
+        min(float(row.get("n_points", 0) or 0) / 4.0, 1.0),
+        min(max(float(row.get("r2", 0) or 0), 0.0), 1.0) if np.isfinite(row.get("r2", np.nan)) else 0,
+        min(float(row.get("mean_delta_energy_j", 0) or 0) / 10.0, 1.0),
+        1.0 - min(float(row.get("ci_width_pct", 100) or 100) / 50.0, 1.0),
+    ]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(np.arange(len(q_vals)), q_vals, color="#9467bd")
+    ax.set_ylim(0, 1.05)
+    ax.set_xticks(np.arange(len(q_vals))); ax.set_xticklabels(q_labels)
+    ax.set_ylabel("quality score proxy")
+    ax.set_title(f"L2 refill quality dashboard — {gpu}\nstatus={row.get('status')} ; {row.get('notes', '')}")
+    ax.grid(True, axis="y", alpha=0.3)
+    _save_fig(fig, out_dir / f"{stem}_02_l2_refill_quality_dashboard.png")
+
+    if not validation.empty:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.axis("off")
+        txt = validation.head(8).to_string(index=False)
+        ax.text(0.01, 0.98, txt, family="monospace", va="top", fontsize=8)
+        ax.set_title("L2 refill counter validation summary")
+        _save_fig(fig, out_dir / f"{stem}_02_l2_refill_counter_validation.png")
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Analyse a gpu_power_bench CSV into plots + a summary.",
@@ -4866,6 +5175,15 @@ def main() -> int:
                          "on pre-Hopper) is ALWAYS shown regardless of this "
                          "flag, because its number — which should coincide "
                          "with matmul_fp16_tc — is a useful sanity check.")
+    ap.add_argument("--ncu-counter-csv", type=Path, default=None,
+                    help="optional Nsight Compute CSV for L2 refill counter validation. "
+                         "Power and counter runs should be separate.")
+    ap.add_argument("--hbm-interface-pj-bit", type=float, default=None,
+                    help="assumed literature/interface pJ/bit used only for the "
+                         "derived SoC-side HBM PHY -> L2 residual proxy.")
+    ap.add_argument("--hbm-boundary-assumption", type=str, default="",
+                    help="free-form text describing the HBM literature boundary "
+                         "used with --hbm-interface-pj-bit.")
     args = ap.parse_args()
 
     csv_path = _resolve_csv(args)
@@ -5185,6 +5503,43 @@ def main() -> int:
                     "k_l2_write_pj_per_bit", "k_l2_copy_effective_pj_per_bit",
                     "copy_error_pct", "per_window_iqr_pct", "status", "reason"]
             print(l2_summary[[c for c in cols if c in l2_summary.columns]].to_string(index=False))
+
+    counter_df = None
+    if args.ncu_counter_csv is not None:
+        try:
+            counter_df = pd.read_csv(args.ncu_counter_csv)
+        except Exception as e:
+            print(f"[warn] could not read --ncu-counter-csv {args.ncu_counter_csv}: {e}")
+
+    # HBM -> L2 refill path proxy.  This is intentionally separate from the
+    # resident-L2 estimate above because it subtracts hot/cold prefetch pairs.
+    refill_summary, refill_points, refill_validation, refill_skips = compute_l2_refill_energy(
+        df,
+        counter_df=counter_df,
+        hbm_interface_pj_bit=args.hbm_interface_pj_bit,
+        boundary_assumption=args.hbm_boundary_assumption,
+        l2_summary=l2_summary,
+    )
+    if not refill_summary.empty:
+        for name, table in (("l2_refill_summary", refill_summary),
+                            ("l2_refill_fit_points", refill_points),
+                            ("l2_refill_validation_summary", refill_validation),
+                            ("l2_refill_skip_reasons", refill_skips)):
+            if table is not None and not table.empty:
+                path = out_dir / f"{stem}_02_{name}.csv"
+                table.to_csv(path, index=False)
+                print(f"[save] {path}")
+        plot_l2_refill_analysis(refill_summary, refill_points, refill_validation,
+                                out_dir, stem, gpu)
+        print("\n== HBM -> L2 refill path proxy ==")
+        print("    Caveat: cold-hot prefetch delta; SoC-side residual is assumption-dependent.")
+        with pd.option_context("display.width", 180,
+                               "display.float_format", lambda v: f"{v:.3f}"):
+            cols = ["k_hbm_to_l2_refill_path_pj_bit", "k_hbm_to_l2_refill_ci_lo",
+                    "k_hbm_to_l2_refill_ci_hi", "r2",
+                    "k_soc_hbm_phy_to_l2_fill_proxy_pj_bit",
+                    "status", "notes"]
+            print(refill_summary[[c for c in cols if c in refill_summary.columns]].to_string(index=False))
 
     # LLM-shape matmul — 2 separate PNGs (J/FLOP-vs-T + per-call energy).
     plot_llm_matmul(plot_df, out_dir, stem, gpu)

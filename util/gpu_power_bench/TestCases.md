@@ -11,7 +11,7 @@ A. Workload 실험   (gpu_power_bench.py)   ─── per-cell J / W / k_op coef
    ├── A.3 Square matmul                  5 variant × 9 K-size
    ├── A.4 LLM-shape matmul               8 preset × 5 token × M variant
    ├── A.5 Fused vs Standalone            6 variant × profile dtype  [full/all 기본 포함]
-   └── A.6 L2/SRAM resident traffic probe custom CUDA kernels × W/R/Δ sweep
+   └── A.6 L2/SRAM resident + HBM→L2 refill probes custom CUDA kernels × W/R/Δ sweep
 
 B. SoC envelope     (soc_power_bench.py)  ─── static / max / leakage 3 점
    ├── B.1 Static (idle baseline)
@@ -324,6 +324,48 @@ l2_policy, block_size, grid_size, kernel_version, cold_pool_bytes
 | `_02_l2_read_write_split.png` | copy measured vs implied |
 | `_02_l2_sliding_delta_validation.png` | Δ slope validation proxy |
 
+#### A.6.2 HBM→L2 refill proxy (`category = l2`, `subcase = refill`)
+
+목적은 기존 L2-hit coefficient와 별도로, cold/hot prefetch 차분을 사용해
+`HBM-to-L2 refill path pJ/bit`를 추정하는 것이다. 이는 순수 HBM cell, 순수
+SoC-side PHY, 순수 L2 SRAM bit-cell energy가 아니라 board-level cold-hot proxy다.
+
+| op | 역할 | logical traffic | 해석 |
+|---|---|---|---|
+| `l2_refill_reg_spin` | memory traffic 없는 baseline | 0 | loop/control overhead 품질 검증 |
+| `l2_prefetch_hot` | warm L2 window prefetch | `W × repeat_inner` | prefetch instruction + hot L2 behavior |
+| `l2_prefetch_cold` | cold pool에서 L2 miss 유도 | `W × repeat_inner` | HBM→L2 refill path proxy |
+
+추가 입력 파라미터:
+
+| flag | H100 기본 | RTX3090 기본 | 비고 |
+|---|---:|---:|---|
+| `--l2-refill-test` | off | off | refill subcase 활성화 |
+| `--l2-refill-window-mb` | `16 24 32 40` | `1 2 3 4` | profile default 사용 가능 |
+| `--l2-refill-cold-pool-gb` | `4` | `2` | cold offset 순환용 pool |
+| `--l2-refill-repeat-inner` | `auto` | `auto` | target energy 기반 |
+| `--l2-refill-target-energy-j` | `10.0` | `10.0` | cold-hot delta 권장 signal |
+| `--l2-refill-k-guess-pj-bit` | `3.0` | `6.0` | auto sizing 초기값 |
+| `--l2-refill-line-bytes` | `128` | `128` | logical requested line bytes |
+| `--l2-refill-ptx` | `cp_async_bulk_prefetch_l2` | `prefetch_global_l2` | H100/RTX3090 경로 분리 |
+
+H100은 `h100_sxm` 또는 `h100_pcie` profile을 사용한다. RTX3090은 Ampere `sm_86`이라
+`cp_async_bulk_prefetch_l2`를 headline 경로로 사용할 수 없고, `prefetch_global_l2`
+fallback 결과로 별도 표시한다. `ldcg` fallback은 SM load path까지 포함하므로
+smoke/fallback row로만 해석한다.
+
+`analyze.py`는 다음 refill sidecar/plot을 추가로 생성한다.
+
+| 파일 | 내용 |
+|---|---|
+| `_02_l2_refill_summary.csv` | HBM→L2 refill pJ/bit, derived residual, status |
+| `_02_l2_refill_fit_points.csv` | hot/cold pair별 delta와 fit input |
+| `_02_l2_refill_validation_summary.csv` | optional NCU sector validation |
+| `_02_l2_refill_skip_reasons.csv` | 제외 pair와 suggested fix |
+| `_02_l2_refill_cold_hot_fit.png` | cold-hot delta fit |
+| `_02_l2_refill_path_breakdown.png` | measured proxy와 assumption-dependent residual |
+| `_02_l2_refill_quality_dashboard.png` | signal/fit 품질 요약 |
+
 #### 분석 caveat
 
 Counter CSV가 없는 power-only 분석은 `headline_source=logical_estimate_PROVISIONAL`로 표시한다. Nsight Compute sector counter run은 power run과 분리해야 한다. profiling replay/cache/clock control이 power 측정을 왜곡할 수 있기 때문이다.
@@ -448,6 +490,8 @@ Counter CSV가 없는 power-only 분석은 `headline_source=logical_estimate_PRO
 ./run_bench.sh --suite full --no-fused --tag h100_base # fused dependency debug용 opt-out
 ./run_bench.sh --suite soc  --device 0 --tag h100   # SoC 만 (~5분)
 ./run_bench.sh --suite l2   --device 0 --tag h100_l2 # L2/SRAM path probe
+./run_bench.sh --cases l2 --l2-refill-test --gpu-profile h100_sxm --l2-refill-ptx cp_async_bulk_prefetch_l2 --tag h100_refill
+./run_bench.sh --cases l2 --l2-refill-test --gpu-profile rtx3090 --l2-refill-ptx prefetch_global_l2 --tag rtx3090_refill
 
 # Cases 직접 조합
 ./run_bench.sh --cases dram soc --device 0 --tag h100_mem

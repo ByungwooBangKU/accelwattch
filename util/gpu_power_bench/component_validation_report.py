@@ -4,8 +4,8 @@
 This is intentionally a post-processing tool. It does not run benchmarks and
 does not change the measurement path. It consumes gpu_power_bench CSVs and
 analysis sidecars, then emits the cross-GPU tables/plots needed to check that
-RTX 3090, A100 SXM, and H100 SXM results are interpreted with the right memory,
-L2, power-envelope, and FP8 assumptions.
+RTX 3090, A100 SXM, H100 SXM, and H100 PCIe results are interpreted with the
+right memory, L2, power-envelope, and FP8 assumptions.
 
 Tables are written to --out-dir. PNGs are written to --image-dir with
 category-numbered filenames so reports stay stable across runs.
@@ -47,6 +47,10 @@ SIDECAR_SUFFIXES = (
     "_02_l2_fit_points.csv",
     "_02_l2_validation_summary.csv",
     "_02_l2_skip_reasons.csv",
+    "_02_l2_refill_summary.csv",
+    "_02_l2_refill_fit_points.csv",
+    "_02_l2_refill_validation_summary.csv",
+    "_02_l2_refill_skip_reasons.csv",
 )
 
 
@@ -63,6 +67,8 @@ COVERAGE_COMPONENTS = (
     "native_fp8_tensor_core",
     "memory_read_write",
     "l2_hit_path",
+    "hbm_to_l2_refill_path",
+    "soc_hbm_phy_to_l2_proxy",
     "standalone_nonlinear",
     "fused_nonlinear",
 )
@@ -154,6 +160,19 @@ def load_or_compute_l2(df: pd.DataFrame, csv_path: Path) -> pd.DataFrame:
     try:
         l2_summary, _, _, _, _ = analyze.compute_l2_energy(df)
         return l2_summary
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_or_compute_l2_refill(df: pd.DataFrame, csv_path: Path, l2_summary: pd.DataFrame | None = None) -> pd.DataFrame:
+    existing = read_csv_safe(companion(csv_path, "_02_l2_refill_summary.csv"))
+    if not existing.empty:
+        return existing
+    if df.empty:
+        return pd.DataFrame()
+    try:
+        refill_summary, _, _, _ = analyze.compute_l2_refill_energy(df, l2_summary=l2_summary)
+        return refill_summary
     except Exception:
         return pd.DataFrame()
 
@@ -378,6 +397,39 @@ def build_coefficient_table(csvs: Iterable[Path]) -> pd.DataFrame:
                     gpu=gpu, headline_eligible=h_eligible,
                     headline_status=h_status, headline_reason=h_reason))
 
+        refill = load_or_compute_l2_refill(df, csv_path, l2)
+        if not refill.empty:
+            r = refill.iloc[0]
+            if profile.startswith("h100"):
+                h_eligible, h_status, h_reason = (
+                    1, "HEADLINE", "h100_cp_async_refill_path_proxy_not_pure_component")
+            else:
+                h_eligible, h_status, h_reason = (
+                    1, "PROXY", "prefetch_global_l2_fallback_not_h100_cp_async_headline")
+            rows.append(_coef_row(
+                profile, csv_path, "k_hbm_to_l2_refill_path", "pJ/bit",
+                r.get("k_hbm_to_l2_refill_path_pj_bit", np.nan),
+                "l2_refill_summary", str(r.get("status", "LOW_CONF")),
+                "cold-hot HBM -> L2 refill path proxy; not isolated HBM cell or PHY energy",
+                r.get("k_hbm_to_l2_refill_ci_lo", np.nan),
+                r.get("k_hbm_to_l2_refill_ci_hi", np.nan),
+                r.get("r2", np.nan), gpu,
+                h_eligible, h_status, h_reason))
+
+            residual = pd.to_numeric(
+                pd.Series([r.get("k_soc_hbm_phy_to_l2_fill_proxy_pj_bit", np.nan)]),
+                errors="coerce").iloc[0]
+            if pd.notna(residual):
+                residual_status = str(r.get("status", "LOW_CONF"))
+                if residual_status == "PASS":
+                    residual_status = "LOW_CONF"
+                rows.append(_coef_row(
+                    profile, csv_path, "k_soc_hbm_phy_to_l2_fill_proxy", "pJ/bit",
+                    residual, "l2_refill_summary", residual_status,
+                    "assumption-dependent residual: refill path minus assumed HBM interface and L2 fill proxy",
+                    gpu=gpu, headline_eligible=h_eligible,
+                    headline_status="PROXY", headline_reason="derived_from_boundary_assumption"))
+
         soc = read_key_value_csv(companion(csv_path, "_soc_summary.csv"))
         if soc:
             for key, coeff in (
@@ -392,7 +444,7 @@ def build_coefficient_table(csvs: Iterable[Path]) -> pd.DataFrame:
 
 
 def build_coverage_matrix(csvs: Iterable[Path], coeffs: pd.DataFrame) -> pd.DataFrame:
-    profiles = ["rtx3090", "a100_sxm", "h100_sxm"]
+    profiles = ["rtx3090", "a100_sxm", "h100_sxm", "h100_pcie"]
     rows = []
 
     def classify(matches: pd.DataFrame) -> tuple[str, str]:
@@ -436,6 +488,10 @@ def build_coverage_matrix(csvs: Iterable[Path], coeffs: pd.DataFrame) -> pd.Data
                 status, reason = classify(c[c["coefficient"].str.startswith("k_mem_")] if not c.empty else pd.DataFrame())
             elif comp == "l2_hit_path":
                 status, reason = classify(c[c["coefficient"].str.startswith("k_l2_")] if not c.empty else pd.DataFrame())
+            elif comp == "hbm_to_l2_refill_path":
+                status, reason = classify(c[c["coefficient"] == "k_hbm_to_l2_refill_path"] if not c.empty else pd.DataFrame())
+            elif comp == "soc_hbm_phy_to_l2_proxy":
+                status, reason = classify(c[c["coefficient"] == "k_soc_hbm_phy_to_l2_fill_proxy"] if not c.empty else pd.DataFrame())
             elif comp == "standalone_nonlinear":
                 status, reason = classify(c[c["coefficient"].str.contains("softmax|gelu|layernorm", case=False, na=False)] if not c.empty else pd.DataFrame())
             elif comp == "fused_nonlinear":

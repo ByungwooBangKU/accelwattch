@@ -1591,6 +1591,8 @@ def build_fused(variant: str, dtype_label: str,
 # (L2 array + slice/fabric + datapath), not isolated SRAM bit-cell energy.
 
 _L2_OPS = ("reg_spin", "l2_read_hit", "l2_write_hit", "l2_copy_hit", "l2_sliding_delta")
+_L2_REFILL_OPS = ("l2_refill_reg_spin", "l2_prefetch_hot", "l2_prefetch_cold")
+_L2_REFILL_PTX = ("auto", "cp_async_bulk_prefetch_l2", "prefetch_global_l2", "ldcg")
 _L2_EXT = None
 
 
@@ -1711,6 +1713,10 @@ void l2_write_hit_launcher(torch::Tensor y, long n_words, int repeat_inner, int 
 void l2_copy_hit_launcher(torch::Tensor x, torch::Tensor y, long n_words, int repeat_inner, int block_size);
 void l2_sliding_delta_launcher(torch::Tensor x, torch::Tensor out, long window_words,
                                long cold_words, long delta_words, int repeat_inner, int block_size);
+void l2_prefetch_launcher(torch::Tensor x, torch::Tensor out, long n_lines,
+                          long pool_lines, long start_stride_lines,
+                          int repeat_inner, int line_bytes, int ptx_policy,
+                          int block_size);
 void l2_reset_persisting_launcher();
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1719,6 +1725,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("write_hit", &l2_write_hit_launcher, "L2 resident store-hit probe");
   m.def("copy_hit", &l2_copy_hit_launcher, "L2 resident copy-hit probe");
   m.def("sliding_delta", &l2_sliding_delta_launcher, "sliding-window L2/HBM delta probe");
+  m.def("prefetch_refill", &l2_prefetch_launcher, "L2 prefetch hot/cold refill probe");
   m.def("reset_persisting_l2", &l2_reset_persisting_launcher, "cudaCtxResetPersistingL2Cache wrapper");
 }
 '''
@@ -1815,6 +1822,67 @@ __global__ void sliding_delta_kernel(const uint32_t* __restrict__ x, uint32_t* o
   if (threadIdx.x == 0) out[blockIdx.x] = acc;
 }
 
+static __device__ __forceinline__ void prefetch_l2_cp_async_bulk(const void* ptr, int size_bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  switch (size_bytes) {
+    case 16:
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], 16;" :: "l"(ptr) : "memory");
+      break;
+    case 32:
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], 32;" :: "l"(ptr) : "memory");
+      break;
+    case 64:
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], 64;" :: "l"(ptr) : "memory");
+      break;
+    case 128:
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(ptr) : "memory");
+      break;
+    case 256:
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(ptr) : "memory");
+      break;
+    default:
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(ptr) : "memory");
+      break;
+  }
+#else
+  asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr) : "memory");
+#endif
+}
+
+static __device__ __forceinline__ void prefetch_l2_global(const void* ptr) {
+  asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr) : "memory");
+}
+
+__global__ void prefetch_refill_kernel(const uint8_t* __restrict__ x, uint32_t* out,
+                                       long n_lines, long pool_lines,
+                                       long start_stride_lines,
+                                       int repeat_inner, int line_bytes,
+                                       int ptx_policy) {
+  long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long stride = (long)gridDim.x * blockDim.x;
+  uint32_t acc = (uint32_t)(tid ^ 0x6d2b79f5u);
+  long max_start = (pool_lines > n_lines) ? (pool_lines - n_lines) : 0L;
+  if (start_stride_lines <= 0) start_stride_lines = n_lines > 0 ? n_lines : 1L;
+  for (int r = 0; r < repeat_inner; ++r) {
+    long start = (max_start > 0) ? (((long)r * start_stride_lines) % max_start) : 0L;
+    for (long line = tid; line < n_lines; line += stride) {
+      long idx = start + line;
+      const uint8_t* ptr = x + idx * (long)line_bytes;
+      if (ptx_policy == 2) {
+        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(ptr);
+        acc += __ldcg(p32);
+      } else if (ptx_policy == 1) {
+        prefetch_l2_global(ptr);
+        acc += (uint32_t)(idx + r);
+      } else {
+        prefetch_l2_cp_async_bulk(ptr, line_bytes);
+        acc += (uint32_t)(idx + r);
+      }
+    }
+  }
+  if (threadIdx.x == 0) out[blockIdx.x] = acc;
+}
+
 void l2_reg_spin_launcher(torch::Tensor out, long n_words, int repeat_inner, int block_size) {
   CHECK_CUDA(out); CHECK_U32(out);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -1856,6 +1924,22 @@ void l2_sliding_delta_launcher(torch::Tensor x, torch::Tensor out, long window_w
   int grid = grid_for(window_words, block_size);
   sliding_delta_kernel<<<grid, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(x.data_ptr<int>()),
       reinterpret_cast<uint32_t*>(out.data_ptr<int>()), window_words, cold_words, delta_words, repeat_inner);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void l2_prefetch_launcher(torch::Tensor x, torch::Tensor out, long n_lines,
+                          long pool_lines, long start_stride_lines,
+                          int repeat_inner, int line_bytes, int ptx_policy,
+                          int block_size) {
+  CHECK_CUDA(x); CHECK_CUDA(out); CHECK_U32(x); CHECK_U32(out);
+  TORCH_CHECK(line_bytes > 0 && (line_bytes % 16) == 0, "line_bytes must be a positive multiple of 16");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int grid = grid_for(n_lines, block_size);
+  prefetch_refill_kernel<<<grid, block_size, 0, stream>>>(
+      reinterpret_cast<const uint8_t*>(x.data_ptr<int>()),
+      reinterpret_cast<uint32_t*>(out.data_ptr<int>()),
+      n_lines, pool_lines, start_stride_lines, repeat_inner,
+      line_bytes, ptx_policy);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1998,5 +2082,149 @@ def build_l2_probe(
             "grid_size": int(out_words),
             "kernel_version": "l2_probe_v1_cuda_ext_cg",
             "cold_pool_bytes": int(cold_pool_bytes if op == "l2_sliding_delta" else 0),
+        },
+    )
+
+
+def build_l2_refill(
+    op: str,
+    working_set_bytes: int,
+    cold_pool_bytes: int,
+    repeat_inner: int,
+    prefetch_line_bytes: int = 128,
+    ptx_policy: str = "auto",
+    pair_id: str = "",
+    device: str | torch.device = "cuda",
+    block_size: int = 256,
+) -> BenchSpec:
+    """Build an HBM-to-L2 refill proxy probe.
+
+    H100/Hopper defaults to cp.async.bulk.prefetch.L2.global. RTX 3090 and
+    other pre-Hopper GPUs use prefetch.global.L2 by default; an explicit
+    "ldcg" policy is available as a wider load-based fallback. The measured
+    quantity is a refill-path proxy, not pure HBM, memory-controller, NoC, or
+    L2 SRAM bit-cell energy.
+    """
+    if op not in _L2_REFILL_OPS:
+        raise ValueError(f"unknown L2 refill op {op!r} (choices: {_L2_REFILL_OPS})")
+    if ptx_policy not in _L2_REFILL_PTX:
+        raise ValueError(f"unknown L2 refill ptx policy {ptx_policy!r} (choices: {_L2_REFILL_PTX})")
+    if working_set_bytes <= 0:
+        raise ValueError("working_set_bytes must be positive")
+    if repeat_inner <= 0:
+        raise ValueError("repeat_inner must be positive")
+    if prefetch_line_bytes <= 0 or prefetch_line_bytes % 16 != 0:
+        raise ValueError("prefetch_line_bytes must be a positive multiple of 16")
+
+    dev = torch.device(device)
+    cc = torch.cuda.get_device_capability(dev)
+    resolved_policy = ptx_policy
+    if resolved_policy == "auto":
+        resolved_policy = "cp_async_bulk_prefetch_l2" if cc[0] >= 9 else "prefetch_global_l2"
+    if resolved_policy == "cp_async_bulk_prefetch_l2" and cc[0] < 9:
+        raise RuntimeError("cp_async_bulk_prefetch_l2 requires sm_90 or newer; "
+                           "use --l2-refill-ptx prefetch_global_l2 or ldg on RTX 3090/Ampere")
+
+    ptx_code = {
+        "cp_async_bulk_prefetch_l2": 0,
+        "prefetch_global_l2": 1,
+        "ldcg": 2,
+    }[resolved_policy]
+
+    line_bytes = int(prefetch_line_bytes)
+    if resolved_policy == "cp_async_bulk_prefetch_l2" and line_bytes not in (16, 32, 64, 128, 256):
+        raise ValueError("cp_async_bulk_prefetch_l2 supports --l2-refill-line-bytes "
+                         "16, 32, 64, 128, or 256")
+    n_lines = max(1, int(working_set_bytes) // line_bytes)
+    working_set_bytes = n_lines * line_bytes
+    cold_pool_bytes = int(cold_pool_bytes or working_set_bytes)
+    if op == "l2_prefetch_cold":
+        cold_pool_bytes = max(cold_pool_bytes, working_set_bytes + line_bytes)
+    else:
+        cold_pool_bytes = working_set_bytes
+    pool_lines = max(n_lines, cold_pool_bytes // line_bytes)
+    cold_pool_bytes = pool_lines * line_bytes
+    start_stride_lines = n_lines
+
+    ext = _l2_extension()
+    out_words = min(65535, max(1, (n_lines + block_size - 1) // block_size))
+    out = torch.empty(out_words, dtype=torch.int32, device=dev)
+    x = None
+    if op in ("l2_prefetch_hot", "l2_prefetch_cold"):
+        alloc_words = max(1, cold_pool_bytes // 4)
+        x = torch.empty(alloc_words, dtype=torch.int32, device=dev)
+
+    def f():
+        if op == "l2_refill_reg_spin":
+            ext.reg_spin(out, n_lines, int(repeat_inner), int(block_size))
+        else:
+            ext.prefetch_refill(
+                x, out, n_lines, pool_lines, start_stride_lines,
+                int(repeat_inner), int(line_bytes), int(ptx_code),
+                int(block_size))
+
+    if op == "l2_prefetch_cold":
+        ext.reg_spin(out, n_lines, 1, int(block_size))
+    else:
+        f()
+    torch.cuda.synchronize(dev)
+
+    requested_bits = int(working_set_bytes) * int(repeat_inner) * 8
+    hbm_refill_bits = requested_bits if op == "l2_prefetch_cold" else 0
+    l2_fill_bits = hbm_refill_bits
+    l2_hot_bits = requested_bits if op == "l2_prefetch_hot" else 0
+
+    if not pair_id:
+        pair_id = (f"W{working_set_bytes >> 20}MB_R{repeat_inner}_"
+                   f"line{line_bytes}_{resolved_policy}")
+
+    if resolved_policy == "ldcg":
+        path_semantics = "l2_refill_proxy_load_based_fallback"
+        compute_unit = "L2/cache path + SM load path"
+        notes_policy = "__ldcg load fallback; includes SM load/datapath effects."
+    elif resolved_policy == "prefetch_global_l2":
+        path_semantics = "l2_refill_proxy_prefetch_global_l2"
+        compute_unit = "L2 prefetch path"
+        notes_policy = "prefetch.global.L2 fallback for pre-Hopper GPUs such as RTX 3090."
+    else:
+        path_semantics = "l2_refill_proxy_cp_async_bulk_prefetch_l2"
+        compute_unit = "L2 prefetch path"
+        notes_policy = "cp.async.bulk.prefetch.L2.global path for sm_90+ H100/Hopper."
+
+    notes = (
+        "HBM-to-L2 refill path proxy; not pure HBM, memory-controller, NoC, "
+        "or L2 SRAM bit-cell energy. Cold-hot subtraction and separate NCU "
+        f"counter validation are required for headline use. {notes_policy}")
+
+    l2 = get_l2_bytes(dev.index or 0)
+    return BenchSpec(
+        name=f"{op}_{working_set_bytes >> 20}mib_R{repeat_inner}_line{line_bytes}",
+        op=op, dtype_label="uint32",
+        shape=(n_lines,), n_elements=n_lines,
+        flops_per_call=0, run=f,
+        compute_unit=compute_unit, emulated=(resolved_policy == "ldcg"),
+        cache_regime=classify_cache_regime(working_set_bytes, l2),
+        path_semantics=path_semantics,
+        notes=notes,
+        extra={
+            "subcase": "refill",
+            "pair_id": pair_id,
+            "working_set_bytes": int(working_set_bytes),
+            "repeat_inner": int(repeat_inner),
+            "delta_bytes": 0,
+            "estimated_l2_read_bits_per_call": 0,
+            "estimated_l2_write_bits_per_call": 0,
+            "estimated_l2_total_bits_per_call": int(l2_hot_bits),
+            "estimated_hbm_refill_bits_per_call": int(hbm_refill_bits),
+            "estimated_prefetch_bits_per_call": int(requested_bits),
+            "estimated_l2_fill_bits_per_call": int(l2_fill_bits),
+            "prefetch_line_bytes": int(line_bytes),
+            "prefetched_lines": int(n_lines * repeat_inner),
+            "ptx_instruction": resolved_policy,
+            "l2_policy": resolved_policy,
+            "block_size": int(block_size),
+            "grid_size": int(out_words),
+            "kernel_version": "l2_refill_v1_prefetch_hot_cold",
+            "cold_pool_bytes": int(cold_pool_bytes if op == "l2_prefetch_cold" else 0),
         },
     )
