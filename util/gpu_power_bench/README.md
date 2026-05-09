@@ -1853,3 +1853,57 @@ GPU core hot-spot temperature. HBM/GDDR 온도는 별도 API. thermal monitoring
 ---
 
 *Maintained under `util/gpu_power_bench/` — PR contributions welcome.*
+
+---
+
+## 16. L2/SRAM resident traffic path probe (`--cases l2`)
+
+`--cases l2` / `--suite l2` 는 H100 50MB L2 안에 들어가는 window를 custom CUDA kernel 내부에서 반복 접근해 **L2-hit traffic path energy** 를 추정한다. 이 값은 **순수 SRAM bit-cell energy가 아니다**. NVML은 board-level power만 제공하므로, 계수에는 L2 SRAM array뿐 아니라 L2 slice/fabric, L1↔L2 interface, load/store datapath 일부가 함께 들어간다.
+
+### 16.1 왜 별도 probe가 필요한가
+
+L2 50MiB를 한 번 읽는 에너지는 pJ/bit 단위에서는 sub-mJ 수준이라 NVML integration noise보다 작다. 그래서 Python loop로 kernel을 반복 launch하지 않고, 단일 CUDA kernel 안의 `repeat_inner` loop로 같은 L2-resident working set을 수천~수만 번 반복 접근한다. `gpu_power_bench.py` 는 logical L2 traffic bits를 CSV에 기록하고, `analyze.py` 는 `reg_spin` baseline을 차감한 뒤 `E_delta vs L2_bits` slope를 pJ/bit로 변환한다.
+
+### 16.2 Test cells
+
+| op | 목적 | 해석 |
+|---|---|---|
+| `reg_spin` | memory traffic 없는 loop/control/register baseline | `E_l2 - E_reg_spin` 차감용 |
+| `l2_read_hit` | primary read-hit path estimate | `k_L2_read` |
+| `l2_write_hit` | primary store-hit path estimate | dirty/writeback 가능성이 있어 “store-hit path” 로만 부름 |
+| `l2_copy_hit` | read/write split sanity check | measured copy vs read/write implied 비교 |
+| `l2_sliding_delta` | L2를 채운 뒤 Δ만큼 이동하는 validation | HBM/L2 gap consistency check. headline estimator가 아님 |
+
+### 16.3 실행 예
+
+```bash
+./run_bench.sh \
+  --cases l2 \
+  --l2-window-mb 16 24 32 40 \
+  --l2-target-energy-j 10 \
+  --l2-delta-kb 0 64 256 1024 4096 8192 16384 \
+  --window-ms 8000 \
+  --rebaseline-every 10 \
+  --tag h100_l2_gpu0
+```
+
+### 16.4 산출물과 caveat
+
+Power-only 분석은 `headline_source=logical_estimate_PROVISIONAL` 로 표시된다. Nsight Compute sector counter run은 power run과 분리해서 수행해야 한다. NCU profiling은 replay/cache control/clock control/instrumentation 때문에 runtime과 power를 바꿀 수 있기 때문이다.
+
+생성 파일:
+
+- `_02_l2_summary.csv`
+- `_02_l2_per_window.csv`
+- `_02_l2_fit_points.csv`
+- `_02_l2_validation_summary.csv`
+- `_02_l2_skip_reasons.csv`
+- `_02_l2_overview_pjbit.png`
+- `_02_l2_primary_fit_read.png`, `_02_l2_primary_fit_write.png`
+- `_02_l2_per_window_stability.png`
+- `_02_l2_read_write_split.png`
+- `_02_l2_sliding_delta_validation.png`
+
+최종 보고 문구는 다음 표현을 권장한다.
+
+> We estimate an L2-hit traffic path energy rather than an isolated SRAM bit-cell energy. The coefficient is obtained by repeatedly accessing a cache-resident window and regressing NVML dynamic energy against L2 traffic bits. Sliding-window Δ rows are used as a validation check, and Nsight Compute sector counters should be collected in a separate run before making headline claims.

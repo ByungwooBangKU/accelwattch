@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import re
 import sys
@@ -177,6 +178,14 @@ SUITES: dict[str, dict] = {
         "_doc":  "gpt-oss-120B layer shapes only (qkv / mlp / lm_head etc.)",
         "cases": ("llm-matmul",),
     },
+    "l2": {
+        # L2/SRAM resident traffic path probe. Produces logical-traffic
+        # pJ/bit estimates; Nsight Compute counters are a separate validation run.
+        "_doc":             "L2/SRAM resident traffic probe (pJ/bit path estimate)",
+        "cases":            ("l2",),
+        "rebaseline_every": 10,
+        "window_ms":        8000.0,
+    },
     "soc": {
         # SoC envelope only — static / max / leakage. ~5 min.
         # Replaces the old soc_power_bench.py / run_soc_bench.sh combo.
@@ -280,6 +289,51 @@ def _filter_loads(loads: list[int], ops: list[str], dtypes: list[str],
             print(f"[memcheck]   dropped N={N:,} "
                   f"(worst case {worst} ≈ {mb/(1<<30):.2f} GB)")
     return kept
+
+
+
+
+def _parse_l2_repeats(values: list[str], window_bytes: int,
+                       target_energy_j: float, k_guess_pj_bit: float) -> list[int]:
+    """Return repeat_inner values for one L2 window.
+
+    `auto` sizes the centre point from target_energy ≈ k_guess·W_bits·R,
+    then returns a 4-point R sweep so analyze.py can fit fixed-W slopes and
+    absorb one-time fill/launch overhead in the intercept.
+    """
+    if values == ["auto"] or "auto" in values:
+        k_j_per_bit = max(k_guess_pj_bit, 1e-6) * 1e-12
+        bits = max(1, int(window_bytes) * 8)
+        base = int(math.ceil(max(target_energy_j, 0.1) / (k_j_per_bit * bits)))
+        base = max(64, min(4_000_000, base))
+        reps = sorted({max(16, base // 4), max(32, base // 2), base,
+                       min(8_000_000, base * 2)})
+        return reps
+    reps: list[int] = []
+    for v in values:
+        try:
+            r = int(v)
+        except ValueError as e:
+            raise SystemExit(f"bad --l2-repeat-inner value {v!r}: expected int or auto") from e
+        if r <= 0:
+            raise SystemExit("--l2-repeat-inner values must be positive")
+        reps.append(r)
+    return sorted(set(reps))
+
+
+
+
+def _variant_key(plan: dict) -> tuple:
+    """Key for suppressing repeated failures.
+
+    Historical behavior ignores load_value so a poisoned CUDA context does not
+    re-trigger for every K/N. L2 probes can legitimately fail only for one large
+    working-set/cold-pool allocation, so include load/delta in that case.
+    """
+    base = (plan.get("op"), plan.get("dtype"), plan.get("mode"), plan.get("llm_preset", ""))
+    if plan.get("category") == "l2":
+        return base + (plan.get("load_value"),)
+    return base
 
 
 def _slugify(name: str) -> str:
@@ -387,8 +441,9 @@ def main() -> int:
     #   matmul       — A.3 square matmul (5 dtype/mode variants × K-sweep)
     #   llm-matmul   — A.4 LLM-shape matmul (8 preset × T-sweep)
     #   dram         — A.2 STREAM-style probes (read/write/copy/scale/triad)
+    #   l2           — A.6 L2/SRAM resident traffic path probe
     #   soc          — B   SoC envelope (static / max / leakage)
-    ALL_CASES = ("elementwise", "matmul", "llm-matmul", "dram", "soc")
+    ALL_CASES = ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc")
     ap.add_argument("--cases", nargs="+", choices=ALL_CASES, default=None,
                     metavar="CASE",
                     help="explicit list of test cases to run. Choices: "
@@ -513,6 +568,42 @@ def main() -> int:
     ap.add_argument("--dram-bw-loads", type=int, nargs="+", default=None,
                     help="working-set-target N values for --dram-bw-test "
                          "(default: 4 sizes deep into the l2_hit_0 regime)")
+    # --- L2/SRAM resident traffic path probe --------------------------------
+    ap.add_argument("--l2-window-mb", type=int, nargs="+",
+                    default=[16, 24, 32, 40],
+                    help="L2 probe working-set windows in MiB. Keep below full "
+                         "L2 to reduce replacement/HBM contamination; H100 "
+                         "default targets 16/24/32/40 MiB.")
+    ap.add_argument("--l2-repeat-inner", nargs="+", default=["auto"],
+                    help="repeat_inner values for the in-kernel loop, or auto. "
+                         "auto derives a small R sweep around --l2-target-energy-j "
+                         "using --l2-k-guess-pj-bit.")
+    ap.add_argument("--l2-target-energy-j", type=float, default=10.0,
+                    help="target logical incremental L2 energy used to size "
+                         "auto repeat_inner values (J).")
+    ap.add_argument("--l2-k-guess-pj-bit", type=float, default=1.0,
+                    help="initial L2-hit path pJ/bit guess for auto R sizing.")
+    ap.add_argument("--l2-delta-kb", type=int, nargs="+",
+                    default=[0, 64, 256, 1024, 4096, 8192, 16384],
+                    help="sliding-window delta sizes in KiB. Delta=0 is the "
+                         "L2-resident reference; nonzero deltas are validation, "
+                         "not the primary estimator.")
+    ap.add_argument("--l2-cold-pool-gb", type=float, default=4.0,
+                    help="cold pool size for l2_sliding_delta (GiB).")
+    ap.add_argument("--l2-dtypes", nargs="+", default=["uint32"],
+                    choices=["uint32", "fp32"],
+                    help="storage word label for L2 probes. Both are 4B words; "
+                         "uint32 is the default to avoid FP arithmetic effects.")
+    l2_persist = ap.add_mutually_exclusive_group()
+    l2_persist.add_argument("--l2-use-persisting", dest="l2_use_persisting",
+                            action="store_true",
+                            help="record persisting-L2 intent in metadata. The "
+                                 "prototype uses __ldcg and counter validation; "
+                                 "MIG may disable persisting set-aside.")
+    l2_persist.add_argument("--l2-no-persisting", dest="l2_use_persisting",
+                            action="store_false",
+                            help="do not request persisting-L2 metadata")
+    ap.set_defaults(l2_use_persisting=False)
     # ---- Fused vs Standalone (G11 / P1.4 — opt-in) -----------------------
     # 6 new variants : attention_flash + attention_qkv_matmul (subtraction
     # baseline), linear_gelu + linear_baseline_gelu, ln_linear +
@@ -522,7 +613,7 @@ def main() -> int:
     # group and computes residual + bootstrap CI. See README §3.7.
     ap.add_argument("--include-fused", action="store_true",
                     help="opt-in: add the 6 fused-vs-standalone variants. "
-                         "Doubles the elementwise CSV row count by ~30%. "
+                         "Doubles the elementwise CSV row count by ~30%%. "
                          "See README §3.7 / TestCases A.5 / REVIEW.md G11.")
     ap.add_argument("--attn-shape", type=str, default="1,64,8,2048,2048,64",
                     help="attention_flash / attention_qkv_matmul shape — "
@@ -814,6 +905,71 @@ def main() -> int:
                         "build": (lambda op=op, dtype=dtype, N=N:
                                   bm.build(op, dtype, N, device="cuda")),
                     })
+    # L2/SRAM resident traffic path probes — custom CUDA extension with an
+    # in-kernel repeat loop.  These rows estimate an L2-hit traffic *path*
+    # coefficient, not isolated SRAM cell energy.  Sliding-delta rows are
+    # validation only; primary estimates come from reg_spin-subtracted
+    # l2_read_hit / l2_write_hit fixed-W R sweeps.
+    if "l2" in cases:
+        l2_windows = [int(mb) * (1 << 20) for mb in args.l2_window_mb]
+        l2_cold_pool = int(float(args.l2_cold_pool_gb) * (1 << 30))
+        l2_budget = int(hbm_bytes * _MEM_SAFETY_FRACTION) if hbm_bytes > 0 else 0
+        print("[l2] L2-hit path probe: windows MiB="
+              f"{args.l2_window_mb}, deltas KiB={args.l2_delta_kb}, "
+              f"dtypes={args.l2_dtypes}, persisting={args.l2_use_persisting}")
+        for dtype in args.l2_dtypes:
+            for W in l2_windows:
+                if l2_budget and W * 2 > l2_budget:
+                    print(f"[l2][memcheck] drop W={W/(1<<20):.1f} MiB "
+                          f"(read+write buffers may exceed 25% HBM budget)")
+                    continue
+                repeats = _parse_l2_repeats(args.l2_repeat_inner, W,
+                                            args.l2_target_energy_j,
+                                            args.l2_k_guess_pj_bit)
+                for R in repeats:
+                    for op in ("reg_spin", "l2_read_hit", "l2_write_hit", "l2_copy_hit"):
+                        plans.append({
+                            "category": "l2",
+                            "mode": "l2_probe",
+                            "op": op, "dtype": dtype,
+                            "load_name": "working_set_bytes", "load_value": W,
+                            "build": (lambda op=op, dtype=dtype, W=W, R=R:
+                                      bm.build_l2_probe(
+                                          op=op, dtype_label=dtype,
+                                          working_set_bytes=W,
+                                          repeat_inner=R,
+                                          device="cuda",
+                                          use_persisting_l2=args.l2_use_persisting)),
+                        })
+                # Sliding validation: use the largest auto/explicit repeat so
+                # E(Δ)-E(0) rises above NVML noise.  Delta=0 reference included.
+                slide_R = max(repeats)
+                for dkb in args.l2_delta_kb:
+                    D = int(dkb) * 1024
+                    if D > W:
+                        print(f"[l2] skip sliding delta {dkb} KiB for "
+                              f"W={W/(1<<20):.1f} MiB (delta > W)")
+                        continue
+                    alloc = max(l2_cold_pool, W + max(D, 4096))
+                    if l2_budget and alloc > l2_budget:
+                        print(f"[l2][memcheck] drop sliding W={W/(1<<20):.1f} MiB "
+                              f"D={dkb} KiB (cold pool {alloc/(1<<30):.2f} GiB "
+                              f"> budget {l2_budget/(1<<30):.2f} GiB)")
+                        continue
+                    plans.append({
+                        "category": "l2",
+                        "mode": "l2_probe",
+                        "op": "l2_sliding_delta", "dtype": dtype,
+                        "load_name": "working_set_bytes", "load_value": W,
+                        "build": (lambda dtype=dtype, W=W, R=slide_R, D=D, alloc=alloc:
+                                  bm.build_l2_probe(
+                                      op="l2_sliding_delta", dtype_label=dtype,
+                                      working_set_bytes=W,
+                                      repeat_inner=R, delta_bytes=D,
+                                      cold_pool_bytes=alloc,
+                                      device="cuda",
+                                      use_persisting_l2=args.l2_use_persisting)),
+                    })
     # LLM-shape sweep — opt-in via --llm-shapes. We pre-filter (preset, T)
     # combos by HBM budget using llm_matmul_footprint_bytes(), so the fat
     # lm_head @ T=32768 cell doesn't blow memory on smaller GPUs.
@@ -939,6 +1095,7 @@ def main() -> int:
           f"(elementwise={sum(1 for p in plans if p['category']=='elementwise')}, "
           f"matmul={sum(1 for p in plans if p['category']=='matmul')}, "
           f"matmul_llm={sum(1 for p in plans if p['category']=='matmul_llm')}, "
+          f"l2={sum(1 for p in plans if p['category']=='l2')}, "
           f"fused={sum(1 for p in plans if p['category']=='fused')})")
 
     rows: list[dict] = []
@@ -965,8 +1122,7 @@ def main() -> int:
     try:
         for i, plan in enumerate(plans, 1):
             # Skip cells from variants we've already proven broken in this run.
-            variant_key = (plan.get("op"), plan.get("dtype"),
-                           plan.get("mode"), plan.get("llm_preset", ""))
+            variant_key = _variant_key(plan)
             if variant_key in broken_variants:
                 print(f"\n[{i}/{total_cells}] {plan['op']}_{plan['dtype']}_{plan['mode']}"
                       + (f"·{plan['llm_preset']}" if plan.get("llm_preset") else "")
@@ -1045,8 +1201,7 @@ def main() -> int:
                     "CUDA call failed",
                 )
                 fatal = any(m in err_msg for m in fatal_markers)
-                variant_key = (plan.get("op"), plan.get("dtype"),
-                               plan.get("mode"), plan.get("llm_preset", ""))
+                variant_key = _variant_key(plan)
                 broken_variants.add(variant_key)
                 if fatal:
                     print(f"  !! FATAL CUDA error during build at {label} "
@@ -1106,8 +1261,7 @@ def main() -> int:
                 # Track that THIS variant is broken so subsequent cells of the
                 # same (op, dtype, mode, llm_preset) get skipped without trying
                 # — the CUDA context is the same, the fault repeats.
-                variant_key = (plan.get("op"), plan.get("dtype"),
-                               plan.get("mode"), plan.get("llm_preset", ""))
+                variant_key = _variant_key(plan)
                 broken_variants.add(variant_key)
                 if fatal:
                     print(f"  !! FATAL CUDA error at {label} "
@@ -1221,8 +1375,38 @@ def main() -> int:
                 "cooldown_reached":   int(bool(cooldown_info["reached"])),
                 "sm_clk_mhz":   meas["sm_clk_mhz"],
                 "mem_clk_mhz":  meas["mem_clk_mhz"],
+                # L2/SRAM resident traffic probe metadata. Blank for non-L2 rows.
+                "working_set_bytes": "",
+                "repeat_inner": "",
+                "delta_bytes": "",
+                "estimated_l2_read_bits": "",
+                "estimated_l2_write_bits": "",
+                "estimated_l2_total_bits": "",
+                "estimated_hbm_refill_bits": "",
+                "l2_policy": "",
+                "block_size": "",
+                "grid_size": "",
+                "kernel_version": "",
+                "cold_pool_bytes": "",
                 "notes":        spec.notes,
             }
+            extra = getattr(spec, "extra", {}) or {}
+            if extra:
+                outer_iters = int(meas["iters"])
+                row.update({
+                    "working_set_bytes": extra.get("working_set_bytes", ""),
+                    "repeat_inner": extra.get("repeat_inner", ""),
+                    "delta_bytes": extra.get("delta_bytes", ""),
+                    "estimated_l2_read_bits": int(extra.get("estimated_l2_read_bits_per_call", 0)) * outer_iters,
+                    "estimated_l2_write_bits": int(extra.get("estimated_l2_write_bits_per_call", 0)) * outer_iters,
+                    "estimated_l2_total_bits": int(extra.get("estimated_l2_total_bits_per_call", 0)) * outer_iters,
+                    "estimated_hbm_refill_bits": int(extra.get("estimated_hbm_refill_bits_per_call", 0)) * outer_iters,
+                    "l2_policy": extra.get("l2_policy", ""),
+                    "block_size": extra.get("block_size", ""),
+                    "grid_size": extra.get("grid_size", ""),
+                    "kernel_version": extra.get("kernel_version", ""),
+                    "cold_pool_bytes": extra.get("cold_pool_bytes", ""),
+                })
             rows.append(row)
             print(f"  E_total={meas['total_energy_j']:.3f} J, "
                   f"E_dyn={dyn_energy:.3f} J, "
@@ -1246,8 +1430,7 @@ def main() -> int:
                 torch.cuda.empty_cache()
             except Exception as e:
                 err_msg = str(e)
-                variant_key = (plan.get("op"), plan.get("dtype"),
-                               plan.get("mode"), plan.get("llm_preset", ""))
+                variant_key = _variant_key(plan)
                 broken_variants.add(variant_key)
                 fatal_markers = (
                     "illegal memory access",
