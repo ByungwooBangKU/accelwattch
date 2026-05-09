@@ -34,6 +34,10 @@ GPU_PROFILES: dict[str, dict[str, Any]] = {
         "fused_dtypes": ["fp16"],
         "l2_windows_mb": [1, 2, 3, 4],
         "l2_delta_kb": [0, 64, 256, 1024],
+        "l2_refill_windows_mb": [1, 2, 3, 4],
+        "l2_refill_cold_pool_gb": 2.0,
+        "l2_refill_k_guess_pj_bit": 6.0,
+        "l2_refill_ptx": "prefetch_global_l2",
         "role": "local smoke / GDDR6X reference",
     },
     "a100_sxm": {
@@ -53,7 +57,37 @@ GPU_PROFILES: dict[str, dict[str, Any]] = {
         "fused_dtypes": ["fp16", "bf16"],
         "l2_windows_mb": [8, 16, 24, 32],
         "l2_delta_kb": [0, 64, 256, 1024, 4096, 8192],
+        "l2_refill_windows_mb": [8, 16, 24, 32],
+        "l2_refill_cold_pool_gb": 4.0,
+        "l2_refill_k_guess_pj_bit": 4.0,
+        "l2_refill_ptx": "prefetch_global_l2",
         "role": "HBM2E / Ampere Tensor Core headline",
+    },
+    "h100_pcie": {
+        "label": "H100 PCIe 80GB",
+        "arch": "Hopper GH100",
+        "expected_cc": "9.0",
+        "memory_type": "HBM3",
+        "memory_capacity_gb": 80,
+        "peak_bw_gbps": 2000.0,
+        "l2_mb": 50.0,
+        "power_envelope_w": 350.0,
+        "native_fp8": True,
+        "native_bf16": True,
+        "default_dtypes": ["fp16", "fp8"],
+        "matmul_variants": [
+            ("fp32", "simt"), ("tf32", "tc"), ("fp16", "tc"),
+            ("bf16", "tc"), ("fp8", "te"),
+        ],
+        "llm_dtypes": [("bf16", "tc"), ("fp8", "te")],
+        "fused_dtypes": ["fp16", "bf16", "fp8"],
+        "l2_windows_mb": [16, 24, 32, 40],
+        "l2_delta_kb": [0, 64, 256, 1024, 4096, 8192, 16384],
+        "l2_refill_windows_mb": [16, 24, 32, 40],
+        "l2_refill_cold_pool_gb": 4.0,
+        "l2_refill_k_guess_pj_bit": 3.0,
+        "l2_refill_ptx": "cp_async_bulk_prefetch_l2",
+        "role": "HBM3 / native FP8 headline, PCIe power envelope",
     },
     "h100_sxm": {
         "label": "H100 SXM 80GB",
@@ -75,6 +109,10 @@ GPU_PROFILES: dict[str, dict[str, Any]] = {
         "fused_dtypes": ["fp16", "bf16", "fp8"],
         "l2_windows_mb": [16, 24, 32, 40],
         "l2_delta_kb": [0, 64, 256, 1024, 4096, 8192, 16384],
+        "l2_refill_windows_mb": [16, 24, 32, 40],
+        "l2_refill_cold_pool_gb": 4.0,
+        "l2_refill_k_guess_pj_bit": 3.0,
+        "l2_refill_ptx": "cp_async_bulk_prefetch_l2",
         "role": "HBM3 / native FP8 headline",
     },
 }
@@ -101,6 +139,8 @@ def normalize_cc(value: object) -> str:
 def infer_gpu_profile(*texts: object) -> str:
     hay = " ".join("" if t is None else str(t).lower() for t in texts)
     if "h100" in hay or "hopper" in hay or "gh100" in hay:
+        if "pcie" in hay or "pci-e" in hay:
+            return "h100_pcie"
         return "h100_sxm"
     if "a100" in hay or "ga100" in hay:
         return "a100_sxm"
@@ -163,6 +203,23 @@ def profile_l2_windows_mb(profile_key: str) -> list[int]:
 
 def profile_l2_delta_kb(profile_key: str) -> list[int]:
     return list(GPU_PROFILES[profile_key]["l2_delta_kb"])
+
+
+def profile_l2_refill_windows_mb(profile_key: str) -> list[int]:
+    profile = GPU_PROFILES[profile_key]
+    return list(profile.get("l2_refill_windows_mb", profile["l2_windows_mb"]))
+
+
+def profile_l2_refill_cold_pool_gb(profile_key: str) -> float:
+    return float(GPU_PROFILES[profile_key].get("l2_refill_cold_pool_gb", 4.0))
+
+
+def profile_l2_refill_k_guess_pj_bit(profile_key: str) -> float:
+    return float(GPU_PROFILES[profile_key].get("l2_refill_k_guess_pj_bit", 3.0))
+
+
+def profile_l2_refill_ptx(profile_key: str) -> str:
+    return str(GPU_PROFILES[profile_key].get("l2_refill_ptx", "auto"))
 
 
 def profile_matmul_variants(profile_key: str) -> list[tuple[str, str]]:

@@ -578,6 +578,10 @@ def main() -> int:
     user_set_dtypes = _argv_has_flag(argv, "--dtypes")
     user_set_l2_windows = _argv_has_flag(argv, "--l2-window-mb")
     user_set_l2_delta = _argv_has_flag(argv, "--l2-delta-kb")
+    user_set_l2_refill_windows = _argv_has_flag(argv, "--l2-refill-window-mb")
+    user_set_l2_refill_cold_pool = _argv_has_flag(argv, "--l2-refill-cold-pool-gb")
+    user_set_l2_refill_k_guess = _argv_has_flag(argv, "--l2-refill-k-guess-pj-bit")
+    user_set_l2_refill_ptx = _argv_has_flag(argv, "--l2-refill-ptx")
     user_set_cases = _argv_has_flag(argv, "--cases")
     user_set_fused = _argv_has_flag(argv, "--include-fused", "--no-fused")
 
@@ -776,6 +780,34 @@ def main() -> int:
                     choices=["uint32", "fp32"],
                     help="storage word label for L2 probes. Both are 4B words; "
                          "uint32 is the default to avoid FP arithmetic effects.")
+    ap.add_argument("--l2-refill-test", action="store_true",
+                    help="add HBM-to-L2 refill proxy rows to --cases l2. "
+                         "H100 defaults to cp.async.bulk.prefetch.L2.global; "
+                         "RTX 3090 defaults to prefetch.global.L2 fallback.")
+    ap.add_argument("--l2-refill-window-mb", type=int, nargs="+", default=None,
+                    help="refill-probe working-set windows in MiB. Default "
+                         "comes from --gpu-profile (H100: 16/24/32/40; "
+                         "RTX 3090: 1/2/3/4).")
+    ap.add_argument("--l2-refill-cold-pool-gb", type=float, default=None,
+                    help="cold pool size for l2_prefetch_cold (GiB). Default "
+                         "comes from --gpu-profile (H100/A100: 4, RTX 3090: 2).")
+    ap.add_argument("--l2-refill-repeat-inner", nargs="+", default=["auto"],
+                    help="repeat_inner values for refill hot/cold kernels, or auto.")
+    ap.add_argument("--l2-refill-target-energy-j", type=float, default=10.0,
+                    help="target cold-hot refill delta energy for auto R sizing (J).")
+    ap.add_argument("--l2-refill-k-guess-pj-bit", type=float, default=None,
+                    help="initial HBM-to-L2 refill pJ/bit guess for auto R sizing. "
+                         "Default comes from --gpu-profile.")
+    ap.add_argument("--l2-refill-line-bytes", type=int, default=128,
+                    help="logical prefetch line size in bytes. prefetch.global.L2/ldcg "
+                         "accept any 16B multiple; cp_async_bulk_prefetch_l2 supports "
+                         "16, 32, 64, 128, or 256.")
+    ap.add_argument("--l2-refill-ptx",
+                    choices=["auto", "cp_async_bulk_prefetch_l2", "prefetch_global_l2", "ldcg"],
+                    default="auto",
+                    help="PTX path for refill prefetch. auto uses profile defaults: "
+                         "H100 -> cp_async_bulk_prefetch_l2, RTX 3090 -> prefetch_global_l2. "
+                         "ldcg is a wider load-based fallback.")
     l2_persist = ap.add_mutually_exclusive_group()
     l2_persist.add_argument("--l2-use-persisting", dest="l2_use_persisting",
                             action="store_true",
@@ -885,6 +917,14 @@ def main() -> int:
         args.l2_window_mb = gp.profile_l2_windows_mb(profile_key)
     if args.l2_delta_kb is None:
         args.l2_delta_kb = gp.profile_l2_delta_kb(profile_key)
+    if args.l2_refill_window_mb is None:
+        args.l2_refill_window_mb = gp.profile_l2_refill_windows_mb(profile_key)
+    if args.l2_refill_cold_pool_gb is None:
+        args.l2_refill_cold_pool_gb = gp.profile_l2_refill_cold_pool_gb(profile_key)
+    if args.l2_refill_k_guess_pj_bit is None:
+        args.l2_refill_k_guess_pj_bit = gp.profile_l2_refill_k_guess_pj_bit(profile_key)
+    if args.l2_refill_ptx == "auto":
+        args.l2_refill_ptx = gp.profile_l2_refill_ptx(profile_key)
 
     # ---- Resolve which test cases to actually run ---------------------
     # Order of precedence:
@@ -972,6 +1012,14 @@ def main() -> int:
             args.l2_window_mb = gp.profile_l2_windows_mb(profile_key)
         if not user_set_l2_delta:
             args.l2_delta_kb = gp.profile_l2_delta_kb(profile_key)
+        if not user_set_l2_refill_windows:
+            args.l2_refill_window_mb = gp.profile_l2_refill_windows_mb(profile_key)
+        if not user_set_l2_refill_cold_pool:
+            args.l2_refill_cold_pool_gb = gp.profile_l2_refill_cold_pool_gb(profile_key)
+        if not user_set_l2_refill_k_guess:
+            args.l2_refill_k_guess_pj_bit = gp.profile_l2_refill_k_guess_pj_bit(profile_key)
+        if not user_set_l2_refill_ptx:
+            args.l2_refill_ptx = gp.profile_l2_refill_ptx(profile_key)
     profile_status, profile_status_reason = gp.profile_cc_status(profile_key, observed_cc)
     profile_reason = "; ".join(x for x in (observed_reason, profile_status_reason) if x)
     if profile_reason:
@@ -1248,6 +1296,45 @@ def main() -> int:
                                       device="cuda",
                                       use_persisting_l2=args.l2_use_persisting)),
                     })
+        if args.l2_refill_test:
+            refill_windows = [int(mb) * (1 << 20) for mb in args.l2_refill_window_mb]
+            refill_cold_pool = int(float(args.l2_refill_cold_pool_gb) * (1 << 30))
+            print("[l2/refill] HBM-to-L2 refill proxy: windows MiB="
+                  f"{args.l2_refill_window_mb}, cold_pool={args.l2_refill_cold_pool_gb:g} GiB, "
+                  f"line={args.l2_refill_line_bytes} B, ptx={args.l2_refill_ptx}, "
+                  f"k_guess={args.l2_refill_k_guess_pj_bit:g} pJ/bit")
+            for W in refill_windows:
+                if l2_budget and refill_cold_pool > l2_budget:
+                    print(f"[l2/refill][memcheck] drop W={W/(1<<20):.1f} MiB "
+                          f"(cold pool {refill_cold_pool/(1<<30):.2f} GiB "
+                          f"> budget {l2_budget/(1<<30):.2f} GiB)")
+                    continue
+                repeats = _parse_l2_repeats(
+                    args.l2_refill_repeat_inner, W,
+                    args.l2_refill_target_energy_j,
+                    float(args.l2_refill_k_guess_pj_bit))
+                for R in repeats:
+                    pair_id = (f"W{W >> 20}MB_R{R}_line{args.l2_refill_line_bytes}_"
+                               f"{args.l2_refill_ptx}")
+                    for op in ("l2_refill_reg_spin", "l2_prefetch_hot", "l2_prefetch_cold"):
+                        plans.append({
+                            "category": "l2",
+                            "subcase": "refill",
+                            "mode": "l2_refill",
+                            "op": op, "dtype": "uint32",
+                            "load_name": "working_set_bytes", "load_value": W,
+                            "pair_id": pair_id,
+                            "build": (lambda op=op, W=W, R=R, pair_id=pair_id:
+                                      bm.build_l2_refill(
+                                          op=op,
+                                          working_set_bytes=W,
+                                          cold_pool_bytes=refill_cold_pool,
+                                          repeat_inner=R,
+                                          prefetch_line_bytes=args.l2_refill_line_bytes,
+                                          ptx_policy=args.l2_refill_ptx,
+                                          pair_id=pair_id,
+                                          device="cuda")),
+                        })
     # LLM-shape sweep — opt-in via --llm-shapes. We pre-filter (preset, T)
     # combos by HBM budget using llm_matmul_footprint_bytes(), so the fat
     # lm_head @ T=32768 cell doesn't blow memory on smaller GPUs.
@@ -1644,6 +1731,7 @@ def main() -> int:
                 "headline_status": headline_status,
                 "headline_reason": headline_reason,
                 "category": plan["category"],
+                "subcase": plan.get("subcase", ""),
                 "op": plan["op"],
                 "dtype": plan["dtype"],
                 "mode": plan["mode"],
@@ -1720,6 +1808,12 @@ def main() -> int:
                 "estimated_l2_write_bits": "",
                 "estimated_l2_total_bits": "",
                 "estimated_hbm_refill_bits": "",
+                "estimated_prefetch_bits": "",
+                "estimated_l2_fill_bits": "",
+                "prefetch_line_bytes": "",
+                "prefetched_lines": "",
+                "ptx_instruction": "",
+                "pair_id": plan.get("pair_id", ""),
                 "l2_policy": "",
                 "block_size": "",
                 "grid_size": "",
@@ -1738,6 +1832,13 @@ def main() -> int:
                     "estimated_l2_write_bits": int(extra.get("estimated_l2_write_bits_per_call", 0)) * outer_iters,
                     "estimated_l2_total_bits": int(extra.get("estimated_l2_total_bits_per_call", 0)) * outer_iters,
                     "estimated_hbm_refill_bits": int(extra.get("estimated_hbm_refill_bits_per_call", 0)) * outer_iters,
+                    "estimated_prefetch_bits": int(extra.get("estimated_prefetch_bits_per_call", 0)) * outer_iters,
+                    "estimated_l2_fill_bits": int(extra.get("estimated_l2_fill_bits_per_call", 0)) * outer_iters,
+                    "prefetch_line_bytes": extra.get("prefetch_line_bytes", ""),
+                    "prefetched_lines": int(extra.get("prefetched_lines", 0)) * outer_iters,
+                    "ptx_instruction": extra.get("ptx_instruction", ""),
+                    "pair_id": extra.get("pair_id", row.get("pair_id", "")),
+                    "subcase": extra.get("subcase", row.get("subcase", "")),
                     "l2_policy": extra.get("l2_policy", ""),
                     "block_size": extra.get("block_size", ""),
                     "grid_size": extra.get("grid_size", ""),
