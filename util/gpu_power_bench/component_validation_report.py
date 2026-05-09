@@ -184,6 +184,8 @@ def build_gpu_spec_matrix(csvs: Iterable[Path]) -> pd.DataFrame:
             "peak_bw_gbps": spec.get("peak_bw_gbps", np.nan),
             "l2_mb": spec.get("l2_mb", np.nan),
             "l2_reported_mb": sidecar.get("l2_reported_mb", ""),
+            "l2_effective_mb": sidecar.get("l2_effective_mb", ""),
+            "l2_source": sidecar.get("l2_source", ""),
             "power_envelope_w": spec.get("power_envelope_w", np.nan),
             "power_limit_w": sidecar.get("power_limit_w", ""),
             "mig_mode_current": sidecar.get("mig_mode_current", ""),

@@ -389,7 +389,8 @@ def _nvml_value(fn, default=""):
 def _gpu_spec_snapshot(profile_key: str, profile: dict, observed_profile: str,
                        profile_status: str, profile_reason: str,
                        gpu_name: str, cc: tuple[int, int], device: int,
-                       handle, hbm_bytes: int, l2_bytes: int) -> dict:
+                       handle, hbm_bytes: int, l2_reported_bytes: int,
+                       l2_effective_bytes: int, l2_source: str) -> dict:
     power_limit_w = _nvml_value(
         lambda: pynvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0, "")
     power_min_w = _nvml_value(
@@ -423,7 +424,9 @@ def _gpu_spec_snapshot(profile_key: str, profile: dict, observed_profile: str,
         "memory_total_gb": f"{hbm_bytes/(1<<30):.3f}" if hbm_bytes else "",
         "peak_bw_expected_gbps": profile.get("peak_bw_gbps", ""),
         "l2_expected_mb": profile.get("l2_mb", ""),
-        "l2_reported_mb": f"{l2_bytes/(1<<20):.3f}" if l2_bytes else "",
+        "l2_reported_mb": f"{l2_reported_bytes/(1<<20):.3f}" if l2_reported_bytes else "",
+        "l2_effective_mb": f"{l2_effective_bytes/(1<<20):.3f}" if l2_effective_bytes else "",
+        "l2_source": l2_source,
         "power_envelope_expected_w": profile.get("power_envelope_w", ""),
         "power_limit_w": f"{power_limit_w:.3f}" if isinstance(power_limit_w, (int, float)) else "",
         "power_limit_min_w": f"{power_min_w:.3f}" if isinstance(power_min_w, (int, float)) else "",
@@ -453,6 +456,42 @@ def _print_fused_failure_hint(err_msg: str) -> None:
         print("  [fused] PyTorch SDPA/FlashAttention backend was not usable. "
               "Check torch/CUDA/cuDNN compatibility.")
     print("  [fused] To bypass fused only for debugging, rerun with --no-fused.")
+
+
+def _apply_effective_l2_cache_regime(spec: bm.BenchSpec, l2_bytes: int,
+                                     l2_source: str) -> None:
+    """Fill cache_regime from the effective L2 size when builders could not.
+
+    Some torch builds do not expose device L2 size for RTX 3090, while the
+    selected GPU profile still has the value needed for workload-size
+    classification. Builders run before they know that profile fallback, so
+    the driver patches unknown regimes here.
+    """
+    if spec.cache_regime != "unknown" or l2_bytes <= 0:
+        return
+    try:
+        if spec.op in bm.FLOP_PER_ELEMENT:
+            ws = bm._elementwise_working_set(  # noqa: SLF001 - local benchmark metadata helper.
+                spec.op, spec.n_elements, bm._dtype_bytes(spec.dtype_label))
+        elif spec.op in ("matmul", "matmul_llm") and len(spec.shape) == 3:
+            a, b, c = spec.shape
+            ws = (a * b + b * c + a * c) * bm._dtype_bytes(spec.dtype_label)
+        elif spec.op in bm.FUSED_VARIANTS:
+            if "attention" in spec.op and len(spec.shape) == 6:
+                B, H_q, H_kv, N_q, N_kv, D_head = spec.shape
+                ws = (B * (H_q + 2 * H_kv) * N_kv * D_head
+                      + B * H_q * N_q * D_head) * 2
+            elif len(spec.shape) == 3:
+                M, D_in, D_out = spec.shape
+                ws = (M * D_in + D_in * D_out + M * D_out) * 2
+            else:
+                return
+        else:
+            return
+    except Exception:
+        return
+    spec.cache_regime = bm.classify_cache_regime(int(ws), l2_bytes)
+    spec.extra["cache_regime_source"] = l2_source
 
 
 def pick_iters(spec: bm.BenchSpec, target_ms: float, ms_per_call: float) -> int:
@@ -1014,10 +1053,25 @@ def main() -> int:
     # Each plan has a `build()` callable that allocates tensors just-in-time
     # so we never hold more than one cell's tensors at once.
     plans: list[dict] = []
-    l2_bytes = bm.get_l2_bytes(args.device)
+    l2_reported_bytes = bm.get_l2_bytes(args.device)
+    l2_bytes = l2_reported_bytes
+    l2_source = "torch"
+    if l2_bytes <= 0:
+        try:
+            profile_l2_mb = float(profile.get("l2_mb", 0) or 0)
+        except (TypeError, ValueError):
+            profile_l2_mb = 0.0
+        if profile_l2_mb > 0:
+            l2_bytes = int(profile_l2_mb * (1 << 20))
+            l2_source = "gpu_profile"
     if l2_bytes > 0:
-        print(f"[info] L2 cache size: {l2_bytes/(1<<20):.1f} MB "
-              f"(used to classify cache_regime for every row)")
+        if l2_reported_bytes > 0:
+            print(f"[info] L2 cache size: {l2_bytes/(1<<20):.1f} MB "
+                  f"(used to classify cache_regime for every row)")
+        else:
+            print(f"[info] L2 cache size not reported by torch — using "
+                  f"{profile_key} profile value {l2_bytes/(1<<20):.1f} MB "
+                  f"to classify cache_regime")
     else:
         print("[info] L2 cache size not reported by torch — cache_regime=unknown")
     # Memory budget: drop elementwise loads that would OOM on this HBM.
@@ -1033,7 +1087,8 @@ def main() -> int:
               f"{hbm_bytes*_MEM_SAFETY_FRACTION/(1<<30):.1f} GB)")
     spec_snapshot = _gpu_spec_snapshot(
         profile_key, profile, observed_profile, profile_status, profile_reason,
-        gpu_name, cc, args.device, handle, hbm_bytes, l2_bytes)
+        gpu_name, cc, args.device, handle, hbm_bytes, l2_reported_bytes,
+        l2_bytes, l2_source if l2_bytes > 0 else "")
     print(f"[profile] expected memory={profile.get('memory_type')} "
           f"{profile.get('memory_capacity_gb')}GB, expected L2={profile.get('l2_mb')}MB, "
           f"power envelope={profile.get('power_envelope_w')}W")
@@ -1447,6 +1502,7 @@ def main() -> int:
                     _print_fused_failure_hint(err_msg)
                     fused_hint_printed = True
                 continue
+            _apply_effective_l2_cache_regime(spec, l2_bytes, l2_source)
             tag = spec.compute_unit + ("  [EMULATED]" if spec.emulated else "")
             print(f"  compute_unit: {tag}")
             print(f"  cache_regime: {spec.cache_regime}")
@@ -1564,6 +1620,8 @@ def main() -> int:
                 "peak_bw_expected_gbps": spec_snapshot.get("peak_bw_expected_gbps", ""),
                 "l2_expected_mb": spec_snapshot.get("l2_expected_mb", ""),
                 "l2_reported_mb": spec_snapshot.get("l2_reported_mb", ""),
+                "l2_effective_mb": spec_snapshot.get("l2_effective_mb", ""),
+                "l2_source": spec_snapshot.get("l2_source", ""),
                 "power_envelope_expected_w": spec_snapshot.get("power_envelope_expected_w", ""),
                 "power_limit_w": spec_snapshot.get("power_limit_w", ""),
                 "native_fp8_headline_allowed": spec_snapshot.get("native_fp8_headline_allowed", ""),
