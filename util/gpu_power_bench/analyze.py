@@ -2270,6 +2270,31 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
                 fallback_used = fb_self_l2 or fb_self_dr
             C = j_self_dr - j_self_l2          # DRAM round-trip
             total = A + B + C                  # = j_self_dr  (identity)
+            # MECE assumes A (J/elem at l2_hit_100) <= total (J/elem at
+            # l2_hit_0) — i.e. spilling to DRAM adds energy per element.
+            # On small-L2 GPUs with cache-sweep mode this is sometimes
+            # VIOLATED : the l2_hit_100 cell is run with a tiny N (~256K
+            # elements on RTX 3090, 6 MB L2), so kernel-launch + setup
+            # overhead amortizes over very few elements and J/elem is
+            # 30-50x larger than the well-amortized l2_hit_0 measurement.
+            # In that regime A > total ⇒ C < 0, and the inline label
+            # `A: <huge> pJ (2678%)` lands far outside the y-axis range
+            # which made `bbox_inches="tight"` expand the saved PNG to
+            # ~4000 px tall. Skip the bar with a clear log entry instead.
+            if A > total * 1.10:   # 10% slack for noise
+                _PlotSkipLog.record(
+                    plot="energy_decomposition_mece",
+                    variant=f"{op}_{dtype}",
+                    reason="A_exceeds_total",
+                    details=f"A={A*1e12:.1f} pJ/elem > total={total*1e12:.1f} "
+                            f"pJ/elem (l2_hit_100 J/elem larger than "
+                            f"l2_hit_0). Likely cause: small-N "
+                            f"l2_hit_100 cell dominated by kernel launch / "
+                            f"setup overhead, not amortized over enough "
+                            f"elements for MECE identity to hold. "
+                            f"Increase --window-ms or use --loads with "
+                            f"larger N at l2_hit_100.")
+                continue
             bars.append({
                 "label":     f"{op}_{dtype}",
                 "op":        op,
@@ -2309,7 +2334,10 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
             reason_tag = "no_bars_built"
             details = (f"regimes={ew_regimes}, dtypes={dtypes_present}, "
                        f"ops={ops_present} — every bar was skipped despite "
-                       f"data presence (slope NaN/<=0 in BOTH WLS and median).")
+                       f"data presence. See per-(op, dtype) rows above for "
+                       f"the specific reason (e.g. A_exceeds_total when "
+                       f"l2_hit_100 J/elem > l2_hit_0 J/elem; or slope "
+                       f"NaN/<=0 in both WLS and median).")
         _PlotSkipLog.record(
             plot="energy_decomposition_mece",
             variant="(all)", reason=reason_tag, details=details)
@@ -2317,12 +2345,16 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
 
     plt = _get_mpl()
     # 2-row layout : main chart on top, caveat box on its own row below.
-    # hspace + height_ratios chosen so x-tick labels never touch the
-    # caveat box. Total height 9 in (was 11) — bbox_inches="tight" in
-    # _save_fig crops empty space below the caveat.
+    # Width capped at 12 in (1920 px @ 160 dpi) so the saved PNG stays
+    # under the 2000 px budget. With 6 bars the natural width is 12 in
+    # and ticks sit comfortably; with fewer bars the legend used to be
+    # bbox_to_anchor=(1.01, 1.0) which pushed bbox_inches="tight" into a
+    # 4000+ px tall image (RTX 3090 cache-sweep had 3 bars only).
+    # Legend now sits inside the axes (top-right corner) so the saved
+    # PNG dimensions match figsize.
     fig, (ax, ax_caveat) = plt.subplots(
         2, 1,
-        figsize=(max(13, 1.6 * len(bars) + 5), 9.0),
+        figsize=(min(12.0, max(8.0, 1.4 * len(bars) + 5)), 9.0),
         gridspec_kw={"height_ratios": [9, 1.6], "hspace": 0.32})
     ax_caveat.set_axis_off()
     xs = np.arange(len(bars))
@@ -2439,9 +2471,11 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     ax.set_xticklabels([b["label"] for b in bars], rotation=20, ha="right",
                        fontsize=10)
     ax.set_ylabel("pJ / element  (dynamic, at l2_hit_0)", fontsize=11)
-    # Headroom for the Σ label above each bar.
+    # Headroom for the Σ label above each bar AND the in-axes legend
+    # (top-right). 1.30x leaves room for both ; with the legend inside
+    # the axes a tighter limit overlapped the tallest bar.
     if any(v > 0 for v in [b["total"] for b in bars]):
-        ax.set_ylim(0, max(b["total"] for b in bars) * 1.15 * 1e12)
+        ax.set_ylim(0, max(b["total"] for b in bars) * 1.30 * 1e12)
     ax.set_title(
         f"MECE energy decomposition — elementwise @ l2_hit_0 — {gpu}\n"
         "A + B + C  ≡  J(op, dtype, l2_hit_0)   (algebraic identity → no overlap, no missing piece)\n"
@@ -2454,9 +2488,12 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     # Default matplotlib order is insertion order (A → B → C), which
     # reads the opposite way from the visual stack.
     handles, labels = ax.get_legend_handles_labels()
+    # Legend INSIDE the axes (was bbox_to_anchor=(1.01, 1.0) outside which
+    # made bbox_inches="tight" expand the saved PNG to ~3x its figsize
+    # height when there were few bars and the legend dominated layout).
     ax.legend(handles[::-1], labels[::-1],
-              loc="upper left", fontsize=9, ncol=1,
-              bbox_to_anchor=(1.01, 1.0))
+              loc="upper right", fontsize=8, ncol=1,
+              framealpha=0.9)
 
     # Caveat — semantic tightening : math is correct (A+B+C ≡ T), but
     # both B and C are *regime-anchored* quantities, not pure
