@@ -430,13 +430,18 @@ def _elementwise_working_set(op: str, n_elements: int, bytes_per_elem: int) -> i
     """Bytes touched per kernel for a given op at a given size.
 
     - mul/add : 2 reads + 1 write = 3·N·bytes_per_elem
+    - stream_read / stream_write : one tensor = 1·N·bytes_per_elem
+    - stream_copy / stream_scale : 1 read + 1 write = 2·N·bytes_per_elem
+    - stream_triad : 2 reads + 1 write = 3·N·bytes_per_elem
     - gelu    : 1 read + 1 write = 2·N·bytes_per_elem
     - softmax / layernorm : 1 read + 1 write = 2·N·bytes_per_elem (+ weight/bias
       are O(D) so negligible relative to N·D)
     This is what the L2 actually has to hold (transient) for the kernel to
     complete — the figure used to classify the regime.
     """
-    if op in ("mul", "add"):
+    if op in ("stream_read", "stream_write"):
+        rw = 1
+    elif op in ("mul", "add", "stream_triad"):
         rw = 3
     else:
         rw = 2

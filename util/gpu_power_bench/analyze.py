@@ -2208,16 +2208,34 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
 
     slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
+    has_median = "median_j_per_unit" in ew.columns
 
     def _slope(op: str, dtype: str, regime: str):
+        """Return positive J/element for (op, dtype, regime) or None.
+
+        Primary source : slope_dyn_wls. When the regime-local fit is
+        unstable (NaN / non-positive slope — happens when dyn_energy at
+        small-N L2-resident cells is near the NVML noise floor and the
+        WLS line goes negative even though every individual cell is
+        positive), fall back to median_j_per_unit which is computed
+        directly from per-cell J/element and is sign-stable. The
+        returned value carries no flag — bars using the fallback are
+        marked separately via _used_fallback below.
+        """
         sub = ew[(ew["op"] == op) & (ew["dtype"] == dtype)
                  & (ew["cache_regime"] == regime)]
         if sub.empty:
-            return None
+            return None, False
         v = sub[slope_col].iloc[0]
-        if pd.isna(v) or v <= 0:
-            return None
-        return float(v)
+        if pd.notna(v) and v > 0:
+            return float(v), False
+        # Fallback : median_j_per_unit. Positive by construction unless
+        # every cell in this regime was clipped to zero.
+        if has_median:
+            m = sub["median_j_per_unit"].iloc[0]
+            if pd.notna(m) and m > 0:
+                return float(m), True
+        return None, False
 
     # Build decomposition rows for every (op, dtype) pair that has the
     # measurements we need. Skip silently when a piece is missing — the
@@ -2233,36 +2251,35 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         if op not in ew["op"].values:
             continue
         for dtype in ("fp16", "fp8"):
-            j_self_l2  = _slope(op, dtype, "l2_hit_100")
-            j_self_dr  = _slope(op, dtype, "l2_hit_0")
+            j_self_l2,  fb_self_l2 = _slope(op, dtype, "l2_hit_100")
+            j_self_dr,  fb_self_dr = _slope(op, dtype, "l2_hit_0")
             if j_self_l2 is None or j_self_dr is None:
                 continue
-            j_fp16_l2 = _slope(op, "fp16", "l2_hit_100") if dtype == "fp8" else None
-            # Component A — "resident workload" (compute + L2 + launch)
-            # For fp16 : just j_self_l2.
-            # For fp8 : the fp16 baseline of the same op (so cast overhead
-            # is attributed cleanly to component B).
             if dtype == "fp8":
+                j_fp16_l2, fb_fp16_l2 = _slope(op, "fp16", "l2_hit_100")
                 if j_fp16_l2 is None:
                     # Without an fp16 baseline we can't separate cast
                     # cleanly — skip rather than misattribute.
                     continue
                 A = j_fp16_l2
                 B = j_self_l2 - j_fp16_l2     # cast overhead
+                fallback_used = fb_self_l2 or fb_self_dr or fb_fp16_l2
             else:
                 A = j_self_l2
                 B = 0.0
+                fallback_used = fb_self_l2 or fb_self_dr
             C = j_self_dr - j_self_l2          # DRAM round-trip
             total = A + B + C                  # = j_self_dr  (identity)
             bars.append({
-                "label": f"{op}_{dtype}",
-                "op":    op,
-                "dtype": dtype,
-                "A":     A,
-                "B":     B,
-                "C":     C,
-                "total": total,
-                "j_self_dr": j_self_dr,         # for sanity check
+                "label":     f"{op}_{dtype}",
+                "op":        op,
+                "dtype":     dtype,
+                "A":         A,
+                "B":         B,
+                "C":         C,
+                "total":     total,
+                "j_self_dr": j_self_dr,
+                "fallback":  fallback_used,
             })
     if not bars:
         return False
@@ -2329,9 +2346,12 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
         b_pct = 100.0 * b["B"] / b["total"] if b["total"] > 0 else 0
         c_pct = 100.0 * b["C"] / b["total"] if b["total"] > 0 else 0
 
-        # Total above the stack
+        # Total above the stack. Trailing `*` marks bars where any
+        # underlying slope fell back to median_j_per_unit (regime fit
+        # was unstable due to small-N noise floor — see _slope() above).
+        sigma_suffix = " *" if b.get("fallback") else ""
         ax.text(xs[i], total_pj * 1.02,
-                f"Σ = {_fmt_pj(total_pj)} pJ/elem",
+                f"Σ = {_fmt_pj(total_pj)} pJ/elem{sigma_suffix}",
                 ha="center", va="bottom", fontsize=SIGMA_FS, fontweight="bold")
 
         segments = [
@@ -2410,8 +2430,14 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
     # Caveat — semantic tightening : math is correct (A+B+C ≡ T), but
     # both B and C are *regime-anchored* quantities, not pure
     # interpretive concepts. Make this explicit.
+    any_fallback = any(b.get("fallback") for b in bars)
+    fallback_line = (
+        "Σ marked with `*` : a regime-local slope_dyn_wls was unstable (NaN / non-positive\n"
+        "from small-N noise floor); the bar uses median_j_per_unit instead. Magnitude correct,\n"
+        "fit confidence reduced.\n") if any_fallback else ""
     ax_caveat.text(
         0.5, 0.5,
+        f"{fallback_line}"
         "A bundles compute + L2 transit + kernel-launch (no NVML measurement isolates pure compute).\n"
         "B is the FP8 cast/emulation overhead OBSERVED AT L2-RESIDENT REGIME — additional cast-path\n"
         "memory effects that appear only when the working set spills to HBM are folded into C, not B.\n"
@@ -3311,6 +3337,455 @@ def plot_attention_te_dtype_compare(df: pd.DataFrame, out_png: Path,
         ha="center", va="top", fontsize=8.5, color="#333", linespacing=1.4,
         bbox=dict(facecolor="#e0f0e0", edgecolor="#2ca02c", pad=6))
     _save_fig(fig, out_png, pad_inches=0.05)
+    return True
+
+
+# ============================================================================
+# FP8 Dashboard (Chunk 4) — 4 plots that consolidate FP8 results in one
+# place so the operator can immediately see :
+#   1) what's MEASURED vs N/A
+#   2) FP8 native compute coefficient (Tensor Core matmul)
+#   3) FP8 total workload energy across categories
+#   4) MECE decomposition status per op group
+# ============================================================================
+
+def plot_fp8_measurement_availability(df: pd.DataFrame, out_png: Path,
+                                       gpu: str) -> bool:
+    """Matrix showing which FP8 results are available, native, and
+    decomposable. Designed to be read at a glance — green = ok,
+    yellow = caveat, red = N/A.
+    """
+    if df is None or df.empty:
+        return False
+    plt = _get_mpl()
+
+    # Op groups + status checks
+    rows_def = [
+        ("Matmul FP8 (matmul_fp8_te)", "matmul",     "matmul_fp8_te"),
+        ("Attention FP8 (attention_flash)", "fused", "attention_flash"),
+        ("Elementwise FP8 mul",   "elementwise", "mul"),
+        ("Elementwise FP8 softmax", "elementwise", "softmax"),
+        ("Elementwise FP8 gelu",  "elementwise", "gelu"),
+        ("Elementwise FP8 layernorm", "elementwise", "layernorm"),
+        ("DRAM stream_copy FP8",  "elementwise", "stream_copy"),
+    ]
+    cols = ["measured", "native FP8 path", "baseline available", "decomposable"]
+    cell_status = []   # "ok" / "caveat" / "na"
+    cell_text   = []
+    for label, cat, op in rows_def:
+        row_df = df[(df["category"].isin((cat, "stream") if cat == "elementwise" else (cat,)))
+                    & (df["op"] == op) & (df["dtype"] == "fp8")]
+        measured = not row_df.empty
+        if not measured:
+            cell_status.append(["na", "na", "na", "na"])
+            cell_text.append(["—", "—", "—", "—"])
+            continue
+        # path_semantics column tells native/emulated/fallback
+        ps = (row_df["path_semantics"].iloc[0]
+              if "path_semantics" in row_df.columns
+              else "native_or_standard")
+        native_status = "ok" if ps == "native_or_te_fp8_tensorcore" else \
+                        ("caveat" if ps == "te_fp16_fallback" else "caveat")
+        native_text = {
+            "native_or_te_fp8_tensorcore": "✓ native TE",
+            "te_fp16_fallback":            "⚠ fp16 fallback",
+            "emulated_cast_compute_cast":  "✗ emulated cast",
+            "native_or_standard":          "✓ standard",
+        }.get(ps, ps)
+        # baseline + decomposable depends on op
+        if op == "matmul_fp8_te":
+            baseline_st, baseline_tx = "ok", "✓ A+C (regimes)"
+            decomp_st, decomp_tx = "ok", "✓ A+C MECE"
+        elif op == "attention_flash":
+            # decomp only if attention_qkv_matmul fp8 exists too
+            qkv_fp8 = df[(df["op"] == "attention_qkv_matmul") & (df["dtype"] == "fp8")]
+            if qkv_fp8.empty:
+                baseline_st, baseline_tx = "na", "✗ no fp8 baseline"
+                decomp_st, decomp_tx = "na", "N/A (no baseline)"
+            else:
+                baseline_st, baseline_tx = "ok", "✓"
+                decomp_st, decomp_tx = "ok", "✓"
+        elif op in ("mul", "softmax", "gelu", "layernorm"):
+            # fp16 cells exist?
+            fp16_present = not df[(df["op"] == op) & (df["dtype"] == "fp16")].empty
+            baseline_st, baseline_tx = ("ok", "✓ fp16 baseline") if fp16_present \
+                                       else ("caveat", "⚠ no fp16 ref")
+            decomp_st, decomp_tx = ("caveat", "A+B+C (B = cast)" if fp16_present
+                                    else "A only")
+        else:  # stream
+            baseline_st, baseline_tx = "caveat", "see DRAM marginal"
+            decomp_st, decomp_tx = "caveat", "L2→HBM proxy"
+        cell_status.append(["ok", native_status, baseline_st, decomp_st])
+        cell_text.append(["✓", native_text, baseline_tx, decomp_tx])
+
+    if not cell_status:
+        return False
+    rows = [r[0] for r in rows_def]
+    n_rows, n_cols = len(rows), len(cols)
+    color_map = {"ok": "#c6efce", "caveat": "#ffeb9c", "na": "#ffc7ce"}
+    # Width capped at 11 inches → 1760 px @ 160 dpi (< 2000 px hard limit).
+    fig, ax = plt.subplots(figsize=(11.0, max(4, n_rows * 0.6 + 2)))
+    ax.set_xlim(-0.5, n_cols - 0.5)
+    ax.set_ylim(-0.5, n_rows - 0.5)
+    ax.invert_yaxis()
+    for ri in range(n_rows):
+        for ci in range(n_cols):
+            rect = plt.Rectangle((ci - 0.5, ri - 0.5), 1.0, 1.0,
+                                 facecolor=color_map[cell_status[ri][ci]],
+                                 edgecolor="#666", linewidth=0.8)
+            ax.add_patch(rect)
+            ax.text(ci, ri, cell_text[ri][ci], ha="center", va="center",
+                    fontsize=8, color="#222")
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(cols, fontsize=10, fontweight="bold")
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels(rows, fontsize=9)
+    ax.tick_params(top=True, bottom=False, labeltop=True, labelbottom=False,
+                   left=True, right=False)
+    ax.spines[:].set_visible(False)
+    ax.set_title(f"FP8 measurement availability — {gpu}\n"
+                 f"green = OK ;  yellow = caveat / partial ;  red = N/A. "
+                 f"Use this to decide what FP8 numbers you can claim.",
+                 fontsize=10, pad=18)
+    _save_fig(fig, out_png, pad_inches=0.1)
+    return True
+
+
+def plot_fp8_native_compute_anchor(summary: pd.DataFrame, out_png: Path,
+                                    gpu: str) -> bool:
+    """FP8 native compute anchor — Tensor Core matmul pJ/FLOP comparison
+    across tf32_tc / fp16_tc / bf16_tc / fp8_te. The fp8_te bar is the
+    headline FP8 native compute coefficient when path_semantics ==
+    `native_or_te_fp8_tensorcore`. Hatched + warning when it's
+    `te_fp16_fallback` (pre-Hopper).
+    """
+    if summary is None or summary.empty:
+        return False
+    mm = summary[summary["category"] == "matmul"].copy()
+    if mm.empty:
+        return False
+    order = ["matmul_tf32_tc", "matmul_fp16_tc",
+             "matmul_bf16_tc", "matmul_fp8_te"]
+    mm2 = mm.set_index("variant").reindex([v for v in order if v in mm["variant"].values])
+    if mm2.empty:
+        return False
+    plt = _get_mpl()
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm2.columns else "slope_dyn"
+    vals = (mm2[slope_col].values * 1e12)   # pJ/FLOP
+    is_fp8 = [v == "matmul_fp8_te" for v in mm2.index]
+    ps = (mm2["path_semantics"].values
+          if "path_semantics" in mm2.columns
+          else ["native_or_standard"] * len(mm2))
+    fallback = [p == "te_fp16_fallback" for p in ps]
+    colors = ["#1f77b4" if not f8 else ("#d62728" if not fb else "#888")
+              for f8, fb in zip(is_fp8, fallback)]
+    hatches = ["xx" if fb else None for fb in fallback]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    xs = np.arange(len(mm2))
+    bars = ax.bar(xs, vals, color=colors, edgecolor="white",
+                  hatch=hatches, alpha=0.92)
+    for rect, v, p, fb in zip(bars, vals, ps, fallback):
+        tag = ""
+        if p == "native_or_te_fp8_tensorcore":
+            tag = "\n✓ native TE FP8"
+        elif fb:
+            tag = "\n⚠ fp16 fallback"
+        ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+                f"{v:.3f}{tag}",
+                ha="center", va="bottom", fontsize=9, linespacing=1.2)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([v.removeprefix("matmul_") for v in mm2.index],
+                       fontsize=10, rotation=0)
+    ax.set_ylabel("pJ / FLOP  (dyn slope, l2_hit_0)")
+    finite = vals[~np.isnan(vals)]
+    if finite.size:
+        ax.set_ylim(0, float(np.max(finite)) * 1.30)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_title(
+        f"FP8 native compute anchor — Tensor Core matmul — {gpu}\n"
+        f"Headline FP8 native energy coefficient when fp8_te is "
+        f"native_or_te_fp8_tensorcore.\nfp8 fallback (red+hatch) means "
+        f"TE silently ran FP16 — NOT a real FP8 measurement.",
+        fontsize=10)
+    _save_fig(fig, out_png, pad_inches=0.1)
+    return True
+
+
+def plot_fp8_total_matmul_energy(summary: pd.DataFrame, out_png: Path,
+                                  gpu: str) -> bool:
+    """FP8 total workload — matmul (Tensor Core) l2_hit_0 pJ/FLOP for
+    fp16 vs bf16 vs fp8. Split out from the original 3-panel dashboard
+    so each PNG stays under the 2000 px width budget.
+    """
+    if summary is None or summary.empty:
+        return False
+    mm = summary[summary["category"] == "matmul"]
+    if mm.empty:
+        return False
+    plt = _get_mpl()
+    slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm.columns else "slope_dyn"
+    order = ["matmul_fp16_tc", "matmul_bf16_tc", "matmul_fp8_te"]
+    sub = mm.set_index("variant").reindex([v for v in order if v in mm["variant"].values])
+    if sub.empty:
+        return False
+    vals = sub[slope_col].values * 1e12
+    colors_map = {"matmul_fp16_tc": "#1f77b4", "matmul_bf16_tc": "#9467bd",
+                  "matmul_fp8_te": "#d62728"}
+    fig, ax = plt.subplots(figsize=(8, 6))
+    xs = np.arange(len(sub))
+    bars = ax.bar(xs, vals,
+                  color=[colors_map.get(v, "#666") for v in sub.index],
+                  edgecolor="white")
+    for rect, v in zip(bars, vals):
+        ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+                f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([v.removeprefix("matmul_") for v in sub.index],
+                       fontsize=10)
+    ax.set_ylabel("pJ / FLOP  (l2_hit_0 dyn slope)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_title(f"FP8 total workload — matmul (Tensor Core) — {gpu}\n"
+                 f"native TE FP8 anchor, l2_hit_0 dyn slope",
+                 fontsize=10)
+    _save_fig(fig, out_png, pad_inches=0.1)
+    return True
+
+
+def plot_fp8_total_attention_energy(df: pd.DataFrame, out_png: Path,
+                                     gpu: str) -> bool:
+    """FP8 total workload — fused attention_flash mJ/call for
+    fp16/bf16/fp8. Single-panel narrow figure.
+    """
+    if df is None or df.empty:
+        return False
+    af = df[(df["category"] == "fused") & (df["op"] == "attention_flash")].copy()
+    if af.empty:
+        return False
+    plt = _get_mpl()
+    af["dyn_J"] = pd.to_numeric(af["dyn_energy_j"], errors="coerce")
+    af["iters_n"] = pd.to_numeric(af["iters"], errors="coerce")
+    af["j_per_call"] = af["dyn_J"] / af["iters_n"]
+    order = [d for d in ("fp16", "bf16", "fp8") if d in af["dtype"].values]
+    if not order:
+        return False
+    grp = (af.groupby("dtype")["j_per_call"].mean()
+           .reindex(order).reset_index())
+    vals = grp["j_per_call"].values * 1e3   # mJ
+    colors_map = {"fp16": "#1f77b4", "bf16": "#9467bd", "fp8": "#d62728"}
+    fig, ax = plt.subplots(figsize=(8, 6))
+    xs = np.arange(len(grp))
+    bars = ax.bar(xs, vals,
+                  color=[colors_map[d] for d in grp["dtype"]],
+                  edgecolor="white")
+    for rect, v in zip(bars, vals):
+        ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(),
+                f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+    ax.set_xticks(xs); ax.set_xticklabels(grp["dtype"], fontsize=10)
+    ax.set_ylabel("mJ / call")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_title(f"FP8 total workload — attention_flash — {gpu}\n"
+                 f"fused total per call ; fp8 path = TE-DPA when accepted",
+                 fontsize=10)
+    _save_fig(fig, out_png, pad_inches=0.1)
+    return True
+
+
+def plot_fp8_total_elementwise_energy(df: pd.DataFrame, out_png: Path,
+                                       gpu: str) -> bool:
+    """FP8 total workload — elementwise softmax/gelu/layernorm pJ/elem at
+    l2_hit_0, fp16 vs fp8. fp8 bars hatched (emulated cast-compute-cast).
+    """
+    if df is None or df.empty:
+        return False
+    by = df[(df["category"] == "elementwise")
+            & (df["op"].isin(("softmax", "gelu", "layernorm")))].copy()
+    if by.empty or "j_per_element_dyn" not in by.columns:
+        return False
+    plt = _get_mpl()
+    by["jpe"] = pd.to_numeric(by["j_per_element_dyn"], errors="coerce")
+    by["cache_regime"] = by["cache_regime"].replace(LEGACY_REGIME_MAP)
+    by_l2_0 = by[by["cache_regime"] == "l2_hit_0"]
+    if by_l2_0.empty:
+        return False
+    grp = (by_l2_0.groupby(["op", "dtype"])["jpe"].median().reset_index())
+    ops = sorted(grp["op"].unique())
+    fig, ax = plt.subplots(figsize=(8, 6))
+    xs = np.arange(len(ops))
+    w = 0.4
+    for i, dt in enumerate(("fp16", "fp8")):
+        vals = []
+        for op in ops:
+            sub = grp[(grp["op"] == op) & (grp["dtype"] == dt)]
+            vals.append(float(sub["jpe"].iloc[0]) * 1e12 if not sub.empty else float("nan"))
+        color = "#1f77b4" if dt == "fp16" else "#d62728"
+        ax.bar(xs + (i - 0.5) * w, vals, w,
+               color=color, edgecolor="white",
+               hatch="//" if dt == "fp8" else None,
+               label=dt + (" (emu)" if dt == "fp8" else ""))
+    ax.set_xticks(xs); ax.set_xticklabels(ops, fontsize=10, rotation=0)
+    ax.set_ylabel("pJ / element")
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_title(f"FP8 total workload — elementwise @ l2_hit_0 — {gpu}\n"
+                 f"fp16 vs fp8 ; fp8 hatched = emulated cast-compute-cast",
+                 fontsize=10)
+    _save_fig(fig, out_png, pad_inches=0.1)
+    return True
+
+
+def plot_fp8_mece_dashboard(df: pd.DataFrame, by_regime: pd.DataFrame,
+                             decomp_df: pd.DataFrame, out_png: Path,
+                             gpu: str) -> bool:
+    """Consolidated FP8 MECE decomposition dashboard. 3 panels :
+       * matmul fp8_te : A (l2_hit_100) + C (l2_hit_0 - l2_hit_100)
+       * elementwise fp8 : A (fp16 baseline) + B (fp8 cast overhead) + C
+       * attention fp8 : N/A baseline badge (TE batched-fp8-gemm absence)
+    """
+    plt = _get_mpl()
+    fig, axes = plt.subplots(3, 1, figsize=(11, 11),
+                             gridspec_kw={"height_ratios": [3, 3, 2]})
+
+    # Panel 1 : matmul fp8_te decomposition
+    ax = axes[0]
+    rendered_1 = False
+    if by_regime is not None and not by_regime.empty:
+        mm = by_regime[(by_regime["category"] == "matmul")
+                       & (by_regime["variant"] == "matmul_fp8_te")].copy()
+        if not mm.empty:
+            mm["cache_regime"] = mm["cache_regime"].replace(LEGACY_REGIME_MAP)
+            slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm.columns else "slope_dyn"
+            l2 = mm[mm["cache_regime"] == "l2_hit_100"]
+            dr = mm[mm["cache_regime"] == "l2_hit_0"]
+            if not l2.empty and not dr.empty:
+                A = float(l2[slope_col].iloc[0]) * 1e12
+                T = float(dr[slope_col].iloc[0]) * 1e12
+                C = T - A
+                ax.bar([0], [A], color="#2ca02c", label="A) L2-resident workload")
+                ax.bar([0], [max(0, C)], bottom=[A], color="#1f77b4",
+                       label="C) Off-chip L2→HBM marginal")
+                ax.text(0, A + max(0, C),
+                        f"Σ = {T:.3f} pJ/FLOP", ha="center", va="bottom",
+                        fontsize=10, fontweight="bold")
+                ax.text(0, A / 2, f"A: {A:.3f} ({100*A/T:.0f}%)",
+                        ha="center", va="center", color="white", fontweight="bold")
+                if C > 0:
+                    ax.text(0, A + C / 2, f"C: {C:.3f} ({100*C/T:.0f}%)",
+                            ha="center", va="center", color="white", fontweight="bold")
+                else:
+                    ax.text(0.05, A * 1.02,
+                            f"⚠ C={C:.3f} < 0 (tile reuse / noise)",
+                            ha="left", va="bottom", color="#b03030", fontsize=9)
+                ax.set_xticks([0]); ax.set_xticklabels(["matmul_fp8_te"])
+                ax.set_ylabel("pJ / FLOP")
+                ax.legend(fontsize=8, loc="upper right")
+                rendered_1 = True
+    ax.set_title("matmul fp8_te — A + C MECE", fontsize=10)
+    if not rendered_1:
+        ax.text(0.5, 0.5, "no matmul fp8_te data (or only one regime measured)",
+                ha="center", va="center", transform=ax.transAxes, color="#888")
+        ax.set_axis_off()
+
+    # Panel 2 : elementwise fp8 decomposition
+    ax = axes[1]
+    rendered_2 = False
+    panel2_any_fallback = False
+    if by_regime is not None and not by_regime.empty:
+        ew = by_regime[by_regime["category"] == "elementwise"].copy()
+        if not ew.empty:
+            ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
+            slope_col = "slope_dyn_wls" if "slope_dyn_wls" in ew.columns else "slope_dyn"
+            has_median_p2 = "median_j_per_unit" in ew.columns
+
+            def _row_jpe(row_df):
+                """Return (j_per_element_pJ, used_fallback) or (None, _).
+                Falls back to median_j_per_unit when WLS slope is NaN or
+                non-positive (small-N noise floor → unstable fit).
+                """
+                if row_df.empty:
+                    return None, False
+                v = row_df[slope_col].iloc[0]
+                if pd.notna(v) and v > 0:
+                    return float(v) * 1e12, False
+                if has_median_p2:
+                    m = row_df["median_j_per_unit"].iloc[0]
+                    if pd.notna(m) and m > 0:
+                        return float(m) * 1e12, True
+                return None, False
+
+            ops = ["softmax", "gelu", "layernorm"]
+            xs = np.arange(len(ops))
+            for i, op in enumerate(ops):
+                fp16_l2 = ew[(ew["op"] == op) & (ew["dtype"] == "fp16")
+                              & (ew["cache_regime"] == "l2_hit_100")]
+                fp8_l2  = ew[(ew["op"] == op) & (ew["dtype"] == "fp8")
+                              & (ew["cache_regime"] == "l2_hit_100")]
+                fp8_dr  = ew[(ew["op"] == op) & (ew["dtype"] == "fp8")
+                              & (ew["cache_regime"] == "l2_hit_0")]
+                A_val,  fb_a = _row_jpe(fp16_l2)
+                f8l_val, fb_b = _row_jpe(fp8_l2)
+                T_val,   fb_t = _row_jpe(fp8_dr)
+                if A_val is None or f8l_val is None or T_val is None:
+                    continue
+                A = A_val
+                B = f8l_val - A_val
+                T = T_val
+                C = T - A - B
+                ax.bar([i], [A], color="#2ca02c",
+                       label="A) L2-resident (fp16 baseline)" if i == 0 else None)
+                ax.bar([i], [max(0, B)], bottom=[A], color="#ff7f0e",
+                       label="B) FP8 emu/cast overhead @ L2-resident" if i == 0 else None)
+                ax.bar([i], [max(0, C)], bottom=[A + max(0, B)], color="#1f77b4",
+                       label="C) Off-chip L2→HBM marginal" if i == 0 else None)
+                fb_marker = " *" if (fb_a or fb_b or fb_t) else ""
+                ax.text(i, T, f"Σ={T:.1f}{fb_marker}", ha="center", va="bottom", fontsize=8)
+                if fb_a or fb_b or fb_t:
+                    panel2_any_fallback = True
+                rendered_2 = True
+            ax.set_xticks(xs); ax.set_xticklabels([f"{op}_fp8" for op in ops], fontsize=9)
+            ax.set_ylabel("pJ / element")
+            if rendered_2:
+                ax.legend(fontsize=7, loc="upper left")
+            if panel2_any_fallback:
+                ax.text(0.99, 0.99, "* = median fallback (WLS slope unstable)",
+                        ha="right", va="top", transform=ax.transAxes,
+                        fontsize=7, color="#666", style="italic",
+                        bbox=dict(facecolor="white", edgecolor="#ccc",
+                                   alpha=0.85, pad=2))
+    ax.set_title("elementwise fp8 — A + B + C MECE  (B = cast overhead, "
+                 "fp8 = emulated cast-compute-cast)", fontsize=10)
+    if not rendered_2:
+        ax.text(0.5, 0.5, "no elementwise fp8 vs fp16 paired data",
+                ha="center", va="center", transform=ax.transAxes, color="#888")
+        ax.set_axis_off()
+
+    # Panel 3 : attention fp8 N/A baseline
+    ax = axes[2]
+    af_fp8 = (df[(df["category"] == "fused") & (df["op"] == "attention_flash")
+                  & (df["dtype"] == "fp8")] if df is not None else pd.DataFrame())
+    if not af_fp8.empty:
+        J = (pd.to_numeric(af_fp8["dyn_energy_j"], errors="coerce").iloc[0]
+             / float(af_fp8["iters"].iloc[0]) * 1e3)   # mJ
+        ax.bar([0], [J], color="#999999", edgecolor="#555", hatch="xx", alpha=0.7)
+        ax.text(0, J / 2, f"flash {J:.2f} mJ\n(N/A baseline)",
+                ha="center", va="center", color="white", fontweight="bold")
+        ax.text(0.5, J,
+                "decomposition UNAVAILABLE\n(no fp8 attention_qkv_matmul baseline ;\n"
+                "TE doesn't expose batched-fp8-gemm public API)",
+                ha="left", va="center", fontsize=9, color="#b03030",
+                bbox=dict(facecolor="#fff0f0", edgecolor="#b03030", pad=4))
+        ax.set_xticks([0]); ax.set_xticklabels(["attention_flash fp8"])
+        ax.set_ylabel("mJ / call")
+        ax.set_xlim(-0.6, 2.5)
+    else:
+        ax.text(0.5, 0.5, "no fp8 attention_flash data",
+                ha="center", va="center", transform=ax.transAxes, color="#888")
+        ax.set_axis_off()
+    ax.set_title("attention fp8 — decomposition status", fontsize=10)
+
+    fig.suptitle(f"FP8 MECE decomposition dashboard — {gpu}",
+                 fontsize=12, y=1.00)
+    _save_fig(fig, out_png, pad_inches=0.1)
     return True
 
 
@@ -4478,6 +4953,27 @@ def main() -> int:
         # TE confounder by routing all dtypes through TE-DPA.
         plot_attention_te_dtype_compare(df,
             out_dir / f"{stem}_03_attention_te_dtype_compare.png", gpu)
+
+    # FP8 dashboard (Chunk 4) — 4 plots that consolidate FP8 results.
+    # Independent of decomp_df : each panel handles missing data by
+    # showing an "N/A" placeholder. Always rendered so the operator
+    # has a single place to read FP8 status.
+    plot_fp8_measurement_availability(df,
+        out_dir / f"{stem}_00_fp8_measurement_availability.png", gpu)
+    plot_fp8_native_compute_anchor(summary,
+        out_dir / f"{stem}_01_fp8_native_compute_anchor.png", gpu)
+    # Plot 02 split into 3 single-panel PNGs to keep each image under
+    # the 2000 px width budget (was a 3-panel 18 in figure).
+    plot_fp8_total_matmul_energy(summary,
+        out_dir / f"{stem}_02a_fp8_total_matmul.png", gpu)
+    plot_fp8_total_attention_energy(df,
+        out_dir / f"{stem}_02b_fp8_total_attention.png", gpu)
+    plot_fp8_total_elementwise_energy(df,
+        out_dir / f"{stem}_02c_fp8_total_elementwise.png", gpu)
+    plot_fp8_mece_dashboard(df, by_regime, fused_decomp,
+        out_dir / f"{stem}_03_fp8_mece_dashboard.png", gpu)
+
+    if not fused_decomp.empty:
         # Tidy console summary so user sees ratios without opening CSV.
         print("\n== Fused-vs-Standalone decomposition (G11 / P1.4) ==")
         with pd.option_context("display.width", 160,
