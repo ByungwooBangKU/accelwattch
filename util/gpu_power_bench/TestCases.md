@@ -10,7 +10,8 @@ A. Workload 실험   (gpu_power_bench.py)   ─── per-cell J / W / k_op coef
    ├── A.2 DRAM bandwidth probes (STREAM) 5 op × 2 dtype × N load
    ├── A.3 Square matmul                  5 variant × 9 K-size
    ├── A.4 LLM-shape matmul               8 preset × 5 token × M variant
-   └── A.5 Fused vs Standalone (opt-in)   6 variant × 2 dtype  [planned, --include-fused]
+   ├── A.5 Fused vs Standalone (opt-in)   6 variant × 2 dtype  [planned, --include-fused]
+   └── A.6 L2/SRAM resident traffic probe custom CUDA kernels × W/R/Δ sweep
 
 B. SoC envelope     (soc_power_bench.py)  ─── static / max / leakage 3 점
    ├── B.1 Static (idle baseline)
@@ -21,7 +22,7 @@ C. Drift correction (gpu_power_bench.py)  ─── 주기적 P_static 재측정
    └── C.1 Periodic re-baseline (--rebaseline-every)
 
 D. Test suites      (--suite NAME)         ─── 위 실험들의 사전정의 묶음
-   └── smoke / powermodel / cache / dram / llm / full
+   └── smoke / powermodel / cache / dram / llm / l2 / full
 ```
 
 본 문서는 **"무엇을 / 왜 / 어떻게" 측정하는가**를 정리한다. 알고리즘적 배경과 단위 환산 공식은 `README.md` 의 §2~§7 을 참조.
@@ -263,6 +264,71 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "fused contribution not sta
 
 ---
 
+
+### A.6 L2/SRAM resident traffic probe (`category = l2`)
+
+#### 목적
+
+H100 50MB L2 안에 resident한 window를 같은 CUDA kernel 내부에서 많이 반복 접근하여, NVML dynamic energy를 logical L2 traffic bits에 회귀한다. **This test estimates L2-hit traffic path energy, not isolated SRAM bit-cell energy.** 즉 산출값에는 L2 SRAM array뿐 아니라 L2 slice/fabric, L1↔L2 interface, load/store datapath 일부가 포함된다.
+
+#### Cell 정의
+
+| op | 역할 | logical traffic per inner repeat | 해석 |
+|---|---|---|---|
+| `reg_spin` | memory traffic 없는 baseline | 0 | loop/control/register overhead 차감용 |
+| `l2_read_hit` | primary read estimate | `W` bytes read | `E(l2_read_hit) - E(reg_spin)` 회귀 |
+| `l2_write_hit` | primary store estimate | `W` bytes write | L2 **store-hit path**, dirty/writeback 가능성 caveat |
+| `l2_copy_hit` | read/write split sanity | `W` read + `W` write | read/write coefficient로 copy energy 예측 |
+| `l2_sliding_delta` | HBM/L2 boundary validation | `(W-Δ)` L2 hit + `Δ` refill proxy | primary가 아니라 sliding-window Δ cross-check |
+
+구현은 PyTorch high-level op가 아니라 `torch.utils.cpp_extension.load_inline`로 빌드되는 CUDA extension을 사용한다. read path는 `__ldcg`를 사용하고, 반복은 Python loop/kernel relaunch가 아니라 kernel 내부 `repeat_inner` loop로 수행한다.
+
+#### 입력 파라미터
+
+| flag | 기본 | 비고 |
+|---|---|---|
+| `--cases l2` / `--suite l2` | off | L2 probe 활성화 |
+| `--l2-window-mb` | `16 24 32 40` | L2 capacity보다 약간 작은 안정 영역 sweep |
+| `--l2-repeat-inner` | `auto` | target energy 기반 R sweep 또는 정수 목록 |
+| `--l2-target-energy-j` | `10.0` | auto R sizing 기준 |
+| `--l2-k-guess-pj-bit` | `1.0` | auto R sizing의 초기 pJ/bit guess |
+| `--l2-delta-kb` | `0 64 256 1024 4096 8192 16384` | sliding validation Δ |
+| `--l2-cold-pool-gb` | `4` | sliding cold pool allocation |
+| `--l2-dtypes` | `uint32` | 4B word traffic. `fp32` label도 가능하지만 compute는 uint32 path |
+| `--l2-use-persisting` / `--l2-no-persisting` | no-persisting | metadata flag. headline은 NCU counter validation과 함께 해석 |
+
+#### 산출물
+
+메인 CSV row에는 다음 L2 metadata가 추가된다.
+
+```text
+working_set_bytes, repeat_inner, delta_bytes,
+estimated_l2_read_bits, estimated_l2_write_bits,
+estimated_l2_total_bits, estimated_hbm_refill_bits,
+l2_policy, block_size, grid_size, kernel_version, cold_pool_bytes
+```
+
+`analyze.py`는 다음 sidecar/plot을 생성한다.
+
+| 파일 | 내용 |
+|---|---|
+| `_02_l2_summary.csv` | read/write/copy pJ/bit headline, status, caveat |
+| `_02_l2_per_window.csv` | W별 coefficient 안정성 |
+| `_02_l2_fit_points.csv` | reg_spin 차감 후 fit raw points |
+| `_02_l2_validation_summary.csv` | copy implied / sliding Δ validation |
+| `_02_l2_skip_reasons.csv` | 제외 row와 suggested fix |
+| `_02_l2_overview_pjbit.png` | L2 read/write/copy overview |
+| `_02_l2_primary_fit_read.png`, `_02_l2_primary_fit_write.png` | E_delta vs L2 bits fit |
+| `_02_l2_per_window_stability.png` | W별 pJ/bit 안정성 |
+| `_02_l2_read_write_split.png` | copy measured vs implied |
+| `_02_l2_sliding_delta_validation.png` | Δ slope validation proxy |
+
+#### 분석 caveat
+
+Counter CSV가 없는 power-only 분석은 `headline_source=logical_estimate_PROVISIONAL`로 표시한다. Nsight Compute sector counter run은 power run과 분리해야 한다. profiling replay/cache/clock control이 power 측정을 왜곡할 수 있기 때문이다.
+
+---
+
 ## B. SoC Envelope — `soc_power_bench.py` (별도 스크립트)
 
 `gpu_power_bench.py` 의 sweep 과는 독립. **GPU 자체의 power 봉투** (static / max / leakage) 3 점만 짧고 굵게.  실행 시간 ~5 분 (기본 옵션).  AccelWattch 의 `P_static` / `P_max` / leakage 의 온도 의존성 파라미터 cross-check 용.
@@ -351,8 +417,8 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "fused contribution not sta
 
 실험 선택은 **두 축이 분리** :
 
-- **Test case (`--cases`)** — 단일 카테고리. 5 개 중 자유 조합 가능 :
-  - `elementwise` (A.1) / `matmul` (A.3) / `llm-matmul` (A.4) / `dram` (A.2) / `soc` (B)
+- **Test case (`--cases`)** — 단일 카테고리. 6 개 중 자유 조합 가능 :
+  - `elementwise` (A.1) / `matmul` (A.3) / `llm-matmul` (A.4) / `dram` (A.2) / `l2` (A.6) / `soc` (B)
 - **Test suite (`--suite`)** — case 조합 + 튜닝의 사전정의. 사용자 explicit flag 가 항상 우선.
 
 ### D.1 Suite 표
@@ -364,6 +430,7 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "fused contribution not sta
 | `cache` | `elementwise`, `matmul` | `--cache-sweep` | ~20 분 |
 | `dram` | `dram` | — | ~10 분 |
 | `llm` | `llm-matmul` | — | ~15 분 |
+| `l2` | `l2` | `--window-ms 8000`, `--rebaseline-every 10` | H100 설정에 따라 변동 |
 | `soc` | `soc` | — | **~5 분** (옛 `run_soc_bench.sh` 와 동등) |
 | `full` | `elementwise`, `matmul`, `llm-matmul`, `dram` | `--rebaseline-every 20` | ~75 분 |
 | `all` | `full` + `soc` | `--rebaseline-every 20` | ~80 분 |
@@ -377,6 +444,7 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "fused contribution not sta
 ./run_bench.sh --suite all  --tag h100              # 모든 cases (sweep + SoC)
 ./run_bench.sh --suite full --tag h100              # SoC 제외 모든 sweep
 ./run_bench.sh --suite soc  --device 0 --tag h100   # SoC 만 (~5분)
+./run_bench.sh --suite l2   --device 0 --tag h100_l2 # L2/SRAM path probe
 
 # Cases 직접 조합
 ./run_bench.sh --cases dram soc --device 0 --tag h100_mem
