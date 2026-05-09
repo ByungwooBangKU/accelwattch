@@ -2282,6 +2282,37 @@ def plot_energy_decomposition(by_regime: pd.DataFrame, out_png: Path,
                 "fallback":  fallback_used,
             })
     if not bars:
+        # Diagnose the most common cause and log it so the user can tell
+        # *why* the MECE plot is missing instead of silently dropping it.
+        # Smoke / quick mode (3 N points: 1M / 4M / 16M) typically lands in
+        # l2_hit_50 / 25 / 0 only — never l2_hit_100 — which kills every bar.
+        ew_regimes = sorted(ew["cache_regime"].unique().tolist())
+        dtypes_present = sorted(ew["dtype"].unique().tolist())
+        ops_present = sorted(set(ew["op"].unique()).intersection(INCLUDED_OPS))
+        if "l2_hit_100" not in ew_regimes:
+            reason_tag = "missing_l2_hit_100_regime"
+            details = (f"no cells at l2_hit_100 — regimes present: "
+                       f"{ew_regimes or 'none'}. "
+                       f"Smoke / --quick lands in l2_hit_50/25/0 only on "
+                       f"small-L2 GPUs. Use `--suite full` or "
+                       f"`--cache-sweep` to cover all 5 regimes.")
+        elif "l2_hit_0" not in ew_regimes:
+            reason_tag = "missing_l2_hit_0_regime"
+            details = (f"no cells at l2_hit_0 — regimes present: "
+                       f"{ew_regimes}. Increase --loads max N to spill to DRAM.")
+        elif not ops_present:
+            reason_tag = "no_included_ops"
+            details = (f"none of softmax/gelu/layernorm measured — "
+                       f"ops present: "
+                       f"{sorted(ew['op'].unique().tolist())}.")
+        else:
+            reason_tag = "no_bars_built"
+            details = (f"regimes={ew_regimes}, dtypes={dtypes_present}, "
+                       f"ops={ops_present} — every bar was skipped despite "
+                       f"data presence (slope NaN/<=0 in BOTH WLS and median).")
+        _PlotSkipLog.record(
+            plot="energy_decomposition_mece",
+            variant="(all)", reason=reason_tag, details=details)
         return False
 
     plt = _get_mpl()
@@ -2563,6 +2594,27 @@ def plot_energy_decomposition_matmul(by_regime: pd.DataFrame, out_png: Path,
             "negative_C": C < 0,
         })
     if not bars:
+        # Diagnose just like elementwise MECE — silent absence is a footgun.
+        mm_regimes = sorted(mm["cache_regime"].unique().tolist())
+        variants_present = sorted(mm["variant"].unique().tolist())
+        if "l2_hit_100" not in mm_regimes:
+            reason_tag = "missing_l2_hit_100_regime"
+            details = (f"no matmul cells at l2_hit_100 — regimes present: "
+                       f"{mm_regimes or 'none'}. matmul tile reuse means "
+                       f"working-set classifier rarely lands in l2_hit_100; "
+                       f"per-K logical_working_set ≤ L2/4 needed.")
+        elif "l2_hit_0" not in mm_regimes:
+            reason_tag = "missing_l2_hit_0_regime"
+            details = (f"no matmul cells at l2_hit_0 — regimes present: "
+                       f"{mm_regimes}.")
+        else:
+            reason_tag = "no_bars_built"
+            details = (f"regimes={mm_regimes}, variants={variants_present} "
+                       f"— every variant skipped (slope NaN/<=0 in WLS and "
+                       f"median).")
+        _PlotSkipLog.record(
+            plot="energy_decomposition_matmul_mece",
+            variant="(all)", reason=reason_tag, details=details)
         return False
 
     plt = _get_mpl()
@@ -3523,6 +3575,15 @@ def plot_fp8_total_matmul_energy(summary: pd.DataFrame, out_png: Path,
     mm = summary[summary["category"] == "matmul"]
     if mm.empty:
         return False
+    if "matmul_fp8_te" not in mm["variant"].values:
+        _PlotSkipLog.record(
+            plot="fp8_total_matmul", variant="(all)",
+            reason="no_fp8_data",
+            details=f"matmul_fp8_te variant absent — variants present: "
+                    f"{sorted(mm['variant'].unique().tolist())}. "
+                    f"Expected on GPUs without FP8 TC path (e.g. RTX 3090, "
+                    f"A100) or when TE is not installed.")
+        return False
     plt = _get_mpl()
     slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm.columns else "slope_dyn"
     order = ["matmul_fp16_tc", "matmul_bf16_tc", "matmul_fp8_te"]
@@ -3562,6 +3623,15 @@ def plot_fp8_total_attention_energy(df: pd.DataFrame, out_png: Path,
     af = df[(df["category"] == "fused") & (df["op"] == "attention_flash")].copy()
     if af.empty:
         return False
+    if "fp8" not in af["dtype"].unique():
+        _PlotSkipLog.record(
+            plot="fp8_total_attention", variant="(all)",
+            reason="no_fp8_data",
+            details=f"attention_flash fp8 cells absent — dtypes present: "
+                    f"{sorted(af['dtype'].unique().tolist())}. Expected on "
+                    f"GPUs without FP8 DPA path (e.g. RTX 3090, A100) or "
+                    f"when TE / cuDNN-FP8 backend is not installed.")
+        return False
     plt = _get_mpl()
     af["dyn_J"] = pd.to_numeric(af["dyn_energy_j"], errors="coerce")
     af["iters_n"] = pd.to_numeric(af["iters"], errors="coerce")
@@ -3595,6 +3665,10 @@ def plot_fp8_total_elementwise_energy(df: pd.DataFrame, out_png: Path,
                                        gpu: str) -> bool:
     """FP8 total workload — elementwise softmax/gelu/layernorm pJ/elem at
     l2_hit_0, fp16 vs fp8. fp8 bars hatched (emulated cast-compute-cast).
+
+    Skipped (with logged reason) on GPUs / runs that have no fp8
+    elementwise cells — otherwise the rendered plot is just an fp16-only
+    bar chart with a misleading "FP8 total workload" title.
     """
     if df is None or df.empty:
         return False
@@ -3602,11 +3676,24 @@ def plot_fp8_total_elementwise_energy(df: pd.DataFrame, out_png: Path,
             & (df["op"].isin(("softmax", "gelu", "layernorm")))].copy()
     if by.empty or "j_per_element_dyn" not in by.columns:
         return False
+    if "fp8" not in by["dtype"].unique():
+        _PlotSkipLog.record(
+            plot="fp8_total_elementwise", variant="(all)",
+            reason="no_fp8_data",
+            details=f"no fp8 cells for softmax/gelu/layernorm — "
+                    f"dtypes present: {sorted(by['dtype'].unique().tolist())}. "
+                    f"Expected on GPUs without FP8 path (e.g. RTX 3090).")
+        return False
     plt = _get_mpl()
     by["jpe"] = pd.to_numeric(by["j_per_element_dyn"], errors="coerce")
     by["cache_regime"] = by["cache_regime"].replace(LEGACY_REGIME_MAP)
     by_l2_0 = by[by["cache_regime"] == "l2_hit_0"]
     if by_l2_0.empty:
+        _PlotSkipLog.record(
+            plot="fp8_total_elementwise", variant="(all)",
+            reason="missing_l2_hit_0_regime",
+            details=f"fp8 elementwise cells exist but none at l2_hit_0; "
+                    f"need DRAM-streaming N for headline.")
         return False
     grp = (by_l2_0.groupby(["op", "dtype"])["jpe"].median().reset_index())
     ops = sorted(grp["op"].unique())
