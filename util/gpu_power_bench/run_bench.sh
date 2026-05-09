@@ -124,8 +124,32 @@ enable_persistence_for_devices() {
     for dev in "$@"; do
         # Keep this selected-device only. A device-less persistence-mode
         # command on a shared multi-GPU node can affect GPUs this run
-        # does not own.
-        sudo -n nvidia-smi -i "$dev" -pm 1 >/dev/null 2>&1 || true
+        # does not own. Resolve the physical NVML index because
+        # CUDA_VISIBLE_DEVICES may remap CUDA --device indices.
+        local smi_dev
+        smi_dev=$("$PYTHON" - "$dev" 2>/dev/null <<'PY'
+import sys
+import pynvml
+from power_monitor import resolve_nvml_handle
+
+dev = int(sys.argv[1])
+pynvml.nvmlInit()
+try:
+    handle, _ = resolve_nvml_handle(dev)
+    print(pynvml.nvmlDeviceGetIndex(handle))
+finally:
+    pynvml.nvmlShutdown()
+PY
+)
+        if [[ -z "$smi_dev" ]]; then
+            if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+                echo "[warn] could not map CUDA --device $dev to a physical nvidia-smi index;" >&2
+                echo "       skip persistence setup to avoid touching the wrong GPU" >&2
+                continue
+            fi
+            smi_dev="$dev"
+        fi
+        sudo -n nvidia-smi -i "$smi_dev" -pm 1 >/dev/null 2>&1 || true
     done
 }
 
