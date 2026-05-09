@@ -542,7 +542,7 @@ build cost 자체는 다음 phase 의 warmup 으로 자연 흡수. SoC envelope 
 | SoC envelope `phase_static` | ✓ (sample 필터는 phase_static 내부엔 없지만, build deferral 로 해결) | ✓ |
 | Per-cell sweep cell | (의도적으로 P0 — 측정 대상이 활성 커널) | (해당 없음) |
 
-### 3.7 Fused vs Standalone 측정 (`--include-fused`, opt-in)   *(planned — REVIEW.md G11 / P1.4)*
+### 3.7 Fused vs Standalone 측정 (`--suite full/all` 기본 포함, `--include-fused` 수동 추가)
 
 #### 3.7.1 동기
 
@@ -559,7 +559,7 @@ build cost 자체는 다음 phase 의 warmup 으로 자연 흡수. SoC envelope 
 | Group | Variant | 정의 |
 |-------|---------|------|
 | **Fused (전체)** | `attention_flash` | `F.scaled_dot_product_attention` (FlashAttention-2 backend). softmax 가 안에 있음 |
-| | `linear_gelu` | `torch.compile` 로 fuse 한 `gelu(linear(x))`. inductor 가 epilogue fusion 안 하면 TransformerEngine `LayerNormMLP` 로 fallback |
+| | `linear_gelu` | `torch.compile` 로 fuse 한 `gelu(linear(x))`. inductor 가 epilogue fusion 안 하면 eager fallback으로 실행되며 emulated로 표시 |
 | | `ln_linear` | `torch.compile` 로 fuse 한 `linear(layer_norm(x))` (pre-norm) |
 | **Subtract baseline** | `attention_qkv_matmul` | `Q @ Kᵀ` + `P @ V` 두 matmul 만 (softmax 자리에 identity), 같은 (B,H,N,D) |
 | | `linear_baseline_gelu` | pure `linear(x, W, b)`, `linear_gelu` 와 동일 shape |
@@ -607,9 +607,9 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "유의미한 fused 항 검
 
 | 항목 | 결정 | 근거 |
 |------|------|------|
-| Fusion 메커니즘 | `torch.compile` 우선, 안 fuse 되면 TransformerEngine fallback, 둘 다 fail 시 variant skip + warn | TE 는 fp8_te 경로에서 이미 import — 추가 의존성 부담 0 |
+| Fusion 메커니즘 | MLP/LN fused 계열은 `torch.compile` 우선, 실패 시 eager fallback + emulated 표시. fp8 attention은 TransformerEngine 경로 사용 | full/all에서는 fused cell이 기본 포함되므로 실패 시 설치/호환성 안내를 출력 |
 | Causal mask | non-causal default | softmax 항의 *upper bound* 측정. causal 은 절반 cost — follow-up |
-| Sweep 통합 | **opt-in `--include-fused`** | 6 variant × 5 cache regime = 30 신규 cell, sweep ~30% 증가. 기본 sweep 영향 없음 |
+| Sweep 통합 | `--suite full` / `--suite all` 에 기본 포함. 다른 suite/cases 조합에서는 `--include-fused` 로 수동 추가 | 전체 component validation에서 fused residual을 기본 산출. 의존성 문제를 분리 디버깅할 때만 `--no-fused` 사용 |
 | Default 수치 검증 방법 | 합성 + 실측 양쪽. residual 음수 → 측정 invalid 로 ERROR | 차감 noise propagation 은 bootstrap CI 로 정량 |
 
 #### 3.7.5 산출물
@@ -626,7 +626,7 @@ residual 의 95% bootstrap CI 가 0 을 포함하면 "유의미한 fused 항 검
 
 #### 3.7.6 한계 (구현 전 합의 완료)
 
-1. **Fusion 보장 환경 의존** : torch.inductor epilogue fusion 은 PyTorch 버전 / shape / dtype 에 따라 안 될 수 있음. PoC 단계에서 graph 캡처로 검증 후 fail 시 TE fallback.
+1. **Fusion 보장 환경 의존** : torch.inductor epilogue fusion 은 PyTorch 버전 / shape / dtype 에 따라 안 될 수 있음. compile 실패 시 eager fallback으로 실행하고 emulated로 표시한다.
 2. **차감 noise propagation** : `J_full ≈ J_baseline` 이면 residual ≈ 0, 측정 noise 만 보임. 95% CI 0 포함 시 honest 라벨 "fused contribution not statistically distinguishable from zero".
 3. **Online softmax rescale 항** 은 standalone 엔 부재 — residual 에 들어가지만 알고리즘 자체로부터 분리 불가능 (B+C 의 본질적 한계). plot caption 에 명시.
 4. **GPT-OSS sliding-window layer (N_kv=128) 미측정** — full-attention 만. SWA layer 의 softmax 항은 N_kv 가 작아 cost 가 크게 다름 → 별도 variant 로 추가 검토 가능.
@@ -1194,29 +1194,32 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
   - `dram`        : A.2 STREAM probes (read/write/copy/scale/triad)
   - `soc`         : B   SoC envelope (static / max / leakage)
 - **Test suites (`--suite`)** — 자주 쓰는 cases 조합 + 튜닝 파라미터의 *프리셋*. 사용자 explicit flag 는 suite default 를 항상 override.
+- 명시적인 `--suite`/`--cases`/legacy scope flag 없이 실행하면 기본 suite는 `full`이다. 즉 `./run_bench.sh --device 0`은 GPU 0에서 전체 component validation을 실행한다.
 
 | Suite | Cases | 추가 옵션 | 시간 |
 |---|---|---|---|
 | `smoke` | `elementwise` | `--quick` | ~5 분 |
-| `powermodel` | `elementwise + matmul` | (default) | ~30 분 |
+| `powermodel` | `elementwise + matmul` | legacy baseline | ~30 분 |
 | `cache` | `elementwise + matmul` | `--cache-sweep` | ~15 분 |
 | `dram` | `dram` | — | ~10 분 |
 | `llm` | `llm-matmul` | — | ~25 분 |
 | `soc` | `soc` | — | **~5 분** (SoC envelope only) |
-| `full` | `elementwise + matmul + llm-matmul + dram` | `--rebaseline-every 20` | ~75 분 |
-| `all` | `full + soc` | `--rebaseline-every 20` | ~80 분 |
+| `full` | `elementwise + matmul + llm-matmul + dram + l2 + soc + fused` | fused 기본 포함, `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
+| `all` | `full` alias | fused 기본 포함, `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
 
 ```bash
-# 가장 자주 쓰는 길 — 5분 smoke → publication-quality full + SoC
+# 가장 자주 쓰는 길 — 5분 smoke → publication-quality full/all
+./run_bench.sh --device 0 --tag h100              # 기본 full: 모든 cases + fused
 ./run_bench.sh --suite smoke --tag h100_smoke
 ./run_bench.sh --suite all   --tag h100
+./run_bench.sh --suite full --no-fused --tag h100_base  # fused dependency debug용 opt-out
 
 # 특정 case 만 자유 조합
 ./run_bench.sh --cases dram soc --device 0 --tag h100_mem
 ./run_bench.sh --cases soc      --device 1 --tag h100_g1   # 옛 run_soc_bench 와 동등
 
 # Suite + 추가 override
-./run_bench.sh --suite full --tag h100 --cases matmul   # full 에서 matmul 만
+./run_bench.sh --suite full --tag h100 --cases matmul   # full tuning값으로 matmul만; fused도 원하면 --include-fused 추가
 
 # 다중 GPU + SoC (각 GPU 마다 sweep + SoC envelope)
 ./run_bench.sh --suite all --num-gpus 8 --tag h100
@@ -1229,14 +1232,15 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
 `run_bench.sh` 는 sweep 끝나면 **자동으로 `analyze.py` 를 호출**해서 plot 까지 생성합니다 (single-GPU). multi-GPU 모드는 자동으로 `multi_gpu_analysis.py` 를 호출.
 
 ```bash
-./run_bench.sh                      # GPU 0 sweep + analyze 자동
+./run_bench.sh                      # GPU 0 full suite + analyze 자동
+./run_bench.sh --device 0           # GPU 0 full suite + analyze 자동
 ./run_bench.sh --no-auto-analyze    # CSV 만 만들고 종료
 ```
 
 ### 9.2 다중 GPU / 태깅
 
 ```bash
-./run_bench.sh --device 0 --tag a100        # 단일 GPU + auto-analyze
+./run_bench.sh --device 0 --tag a100        # 단일 GPU full suite + auto-analyze
 ./run_bench.sh --num-gpus 8  --tag h100     # 8 장 병렬 + multi_gpu_analysis 자동
 ./run_bench.sh --devices "0,2,4" --tag h100 --suite full
 ```
@@ -1853,3 +1857,57 @@ GPU core hot-spot temperature. HBM/GDDR 온도는 별도 API. thermal monitoring
 ---
 
 *Maintained under `util/gpu_power_bench/` — PR contributions welcome.*
+
+---
+
+## 16. L2/SRAM resident traffic path probe (`--cases l2`)
+
+`--cases l2` / `--suite l2` 는 H100 50MB L2 안에 들어가는 window를 custom CUDA kernel 내부에서 반복 접근해 **L2-hit traffic path energy** 를 추정한다. 이 값은 **순수 SRAM bit-cell energy가 아니다**. NVML은 board-level power만 제공하므로, 계수에는 L2 SRAM array뿐 아니라 L2 slice/fabric, L1↔L2 interface, load/store datapath 일부가 함께 들어간다.
+
+### 16.1 왜 별도 probe가 필요한가
+
+L2 50MiB를 한 번 읽는 에너지는 pJ/bit 단위에서는 sub-mJ 수준이라 NVML integration noise보다 작다. 그래서 Python loop로 kernel을 반복 launch하지 않고, 단일 CUDA kernel 안의 `repeat_inner` loop로 같은 L2-resident working set을 수천~수만 번 반복 접근한다. `gpu_power_bench.py` 는 logical L2 traffic bits를 CSV에 기록하고, `analyze.py` 는 `reg_spin` baseline을 차감한 뒤 `E_delta vs L2_bits` slope를 pJ/bit로 변환한다.
+
+### 16.2 Test cells
+
+| op | 목적 | 해석 |
+|---|---|---|
+| `reg_spin` | memory traffic 없는 loop/control/register baseline | `E_l2 - E_reg_spin` 차감용 |
+| `l2_read_hit` | primary read-hit path estimate | `k_L2_read` |
+| `l2_write_hit` | primary store-hit path estimate | dirty/writeback 가능성이 있어 “store-hit path” 로만 부름 |
+| `l2_copy_hit` | read/write split sanity check | measured copy vs read/write implied 비교 |
+| `l2_sliding_delta` | L2를 채운 뒤 Δ만큼 이동하는 validation | HBM/L2 gap consistency check. headline estimator가 아님 |
+
+### 16.3 실행 예
+
+```bash
+./run_bench.sh \
+  --cases l2 \
+  --l2-window-mb 16 24 32 40 \
+  --l2-target-energy-j 10 \
+  --l2-delta-kb 0 64 256 1024 4096 8192 16384 \
+  --window-ms 8000 \
+  --rebaseline-every 10 \
+  --tag h100_l2_gpu0
+```
+
+### 16.4 산출물과 caveat
+
+Power-only 분석은 `headline_source=logical_estimate_PROVISIONAL` 로 표시된다. Nsight Compute sector counter run은 power run과 분리해서 수행해야 한다. NCU profiling은 replay/cache control/clock control/instrumentation 때문에 runtime과 power를 바꿀 수 있기 때문이다.
+
+생성 파일:
+
+- `_02_l2_summary.csv`
+- `_02_l2_per_window.csv`
+- `_02_l2_fit_points.csv`
+- `_02_l2_validation_summary.csv`
+- `_02_l2_skip_reasons.csv`
+- `_02_l2_overview_pjbit.png`
+- `_02_l2_primary_fit_read.png`, `_02_l2_primary_fit_write.png`
+- `_02_l2_per_window_stability.png`
+- `_02_l2_read_write_split.png`
+- `_02_l2_sliding_delta_validation.png`
+
+최종 보고 문구는 다음 표현을 권장한다.
+
+> We estimate an L2-hit traffic path energy rather than an isolated SRAM bit-cell energy. The coefficient is obtained by repeatedly accessing a cache-resident window and regressing NVML dynamic energy against L2 traffic bits. Sliding-window Δ rows are used as a validation check, and Nsight Compute sector counters should be collected in a separate run before making headline claims.

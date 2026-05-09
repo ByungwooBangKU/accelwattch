@@ -21,7 +21,7 @@ FP8 notes:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import torch
@@ -75,9 +75,11 @@ class BenchSpec:
     # Cache/locality regime — classified from working-set vs L2 size. Lets the
     # analyser separate L2-bound from DRAM-bound points instead of forcing a
     # single regression line across a regime change.
-    #   "l2_resident"  — working set ≤ L2/2, ≈ 100% L2 hit after iter 1
-    #   "l2_partial"   — working set within [L2/2, 2·L2], thrashing / ~50%
-    #   "dram_stream"  — working set ≥ 2·L2, ≈ 0% L2 hit
+    #   "l2_hit_100"   — working set ≤ L2/4, comfortably L2-resident
+    #   "l2_hit_75"    — L2/4 < working set ≤ L2/2
+    #   "l2_hit_50"    — L2/2 < working set ≤ 2·L2
+    #   "l2_hit_25"    — 2·L2 < working set ≤ 4·L2
+    #   "l2_hit_0"     — working set > 4·L2, DRAM streaming
     #   "unknown"      — L2 size unavailable (legacy rows / non-CUDA)
     cache_regime: str = "unknown"
     # Fine-grained classification of WHAT the measured energy actually
@@ -95,6 +97,9 @@ class BenchSpec:
     # and exclude emulated rows from FP8 energy claims.
     path_semantics: str = "native_or_standard"
     notes: str = ""
+    # Extra per-case metadata persisted by gpu_power_bench.py.
+    # L2 probes use this for logical traffic bits, policy, and kernel geometry.
+    extra: dict = field(default_factory=dict)
 
 
 # ---------- dtype resolution ------------------------------------------------
@@ -1570,4 +1575,423 @@ def build_fused(variant: str, dtype_label: str,
         flops_per_call=int(flops), run=fn,
         compute_unit=compute_unit, emulated=emulated,
         cache_regime=regime, path_semantics=path_semantics, notes=notes,
+    )
+
+
+# ---------- L2/SRAM resident traffic probes ----------------------------------
+# These probes deliberately avoid PyTorch high-level ops.  A small CUDA
+# extension launches one kernel whose INNER loop repeats the same L2-sized
+# window many times, so NVML sees a multi-Joule signal instead of a single
+# sub-mJ L2 pass.  The reported coefficient is an L2-hit *traffic path* energy
+# (L2 array + slice/fabric + datapath), not isolated SRAM bit-cell energy.
+
+_L2_OPS = ("reg_spin", "l2_read_hit", "l2_write_hit", "l2_copy_hit", "l2_sliding_delta")
+_L2_EXT = None
+
+
+def _cuda_target_include_paths() -> list[str]:
+    """Return extra CUDA include dirs needed by conda-packaged toolkits.
+
+    Recent conda CUDA packages can place CCCL headers such as `nv/target`
+    under targets/x86_64-linux/include instead of the top-level include dir.
+    torch.utils.cpp_extension adds CUDA_HOME/include, but not always this
+    target-specific path.
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    roots = []
+    for key in ("CUDA_HOME", "CUDA_PATH", "CONDA_PREFIX"):
+        value = os.environ.get(key)
+        if value:
+            roots.append(value)
+    roots.append(sys.prefix)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        target_include = Path(root) / "targets" / "x86_64-linux" / "include"
+        candidates = [
+            target_include,
+            target_include / "cccl",
+        ]
+        for path in candidates:
+            has_cuda_cccl = (
+                (path / "nv" / "target").exists()
+                or (path / "thrust" / "complex.h").exists()
+                or (path / "cub" / "cub.cuh").exists()
+            )
+            if not has_cuda_cccl:
+                continue
+            s = str(path)
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
+
+
+def _cuda_target_library_paths() -> list[str]:
+    """Return CUDA library dirs needed by conda-packaged toolkits.
+
+    Some conda CUDA installs expose the usable runtime library under
+    targets/x86_64-linux/lib while the top-level lib/libcudart.so symlink can
+    be absent or stale.  torch's extension linker still adds the top-level lib
+    dir, so prepend the target-specific lib dir through LIBRARY_PATH before
+    building the L2 extension.
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    roots = []
+    for key in ("CUDA_HOME", "CUDA_PATH", "CONDA_PREFIX"):
+        value = os.environ.get(key)
+        if value:
+            roots.append(value)
+    roots.append(sys.prefix)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        candidates = [
+            Path(root) / "targets" / "x86_64-linux" / "lib",
+            Path(root) / "lib64",
+            Path(root) / "lib",
+        ]
+        for path in candidates:
+            if not (
+                (path / "libcudart.so").exists()
+                or (path / "libcudart.so.12").exists()
+                or (path / "libcudart_static.a").exists()
+            ):
+                continue
+            s = str(path)
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
+
+
+def _prepend_env_path(name: str, paths: list[str]) -> None:
+    """Prepend unique paths to a colon-separated environment variable."""
+    import os
+
+    existing = [p for p in os.environ.get(name, "").split(os.pathsep) if p]
+    merged: list[str] = []
+    seen: set[str] = set()
+    for path in [*paths, *existing]:
+        if path and path not in seen:
+            merged.append(path)
+            seen.add(path)
+    if merged:
+        os.environ[name] = os.pathsep.join(merged)
+
+
+def _l2_extension():
+    """Compile/load the CUDA extension used by build_l2_probe()."""
+    global _L2_EXT
+    if _L2_EXT is not None:
+        return _L2_EXT
+    from torch.utils.cpp_extension import load_inline
+
+    _prepend_env_path("LIBRARY_PATH", _cuda_target_library_paths())
+
+    cpp_src = r'''
+#include <torch/extension.h>
+
+void l2_reg_spin_launcher(torch::Tensor out, long n_words, int repeat_inner, int block_size);
+void l2_read_hit_launcher(torch::Tensor x, torch::Tensor out, long n_words, int repeat_inner, int block_size);
+void l2_write_hit_launcher(torch::Tensor y, long n_words, int repeat_inner, int block_size);
+void l2_copy_hit_launcher(torch::Tensor x, torch::Tensor y, long n_words, int repeat_inner, int block_size);
+void l2_sliding_delta_launcher(torch::Tensor x, torch::Tensor out, long window_words,
+                               long cold_words, long delta_words, int repeat_inner, int block_size);
+void l2_reset_persisting_launcher();
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("reg_spin", &l2_reg_spin_launcher, "register/control-loop baseline");
+  m.def("read_hit", &l2_read_hit_launcher, "L2 resident read-hit probe");
+  m.def("write_hit", &l2_write_hit_launcher, "L2 resident store-hit probe");
+  m.def("copy_hit", &l2_copy_hit_launcher, "L2 resident copy-hit probe");
+  m.def("sliding_delta", &l2_sliding_delta_launcher, "sliding-window L2/HBM delta probe");
+  m.def("reset_persisting_l2", &l2_reset_persisting_launcher, "cudaCtxResetPersistingL2Cache wrapper");
+}
+'''
+
+    cuda_src = r'''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_U32(x) TORCH_CHECK((x).scalar_type() == at::kInt, #x " must be torch.int32")
+#define CUDA_CHECK(call) do { cudaError_t err = (call); TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err)); } while (0)
+
+static inline int grid_for(long n_words, int block_size) {
+  long blocks = (n_words + block_size - 1) / block_size;
+  if (blocks < 1) blocks = 1;
+  if (blocks > 65535) blocks = 65535;
+  return (int)blocks;
+}
+
+__global__ void reg_spin_kernel(uint32_t* out, long n_words, int repeat_inner) {
+  long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long stride = (long)gridDim.x * blockDim.x;
+  uint32_t acc = (uint32_t)(tid + 0x9e3779b9u);
+  for (int r = 0; r < repeat_inner; ++r) {
+    for (long i = tid; i < n_words; i += stride) {
+      // Similar loop/control shape to the memory probes, but no data traffic.
+      acc ^= (uint32_t)i + 0x7f4a7c15u + (acc << 6) + (acc >> 2);
+    }
+  }
+  if (threadIdx.x == 0) out[blockIdx.x] = acc;
+}
+
+__global__ void read_hit_kernel(const uint32_t* __restrict__ x, uint32_t* out,
+                                long n_words, int repeat_inner) {
+  long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long stride = (long)gridDim.x * blockDim.x;
+  uint32_t acc = 0;
+  // One in-kernel warm pass helps populate L2.  Measurement metadata excludes it;
+  // the regression intercept absorbs this one-time fill cost.
+  for (long i = tid; i < n_words; i += stride) acc += __ldcg(x + i);
+  for (int r = 0; r < repeat_inner; ++r) {
+    for (long i = tid; i < n_words; i += stride) acc += __ldcg(x + i);
+  }
+  if (threadIdx.x == 0) out[blockIdx.x] = acc;
+}
+
+__global__ void write_hit_kernel(uint32_t* y, long n_words, int repeat_inner) {
+  long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long stride = (long)gridDim.x * blockDim.x;
+  uint32_t v = (uint32_t)(tid ^ 0xa5a5a5a5u);
+  // Allocate/warm target lines before the measured repeated stores.
+  for (long i = tid; i < n_words; i += stride) y[i] = v;
+  for (int r = 0; r < repeat_inner; ++r) {
+    v += (uint32_t)r + 1u;
+    for (long i = tid; i < n_words; i += stride) y[i] = v;
+  }
+}
+
+__global__ void copy_hit_kernel(const uint32_t* __restrict__ x, uint32_t* y,
+                                long n_words, int repeat_inner) {
+  long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long stride = (long)gridDim.x * blockDim.x;
+  uint32_t acc = 0;
+  for (long i = tid; i < n_words; i += stride) {
+    uint32_t v = __ldcg(x + i);
+    y[i] = v;
+    acc += v;
+  }
+  for (int r = 0; r < repeat_inner; ++r) {
+    for (long i = tid; i < n_words; i += stride) {
+      uint32_t v = __ldcg(x + i);
+      y[i] = v + (uint32_t)r;
+      acc += v;
+    }
+  }
+  if (threadIdx.x == 0) y[blockIdx.x % n_words] = acc;
+}
+
+__global__ void sliding_delta_kernel(const uint32_t* __restrict__ x, uint32_t* out,
+                                     long window_words, long cold_words,
+                                     long delta_words, int repeat_inner) {
+  long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long stride = (long)gridDim.x * blockDim.x;
+  uint32_t acc = 0;
+  long max_start = (cold_words - window_words) > 1L ? (cold_words - window_words) : 1L;
+  for (int r = 0; r < repeat_inner; ++r) {
+    long start = (delta_words <= 0) ? 0 : ((long)r * delta_words) % max_start;
+    for (long i = tid; i < window_words; i += stride) {
+      acc += __ldcg(x + start + i);
+    }
+  }
+  if (threadIdx.x == 0) out[blockIdx.x] = acc;
+}
+
+void l2_reg_spin_launcher(torch::Tensor out, long n_words, int repeat_inner, int block_size) {
+  CHECK_CUDA(out); CHECK_U32(out);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int grid = grid_for(n_words, block_size);
+  reg_spin_kernel<<<grid, block_size, 0, stream>>>(reinterpret_cast<uint32_t*>(out.data_ptr<int>()), n_words, repeat_inner);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void l2_read_hit_launcher(torch::Tensor x, torch::Tensor out, long n_words, int repeat_inner, int block_size) {
+  CHECK_CUDA(x); CHECK_CUDA(out); CHECK_U32(x); CHECK_U32(out);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int grid = grid_for(n_words, block_size);
+  read_hit_kernel<<<grid, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(x.data_ptr<int>()),
+      reinterpret_cast<uint32_t*>(out.data_ptr<int>()), n_words, repeat_inner);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void l2_write_hit_launcher(torch::Tensor y, long n_words, int repeat_inner, int block_size) {
+  CHECK_CUDA(y); CHECK_U32(y);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int grid = grid_for(n_words, block_size);
+  write_hit_kernel<<<grid, block_size, 0, stream>>>(reinterpret_cast<uint32_t*>(y.data_ptr<int>()), n_words, repeat_inner);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void l2_copy_hit_launcher(torch::Tensor x, torch::Tensor y, long n_words, int repeat_inner, int block_size) {
+  CHECK_CUDA(x); CHECK_CUDA(y); CHECK_U32(x); CHECK_U32(y);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int grid = grid_for(n_words, block_size);
+  copy_hit_kernel<<<grid, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(x.data_ptr<int>()),
+      reinterpret_cast<uint32_t*>(y.data_ptr<int>()), n_words, repeat_inner);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void l2_sliding_delta_launcher(torch::Tensor x, torch::Tensor out, long window_words,
+                               long cold_words, long delta_words, int repeat_inner, int block_size) {
+  CHECK_CUDA(x); CHECK_CUDA(out); CHECK_U32(x); CHECK_U32(out);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int grid = grid_for(window_words, block_size);
+  sliding_delta_kernel<<<grid, block_size, 0, stream>>>(reinterpret_cast<const uint32_t*>(x.data_ptr<int>()),
+      reinterpret_cast<uint32_t*>(out.data_ptr<int>()), window_words, cold_words, delta_words, repeat_inner);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void l2_reset_persisting_launcher() {
+  CUDA_CHECK(cudaCtxResetPersistingL2Cache());
+}
+'''
+    _L2_EXT = load_inline(
+        name="gpu_power_l2_probe_ext",
+        cpp_sources=[cpp_src],
+        cuda_sources=[cuda_src],
+        functions=None,
+        extra_include_paths=_cuda_target_include_paths(),
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        verbose=False,
+    )
+    return _L2_EXT
+
+
+def build_l2_probe(
+    op: str,
+    dtype_label: str,
+    working_set_bytes: int,
+    repeat_inner: int,
+    delta_bytes: int = 0,
+    cold_pool_bytes: int = 0,
+    device: str | torch.device = "cuda",
+    use_persisting_l2: bool = False,
+    block_size: int = 256,
+) -> BenchSpec:
+    """Build one custom-kernel L2/SRAM traffic probe.
+
+    The logical traffic counters in `extra` are per *single spec.run() call*;
+    gpu_power_bench.py multiplies them by the measured outer iteration count
+    before writing CSV.  The unit under test is an L2-hit traffic path, not an
+    isolated SRAM cell.
+    """
+    if op not in _L2_OPS:
+        raise ValueError(f"unknown L2 op {op!r} (choices: {_L2_OPS})")
+    if dtype_label not in ("uint32", "fp32"):
+        raise ValueError("L2 probes currently use uint32/fp32-sized 4B words only")
+    if working_set_bytes <= 0:
+        raise ValueError("working_set_bytes must be positive")
+    if repeat_inner <= 0:
+        raise ValueError("repeat_inner must be positive")
+
+    dev = torch.device(device)
+    word_bytes = 4
+    n_words = max(1, int(working_set_bytes) // word_bytes)
+    working_set_bytes = n_words * word_bytes
+    delta_bytes = max(0, int(delta_bytes))
+    delta_bytes = min(delta_bytes, working_set_bytes)
+    delta_words = delta_bytes // word_bytes
+    cold_pool_bytes = int(cold_pool_bytes or working_set_bytes)
+    if op == "l2_sliding_delta":
+        cold_pool_bytes = max(cold_pool_bytes, working_set_bytes + max(delta_bytes, 1))
+    cold_words = max(n_words, cold_pool_bytes // word_bytes)
+    cold_pool_bytes = cold_words * word_bytes
+
+    ext = _l2_extension()
+    out_words = min(65535, max(1, (n_words + block_size - 1) // block_size))
+    out = torch.empty(out_words, dtype=torch.int32, device=dev)
+
+    # int32 is intentional: traffic path is 4B words; dtype_label is metadata.
+    x = y = None
+    if op in ("l2_read_hit", "l2_copy_hit", "l2_sliding_delta"):
+        alloc_words = cold_words if op == "l2_sliding_delta" else n_words
+        x = torch.arange(alloc_words, dtype=torch.int32, device=dev)
+    if op in ("l2_write_hit", "l2_copy_hit"):
+        y = torch.empty(n_words, dtype=torch.int32, device=dev)
+
+    # Reset persisting lines from previous probes.  Actual access-policy-window
+    # set-aside is deliberately not claimed here; cache policy is controlled by
+    # __ldcg and validated later with Nsight Compute counters.
+    try:
+        ext.reset_persisting_l2()
+    except Exception:
+        pass
+
+    def f():
+        if op == "reg_spin":
+            ext.reg_spin(out, n_words, int(repeat_inner), int(block_size))
+        elif op == "l2_read_hit":
+            ext.read_hit(x, out, n_words, int(repeat_inner), int(block_size))
+        elif op == "l2_write_hit":
+            ext.write_hit(y, n_words, int(repeat_inner), int(block_size))
+        elif op == "l2_copy_hit":
+            ext.copy_hit(x, y, n_words, int(repeat_inner), int(block_size))
+        elif op == "l2_sliding_delta":
+            ext.sliding_delta(x, out, n_words, cold_words, delta_words,
+                              int(repeat_inner), int(block_size))
+
+    # Build/warm once so JIT/extension and initial allocation are outside the
+    # measured section. gpu_power_bench.py will still do its standard warmups.
+    f()
+    torch.cuda.synchronize(dev)
+
+    read_bits = write_bits = hbm_bits = 0
+    if op == "l2_read_hit":
+        read_bits = working_set_bytes * repeat_inner * 8
+    elif op == "l2_write_hit":
+        write_bits = working_set_bytes * repeat_inner * 8
+    elif op == "l2_copy_hit":
+        read_bits = working_set_bytes * repeat_inner * 8
+        write_bits = working_set_bytes * repeat_inner * 8
+    elif op == "l2_sliding_delta":
+        hit_bytes = max(0, working_set_bytes - delta_bytes)
+        read_bits = hit_bytes * repeat_inner * 8
+        hbm_bits = delta_bytes * repeat_inner * 8
+    # reg_spin intentionally stays zero.
+
+    l2 = get_l2_bytes(dev.index or 0)
+    policy = "ld.global.cg" + ("+persisting_requested" if use_persisting_l2 else "+no_persisting")
+    notes = ("L2-hit traffic path energy probe; not isolated SRAM bit-cell energy. "
+             "Uses custom CUDA kernel with in-kernel repeat_inner loop and __ldcg reads; "
+             "validate hit rate with separate Nsight Compute counter run.")
+    if use_persisting_l2:
+        notes += " Persisting L2 was requested in metadata; this prototype does not rely on it."
+
+    return BenchSpec(
+        name=f"{op}_{working_set_bytes >> 20}mib_R{repeat_inner}"
+             + (f"_D{delta_bytes >> 10}k" if op == "l2_sliding_delta" else ""),
+        op=op, dtype_label=dtype_label,
+        shape=(n_words,), n_elements=n_words,
+        flops_per_call=0, run=f,
+        compute_unit="L2/cache path", emulated=False,
+        cache_regime=classify_cache_regime(working_set_bytes, l2),
+        path_semantics="l2_hit_path_probe",
+        notes=notes,
+        extra={
+            "working_set_bytes": working_set_bytes,
+            "repeat_inner": int(repeat_inner),
+            "delta_bytes": int(delta_bytes),
+            "estimated_l2_read_bits_per_call": int(read_bits),
+            "estimated_l2_write_bits_per_call": int(write_bits),
+            "estimated_l2_total_bits_per_call": int(read_bits + write_bits),
+            "estimated_hbm_refill_bits_per_call": int(hbm_bits),
+            "l2_policy": policy,
+            "block_size": int(block_size),
+            "grid_size": int(out_words),
+            "kernel_version": "l2_probe_v1_cuda_ext_cg",
+            "cold_pool_bytes": int(cold_pool_bytes if op == "l2_sliding_delta" else 0),
+        },
     )

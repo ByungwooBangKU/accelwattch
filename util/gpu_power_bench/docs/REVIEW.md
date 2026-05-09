@@ -535,3 +535,13 @@ P2 / P3 는 시간 여유에 따라.
 ---
 
 *Review 작성 : 2026-04-29 (commit `e76ac34` 시점). 다음 review 는 P1 처리 후 또는 새 axis 추가 시 권장.*
+
+---
+
+## Addendum — L2/SRAM path-energy probe caveat
+
+The `--cases l2` benchmark estimates **L2-hit traffic path energy**, not isolated SRAM bit-cell energy. The measured coefficient is derived from board-level NVML dynamic energy after subtracting a matched `reg_spin` baseline and regressing against logical L2 traffic bits. Therefore it includes L2 array access plus slice/fabric, L1↔L2 interface, and load/store datapath effects.
+
+Sliding-window Δ rows are validation rows only. They intentionally mix L2-hit traffic with HBM refill/eviction effects and should be used to check consistency against an independently measured HBM pJ/bit, not as the primary `k_L2` estimator.
+
+Nsight Compute sector counters should be collected in a separate run and joined after the power run. Running NCU during power measurement can perturb runtime, cache state, clocks, and therefore NVML-integrated energy.

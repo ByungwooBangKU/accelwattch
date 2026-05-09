@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import re
 import sys
@@ -39,6 +40,7 @@ import pynvml
 import torch
 
 import benchmarks as bm
+import gpu_profiles as gp
 from power_monitor import (PowerSampler, measure_static_power,
                             wait_for_cooldown, wait_for_pstate_idle,
                             force_p8_for_measurement,
@@ -133,7 +135,8 @@ _MEM_SAFETY_FRACTION = 0.25
 # bundles so a user doesn't have to memorise 8 flags to run a focused test.
 #
 # Usage:
-#   ./run_bench.sh --suite smoke              # 5-min sanity check
+#   ./run_bench.sh                           # full validation suite
+#   ./run_bench.sh --suite smoke             # 5-min sanity check
 #   ./run_bench.sh --suite cache --tag h100   # pure cache regime sweep
 #   ./run_bench.sh --suite full --tag h100    # everything + drift correction
 #
@@ -156,7 +159,7 @@ SUITES: dict[str, dict] = {
     "powermodel": {
         # Original baseline benchmark — elementwise + matmul, no extras.
         # Produces the canonical k_op coefficient table.
-        "_doc":  "elementwise + matmul, no extra probes (legacy default)",
+        "_doc":  "elementwise + matmul, no extra probes (legacy baseline)",
         "cases": ("elementwise", "matmul"),
     },
     "cache": {
@@ -177,6 +180,14 @@ SUITES: dict[str, dict] = {
         "_doc":  "gpt-oss-120B layer shapes only (qkv / mlp / lm_head etc.)",
         "cases": ("llm-matmul",),
     },
+    "l2": {
+        # L2/SRAM resident traffic path probe. Produces logical-traffic
+        # pJ/bit estimates; Nsight Compute counters are a separate validation run.
+        "_doc":             "L2/SRAM resident traffic probe (pJ/bit path estimate)",
+        "cases":            ("l2",),
+        "rebaseline_every": 10,
+        "window_ms":        8000.0,
+    },
     "soc": {
         # SoC envelope only — static / max / leakage. ~5 min.
         # Replaces the old soc_power_bench.py / run_soc_bench.sh combo.
@@ -184,18 +195,22 @@ SUITES: dict[str, dict] = {
         "cases": ("soc",),
     },
     "full": {
-        # Everything except SoC envelope, plus drift correction. ~75 min.
-        # The recommended suite for a publication-quality k_op measurement.
-        "_doc":             "everything except SoC + periodic re-baseline (~75 min)",
-        "cases":            ("elementwise", "matmul", "llm-matmul", "dram"),
+        # All built-in experiment cases, plus fused variants and drift
+        # correction.  Users may pass --no-fused for dependency debugging.
+        "_doc":             "all cases including L2 + SoC + fused + periodic re-baseline",
+        "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc"),
+        "include_fused":    True,
         "rebaseline_every": 20,
+        "window_ms":        6000.0,
     },
     "all": {
-        # full + SoC envelope. The canonical "give me every measurement"
-        # suite for new GPU characterisation.
-        "_doc":             "full + SoC envelope (~80 min)",
-        "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "soc"),
+        # Alias of full kept for users who expect "all" to mean literally
+        # every built-in case.
+        "_doc":             "alias of full: all cases including L2 + SoC + fused",
+        "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc"),
+        "include_fused":    True,
         "rebaseline_every": 20,
+        "window_ms":        6000.0,
     },
     "fp8-mece": {
         # FP8-focused MECE characterisation. Long --window-ms because
@@ -211,6 +226,37 @@ SUITES: dict[str, dict] = {
         "fused_dtypes":     ("fp16", "bf16", "fp8"),
     },
 }
+
+
+def _argv_has_flag(argv: list[str], *names: str) -> bool:
+    return any(a == name or a.startswith(name + "=")
+               for a in argv for name in names)
+
+
+def _implicit_suite_from_argv(argv: list[str]) -> str | None:
+    """Default to the full validation suite unless argv selects a scope.
+
+    Device/tag/output flags are not experiment-scope choices, so
+    `run_bench.sh --device 0` should still run the full component sweep.
+    Legacy scope flags keep their old behavior, while bare `--quick`
+    maps to the smoke suite so the documented quick path stays short.
+    """
+    if _argv_has_flag(argv, "--suite", "--cases"):
+        return None
+    quick = _argv_has_flag(argv, "--quick")
+    legacy_scope = _argv_has_flag(
+        argv,
+        "--no-elementwise",
+        "--no-matmul",
+        "--llm-shapes",
+        "--dram-bw-test",
+        "--cache-sweep",
+    )
+    if quick and not legacy_scope:
+        return "smoke"
+    if not quick and not legacy_scope:
+        return "full"
+    return None
 
 
 def _apply_suite_to_parser(parser, suite_name: str) -> None:
@@ -282,10 +328,174 @@ def _filter_loads(loads: list[int], ops: list[str], dtypes: list[str],
     return kept
 
 
+
+
+def _parse_l2_repeats(values: list[str], window_bytes: int,
+                       target_energy_j: float, k_guess_pj_bit: float) -> list[int]:
+    """Return repeat_inner values for one L2 window.
+
+    `auto` sizes the centre point from target_energy ≈ k_guess·W_bits·R,
+    then returns a 4-point R sweep so analyze.py can fit fixed-W slopes and
+    absorb one-time fill/launch overhead in the intercept.
+    """
+    if values == ["auto"] or "auto" in values:
+        k_j_per_bit = max(k_guess_pj_bit, 1e-6) * 1e-12
+        bits = max(1, int(window_bytes) * 8)
+        base = int(math.ceil(max(target_energy_j, 0.1) / (k_j_per_bit * bits)))
+        base = max(64, min(4_000_000, base))
+        reps = sorted({max(16, base // 4), max(32, base // 2), base,
+                       min(8_000_000, base * 2)})
+        return reps
+    reps: list[int] = []
+    for v in values:
+        try:
+            r = int(v)
+        except ValueError as e:
+            raise SystemExit(f"bad --l2-repeat-inner value {v!r}: expected int or auto") from e
+        if r <= 0:
+            raise SystemExit("--l2-repeat-inner values must be positive")
+        reps.append(r)
+    return sorted(set(reps))
+
+
+
+
+def _variant_key(plan: dict) -> tuple:
+    """Key for suppressing repeated failures.
+
+    Historical behavior ignores load_value so a poisoned CUDA context does not
+    re-trigger for every K/N. L2 probes can legitimately fail only for one large
+    working-set/cold-pool allocation, so include load/delta in that case.
+    """
+    base = (plan.get("op"), plan.get("dtype"), plan.get("mode"), plan.get("llm_preset", ""))
+    if plan.get("category") == "l2":
+        return base + (plan.get("load_value"),)
+    return base
+
+
 def _slugify(name: str) -> str:
     s = re.sub(r"(?i)nvidia|geforce|pcie|sxm\d?|\bhbm\d*\b|\bon\b", "", name)
     s = re.sub(r"[^a-zA-Z0-9]+", "_", s).strip("_").lower()
     return s or "gpu"
+
+
+def _nvml_value(fn, default=""):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _gpu_spec_snapshot(profile_key: str, profile: dict, observed_profile: str,
+                       profile_status: str, profile_reason: str,
+                       gpu_name: str, cc: tuple[int, int], device: int,
+                       handle, hbm_bytes: int, l2_reported_bytes: int,
+                       l2_effective_bytes: int, l2_source: str) -> dict:
+    power_limit_w = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0, "")
+    power_min_w = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetPowerManagementLimitConstraints(handle)[0] / 1000.0, "")
+    power_max_w = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetPowerManagementLimitConstraints(handle)[1] / 1000.0, "")
+    sm_max_mhz = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM), "")
+    mem_max_mhz = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM), "")
+    mig_current = ""
+    mig_pending = ""
+    mig_mode = _nvml_value(lambda: pynvml.nvmlDeviceGetMigMode(handle), None)
+    if isinstance(mig_mode, tuple) and len(mig_mode) >= 2:
+        mig_current, mig_pending = mig_mode[0], mig_mode[1]
+
+    observed_cc = f"{cc[0]}.{cc[1]}"
+    return {
+        "gpu_profile": profile_key,
+        "gpu_profile_label": profile.get("label", ""),
+        "gpu_profile_status": profile_status,
+        "gpu_profile_reason": profile_reason,
+        "observed_profile": observed_profile,
+        "gpu": gpu_name,
+        "device": device,
+        "compute_cap": observed_cc,
+        "expected_compute_cap": profile.get("expected_cc", ""),
+        "arch_expected": profile.get("arch", ""),
+        "memory_type_expected": profile.get("memory_type", ""),
+        "memory_capacity_expected_gb": profile.get("memory_capacity_gb", ""),
+        "memory_total_gb": f"{hbm_bytes/(1<<30):.3f}" if hbm_bytes else "",
+        "peak_bw_expected_gbps": profile.get("peak_bw_gbps", ""),
+        "l2_expected_mb": profile.get("l2_mb", ""),
+        "l2_reported_mb": f"{l2_reported_bytes/(1<<20):.3f}" if l2_reported_bytes else "",
+        "l2_effective_mb": f"{l2_effective_bytes/(1<<20):.3f}" if l2_effective_bytes else "",
+        "l2_source": l2_source,
+        "power_envelope_expected_w": profile.get("power_envelope_w", ""),
+        "power_limit_w": f"{power_limit_w:.3f}" if isinstance(power_limit_w, (int, float)) else "",
+        "power_limit_min_w": f"{power_min_w:.3f}" if isinstance(power_min_w, (int, float)) else "",
+        "power_limit_max_w": f"{power_max_w:.3f}" if isinstance(power_max_w, (int, float)) else "",
+        "sm_clock_max_mhz": sm_max_mhz,
+        "mem_clock_max_mhz": mem_max_mhz,
+        "mig_mode_current": mig_current,
+        "mig_mode_pending": mig_pending,
+        "native_fp8_headline_allowed": int(gp.native_fp8_headline_allowed(profile_key, observed_cc)),
+        "native_bf16_headline_allowed": int(bool(profile.get("native_bf16", False))),
+        "profile_role": profile.get("role", ""),
+    }
+
+
+def _print_fused_failure_hint(err_msg: str) -> None:
+    msg = err_msg.lower()
+    print("  [fused] fused cell skipped. For full H100 component validation, "
+          "fused support should be installed and working.")
+    print("  [fused] check/install:")
+    print("  [fused]   cd util/gpu_power_bench")
+    print("  [fused]   ./install_transformer_engine.sh")
+    print("  [fused]   python3 preflight.py --device 0")
+    if any(x in msg for x in ("transformer_engine", "fp8", "dotproductattention", "nvte")):
+        print("  [fused] Transformer Engine is required for fp8 fused attention "
+              "and TE attention paths.")
+    if any(x in msg for x in ("flash", "scaled_dot_product", "sdpa", "cudnn")):
+        print("  [fused] PyTorch SDPA/FlashAttention backend was not usable. "
+              "Check torch/CUDA/cuDNN compatibility.")
+    print("  [fused] To bypass fused only for debugging, rerun with --no-fused.")
+
+
+def _apply_effective_l2_cache_regime(spec: bm.BenchSpec, l2_bytes: int,
+                                     l2_source: str) -> None:
+    """Fill cache_regime from the effective L2 size when builders could not.
+
+    Some torch builds do not expose device L2 size for RTX 3090, while the
+    selected GPU profile still has the value needed for workload-size
+    classification. Builders run before they know that profile fallback, so
+    the driver patches unknown regimes here.
+    """
+    if spec.cache_regime != "unknown" or l2_bytes <= 0:
+        return
+    try:
+        if spec.path_semantics == "l2_hit_path_probe" or spec.compute_unit == "L2/cache path":
+            ws = int(spec.extra.get("working_set_bytes", 0) or 0)
+            if ws <= 0:
+                return
+        elif spec.op in bm.FLOP_PER_ELEMENT:
+            ws = bm._elementwise_working_set(  # noqa: SLF001 - local benchmark metadata helper.
+                spec.op, spec.n_elements, bm._dtype_bytes(spec.dtype_label))
+        elif spec.op in ("matmul", "matmul_llm") and len(spec.shape) == 3:
+            a, b, c = spec.shape
+            ws = (a * b + b * c + a * c) * bm._dtype_bytes(spec.dtype_label)
+        elif spec.op in bm.FUSED_VARIANTS:
+            if "attention" in spec.op and len(spec.shape) == 6:
+                B, H_q, H_kv, N_q, N_kv, D_head = spec.shape
+                ws = (B * (H_q + 2 * H_kv) * N_kv * D_head
+                      + B * H_q * N_q * D_head) * 2
+            elif len(spec.shape) == 3:
+                M, D_in, D_out = spec.shape
+                ws = (M * D_in + D_in * D_out + M * D_out) * 2
+            else:
+                return
+        else:
+            return
+    except Exception:
+        return
+    spec.cache_regime = bm.classify_cache_regime(int(ws), l2_bytes)
+    spec.extra["cache_regime_source"] = l2_source
 
 
 def pick_iters(spec: bm.BenchSpec, target_ms: float, ms_per_call: float) -> int:
@@ -364,6 +574,13 @@ def run_measurement(spec: bm.BenchSpec, sampler: PowerSampler,
 
 
 def main() -> int:
+    argv = sys.argv[1:]
+    user_set_dtypes = _argv_has_flag(argv, "--dtypes")
+    user_set_l2_windows = _argv_has_flag(argv, "--l2-window-mb")
+    user_set_l2_delta = _argv_has_flag(argv, "--l2-delta-kb")
+    user_set_cases = _argv_has_flag(argv, "--cases")
+    user_set_fused = _argv_has_flag(argv, "--include-fused", "--no-fused")
+
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -373,7 +590,8 @@ def main() -> int:
     ap.add_argument("--suite", choices=list(SUITES), default=None,
                     help="apply a predefined bundle of flags. See epilog "
                          "above. Individual flags after --suite still "
-                         "override the suite's defaults.")
+                         "override the suite's defaults. If no suite/cases "
+                         "or legacy scope flags are given, defaults to full.")
     # ---- Test cases — orthogonal axis to suites ----------------------------
     # `--cases` selects which experiment categories to run, decoupled from
     # the suite presets. When set, it's the authoritative source — any
@@ -387,21 +605,32 @@ def main() -> int:
     #   matmul       — A.3 square matmul (5 dtype/mode variants × K-sweep)
     #   llm-matmul   — A.4 LLM-shape matmul (8 preset × T-sweep)
     #   dram         — A.2 STREAM-style probes (read/write/copy/scale/triad)
+    #   l2           — A.6 L2/SRAM resident traffic path probe
     #   soc          — B   SoC envelope (static / max / leakage)
-    ALL_CASES = ("elementwise", "matmul", "llm-matmul", "dram", "soc")
+    ALL_CASES = ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc")
     ap.add_argument("--cases", nargs="+", choices=ALL_CASES, default=None,
                     metavar="CASE",
                     help="explicit list of test cases to run. Choices: "
                          + " / ".join(ALL_CASES) + ". When set, overrides "
-                         "legacy --no-* flags. When unset, derived from "
-                         "legacy flags (--no-elementwise / --no-matmul / "
-                         "--llm-shapes / --dram-bw-test) for back-compat.")
+                         "suite cases and legacy --no-* flags. If used with "
+                         "--suite full/all, fused is disabled unless "
+                         "--include-fused is also explicit. When unset, "
+                         "derived from legacy flags (--no-elementwise / "
+                         "--no-matmul / --llm-shapes / --dram-bw-test) for "
+                         "back-compat.")
     ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--gpu-profile", choices=gp.profile_choices(),
+                    default=gp.DEFAULT_GPU_PROFILE,
+                    help="experiment profile for GPU-specific defaults and headline gating. "
+                         "Default is h100_sxm because H100 SXM is the primary target.")
+    ap.add_argument("--allow-non-headline", action="store_true",
+                    help="do not filter profile-unsupported dtype/variant choices. "
+                         "Rows still record headline_status=NOT_HEADLINE/PROXY.")
     ap.add_argument("--ops", nargs="+",
                     default=list(bm.OPS),
                     choices=list(bm.OPS))
     ap.add_argument("--dtypes", nargs="+",
-                    default=list(bm.DTYPES),
+                    default=None,
                     choices=list(bm.DTYPES))
     ap.add_argument("--loads", type=int, nargs="+", default=None,
                     help="tensor element counts; default: 256K..256M sweep")
@@ -433,8 +662,15 @@ def main() -> int:
                          "P0 even after temp drops, inflating P_static by "
                          "30..50 W and triggering the '0/N samples reached "
                          "P8' warning. Recommended: 30s on H100, longer if "
-                         "boost-clock lock survives. `nvidia-smi -rgc` before "
-                         "sweep is a stronger but root-only alternative.")
+                         "boost-clock lock survives. Use --sudo-pstate when "
+                         "the selected GPU allows sudo clock resets.")
+    ap.add_argument("--sudo-pstate", action="store_true",
+                    help="allow selected-GPU P-state reset helpers to run "
+                         "`sudo -n nvidia-smi -i <selected_gpu> -rgc` during "
+                         "baseline/rebaseline. This does not run the benchmark "
+                         "as root. run_bench.sh asks for sudo once and keeps "
+                         "the timestamp alive; if calling this Python file "
+                         "directly, run `sudo -v` first.")
     ap.add_argument("--rebaseline-every", type=int, default=0,
                     help="re-measure idle / static power every N cells "
                          "(0 = once at start, no drift correction). 20 is a "
@@ -513,7 +749,44 @@ def main() -> int:
     ap.add_argument("--dram-bw-loads", type=int, nargs="+", default=None,
                     help="working-set-target N values for --dram-bw-test "
                          "(default: 4 sizes deep into the l2_hit_0 regime)")
-    # ---- Fused vs Standalone (G11 / P1.4 — opt-in) -----------------------
+    # --- L2/SRAM resident traffic path probe --------------------------------
+    ap.add_argument("--l2-window-mb", type=int, nargs="+",
+                    default=None,
+                    help="L2 probe working-set windows in MiB. Keep below full "
+                         "L2 to reduce replacement/HBM contamination. Default "
+                         "comes from --gpu-profile (H100: 16/24/32/40 MiB).")
+    ap.add_argument("--l2-repeat-inner", nargs="+", default=["auto"],
+                    help="repeat_inner values for the in-kernel loop, or auto. "
+                         "auto derives a small R sweep around --l2-target-energy-j "
+                         "using --l2-k-guess-pj-bit.")
+    ap.add_argument("--l2-target-energy-j", type=float, default=10.0,
+                    help="target logical incremental L2 energy used to size "
+                         "auto repeat_inner values (J).")
+    ap.add_argument("--l2-k-guess-pj-bit", type=float, default=1.0,
+                    help="initial L2-hit path pJ/bit guess for auto R sizing.")
+    ap.add_argument("--l2-delta-kb", type=int, nargs="+",
+                    default=None,
+                    help="sliding-window delta sizes in KiB. Delta=0 is the "
+                         "L2-resident reference; nonzero deltas are validation, "
+                         "not the primary estimator. Default comes from "
+                         "--gpu-profile.")
+    ap.add_argument("--l2-cold-pool-gb", type=float, default=4.0,
+                    help="cold pool size for l2_sliding_delta (GiB).")
+    ap.add_argument("--l2-dtypes", nargs="+", default=["uint32"],
+                    choices=["uint32", "fp32"],
+                    help="storage word label for L2 probes. Both are 4B words; "
+                         "uint32 is the default to avoid FP arithmetic effects.")
+    l2_persist = ap.add_mutually_exclusive_group()
+    l2_persist.add_argument("--l2-use-persisting", dest="l2_use_persisting",
+                            action="store_true",
+                            help="record persisting-L2 intent in metadata. The "
+                                 "prototype uses __ldcg and counter validation; "
+                                 "MIG may disable persisting set-aside.")
+    l2_persist.add_argument("--l2-no-persisting", dest="l2_use_persisting",
+                            action="store_false",
+                            help="do not request persisting-L2 metadata")
+    ap.set_defaults(l2_use_persisting=False)
+    # ---- Fused vs Standalone (G11 / P1.4) --------------------------------
     # 6 new variants : attention_flash + attention_qkv_matmul (subtraction
     # baseline), linear_gelu + linear_baseline_gelu, ln_linear +
     # linear_baseline_ln. Each variant runs as a SINGLE cell at fixed
@@ -521,9 +794,13 @@ def main() -> int:
     # GPT-OSS 120B defaults). analyze.py pairs full ↔ baseline by op
     # group and computes residual + bootstrap CI. See README §3.7.
     ap.add_argument("--include-fused", action="store_true",
-                    help="opt-in: add the 6 fused-vs-standalone variants. "
-                         "Doubles the elementwise CSV row count by ~30%. "
-                         "See README §3.7 / TestCases A.5 / REVIEW.md G11.")
+                    help="add the fused-vs-standalone variants. Enabled by "
+                         "--suite full/all. See README §3.7 / TestCases A.5 "
+                         "/ REVIEW.md G11.")
+    ap.add_argument("--no-fused", dest="include_fused", action="store_false",
+                    help="disable fused variants even if the selected suite "
+                         "enables them. Use only for dependency debugging.")
+    ap.set_defaults(include_fused=False)
     ap.add_argument("--attn-shape", type=str, default="1,64,8,2048,2048,64",
                     help="attention_flash / attention_qkv_matmul shape — "
                          "B,H_q,H_kv,N_q,N_kv,D_head. Default = GPT-OSS 120B "
@@ -542,9 +819,10 @@ def main() -> int:
                          "with a warning. 'eager' disables fusion entirely "
                          "(diagnostic only — residuals will inflate).")
     ap.add_argument("--fused-dtypes", nargs="+", default=None,
-                    help="dtypes for fused variants. Default = intersection "
-                         "of --dtypes with {fp16, bf16, fp8}. fp8 only "
-                         "applies to attention_flash (via Transformer "
+                    help="dtypes for fused variants. Default = profile fused "
+                         "dtypes, or the intersection of --dtypes with "
+                         "{fp16, bf16, fp8} when --dtypes is explicit. fp8 "
+                         "only applies to attention_flash (via Transformer "
                          "Engine + fp8_autocast) — all other fused "
                          "variants (qkv_matmul baseline, linear_gelu, "
                          "ln_linear) remain fp16/bf16. fp8 MLP fused is "
@@ -576,22 +854,44 @@ def main() -> int:
                     help="SoC envelope: compute path (simt/tc/te)")
     args = ap.parse_args()
 
-    # If a suite was named, re-parse so its overrides become defaults but
-    # explicit user flags still take precedence. Also print the resolved
-    # config so the user can see what the suite expanded into.
-    if args.suite:
-        _apply_suite_to_parser(ap, args.suite)
+    selected_suite = args.suite or _implicit_suite_from_argv(argv)
+
+    # If a suite was named or inferred, re-parse so its overrides become
+    # defaults but explicit user flags still take precedence. Also print the
+    # resolved config so the user can see what the suite expanded into.
+    if selected_suite:
+        if args.suite is None:
+            ap.set_defaults(suite=selected_suite)
+        _apply_suite_to_parser(ap, selected_suite)
         args = ap.parse_args()
-        sd = SUITES[args.suite]
+        sd = SUITES[selected_suite]
         flags = ", ".join(f"{k}={v}" for k, v in sd.items() if not k.startswith("_"))
-        print(f"[suite] '{args.suite}' → {flags or '(no overrides — legacy default)'}")
+        if selected_suite == args.suite and _argv_has_flag(argv, "--suite"):
+            origin = "selected"
+        else:
+            origin = "default"
+        print(f"[suite] '{selected_suite}' ({origin}) → "
+              f"{flags or '(no overrides — legacy default)'}")
+        if user_set_cases and not user_set_fused and args.include_fused:
+            args.include_fused = False
+            print("[suite] explicit --cases overrides the suite fused default; "
+                  "add --include-fused to keep fused variants.")
+
+    profile_key = args.gpu_profile if args.gpu_profile != "auto" else gp.DEFAULT_GPU_PROFILE
+    profile = gp.GPU_PROFILES[profile_key]
+    if args.dtypes is None:
+        args.dtypes = gp.profile_default_dtypes(profile_key)
+    if args.l2_window_mb is None:
+        args.l2_window_mb = gp.profile_l2_windows_mb(profile_key)
+    if args.l2_delta_kb is None:
+        args.l2_delta_kb = gp.profile_l2_delta_kb(profile_key)
 
     # ---- Resolve which test cases to actually run ---------------------
     # Order of precedence:
     #   1. --cases X Y Z          (explicit; overrides legacy flags)
     #   2. SUITES[suite]["cases"] (suite-level default; set by re-parse above)
-    #   3. legacy --no-* / --llm-shapes / --dram-bw-test flags + sensible
-    #      default of {elementwise, matmul} if nothing else specified
+    #   3. legacy --no-* / --llm-shapes / --dram-bw-test flags. A bare
+    #      command is handled earlier by the implicit full suite.
     if args.cases is not None:
         cases = set(args.cases)
         # User asked for explicit cases — silently ignore legacy --no-* /
@@ -660,6 +960,48 @@ def main() -> int:
     cc = torch.cuda.get_device_capability(args.device)
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     handle, nvml_resolution = resolve_nvml_handle(args.device)
+    observed_cc = f"{cc[0]}.{cc[1]}"
+    resolved_key, resolved_profile, observed_profile, observed_reason = gp.resolve_gpu_profile(
+        args.gpu_profile, gpu_name, observed_cc)
+    if args.gpu_profile == "auto" and resolved_key != profile_key:
+        profile_key = resolved_key
+        profile = resolved_profile
+        if not user_set_dtypes:
+            args.dtypes = gp.profile_default_dtypes(profile_key)
+        if not user_set_l2_windows:
+            args.l2_window_mb = gp.profile_l2_windows_mb(profile_key)
+        if not user_set_l2_delta:
+            args.l2_delta_kb = gp.profile_l2_delta_kb(profile_key)
+    profile_status, profile_status_reason = gp.profile_cc_status(profile_key, observed_cc)
+    profile_reason = "; ".join(x for x in (observed_reason, profile_status_reason) if x)
+    if profile_reason:
+        print(f"[profile] WARN {profile_reason}")
+
+    kept_dtypes, dropped_dtypes = gp.filter_with_profile(
+        list(args.dtypes), gp.profile_default_dtypes(profile_key),
+        label="--dtypes", allow_non_headline=args.allow_non_headline)
+    if dropped_dtypes:
+        print(f"[profile] dropped non-headline --dtypes for {profile_key}: {dropped_dtypes} "
+              f"(use --allow-non-headline to keep them)")
+    args.dtypes = kept_dtypes
+
+    kept_variants, dropped_variants = gp.filter_with_profile(
+        matmul_variants, gp.profile_matmul_variants(profile_key),
+        label="--matmul-variants", allow_non_headline=args.allow_non_headline)
+    if dropped_variants:
+        dropped_fmt = [f"{d}:{m}" for d, m in dropped_variants]
+        print(f"[profile] dropped non-headline --matmul-variants for {profile_key}: "
+              f"{dropped_fmt} (use --allow-non-headline to keep them)")
+    matmul_variants = kept_variants
+    soc_variant = (args.soc_dtype, args.soc_mode)
+    if "soc" in cases and not args.allow_non_headline:
+        allowed_soc = gp.profile_matmul_variants(profile_key)
+        if soc_variant not in allowed_soc:
+            fallback = ("fp16", "tc") if ("fp16", "tc") in allowed_soc else allowed_soc[0]
+            print(f"[profile] changed non-headline SoC GEMM {args.soc_dtype}:{args.soc_mode} "
+                  f"to {fallback[0]}:{fallback[1]} for {profile_key} "
+                  f"(use --allow-non-headline to keep it)")
+            args.soc_dtype, args.soc_mode = fallback
     if "by index" in nvml_resolution and cvd:
         print(f"[warn] CUDA_VISIBLE_DEVICES={cvd!r} is set but we could not "
               f"resolve the GPU by PCI bus id / UUID — NVML reads may target "
@@ -667,6 +1009,8 @@ def main() -> int:
               f"without CUDA_VISIBLE_DEVICES, or upgrade torch.")
     gpu_slug = _slugify(gpu_name)
     print(f"\n[info] GPU={gpu_name}  cc={cc[0]}.{cc[1]}  slug={gpu_slug}")
+    print(f"[profile] requested={args.gpu_profile}  active={profile_key} "
+          f"({gp.profile_label(profile_key)})  status={profile_status}")
     print(f"[info] NVML handle resolved {nvml_resolution}"
           + (f"  (CUDA_VISIBLE_DEVICES={cvd})" if cvd else ""))
     print(f"[info] ops={args.ops}  dtypes={args.dtypes}  loads={loads}")
@@ -688,8 +1032,11 @@ def main() -> int:
     # static measurement actually captures cold-idle, not P0-locked boost
     # idle. The restore() callback unlocks clocks AFTER the measurement,
     # so the workload phase keeps full DVFS.
-    p8_ctx = force_p8_for_measurement(handle) if args.pstate_idle_wait > 0 else \
-             {"success": False, "method": "skipped", "restore": None}
+    if args.pstate_idle_wait > 0:
+        p8_ctx = force_p8_for_measurement(
+            handle, use_sudo=args.sudo_pstate)
+    else:
+        p8_ctx = {"success": False, "method": "skipped", "restore": None}
     print(f"[baseline] measuring static power for {args.static_seconds:.1f}s …")
     baseline = measure_static_power(handle, seconds=args.static_seconds,
                                     hz=args.poll_hz,
@@ -720,10 +1067,25 @@ def main() -> int:
     # Each plan has a `build()` callable that allocates tensors just-in-time
     # so we never hold more than one cell's tensors at once.
     plans: list[dict] = []
-    l2_bytes = bm.get_l2_bytes(args.device)
+    l2_reported_bytes = bm.get_l2_bytes(args.device)
+    l2_bytes = l2_reported_bytes
+    l2_source = "torch"
+    if l2_bytes <= 0:
+        try:
+            profile_l2_mb = float(profile.get("l2_mb", 0) or 0)
+        except (TypeError, ValueError):
+            profile_l2_mb = 0.0
+        if profile_l2_mb > 0:
+            l2_bytes = int(profile_l2_mb * (1 << 20))
+            l2_source = "gpu_profile"
     if l2_bytes > 0:
-        print(f"[info] L2 cache size: {l2_bytes/(1<<20):.1f} MB "
-              f"(used to classify cache_regime for every row)")
+        if l2_reported_bytes > 0:
+            print(f"[info] L2 cache size: {l2_bytes/(1<<20):.1f} MB "
+                  f"(used to classify cache_regime for every row)")
+        else:
+            print(f"[info] L2 cache size not reported by torch — using "
+                  f"{profile_key} profile value {l2_bytes/(1<<20):.1f} MB "
+                  f"to classify cache_regime")
     else:
         print("[info] L2 cache size not reported by torch — cache_regime=unknown")
     # Memory budget: drop elementwise loads that would OOM on this HBM.
@@ -737,6 +1099,13 @@ def main() -> int:
         print(f"[info] HBM total: {hbm_bytes/(1<<30):.1f} GB "
               f"(per-cell budget: {int(_MEM_SAFETY_FRACTION*100)}% = "
               f"{hbm_bytes*_MEM_SAFETY_FRACTION/(1<<30):.1f} GB)")
+    spec_snapshot = _gpu_spec_snapshot(
+        profile_key, profile, observed_profile, profile_status, profile_reason,
+        gpu_name, cc, args.device, handle, hbm_bytes, l2_reported_bytes,
+        l2_bytes, l2_source if l2_bytes > 0 else "")
+    print(f"[profile] expected memory={profile.get('memory_type')} "
+          f"{profile.get('memory_capacity_gb')}GB, expected L2={profile.get('l2_mb')}MB, "
+          f"power envelope={profile.get('power_envelope_w')}W")
     safe_loads = _filter_loads(loads, list(args.ops), list(args.dtypes), hbm_bytes)
     if "elementwise" in cases:
         for dtype in args.dtypes:
@@ -814,6 +1183,71 @@ def main() -> int:
                         "build": (lambda op=op, dtype=dtype, N=N:
                                   bm.build(op, dtype, N, device="cuda")),
                     })
+    # L2/SRAM resident traffic path probes — custom CUDA extension with an
+    # in-kernel repeat loop.  These rows estimate an L2-hit traffic *path*
+    # coefficient, not isolated SRAM cell energy.  Sliding-delta rows are
+    # validation only; primary estimates come from reg_spin-subtracted
+    # l2_read_hit / l2_write_hit fixed-W R sweeps.
+    if "l2" in cases:
+        l2_windows = [int(mb) * (1 << 20) for mb in args.l2_window_mb]
+        l2_cold_pool = int(float(args.l2_cold_pool_gb) * (1 << 30))
+        l2_budget = int(hbm_bytes * _MEM_SAFETY_FRACTION) if hbm_bytes > 0 else 0
+        print("[l2] L2-hit path probe: windows MiB="
+              f"{args.l2_window_mb}, deltas KiB={args.l2_delta_kb}, "
+              f"dtypes={args.l2_dtypes}, persisting={args.l2_use_persisting}")
+        for dtype in args.l2_dtypes:
+            for W in l2_windows:
+                if l2_budget and W * 2 > l2_budget:
+                    print(f"[l2][memcheck] drop W={W/(1<<20):.1f} MiB "
+                          f"(read+write buffers may exceed 25% HBM budget)")
+                    continue
+                repeats = _parse_l2_repeats(args.l2_repeat_inner, W,
+                                            args.l2_target_energy_j,
+                                            args.l2_k_guess_pj_bit)
+                for R in repeats:
+                    for op in ("reg_spin", "l2_read_hit", "l2_write_hit", "l2_copy_hit"):
+                        plans.append({
+                            "category": "l2",
+                            "mode": "l2_probe",
+                            "op": op, "dtype": dtype,
+                            "load_name": "working_set_bytes", "load_value": W,
+                            "build": (lambda op=op, dtype=dtype, W=W, R=R:
+                                      bm.build_l2_probe(
+                                          op=op, dtype_label=dtype,
+                                          working_set_bytes=W,
+                                          repeat_inner=R,
+                                          device="cuda",
+                                          use_persisting_l2=args.l2_use_persisting)),
+                        })
+                # Sliding validation: use the largest auto/explicit repeat so
+                # E(Δ)-E(0) rises above NVML noise.  Delta=0 reference included.
+                slide_R = max(repeats)
+                for dkb in args.l2_delta_kb:
+                    D = int(dkb) * 1024
+                    if D > W:
+                        print(f"[l2] skip sliding delta {dkb} KiB for "
+                              f"W={W/(1<<20):.1f} MiB (delta > W)")
+                        continue
+                    alloc = max(l2_cold_pool, W + max(D, 4096))
+                    if l2_budget and alloc > l2_budget:
+                        print(f"[l2][memcheck] drop sliding W={W/(1<<20):.1f} MiB "
+                              f"D={dkb} KiB (cold pool {alloc/(1<<30):.2f} GiB "
+                              f"> budget {l2_budget/(1<<30):.2f} GiB)")
+                        continue
+                    plans.append({
+                        "category": "l2",
+                        "mode": "l2_probe",
+                        "op": "l2_sliding_delta", "dtype": dtype,
+                        "load_name": "working_set_bytes", "load_value": W,
+                        "build": (lambda dtype=dtype, W=W, R=slide_R, D=D, alloc=alloc:
+                                  bm.build_l2_probe(
+                                      op="l2_sliding_delta", dtype_label=dtype,
+                                      working_set_bytes=W,
+                                      repeat_inner=R, delta_bytes=D,
+                                      cold_pool_bytes=alloc,
+                                      device="cuda",
+                                      use_persisting_l2=args.l2_use_persisting)),
+                    })
     # LLM-shape sweep — opt-in via --llm-shapes. We pre-filter (preset, T)
     # combos by HBM budget using llm_matmul_footprint_bytes(), so the fat
     # lm_head @ T=32768 cell doesn't blow memory on smaller GPUs.
@@ -835,6 +1269,13 @@ def main() -> int:
                     print(f"bad --llm-dtypes entry {v!r} (expected dtype:mode)")
                     return 1
                 llm_dtypes.append(tuple(parts))
+        llm_dtypes, dropped_llm_dtypes = gp.filter_with_profile(
+            llm_dtypes, gp.profile_llm_dtypes(profile_key),
+            label="--llm-dtypes", allow_non_headline=args.allow_non_headline)
+        if dropped_llm_dtypes:
+            dropped_fmt = [f"{d}:{m}" for d, m in dropped_llm_dtypes]
+            print(f"[profile] dropped non-headline --llm-dtypes for {profile_key}: "
+                  f"{dropped_fmt} (use --allow-non-headline to keep them)")
         budget = int(hbm_bytes * _MEM_SAFETY_FRACTION) if hbm_bytes > 0 else 0
         dropped_llm: list[tuple[str, int, str, int]] = []
         for dtype_label, mode in llm_dtypes:
@@ -862,9 +1303,10 @@ def main() -> int:
                 print(f"[memcheck]   {preset:>8s} @ T={T:<6d} {dt:>4s}  "
                       f"≈ {fp/(1<<30):.2f} GB")
 
-    # Fused vs Standalone (G11 / P1.4) — opt-in. Each variant runs as
-    # a single cell at fixed shape (no load sweep). Shape comes from
-    # CLI (--attn-shape / --mlp-shape, GPT-OSS 120B defaults).
+    # Fused vs Standalone (G11 / P1.4). full/all suites enable this by
+    # default; non-full suites can still opt in with --include-fused. Each
+    # variant runs as a single cell at fixed shape (no load sweep). Shape
+    # comes from CLI (--attn-shape / --mlp-shape, GPT-OSS 120B defaults).
     if args.include_fused:
         try:
             attn_shape = tuple(int(x) for x in args.attn_shape.split(","))
@@ -886,6 +1328,8 @@ def main() -> int:
         # remain fp16/bf16-only ; G12/P2.4 follow-up will add fp8 paths.
         if args.fused_dtypes is not None:
             fused_dtypes = list(args.fused_dtypes)
+        elif not user_set_dtypes:
+            fused_dtypes = gp.profile_fused_dtypes(profile_key)
         else:
             fused_dtypes = [d for d in args.dtypes if d in ("fp16", "bf16", "fp8")]
             if not fused_dtypes:
@@ -895,6 +1339,12 @@ def main() -> int:
         if unsupported:
             print(f"[error] fused only supports fp16/bf16/fp8; got {unsupported}.")
             return 1
+        fused_dtypes, dropped_fused_dtypes = gp.filter_with_profile(
+            fused_dtypes, gp.profile_fused_dtypes(profile_key),
+            label="--fused-dtypes", allow_non_headline=args.allow_non_headline)
+        if dropped_fused_dtypes:
+            print(f"[profile] dropped non-headline --fused-dtypes for {profile_key}: "
+                  f"{dropped_fused_dtypes} (use --allow-non-headline to keep them)")
         n_fused_cells = 0
         for dtype in fused_dtypes:
             for variant in bm.FUSED_VARIANTS:
@@ -939,6 +1389,7 @@ def main() -> int:
           f"(elementwise={sum(1 for p in plans if p['category']=='elementwise')}, "
           f"matmul={sum(1 for p in plans if p['category']=='matmul')}, "
           f"matmul_llm={sum(1 for p in plans if p['category']=='matmul_llm')}, "
+          f"l2={sum(1 for p in plans if p['category']=='l2')}, "
           f"fused={sum(1 for p in plans if p['category']=='fused')})")
 
     rows: list[dict] = []
@@ -962,11 +1413,11 @@ def main() -> int:
     # CUDA fault repeats deterministically and we'd just waste time.
     broken_variants: set[tuple[str, str, str, str]] = set()
     fatal_error: str | None = None
+    fused_hint_printed = False
     try:
         for i, plan in enumerate(plans, 1):
             # Skip cells from variants we've already proven broken in this run.
-            variant_key = (plan.get("op"), plan.get("dtype"),
-                           plan.get("mode"), plan.get("llm_preset", ""))
+            variant_key = _variant_key(plan)
             if variant_key in broken_variants:
                 print(f"\n[{i}/{total_cells}] {plan['op']}_{plan['dtype']}_{plan['mode']}"
                       + (f"·{plan['llm_preset']}" if plan.get("llm_preset") else "")
@@ -995,7 +1446,8 @@ def main() -> int:
                                          verbose=False)
                 # Force P8 around each rebaseline too — quiet (verbose=False)
                 # so a 130-cell sweep doesn't print 6 force-p8 noise blocks.
-                rb_p8 = (force_p8_for_measurement(handle, verbose=False)
+                rb_p8 = (force_p8_for_measurement(handle, verbose=False,
+                                                  use_sudo=args.sudo_pstate)
                           if args.pstate_idle_wait > 0
                           else {"success": False, "restore": None})
                 rb = measure_static_power(handle,
@@ -1045,21 +1497,27 @@ def main() -> int:
                     "CUDA call failed",
                 )
                 fatal = any(m in err_msg for m in fatal_markers)
-                variant_key = (plan.get("op"), plan.get("dtype"),
-                               plan.get("mode"), plan.get("llm_preset", ""))
+                variant_key = _variant_key(plan)
                 broken_variants.add(variant_key)
                 if fatal:
                     print(f"  !! FATAL CUDA error during build at {label} "
                           f"{plan['load_name']}={plan['load_value']}: {err_msg}")
+                    if plan.get("category") == "fused" and not fused_hint_printed:
+                        _print_fused_failure_hint(err_msg)
+                        fused_hint_printed = True
                     print(f"  !! CUDA context is now unrecoverable — "
                           f"flushing {len(rows)} completed cells to CSV "
                           f"and exiting early. Re-run without the offending "
                           f"variant (e.g. --matmul-variants without fp8:te, "
-                          f"or skip --llm-shapes).")
+                          f"--no-fused, or skip --llm-shapes).")
                     fatal_error = err_msg
                     break
                 print(f"  ! build failed: {err_msg}  — skipped")
+                if plan.get("category") == "fused" and not fused_hint_printed:
+                    _print_fused_failure_hint(err_msg)
+                    fused_hint_printed = True
                 continue
+            _apply_effective_l2_cache_regime(spec, l2_bytes, l2_source)
             tag = spec.compute_unit + ("  [EMULATED]" if spec.emulated else "")
             print(f"  compute_unit: {tag}")
             print(f"  cache_regime: {spec.cache_regime}")
@@ -1106,21 +1564,26 @@ def main() -> int:
                 # Track that THIS variant is broken so subsequent cells of the
                 # same (op, dtype, mode, llm_preset) get skipped without trying
                 # — the CUDA context is the same, the fault repeats.
-                variant_key = (plan.get("op"), plan.get("dtype"),
-                               plan.get("mode"), plan.get("llm_preset", ""))
+                variant_key = _variant_key(plan)
                 broken_variants.add(variant_key)
                 if fatal:
                     print(f"  !! FATAL CUDA error at {label} "
                           f"{plan['load_name']}={plan['load_value']}: {err_msg}")
+                    if plan.get("category") == "fused" and not fused_hint_printed:
+                        _print_fused_failure_hint(err_msg)
+                        fused_hint_printed = True
                     print(f"  !! CUDA context is now unrecoverable — "
                           f"flushing {len(rows)} completed cells to CSV "
                           f"and exiting early. Re-run without the offending "
                           f"variant (e.g. --no-matmul / drop --llm-shapes / "
-                          f"--matmul-variants without fp8:te).")
+                          f"--matmul-variants without fp8:te / --no-fused).")
                     fatal_error = err_msg
                     break  # exit the for-loop; the finally: + post-loop save
                            # still write whatever we accumulated.
                 print(f"  ! run failed: {err_msg}")
+                if plan.get("category") == "fused" and not fused_hint_printed:
+                    _print_fused_failure_hint(err_msg)
+                    fused_hint_printed = True
                 del spec
                 try:
                     torch.cuda.empty_cache()
@@ -1148,10 +1611,38 @@ def main() -> int:
 
             total_elements = spec.n_elements * meas["iters"]
             total_flops = spec.flops_per_call * meas["iters"]
+            headline_eligible, headline_status, headline_reason = gp.headline_status(
+                profile_key,
+                category=plan["category"],
+                op=plan["op"],
+                dtype=plan["dtype"],
+                mode=plan["mode"],
+                compute_unit=spec.compute_unit,
+                emulated=bool(spec.emulated),
+                observed_cc=observed_cc,
+            )
 
             row = {
                 "gpu": gpu_name,
                 "compute_cap": f"{cc[0]}.{cc[1]}",
+                "gpu_profile": profile_key,
+                "gpu_profile_status": profile_status,
+                "gpu_profile_reason": profile_reason,
+                "observed_profile": observed_profile,
+                "memory_type_expected": spec_snapshot.get("memory_type_expected", ""),
+                "memory_capacity_expected_gb": spec_snapshot.get("memory_capacity_expected_gb", ""),
+                "memory_total_gb": spec_snapshot.get("memory_total_gb", ""),
+                "peak_bw_expected_gbps": spec_snapshot.get("peak_bw_expected_gbps", ""),
+                "l2_expected_mb": spec_snapshot.get("l2_expected_mb", ""),
+                "l2_reported_mb": spec_snapshot.get("l2_reported_mb", ""),
+                "l2_effective_mb": spec_snapshot.get("l2_effective_mb", ""),
+                "l2_source": spec_snapshot.get("l2_source", ""),
+                "power_envelope_expected_w": spec_snapshot.get("power_envelope_expected_w", ""),
+                "power_limit_w": spec_snapshot.get("power_limit_w", ""),
+                "native_fp8_headline_allowed": spec_snapshot.get("native_fp8_headline_allowed", ""),
+                "headline_eligible": headline_eligible,
+                "headline_status": headline_status,
+                "headline_reason": headline_reason,
                 "category": plan["category"],
                 "op": plan["op"],
                 "dtype": plan["dtype"],
@@ -1221,8 +1712,38 @@ def main() -> int:
                 "cooldown_reached":   int(bool(cooldown_info["reached"])),
                 "sm_clk_mhz":   meas["sm_clk_mhz"],
                 "mem_clk_mhz":  meas["mem_clk_mhz"],
+                # L2/SRAM resident traffic probe metadata. Blank for non-L2 rows.
+                "working_set_bytes": "",
+                "repeat_inner": "",
+                "delta_bytes": "",
+                "estimated_l2_read_bits": "",
+                "estimated_l2_write_bits": "",
+                "estimated_l2_total_bits": "",
+                "estimated_hbm_refill_bits": "",
+                "l2_policy": "",
+                "block_size": "",
+                "grid_size": "",
+                "kernel_version": "",
+                "cold_pool_bytes": "",
                 "notes":        spec.notes,
             }
+            extra = getattr(spec, "extra", {}) or {}
+            if extra:
+                outer_iters = int(meas["iters"])
+                row.update({
+                    "working_set_bytes": extra.get("working_set_bytes", ""),
+                    "repeat_inner": extra.get("repeat_inner", ""),
+                    "delta_bytes": extra.get("delta_bytes", ""),
+                    "estimated_l2_read_bits": int(extra.get("estimated_l2_read_bits_per_call", 0)) * outer_iters,
+                    "estimated_l2_write_bits": int(extra.get("estimated_l2_write_bits_per_call", 0)) * outer_iters,
+                    "estimated_l2_total_bits": int(extra.get("estimated_l2_total_bits_per_call", 0)) * outer_iters,
+                    "estimated_hbm_refill_bits": int(extra.get("estimated_hbm_refill_bits_per_call", 0)) * outer_iters,
+                    "l2_policy": extra.get("l2_policy", ""),
+                    "block_size": extra.get("block_size", ""),
+                    "grid_size": extra.get("grid_size", ""),
+                    "kernel_version": extra.get("kernel_version", ""),
+                    "cold_pool_bytes": extra.get("cold_pool_bytes", ""),
+                })
             rows.append(row)
             print(f"  E_total={meas['total_energy_j']:.3f} J, "
                   f"E_dyn={dyn_energy:.3f} J, "
@@ -1246,8 +1767,7 @@ def main() -> int:
                 torch.cuda.empty_cache()
             except Exception as e:
                 err_msg = str(e)
-                variant_key = (plan.get("op"), plan.get("dtype"),
-                               plan.get("mode"), plan.get("llm_preset", ""))
+                variant_key = _variant_key(plan)
                 broken_variants.add(variant_key)
                 fatal_markers = (
                     "illegal memory access",
@@ -1282,11 +1802,13 @@ def main() -> int:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     suffix = f"_{args.tag}" if args.tag else ""
     csv_path = out_dir / f"gpu_power_bench_{gpu_slug}_{stamp}{suffix}.csv"
+    csv_saved = False
     if rows:
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader()
             w.writerows(rows)
+        csv_saved = True
         if fatal_error:
             print(f"\n[save] {csv_path}  ({len(rows)} rows — partial; "
                   f"sweep aborted by '{fatal_error}')")
@@ -1305,6 +1827,14 @@ def main() -> int:
         else:
             print("\n[warn] no rows collected — nothing saved")
             return 2
+
+    spec_path = out_dir / f"gpu_power_bench_{gpu_slug}_{stamp}{suffix}_gpu_spec_snapshot.csv"
+    with open(spec_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "value"])
+        for k, v in spec_snapshot.items():
+            w.writerow([k, v])
+    print(f"[save] {spec_path}")
 
     # ---- clip-bias report ------------------------------------------------
     # Tells the user how often the dyn = max(0, raw) clip fired. Frequent
@@ -1616,10 +2146,13 @@ def main() -> int:
             try: pynvml.nvmlShutdown()
             except Exception: pass
 
-    print("\nnext: python3 analyze.py {}  # generate linearity plots".format(csv_path))
-    # Machine-readable last line — run_bench.sh greps this to chain
-    # `analyze.py <csv>` automatically. Keep the prefix exact.
-    print(f"[OUTPUT_CSV] {csv_path}")
+    if csv_saved:
+        print("\nnext: python3 analyze.py {}  # generate linearity plots".format(csv_path))
+        # Machine-readable last line — run_bench.sh greps this to chain
+        # `analyze.py <csv>` automatically. Keep the prefix exact.
+        print(f"[OUTPUT_CSV] {csv_path}")
+    else:
+        print("\n[info] no benchmark CSV emitted; analysis plots are only available for per-cell sweeps")
     return 0
 
 

@@ -77,10 +77,6 @@ fi
     exit 1
 }
 
-if command -v nvidia-smi >/dev/null; then
-    sudo -n nvidia-smi -pm 1 >/dev/null 2>&1 || true
-fi
-
 mkdir -p reports
 
 # ---- argv parsing (we only intercept our new flags; rest forwards) ----
@@ -88,6 +84,8 @@ NUM_GPUS=""
 DEVICES=""
 SEQUENTIAL=0
 BASE_TAG=""
+SINGLE_DEVICE="0"
+SUDO_PSTATE=0
 FORWARD=()
 
 AUTO_ANALYZE=1   # default ON for single-GPU; multi-GPU paths disable it below.
@@ -100,10 +98,11 @@ while [[ $# -gt 0 ]]; do
         --devices=*)        DEVICES="${1#*=}"; shift ;;
         --sequential)       SEQUENTIAL=1; shift ;;
         --no-auto-analyze)  AUTO_ANALYZE=0; shift ;;
+        --sudo-pstate)      SUDO_PSTATE=1; FORWARD+=("$1"); shift ;;
         --tag)              BASE_TAG="$2"; FORWARD+=("--tag" "$2"); shift 2 ;;
         --tag=*)            BASE_TAG="${1#*=}"; FORWARD+=("$1"); shift ;;
-        # --device is a single-GPU flag we leave as-is when no multi-GPU
-        # option is given (preserves existing single-GPU behaviour).
+        --device)           SINGLE_DEVICE="$2"; FORWARD+=("--device" "$2"); shift 2 ;;
+        --device=*)         SINGLE_DEVICE="${1#*=}"; FORWARD+=("$1"); shift ;;
         *)                  FORWARD+=("$1"); shift ;;
     esac
 done
@@ -119,6 +118,83 @@ elif [[ -n "$NUM_GPUS" ]]; then
     for ((i=0; i<NUM_GPUS; i++)); do DEVS+=("$i"); done
 fi
 
+SUDO_KEEPALIVE_PID=""
+cleanup_sudo_keepalive() {
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+        wait "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    fi
+}
+
+start_sudo_keepalive() {
+    command -v sudo >/dev/null || {
+        echo "error: --sudo-pstate requested but sudo is not available" >&2
+        exit 1
+    }
+    echo "[sudo-pstate] requesting sudo once for selected-GPU clock reset helpers"
+    sudo -v || {
+        echo "error: sudo authentication failed; rerun without --sudo-pstate or ask the admin" >&2
+        exit 1
+    }
+    (
+        while true; do
+            sudo -n -v >/dev/null 2>&1 || exit
+            sleep 60
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
+    trap cleanup_sudo_keepalive EXIT
+}
+
+if (( SUDO_PSTATE == 1 )); then
+    start_sudo_keepalive
+fi
+
+enable_persistence_for_devices() {
+    [[ "${RUN_BENCH_PERSISTENCE:-1}" == "1" ]] || return 0
+    command -v nvidia-smi >/dev/null || return 0
+    command -v sudo >/dev/null || return 0
+    local dev
+    for dev in "$@"; do
+        # Keep this selected-device only. A device-less persistence-mode
+        # command on a shared multi-GPU node can affect GPUs this run
+        # does not own. Resolve the physical NVML index because
+        # CUDA_VISIBLE_DEVICES may remap CUDA --device indices.
+        local smi_dev
+        smi_dev=$("$PYTHON" - "$dev" 2>/dev/null <<'PY'
+import sys
+import pynvml
+from power_monitor import resolve_nvml_handle
+
+dev = int(sys.argv[1])
+pynvml.nvmlInit()
+try:
+    handle, _ = resolve_nvml_handle(dev)
+    print(pynvml.nvmlDeviceGetIndex(handle))
+finally:
+    pynvml.nvmlShutdown()
+PY
+)
+        if [[ -z "$smi_dev" ]]; then
+            if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+                echo "[warn] could not map CUDA --device $dev to a physical nvidia-smi index;" >&2
+                echo "       skip persistence setup to avoid touching the wrong GPU" >&2
+                continue
+            fi
+            smi_dev="$dev"
+        fi
+        sudo -n nvidia-smi -i "$smi_dev" -pm 1 >/dev/null 2>&1 || true
+    done
+}
+
+PERSIST_DEVS=()
+if [[ ${#DEVS[@]} -gt 0 ]]; then
+    PERSIST_DEVS=("${DEVS[@]}")
+else
+    PERSIST_DEVS=("$SINGLE_DEVICE")
+fi
+enable_persistence_for_devices "${PERSIST_DEVS[@]}"
+
 # Strip any --tag the user passed — we re-add a per-GPU tag below.
 STRIPPED=()
 skip_next=0
@@ -127,6 +203,8 @@ for a in "${FORWARD[@]+"${FORWARD[@]}"}"; do
     case "$a" in
         --tag)    skip_next=1 ;;
         --tag=*)  ;;   # drop
+        --device) skip_next=1 ;;
+        --device=*) ;;
         *)        STRIPPED+=("$a") ;;
     esac
 done
@@ -209,13 +287,18 @@ if [[ ${#DEVS[@]} -eq 0 ]]; then
         # gpu_power_bench.py writes a "[OUTPUT_CSV] <path>" line at the end
         # — pluck it out so we don't have to glob. Log is preserved either
         # way for later inspection.
-        csv_line=$(grep -E '^\[OUTPUT_CSV\] ' "$sweep_log" | tail -n 1)
+        csv_line=$({ grep -E '^\[OUTPUT_CSV\] ' "$sweep_log" || true; } | tail -n 1)
         if [[ -z "$csv_line" ]]; then
             echo "[warn] sweep finished but no [OUTPUT_CSV] marker found — skip auto-analyze" >&2
             echo "[info] log: $sweep_log"
             exit 0
         fi
         csv_path="${csv_line#\[OUTPUT_CSV\] }"
+        if [[ ! -f "$csv_path" ]]; then
+            echo "[warn] [OUTPUT_CSV] marker points to a missing file — skip auto-analyze: $csv_path" >&2
+            echo "[info] log: $sweep_log"
+            exit 0
+        fi
         echo
         echo "[auto-analyze] running analyze.py on $csv_path"
         echo "                (skip with --no-auto-analyze; or run later: python3 analyze.py <csv>)"
@@ -324,7 +407,7 @@ else
                 echo "[skip-analyze] gpu${dev}: log missing — sweep died early"
                 continue
             fi
-            csv_line=$(grep -E '^\[OUTPUT_CSV\] ' "$gpulog" | tail -n 1)
+            csv_line=$({ grep -E '^\[OUTPUT_CSV\] ' "$gpulog" || true; } | tail -n 1)
             if [[ -z "$csv_line" ]]; then
                 echo "[skip-analyze] gpu${dev}: no [OUTPUT_CSV] marker (sweep failed?)"
                 continue

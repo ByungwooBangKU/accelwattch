@@ -928,7 +928,7 @@ def plot_kop_per_K(per_K_df: pd.DataFrame, out_png: Path, gpu: str) -> bool:
 
 def _annot_bar_pj(rect, value_j, r2, scale_label):
     """Write '0.31 pJ/elem\\nR²=0.99' on top of a bar, skipping NaNs."""
-    if value_j is None or np.isnan(value_j):
+    if value_j is None or not np.isfinite(value_j) or value_j <= 0:
         return
     v_p = value_j * 1e12   # J → pJ
     if abs(v_p) >= 100:
@@ -1017,19 +1017,26 @@ def _coef_bar_elementwise(ew, out_png: Path, gpu: str) -> bool:
                 errs_lo.append(0.0); errs_hi.append(0.0)
             else:
                 v = float(row[slope_col].iloc[0])
-                vals.append(v); r2s.append(float(row[r2_col].iloc[0]))
-                if ("slope_dyn_ci_lo" in row.columns
-                        and pd.notna(row["slope_dyn_ci_lo"].iloc[0])):
-                    ci_lo = float(row["slope_dyn_ci_lo"].iloc[0])
-                    ci_hi = float(row["slope_dyn_ci_hi"].iloc[0])
-                    errs_lo.append(max(0.0, v - ci_lo))
-                    errs_hi.append(max(0.0, ci_hi - v))
-                else:
+                if not np.isfinite(v) or v <= 0:
+                    _PlotSkipLog.record(
+                        plot="coef_bar_elementwise", variant=op, dtype=dt,
+                        reason="nonpositive_slope",
+                        details=f"{slope_col}={v:.3e}; omitted from log-scale coefficient bar")
+                    vals.append(float("nan")); r2s.append(float("nan"))
                     errs_lo.append(0.0); errs_hi.append(0.0)
+                else:
+                    vals.append(v); r2s.append(float(row[r2_col].iloc[0]))
+                    if ("slope_dyn_ci_lo" in row.columns
+                            and pd.notna(row["slope_dyn_ci_lo"].iloc[0])):
+                        ci_lo = float(row["slope_dyn_ci_lo"].iloc[0])
+                        ci_hi = float(row["slope_dyn_ci_hi"].iloc[0])
+                        errs_lo.append(max(0.0, v - ci_lo))
+                        errs_hi.append(max(0.0, ci_hi - v))
+                    else:
+                        errs_lo.append(0.0); errs_hi.append(0.0)
+                    all_positive.append(v)
                 if "emulated" in row.columns and int(row["emulated"].iloc[0]):
                     has_emulated = True
-                if np.isfinite(v) and v > 0:
-                    all_positive.append(v)
         emu_dt = (dt == "fp8")
         label = f"{dt} [CUDA]" + (" *EMU" if emu_dt else "")
         yerr = [errs_lo, errs_hi] if any(errs_lo) or any(errs_hi) else None
@@ -1092,7 +1099,17 @@ def _coef_bar_matmul(mm, out_png: Path, gpu: str) -> bool:
     hatches = ["//" if _emu(v) else None for v in mm2.index]
     slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm2.columns else "slope_dyn"
     r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in mm2.columns else "R2_dyn"
-    slope_vals = mm2[slope_col].values
+    slope_vals_raw = [float(v) if pd.notna(v) else float("nan")
+                      for v in mm2[slope_col].values]
+    slope_vals = [v if np.isfinite(v) and v > 0 else float("nan")
+                  for v in slope_vals_raw]
+    for variant, v in zip(mm2.index, slope_vals_raw):
+        if not np.isfinite(v) or v <= 0:
+            _PlotSkipLog.record(
+                plot="coef_bar_matmul", variant=variant,
+                dtype=str(mm2.loc[variant, "dtype"]) if "dtype" in mm2.columns else "",
+                reason="nonpositive_slope",
+                details=f"{slope_col}={v:.3e}; omitted from log-scale coefficient bar")
     if "slope_dyn_ci_lo" in mm2.columns and "slope_dyn_ci_hi" in mm2.columns:
         errs_lo, errs_hi = [], []
         for v, lo, hi in zip(slope_vals,
@@ -4086,18 +4103,28 @@ def compute_dram_marginal(df: pd.DataFrame) -> pd.DataFrame:
 
     Cells where dyn_energy_j was clipped to 0 are excluded.
     """
+    out_cols = [
+        "op", "dtype",
+        "l2_slope_J_per_bit",
+        "dram_slope_J_per_bit",
+        "marginal_pJ_per_bit",
+        "direct_dram_pJ_per_bit",
+        "R2_l2", "R2_dram",
+        "n_l2_cells", "n_dram_cells",
+        "is_simple_memory_bound",
+    ]
     if ("pj_per_bit_traffic" not in df.columns
             or "bytes_traffic" not in df.columns):
-        return pd.DataFrame()
+        return pd.DataFrame(columns=out_cols)
     ew = df[df["category"].isin(DRAM_TRAFFIC_CATEGORIES)].copy()
     if ew.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=out_cols)
     ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
     ew["dyn_energy_j"]  = pd.to_numeric(ew["dyn_energy_j"], errors="coerce")
     ew["bytes_traffic"] = pd.to_numeric(ew["bytes_traffic"], errors="coerce")
     ew = ew[(ew["dyn_energy_j"] > 0) & (ew["bytes_traffic"] > 0)]
     if ew.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=out_cols)
 
     # Simple memory-bound op set : marginal ≈ DRAM bit energy is only
     # justified for these. Reduction / compute-heavy ops have multi-pass
@@ -4157,7 +4184,10 @@ def compute_dram_marginal(df: pd.DataFrame) -> pd.DataFrame:
             n_l2_cells=n_l2, n_dram_cells=n_dr,
             is_simple_memory_bound=int(op in SIMPLE_OPS),
         ))
-    return pd.DataFrame(rows).sort_values(["op", "dtype"]).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=out_cols)
+    return pd.DataFrame(rows, columns=out_cols).sort_values(
+        ["op", "dtype"]).reset_index(drop=True)
 
 
 def plot_dram_rw_split(rw_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
@@ -4419,6 +4449,271 @@ def _resolve_csv(args) -> Path | None:
             print(f"         {p.name}")
     return candidates[0]
 
+
+
+# ============================================================================
+# L2/SRAM resident traffic path analysis (A.6)
+# ============================================================================
+# Estimates L2-hit traffic path energy, not isolated SRAM bit-cell energy.
+# Power rows may be joined with Nsight Compute counters in a later workflow;
+# this first-pass implementation consumes the logical traffic columns written
+# by gpu_power_bench.py and marks the headline as PROVISIONAL.
+
+
+def _num(s, default=np.nan):
+    return pd.to_numeric(s, errors="coerce").fillna(default)
+
+
+def _bootstrap_slope_ci(x: np.ndarray, y: np.ndarray, n_boot: int = 400) -> tuple[float, float]:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if len(x) < 3:
+        return np.nan, np.nan
+    rng = np.random.default_rng(12345)
+    vals = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, len(x), len(x))
+        if len(np.unique(x[idx])) < 2:
+            continue
+        m, _, _ = linear_fit(x[idx], y[idx])
+        if np.isfinite(m):
+            vals.append(m)
+    if not vals:
+        return np.nan, np.nan
+    return tuple(np.percentile(vals, [2.5, 97.5]))
+
+
+def compute_l2_energy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return L2 summary, per-window, fit-points, validation, skip tables."""
+    if "category" not in df or not (df["category"] == "l2").any():
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, empty
+    l2 = df[df["category"] == "l2"].copy()
+    for c in ["dyn_energy_j", "iters", "working_set_bytes", "repeat_inner",
+              "delta_bytes", "estimated_l2_read_bits", "estimated_l2_write_bits",
+              "estimated_l2_total_bits", "estimated_hbm_refill_bits"]:
+        if c not in l2:
+            l2[c] = np.nan
+        l2[c] = pd.to_numeric(l2[c], errors="coerce")
+    for c in ["block_size", "grid_size", "kernel_version", "l2_policy"]:
+        if c not in l2:
+            l2[c] = ""
+
+    key = ["dtype", "working_set_bytes", "repeat_inner",
+           "block_size", "grid_size", "kernel_version"]
+    regs = l2[l2["op"] == "reg_spin"].copy()
+    if regs.empty:
+        skips = pd.DataFrame([{"op": "*", "reason": "missing_reg_spin_baseline",
+                               "severity": "FAIL", "suggested_fix": "rerun --cases l2 including reg_spin"}])
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), skips
+    regs["reg_dyn_per_outer_iter_j"] = regs["dyn_energy_j"] / regs["iters"].replace(0, np.nan)
+    reg_cols = key + ["reg_dyn_per_outer_iter_j"]
+    pts = l2[l2["op"] != "reg_spin"].merge(regs[reg_cols], on=key, how="left")
+    pts["E_reg_spin_j"] = pts["reg_dyn_per_outer_iter_j"] * pts["iters"]
+    pts["E_dyn_j"] = pts["dyn_energy_j"]
+    pts["E_delta_j"] = pts["E_dyn_j"] - pts["E_reg_spin_j"]
+    pts["l2_bits_est"] = pts["estimated_l2_total_bits"]
+    pts["working_set_mib"] = pts["working_set_bytes"] / (1 << 20)
+    pts["j_per_l2_bit_est"] = pts["E_delta_j"] / pts["l2_bits_est"].replace(0, np.nan)
+    pts["status"] = "PASS"
+    pts["reason"] = ""
+    bad = pts["reg_dyn_per_outer_iter_j"].isna()
+    pts.loc[bad, ["status", "reason"]] = ["FAIL", "missing matched reg_spin"]
+    bad = pts["E_delta_j"] <= 0
+    pts.loc[bad, ["status", "reason"]] = ["FAIL", "E_delta <= 0 after reg_spin subtraction"]
+    bad = pts["l2_bits_est"] <= 0
+    pts.loc[bad & (pts["op"] != "l2_sliding_delta"), ["status", "reason"]] = ["FAIL", "L2 bits <= 0"]
+
+    skip_rows = []
+    for _, r in pts[pts["status"] == "FAIL"].iterrows():
+        skip_rows.append({
+            "op": r.get("op", ""), "working_set_bytes": r.get("working_set_bytes", ""),
+            "repeat_inner": r.get("repeat_inner", ""), "delta_bytes": r.get("delta_bytes", ""),
+            "reason": r.get("reason", ""), "severity": "FAIL",
+            "suggested_fix": "increase --l2-target-energy-j/--window-ms or check baseline matching",
+        })
+
+    valid = pts[(pts["status"] == "PASS") & (pts["op"].isin(["l2_read_hit", "l2_write_hit", "l2_copy_hit"]))].copy()
+    perw_rows = []
+    for (op, W), g in valid.groupby(["op", "working_set_bytes"]):
+        x = g["l2_bits_est"].to_numpy(float)
+        y = g["E_delta_j"].to_numpy(float)
+        if len(g) < 3 or len(np.unique(x)) < 2:
+            perw_rows.append({"op": op, "working_set_bytes": W, "working_set_mib": W/(1<<20),
+                              "n_points": len(g), "k_l2_pj_per_bit": np.nan,
+                              "ci_lo": np.nan, "ci_hi": np.nan, "R2": np.nan,
+                              "status": "FAIL", "reason": "n_points < 3 or no x variation"})
+            continue
+        slope, intercept, r2 = linear_fit(x, y)
+        ci_lo, ci_hi = _bootstrap_slope_ci(x, y)
+        status = "PASS"
+        reason = ""
+        if slope <= 0 or r2 < 0.90:
+            status, reason = "FAIL", "non-positive slope or R2 < 0.90"
+        elif r2 < 0.98:
+            status, reason = "LOW_CONF", "R2 < 0.98"
+        perw_rows.append({"op": op, "working_set_bytes": W, "working_set_mib": W/(1<<20),
+                          "n_points": len(g), "k_l2_pj_per_bit": slope*1e12,
+                          "ci_lo": ci_lo*1e12 if np.isfinite(ci_lo) else np.nan,
+                          "ci_hi": ci_hi*1e12 if np.isfinite(ci_hi) else np.nan,
+                          "R2": r2, "status": status, "reason": reason})
+    perw = pd.DataFrame(perw_rows)
+
+    summary_rows = []
+    def _global(op):
+        g = valid[valid["op"] == op]
+        if len(g) < 3 or g["l2_bits_est"].nunique() < 2:
+            return (np.nan, np.nan, np.nan, np.nan, "FAIL", "n_points < 3")
+        slope, intercept, r2 = linear_fit(g["l2_bits_est"].to_numpy(float), g["E_delta_j"].to_numpy(float))
+        ci_lo, ci_hi = _bootstrap_slope_ci(g["l2_bits_est"].to_numpy(float), g["E_delta_j"].to_numpy(float))
+        vals = perw[(perw["op"] == op) & (perw["status"] != "FAIL")]["k_l2_pj_per_bit"].dropna()
+        iqr_pct = np.nan
+        if len(vals) >= 2 and np.nanmedian(vals) != 0:
+            iqr_pct = (np.nanpercentile(vals, 75) - np.nanpercentile(vals, 25)) / abs(np.nanmedian(vals)) * 100.0
+        status = "PASS"; reason = ""
+        if slope <= 0 or r2 < 0.90:
+            status, reason = "FAIL", "non-positive slope or R2 < 0.90"
+        elif r2 < 0.98 or (np.isfinite(iqr_pct) and iqr_pct > 30):
+            status, reason = "LOW_CONF", "R2 < 0.98 or per-window IQR > 30%"
+        return slope*1e12, ci_lo*1e12, ci_hi*1e12, iqr_pct, status, reason
+
+    kr, rlo, rhi, riqr, rstat, rwhy = _global("l2_read_hit")
+    kw, wlo, whi, wiqr, wstat, wwhy = _global("l2_write_hit")
+    copy_error = np.nan
+    copy_eff = np.nan
+    val_rows = []
+    copy = valid[valid["op"] == "l2_copy_hit"].copy()
+    if not copy.empty and np.isfinite(kr) and np.isfinite(kw):
+        copy["E_implied_j"] = (kr * 1e-12 * copy["estimated_l2_read_bits"]
+                                + kw * 1e-12 * copy["estimated_l2_write_bits"])
+        copy["err_pct"] = (copy["E_delta_j"] - copy["E_implied_j"]).abs() / copy["E_delta_j"].abs() * 100.0
+        copy_error = float(copy["err_pct"].median())
+        copy_eff = float((copy["E_delta_j"] / copy["l2_bits_est"]).median() * 1e12)
+        vstat = "PASS" if copy_error <= 10 else ("LOW_CONF" if copy_error <= 20 else "FAIL")
+        val_rows.append({"validation_name": "copy_read_write_implied", "measured": float(copy["E_delta_j"].median()),
+                         "predicted": float(copy["E_implied_j"].median()), "error_pct": copy_error,
+                         "status": vstat, "reason": "median across l2_copy_hit rows"})
+    if rstat == "FAIL" or wstat == "FAIL":
+        status = "FAIL"
+    elif rstat == "PASS" and wstat == "PASS":
+        status = "PASS"
+    else:
+        status = "LOW_CONF"
+    reasons = "; ".join(x for x in [rwhy, wwhy] if x)
+    if copy_error == copy_error and copy_error > 20:
+        status = "LOW_CONF" if status == "PASS" else status
+        reasons = (reasons + "; " if reasons else "") + "copy implied error > 20%"
+    summary_rows.append({
+        "gpu": l2["gpu"].iloc[0] if "gpu" in l2 and not l2.empty else "",
+        "tag": "", "headline_source": "logical_estimate_PROVISIONAL",
+        "op_group": "l2_hit_path",
+        "k_l2_read_pj_per_bit": kr, "k_l2_read_ci_lo": rlo, "k_l2_read_ci_hi": rhi,
+        "k_l2_write_pj_per_bit": kw, "k_l2_write_ci_lo": wlo, "k_l2_write_ci_hi": whi,
+        "k_l2_copy_effective_pj_per_bit": copy_eff,
+        "hbm_reference_pj_per_bit": np.nan,
+        "copy_error_pct": copy_error,
+        "sliding_error_pct": np.nan,
+        "per_window_iqr_pct": np.nanmax([riqr, wiqr]) if any(np.isfinite([riqr, wiqr])) else np.nan,
+        "logical_vs_counter_gap_pct": np.nan,
+        "status": status, "reason": reasons,
+    })
+
+    # Sliding validation table (power-only): E(Δ)-E(0) per W/R/dtype.
+    slide = pts[(pts["op"] == "l2_sliding_delta") & (pts["E_delta_j"] > 0)].copy()
+    if not slide.empty:
+        for (dt, W, R), g in slide.groupby(["dtype", "working_set_bytes", "repeat_inner"]):
+            ref = g[g["delta_bytes"] == 0]
+            non = g[g["delta_bytes"] > 0]
+            if ref.empty or len(non) < 2:
+                continue
+            e0 = float(ref["E_delta_j"].median())
+            x = non["delta_bytes"].to_numpy(float) * 8.0 * non["repeat_inner"].to_numpy(float) * non["iters"].to_numpy(float)
+            y = non["E_delta_j"].to_numpy(float) - e0
+            slope, intercept, r2 = linear_fit(x, y)
+            val_rows.append({"validation_name": f"sliding_delta_W{int(W)}_R{int(R)}_{dt}",
+                             "measured": slope*1e12, "predicted": np.nan,
+                             "error_pct": np.nan, "status": "PASS" if r2 >= 0.90 else "LOW_CONF",
+                             "reason": f"delta slope pJ/bit gap proxy; R2={r2:.3f}; requires HBM reference for cross-check"})
+    validation = pd.DataFrame(val_rows)
+    skips = pd.DataFrame(skip_rows)
+    fit_cols = ["op", "dtype", "working_set_bytes", "working_set_mib", "repeat_inner", "delta_bytes",
+                "E_dyn_j", "E_reg_spin_j", "E_delta_j", "l2_bits_est",
+                "estimated_l2_read_bits", "estimated_l2_write_bits", "estimated_hbm_refill_bits",
+                "j_per_l2_bit_est", "status", "reason"]
+    return pd.DataFrame(summary_rows), perw, pts[[c for c in fit_cols if c in pts.columns]], validation, skips
+
+
+def plot_l2_analysis(summary: pd.DataFrame, perw: pd.DataFrame, pts: pd.DataFrame,
+                     validation: pd.DataFrame, out_dir: Path, stem: str, gpu: str) -> None:
+    if summary.empty:
+        return
+    plt = _get_mpl()
+    caveat = "L2-hit path energy, not isolated SRAM bit-cell energy. PROVISIONAL: logical traffic estimate; attach Nsight Compute counters for headline claims."
+    # Overview bar.
+    row = summary.iloc[0]
+    labels = ["L2 read-hit path", "L2 write/store-hit path", "L2 copy effective"]
+    vals = [row.get("k_l2_read_pj_per_bit", np.nan), row.get("k_l2_write_pj_per_bit", np.nan), row.get("k_l2_copy_effective_pj_per_bit", np.nan)]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    xs = np.arange(len(labels))
+    ax.bar(xs, vals, color=["#1f77b4", "#ff7f0e", "#2ca02c"], alpha=0.85)
+    ax.set_xticks(xs); ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_ylabel("pJ / bit")
+    ax.set_title(f"L2/SRAM resident traffic path estimate — {gpu}\n{caveat}", fontsize=10)
+    ax.grid(True, axis="y", alpha=0.3)
+    _save_fig(fig, out_dir / f"{stem}_02_l2_overview_pjbit.png")
+
+    # Primary read/write fits.
+    for op, fname, color in [("l2_read_hit", "read", "#1f77b4"), ("l2_write_hit", "write", "#ff7f0e")]:
+        g = pts[(pts["op"] == op) & (pts["status"] == "PASS")].copy()
+        if g.empty:
+            continue
+        x = g["l2_bits_est"].to_numpy(float); y = g["E_delta_j"].to_numpy(float)
+        slope, intercept, r2 = linear_fit(x, y)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for W, wg in g.groupby("working_set_mib"):
+            ax.scatter(wg["l2_bits_est"] / 1e12, wg["E_delta_j"], label=f"W={W:.0f} MiB", s=36)
+        xx = np.linspace(np.nanmin(x), np.nanmax(x), 100)
+        ax.plot(xx / 1e12, intercept + slope * xx, color=color, lw=2,
+                label=f"fit: {slope*1e12:.3g} pJ/bit, R²={r2:.3f}")
+        ax.set_xlabel("logical L2 traffic (Tbit)")
+        ax.set_ylabel("E_delta after reg_spin subtraction (J)")
+        ax.set_title(f"Primary L2 {fname} fit — {gpu}\n{caveat}", fontsize=10)
+        ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+        _save_fig(fig, out_dir / f"{stem}_02_l2_primary_fit_{fname}.png")
+
+    if not perw.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for op, label, color in [("l2_read_hit", "read", "#1f77b4"), ("l2_write_hit", "write", "#ff7f0e")]:
+            g = perw[(perw["op"] == op) & (perw["k_l2_pj_per_bit"].notna())]
+            if not g.empty:
+                ax.plot(g["working_set_mib"], g["k_l2_pj_per_bit"], marker="o", label=label, color=color)
+        ax.set_xlabel("working set (MiB)"); ax.set_ylabel("pJ / bit")
+        ax.set_title(f"L2 per-window stability — {gpu}\n{caveat}", fontsize=10)
+        ax.grid(True, alpha=0.3); ax.legend()
+        _save_fig(fig, out_dir / f"{stem}_02_l2_per_window_stability.png")
+
+    copy_val = validation[validation["validation_name"] == "copy_read_write_implied"] if not validation.empty else pd.DataFrame()
+    if not copy_val.empty:
+        r = copy_val.iloc[0]
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar([0, 1], [r["measured"], r["predicted"]], color=["#2ca02c", "#9467bd"])
+        ax.set_xticks([0, 1]); ax.set_xticklabels(["copy measured", "read/write implied"])
+        ax.set_ylabel("median E_delta (J)")
+        ax.set_title(f"L2 copy validation — error {r['error_pct']:.1f}% ({r['status']})")
+        ax.grid(True, axis="y", alpha=0.3)
+        _save_fig(fig, out_dir / f"{stem}_02_l2_read_write_split.png")
+
+    slide = validation[validation["validation_name"].str.startswith("sliding_delta", na=False)] if not validation.empty else pd.DataFrame()
+    if not slide.empty:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(np.arange(len(slide)), slide["measured"], color="#8c564b")
+        ax.set_xticks(np.arange(len(slide))); ax.set_xticklabels(slide["validation_name"], rotation=45, ha="right", fontsize=7)
+        ax.set_ylabel("Δ slope gap proxy (pJ/bit)")
+        ax.set_title("Sliding-window Δ validation (requires HBM reference for k_L2 cross-check)")
+        ax.grid(True, axis="y", alpha=0.3)
+        _save_fig(fig, out_dir / f"{stem}_02_l2_sliding_delta_validation.png")
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -4743,6 +5038,30 @@ def main() -> int:
                 print(f"          → {r['op']}·{r['dtype']}: marginal "
                       f"{r['marginal_pJ_per_bit']:+.2f} pJ/bit "
                       f"(direct={r['direct_dram_pJ_per_bit']:.2f})")
+    # L2/SRAM resident traffic path estimate — fires only for --cases l2.
+    l2_summary, l2_perw, l2_points, l2_validation, l2_skips = compute_l2_energy(plot_df)
+    if not l2_summary.empty:
+        for name, table in (("l2_summary", l2_summary),
+                            ("l2_per_window", l2_perw),
+                            ("l2_fit_points", l2_points),
+                            ("l2_validation_summary", l2_validation),
+                            ("l2_skip_reasons", l2_skips)):
+            if table is not None and not table.empty:
+                path = out_dir / f"{stem}_02_{name}.csv"
+                table.to_csv(path, index=False)
+                print(f"[save] {path}")
+        plot_l2_analysis(l2_summary, l2_perw, l2_points, l2_validation,
+                         out_dir, stem, gpu)
+        print("\n== L2/SRAM resident traffic path estimate ==")
+        print("    Caveat: this is L2-hit path energy, not isolated SRAM bit-cell energy.")
+        print("    Source: logical traffic estimate (PROVISIONAL until NCU counters are joined).")
+        with pd.option_context("display.width", 180,
+                               "display.float_format", lambda v: f"{v:.3f}"):
+            cols = ["headline_source", "k_l2_read_pj_per_bit",
+                    "k_l2_write_pj_per_bit", "k_l2_copy_effective_pj_per_bit",
+                    "copy_error_pct", "per_window_iqr_pct", "status", "reason"]
+            print(l2_summary[[c for c in cols if c in l2_summary.columns]].to_string(index=False))
+
     # LLM-shape matmul — 2 separate PNGs (J/FLOP-vs-T + per-call energy).
     plot_llm_matmul(plot_df, out_dir, stem, gpu)
 

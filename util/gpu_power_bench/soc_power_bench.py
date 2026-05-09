@@ -106,13 +106,13 @@ def phase_static(sampler: PowerSampler, seconds: float) -> tuple[float, float]:
     return t0, t1
 
 
-def _run_gemm_for(spec, seconds: float, batch: int = 32) -> None:
+def _run_gemm_for(spec, seconds: float, batch: int = 4) -> None:
     """Loop the GEMM call() until `seconds` has elapsed.
 
     Calls are batched in groups of `batch` so Python loop overhead doesn't
-    starve the GPU between launches — at large K each call already takes
-    enough ms that GPU stays saturated, but smaller GEMMs would otherwise
-    leave gaps that drop us out of the max-power envelope.
+    starve the GPU between launches.  We synchronize after each batch because
+    CUDA launches are asynchronous: timing only CPU enqueue time can otherwise
+    build a multi-minute GPU backlog for a nominal 30s stress window.
 
     A fatal CUDA fault here (Blackwell amax race for fp8_te, OOM, etc.)
     poisons the whole process — same hazard as gpu_power_bench.py covers
@@ -124,7 +124,7 @@ def _run_gemm_for(spec, seconds: float, batch: int = 32) -> None:
         while time.perf_counter() < end:
             for _ in range(batch):
                 spec.run()
-        torch.cuda.synchronize()
+            torch.cuda.synchronize()
     except Exception as e:
         msg = str(e)
         fatal_markers = ("illegal memory access", "CUDA error",
