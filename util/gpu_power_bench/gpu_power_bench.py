@@ -511,8 +511,29 @@ def pick_iters(spec: bm.BenchSpec, target_ms: float, ms_per_call: float) -> int:
     return max(16, min(1_000_000, iters))
 
 
-def time_one_call(spec: bm.BenchSpec, warmup: int = 5, reps: int = 8) -> float:
-    """Return milliseconds per call (best-of-N)."""
+def time_one_call(spec: bm.BenchSpec, warmup: int = 5, reps: int = 8,
+                  burst_calibrate: bool = True) -> float:
+    """Return milliseconds per call.
+
+    Two-stage estimate :
+
+    1. Per-call best-of-N : warmup ``warmup`` calls, then time ``reps`` calls
+       individually with cuda Events and take the minimum.
+
+    2. Burst calibration (default ON, opt-out via ``burst_calibrate=False``) :
+       run a 100-call burst back-to-back inside one synchronize boundary and
+       divide the elapsed wall time by 100. Reason : per-call cuda Events
+       carry ~50-100 µs of record/synchronize overhead each, which dominates
+       sub-millisecond kernels (matmul fp16_tc K=2048 measured at 2.2 ms via
+       events vs 0.38 ms steady-state, off by 6×). On RTX 3090 audit this
+       caused small-K matmul cells to run only ~1 s of the requested 6 s
+       window because ``pick_iters = window_ms / ms_per_call_estimate`` got
+       a 6× inflated ``ms_per_call``.
+
+    The smaller of the two estimates is returned : best-of-8 is closer for
+    long kernels (event overhead negligible), burst is closer for short
+    kernels (event overhead dominant).
+    """
     for _ in range(warmup):
         spec.run()
     torch.cuda.synchronize()
@@ -525,7 +546,20 @@ def time_one_call(spec: bm.BenchSpec, warmup: int = 5, reps: int = 8) -> float:
         end.record()
         end.synchronize()
         best = min(best, start.elapsed_time(end))
-    return best
+
+    if not burst_calibrate:
+        return best
+
+    burst = 100
+    burst_start = torch.cuda.Event(enable_timing=True)
+    burst_end   = torch.cuda.Event(enable_timing=True)
+    burst_start.record()
+    for _ in range(burst):
+        spec.run()
+    burst_end.record()
+    burst_end.synchronize()
+    burst_ms_per_call = burst_start.elapsed_time(burst_end) / burst
+    return min(best, burst_ms_per_call)
 
 
 def run_measurement(spec: bm.BenchSpec, sampler: PowerSampler,
@@ -874,8 +908,11 @@ def main() -> int:
                     help="SoC envelope: GEMM stress duration per leakage cycle")
     ap.add_argument("--soc-leakage-decay-s", type=float, default=15.0,
                     help="SoC envelope: post-stress idle decay per cycle")
-    ap.add_argument("--soc-leak-window-s", type=float, default=1.0,
-                    help="SoC envelope: window after stress-stop for hot-leakage avg")
+    ap.add_argument("--soc-leak-window-s", type=float, default=5.0,
+                    help="SoC envelope: window after stress-stop for hot-leakage avg. "
+                         "Default 5.0 (was 1.0 pre-2026-05-10) — 1 s caught residual "
+                         "workload-clock power on RTX 3090 (251 W spurious 'leakage'). "
+                         "5 s lets clocks gate to P8 before averaging.")
     ap.add_argument("--soc-matmul-K", type=int, default=16384,
                     help="SoC envelope: square GEMM K for max/stress phases")
     ap.add_argument("--soc-dtype", type=str, default="fp16",
