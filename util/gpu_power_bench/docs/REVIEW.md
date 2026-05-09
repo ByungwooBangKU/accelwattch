@@ -8,12 +8,12 @@
 |---|---|---|
 | 1. Static vs Dynamic 분리 | ✓ | P-state filter + drift correction + clip-bias audit. **잘 됨** |
 | 2. Compute path 분리 | ✓ | 5 matmul variant + emulated flag + LLM shape. **HW 한계까지 갖춤** |
-| 3. Memory hierarchy 분리 | △ | DRAM read/write/marginal 깨끗. **L2 미만 (L1/SMEM/register) 은 bundled** |
+| 3. Memory hierarchy 분리 | △ | DRAM read/write/marginal 깨끗. **L2-hit traffic path 도 `--cases l2` probe 로 별도 측정 (Addendum 참조)**. L1 / SMEM / register 만 bundled |
 | 4. k_op 추출 방법론 | ✓ | WLS + bootstrap CI + clip-bias + noise floor 자동 제외. **robust** |
 | 5. Thermal & leakage | ✓ | SoC envelope (static / max / leakage 5-cycle). **board-level 적정** |
 | 6. MECE Decomposition | ✓ | 3-component 항등식 (compute/cast/DRAM). **수학적 MECE** |
 
-**한 줄 평** — DRAM 까지의 component 분리는 rigorous. **L2 안쪽 (L1 / register / pure compute) 은 NVML 측정의 *근본적 한계* 라 bundled** 되어 있고 그게 정직하게 명시됨. AccelWattch 수준의 power model 에 필요한 거의 모든 항을 채울 수 있음.
+**한 줄 평** — DRAM 까지의 component 분리는 rigorous, **L2-hit traffic path 도 `--cases l2` 의 reg_spin 차감 probe 로 별도 추출 가능** (Addendum 참조). L1 / SMEM / register / pure compute 만 NVML 측정의 *근본적 한계* 로 bundled 되어 있고 그게 정직하게 명시됨. AccelWattch 수준의 power model 에 필요한 거의 모든 항을 채울 수 있음.
 
 자세한 각 axis 의 ✓/△/✗ 근거와 한계는 아래 §1~§6, gap analysis 와 우선순위 권장은 §7~§8.
 
@@ -94,7 +94,7 @@ GPU 의 compute path 종류는 사실상 모두 (5 matmul variant + LLM-shape + 
 
 ---
 
-## Axis 3 — Memory Hierarchy 분리   **△ DRAM 까지만 깨끗, 그 안쪽은 bundled**
+## Axis 3 — Memory Hierarchy 분리   **△ DRAM + L2-hit traffic path 측정, L1/SMEM/register 만 bundled**
 
 ### 핵심 질문
 *"GPU 의 register file → L1/SMEM → L2 → DRAM 계층의 에너지가 분리 측정되는가?"*
@@ -104,7 +104,8 @@ GPU 의 compute path 종류는 사실상 모두 (5 matmul variant + LLM-shape + 
 | 메커니즘 | 위치 | 어떤 layer 분리 |
 |---|---|---|
 | 5-bucket cache regime classifier | `benchmarks.py:380-407` `classify_cache_regime` | l2_hit_100 / 75 / 50 / 25 / 0 — working set vs L2 비율로 라벨 |
-| Working-set formula | `_elementwise_working_set()` | op 별 R/W byte 수 카운트 (mul/add 3·N·bpe, gelu/softmax/ln 2·N·bpe) |
+| Working-set formula | `_elementwise_working_set()` | op 별 R/W byte 수 카운트 (mul/add 3·N·bpe, gelu/softmax/ln 2·N·bpe, stream_read/write 1·N·bpe, stream_copy/scale 2·N·bpe, stream_triad 3·N·bpe) |
+| **L2-hit traffic path probe** | `--cases l2` (`benchmarks.py` CUDA extension : `reg_spin / l2_read_hit / l2_write_hit / l2_copy_hit / l2_sliding_delta`) | reg_spin 차감 후 logical L2 traffic bits 에 회귀 → **L2-hit traffic path pJ/bit** 산출 (Addendum 참조). isolated SRAM 비트셀 에너지가 아니라 L2 array + slice/fabric + L1↔L2 인터페이스 + load/store datapath 합. |
 | **STREAM probes** | `stream_copy / scale / triad / read / write` | compute-light → 측정 에너지 거의 전부가 메모리 트래픽 |
 | **DRAM read/write split** ([PR #30](#)) | `compute_dram_rw_split()` | `stream_read` / `stream_write` 로 read pJ/bit, write pJ/bit 분리 |
 | **DRAM marginal 분석** | `compute_dram_marginal()` | `J(l2_hit_0) − J(l2_hit_100)` → SM compute + L2 baseline cancel, DRAM 단가 추출 |
@@ -128,7 +129,7 @@ GPU 의 compute path 종류는 사실상 모두 (5 matmul variant + LLM-shape + 
 
 ### 평가 — △
 
-DRAM 까지의 분리는 rigorous (marginal subtraction + R/W split + literature 비교) — 그 영역은 ✓ 수준. **L2 안쪽 (L1 / SMEM / register / compute) 은 분리 못 함** 이 axis 의 한계 — 이건 NVML 측정의 fundamental limit 이고 본 suite 가 정직하게 인정 (component A bundled). AccelWattch 가 보통 L2 / DRAM 단가를 분리하면 충분하므로 실용적으로는 OK, 하지만 "L1 hit 의 에너지 효과" 같은 더 깊은 분석이 필요하면 NVML 만으로는 한계.
+DRAM 까지의 분리는 rigorous (marginal subtraction + R/W split + literature 비교) — 그 영역은 ✓ 수준. **L2-hit traffic path 도 `--cases l2` probe (reg_spin 차감 + logical L2 bits 회귀) 로 별도 추출 가능** — 단, NVML board-level 측정이라 isolated SRAM bit-cell 이 아닌 "L2 array + slice/fabric + L1↔L2 interface + load/store datapath" 합 (Addendum 참조). **L1 / SMEM / register / pure compute 은 여전히 분리 못 함** — 이건 NVML 측정의 fundamental limit 이고 본 suite 가 정직하게 인정 (component A bundled). AccelWattch 가 보통 L2 / DRAM 단가를 분리하면 충분하므로 실용적으로는 OK, 하지만 "L1 hit 의 에너지 효과" 같은 더 깊은 분석이 필요하면 NVML 만으로는 한계.
 
 ---
 
@@ -474,8 +475,9 @@ leakage 측정 자체는 깨끗 — "hot idle minus cold idle" 수식 그대로,
 | **DRAM read 단가 (pJ/bit)** | HBM read energy | `stream_read` probe @ l2_hit_0 | `_02_dram_energy_rw_split.png`, `dram_rw_split.csv` | ✓ |
 | **DRAM write 단가 (pJ/bit)** | HBM write energy | `stream_write` probe @ l2_hit_0 | 동일 | ✓ |
 | **DRAM marginal (SM/L2 cancelled)** | 순수 DRAM 단가 | `compute_dram_marginal()` (PR #30) | `_02_dram_energy_marginal.png`, `dram_marginal.csv` | ✓ |
+| **L2-hit traffic path 단가 (pJ/bit)** | L2 array + slice/fabric + L1↔L2 interface + load/store datapath | `--cases l2` (reg_spin 차감 + logical L2 bits 회귀) | `_02_l2_summary.csv`, `_02_l2_overview_pjbit.png`, `_02_l2_primary_fit_*.png` | ✓ (Addendum 의 caveat — isolated SRAM bit-cell 아님) |
 | **Cache locality factor** | k_op 의 hit rate 의존성 | per-regime k_op (5 regime) | `_02_cache_regime_*_kop.png` | ✓ (regime 은 heuristic 라벨) |
-| **L1 / SMEM / register 단가** | sub-L2 cache layer | — (NVML 한계로 미측정) | bundled in component A | ✗ G1 |
+| **L1 / SMEM / register 단가** | sub-L2 cache layer (L2 안쪽) | — (NVML 한계로 미측정) | bundled in component A | ✗ G1 |
 | **Pure compute energy** | mma / FP unit 단독 비용 | — (PyTorch 한계로 미측정) | bundled in component A | ✗ G2 |
 | **Cast overhead (fp8 emulation)** | cast-compute-cast 추가 비용 | MECE component B = J(fp8) − J(fp16) @ l2_hit_100 | `_03_energy_decomposition_mece.png` | ✓ |
 | **Per-step inference J (full model)** | analytical 합산값 검증 | — (별도 워크로드 측정 미실시) | — | ✗ G10 (P3) |
