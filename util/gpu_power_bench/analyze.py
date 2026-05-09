@@ -928,7 +928,7 @@ def plot_kop_per_K(per_K_df: pd.DataFrame, out_png: Path, gpu: str) -> bool:
 
 def _annot_bar_pj(rect, value_j, r2, scale_label):
     """Write '0.31 pJ/elem\\nR²=0.99' on top of a bar, skipping NaNs."""
-    if value_j is None or np.isnan(value_j):
+    if value_j is None or not np.isfinite(value_j) or value_j <= 0:
         return
     v_p = value_j * 1e12   # J → pJ
     if abs(v_p) >= 100:
@@ -1017,19 +1017,26 @@ def _coef_bar_elementwise(ew, out_png: Path, gpu: str) -> bool:
                 errs_lo.append(0.0); errs_hi.append(0.0)
             else:
                 v = float(row[slope_col].iloc[0])
-                vals.append(v); r2s.append(float(row[r2_col].iloc[0]))
-                if ("slope_dyn_ci_lo" in row.columns
-                        and pd.notna(row["slope_dyn_ci_lo"].iloc[0])):
-                    ci_lo = float(row["slope_dyn_ci_lo"].iloc[0])
-                    ci_hi = float(row["slope_dyn_ci_hi"].iloc[0])
-                    errs_lo.append(max(0.0, v - ci_lo))
-                    errs_hi.append(max(0.0, ci_hi - v))
-                else:
+                if not np.isfinite(v) or v <= 0:
+                    _PlotSkipLog.record(
+                        plot="coef_bar_elementwise", variant=op, dtype=dt,
+                        reason="nonpositive_slope",
+                        details=f"{slope_col}={v:.3e}; omitted from log-scale coefficient bar")
+                    vals.append(float("nan")); r2s.append(float("nan"))
                     errs_lo.append(0.0); errs_hi.append(0.0)
+                else:
+                    vals.append(v); r2s.append(float(row[r2_col].iloc[0]))
+                    if ("slope_dyn_ci_lo" in row.columns
+                            and pd.notna(row["slope_dyn_ci_lo"].iloc[0])):
+                        ci_lo = float(row["slope_dyn_ci_lo"].iloc[0])
+                        ci_hi = float(row["slope_dyn_ci_hi"].iloc[0])
+                        errs_lo.append(max(0.0, v - ci_lo))
+                        errs_hi.append(max(0.0, ci_hi - v))
+                    else:
+                        errs_lo.append(0.0); errs_hi.append(0.0)
+                    all_positive.append(v)
                 if "emulated" in row.columns and int(row["emulated"].iloc[0]):
                     has_emulated = True
-                if np.isfinite(v) and v > 0:
-                    all_positive.append(v)
         emu_dt = (dt == "fp8")
         label = f"{dt} [CUDA]" + (" *EMU" if emu_dt else "")
         yerr = [errs_lo, errs_hi] if any(errs_lo) or any(errs_hi) else None
@@ -1092,7 +1099,17 @@ def _coef_bar_matmul(mm, out_png: Path, gpu: str) -> bool:
     hatches = ["//" if _emu(v) else None for v in mm2.index]
     slope_col = "slope_dyn_wls" if "slope_dyn_wls" in mm2.columns else "slope_dyn"
     r2_col    = "R2_dyn_wls"    if "R2_dyn_wls"    in mm2.columns else "R2_dyn"
-    slope_vals = mm2[slope_col].values
+    slope_vals_raw = [float(v) if pd.notna(v) else float("nan")
+                      for v in mm2[slope_col].values]
+    slope_vals = [v if np.isfinite(v) and v > 0 else float("nan")
+                  for v in slope_vals_raw]
+    for variant, v in zip(mm2.index, slope_vals_raw):
+        if not np.isfinite(v) or v <= 0:
+            _PlotSkipLog.record(
+                plot="coef_bar_matmul", variant=variant,
+                dtype=str(mm2.loc[variant, "dtype"]) if "dtype" in mm2.columns else "",
+                reason="nonpositive_slope",
+                details=f"{slope_col}={v:.3e}; omitted from log-scale coefficient bar")
     if "slope_dyn_ci_lo" in mm2.columns and "slope_dyn_ci_hi" in mm2.columns:
         errs_lo, errs_hi = [], []
         for v, lo, hi in zip(slope_vals,
