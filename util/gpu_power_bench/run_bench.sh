@@ -77,10 +77,6 @@ fi
     exit 1
 }
 
-if command -v nvidia-smi >/dev/null; then
-    sudo -n nvidia-smi -pm 1 >/dev/null 2>&1 || true
-fi
-
 mkdir -p reports
 
 # ---- argv parsing (we only intercept our new flags; rest forwards) ----
@@ -88,6 +84,7 @@ NUM_GPUS=""
 DEVICES=""
 SEQUENTIAL=0
 BASE_TAG=""
+SINGLE_DEVICE="0"
 FORWARD=()
 
 AUTO_ANALYZE=1   # default ON for single-GPU; multi-GPU paths disable it below.
@@ -102,8 +99,8 @@ while [[ $# -gt 0 ]]; do
         --no-auto-analyze)  AUTO_ANALYZE=0; shift ;;
         --tag)              BASE_TAG="$2"; FORWARD+=("--tag" "$2"); shift 2 ;;
         --tag=*)            BASE_TAG="${1#*=}"; FORWARD+=("$1"); shift ;;
-        # --device is a single-GPU flag we leave as-is when no multi-GPU
-        # option is given (preserves existing single-GPU behaviour).
+        --device)           SINGLE_DEVICE="$2"; FORWARD+=("--device" "$2"); shift 2 ;;
+        --device=*)         SINGLE_DEVICE="${1#*=}"; FORWARD+=("$1"); shift ;;
         *)                  FORWARD+=("$1"); shift ;;
     esac
 done
@@ -119,6 +116,27 @@ elif [[ -n "$NUM_GPUS" ]]; then
     for ((i=0; i<NUM_GPUS; i++)); do DEVS+=("$i"); done
 fi
 
+enable_persistence_for_devices() {
+    [[ "${RUN_BENCH_PERSISTENCE:-1}" == "1" ]] || return 0
+    command -v nvidia-smi >/dev/null || return 0
+    command -v sudo >/dev/null || return 0
+    local dev
+    for dev in "$@"; do
+        # Keep this selected-device only. A device-less persistence-mode
+        # command on a shared multi-GPU node can affect GPUs this run
+        # does not own.
+        sudo -n nvidia-smi -i "$dev" -pm 1 >/dev/null 2>&1 || true
+    done
+}
+
+PERSIST_DEVS=()
+if [[ ${#DEVS[@]} -gt 0 ]]; then
+    PERSIST_DEVS=("${DEVS[@]}")
+else
+    PERSIST_DEVS=("$SINGLE_DEVICE")
+fi
+enable_persistence_for_devices "${PERSIST_DEVS[@]}"
+
 # Strip any --tag the user passed — we re-add a per-GPU tag below.
 STRIPPED=()
 skip_next=0
@@ -127,6 +145,8 @@ for a in "${FORWARD[@]+"${FORWARD[@]}"}"; do
     case "$a" in
         --tag)    skip_next=1 ;;
         --tag=*)  ;;   # drop
+        --device) skip_next=1 ;;
+        --device=*) ;;
         *)        STRIPPED+=("$a") ;;
     esac
 done
