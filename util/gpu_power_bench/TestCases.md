@@ -427,7 +427,7 @@ Counter CSV가 없는 power-only 분석은 `headline_source=logical_estimate_PRO
 | suite | cases | 추가 옵션 | 시간 |
 |---|---|---|---|
 | `smoke` | `elementwise` | `--quick` | ~5 분 |
-| `powermodel` | `elementwise`, `matmul` | (default) | ~25 분 |
+| `powermodel` | `elementwise`, `matmul` | legacy baseline | ~25 분 |
 | `cache` | `elementwise`, `matmul` | `--cache-sweep` | ~20 분 |
 | `dram` | `dram` | — | ~10 분 |
 | `llm` | `llm-matmul` | — | ~15 분 |
@@ -442,6 +442,7 @@ Counter CSV가 없는 power-only 분석은 `headline_source=logical_estimate_PRO
 
 ```bash
 # Suite 한 줄
+./run_bench.sh --device 0                         # 기본 full: 모든 cases + fused
 ./run_bench.sh --suite all  --tag h100              # 모든 cases + fused (full alias)
 ./run_bench.sh --suite full --tag h100              # 모든 cases + fused
 ./run_bench.sh --suite full --no-fused --tag h100_base # fused dependency debug용 opt-out

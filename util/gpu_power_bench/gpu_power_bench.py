@@ -135,7 +135,8 @@ _MEM_SAFETY_FRACTION = 0.25
 # bundles so a user doesn't have to memorise 8 flags to run a focused test.
 #
 # Usage:
-#   ./run_bench.sh --suite smoke              # 5-min sanity check
+#   ./run_bench.sh                           # full validation suite
+#   ./run_bench.sh --suite smoke             # 5-min sanity check
 #   ./run_bench.sh --suite cache --tag h100   # pure cache regime sweep
 #   ./run_bench.sh --suite full --tag h100    # everything + drift correction
 #
@@ -158,7 +159,7 @@ SUITES: dict[str, dict] = {
     "powermodel": {
         # Original baseline benchmark — elementwise + matmul, no extras.
         # Produces the canonical k_op coefficient table.
-        "_doc":  "elementwise + matmul, no extra probes (legacy default)",
+        "_doc":  "elementwise + matmul, no extra probes (legacy baseline)",
         "cases": ("elementwise", "matmul"),
     },
     "cache": {
@@ -225,6 +226,37 @@ SUITES: dict[str, dict] = {
         "fused_dtypes":     ("fp16", "bf16", "fp8"),
     },
 }
+
+
+def _argv_has_flag(argv: list[str], *names: str) -> bool:
+    return any(a == name or a.startswith(name + "=")
+               for a in argv for name in names)
+
+
+def _implicit_suite_from_argv(argv: list[str]) -> str | None:
+    """Default to the full validation suite unless argv selects a scope.
+
+    Device/tag/output flags are not experiment-scope choices, so
+    `run_bench.sh --device 0` should still run the full component sweep.
+    Legacy scope flags keep their old behavior, while bare `--quick`
+    maps to the smoke suite so the documented quick path stays short.
+    """
+    if _argv_has_flag(argv, "--suite", "--cases"):
+        return None
+    quick = _argv_has_flag(argv, "--quick")
+    legacy_scope = _argv_has_flag(
+        argv,
+        "--no-elementwise",
+        "--no-matmul",
+        "--llm-shapes",
+        "--dram-bw-test",
+        "--cache-sweep",
+    )
+    if quick and not legacy_scope:
+        return "smoke"
+    if not quick and not legacy_scope:
+        return "full"
+    return None
 
 
 def _apply_suite_to_parser(parser, suite_name: str) -> None:
@@ -500,11 +532,11 @@ def run_measurement(spec: bm.BenchSpec, sampler: PowerSampler,
 
 def main() -> int:
     argv = sys.argv[1:]
-    user_set_dtypes = any(a == "--dtypes" or a.startswith("--dtypes=") for a in argv)
-    user_set_l2_windows = any(a == "--l2-window-mb" or a.startswith("--l2-window-mb=") for a in argv)
-    user_set_l2_delta = any(a == "--l2-delta-kb" or a.startswith("--l2-delta-kb=") for a in argv)
-    user_set_cases = any(a == "--cases" or a.startswith("--cases=") for a in argv)
-    user_set_fused = any(a in ("--include-fused", "--no-fused") for a in argv)
+    user_set_dtypes = _argv_has_flag(argv, "--dtypes")
+    user_set_l2_windows = _argv_has_flag(argv, "--l2-window-mb")
+    user_set_l2_delta = _argv_has_flag(argv, "--l2-delta-kb")
+    user_set_cases = _argv_has_flag(argv, "--cases")
+    user_set_fused = _argv_has_flag(argv, "--include-fused", "--no-fused")
 
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -515,7 +547,8 @@ def main() -> int:
     ap.add_argument("--suite", choices=list(SUITES), default=None,
                     help="apply a predefined bundle of flags. See epilog "
                          "above. Individual flags after --suite still "
-                         "override the suite's defaults.")
+                         "override the suite's defaults. If no suite/cases "
+                         "or legacy scope flags are given, defaults to full.")
     # ---- Test cases — orthogonal axis to suites ----------------------------
     # `--cases` selects which experiment categories to run, decoupled from
     # the suite presets. When set, it's the authoritative source — any
@@ -771,15 +804,24 @@ def main() -> int:
                     help="SoC envelope: compute path (simt/tc/te)")
     args = ap.parse_args()
 
-    # If a suite was named, re-parse so its overrides become defaults but
-    # explicit user flags still take precedence. Also print the resolved
-    # config so the user can see what the suite expanded into.
-    if args.suite:
-        _apply_suite_to_parser(ap, args.suite)
+    selected_suite = args.suite or _implicit_suite_from_argv(argv)
+
+    # If a suite was named or inferred, re-parse so its overrides become
+    # defaults but explicit user flags still take precedence. Also print the
+    # resolved config so the user can see what the suite expanded into.
+    if selected_suite:
+        if args.suite is None:
+            ap.set_defaults(suite=selected_suite)
+        _apply_suite_to_parser(ap, selected_suite)
         args = ap.parse_args()
-        sd = SUITES[args.suite]
+        sd = SUITES[selected_suite]
         flags = ", ".join(f"{k}={v}" for k, v in sd.items() if not k.startswith("_"))
-        print(f"[suite] '{args.suite}' → {flags or '(no overrides — legacy default)'}")
+        if selected_suite == args.suite and _argv_has_flag(argv, "--suite"):
+            origin = "selected"
+        else:
+            origin = "default"
+        print(f"[suite] '{selected_suite}' ({origin}) → "
+              f"{flags or '(no overrides — legacy default)'}")
         if user_set_cases and not user_set_fused and args.include_fused:
             args.include_fused = False
             print("[suite] explicit --cases overrides the suite fused default; "
@@ -798,8 +840,8 @@ def main() -> int:
     # Order of precedence:
     #   1. --cases X Y Z          (explicit; overrides legacy flags)
     #   2. SUITES[suite]["cases"] (suite-level default; set by re-parse above)
-    #   3. legacy --no-* / --llm-shapes / --dram-bw-test flags + sensible
-    #      default of {elementwise, matmul} if nothing else specified
+    #   3. legacy --no-* / --llm-shapes / --dram-bw-test flags. A bare
+    #      command is handled earlier by the implicit full suite.
     if args.cases is not None:
         cases = set(args.cases)
         # User asked for explicit cases — silently ignore legacy --no-* /

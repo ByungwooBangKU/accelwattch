@@ -29,14 +29,15 @@ The default experiment profile is `h100_sxm`.
    - expected memory type/capacity/BW, expected and reported L2, power envelope/limit
    - `headline_eligible`, `headline_status`, and `headline_reason`
 6. Each run writes `<main-stem>_gpu_spec_snapshot.csv` so reports can validate the GPU assumptions without relying on filename inference.
-7. `--suite full` and `--suite all` include fused variants by default. `--no-fused` is available only as a dependency-debug opt-out.
-8. `component_validation_report.py` writes tables to `--out-dir` and image report PNGs to a separate `--image-dir`.
-9. Image report filenames are category-numbered:
+7. If no explicit `--suite`, `--cases`, or legacy scope flag is given, the default suite is `full`; `./run_bench.sh --device 0` must run the full component validation on GPU 0.
+8. `--suite full` and `--suite all` include fused variants by default. `--no-fused` is available only as a dependency-debug opt-out.
+9. `component_validation_report.py` writes tables to `--out-dir` and image report PNGs to a separate `--image-dir`.
+10. Image report filenames are category-numbered:
    - `00_component_coverage_matrix.png`
    - `01_model_vs_measured_scatter_by_gpu.png`
    - `02_delta_by_gpu_and_workload.png`
    - `03_component_reconstruction_residual.png`
-10. Report classification must distinguish:
+11. Report classification must distinguish:
    - `pass`: headline coefficient exists and quality gates pass.
    - `low_conf`: coefficient exists but regression/proxy confidence is limited.
    - `not_headline`: row exists only as fallback/emulation/smoke.

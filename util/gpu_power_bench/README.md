@@ -1194,11 +1194,12 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
   - `dram`        : A.2 STREAM probes (read/write/copy/scale/triad)
   - `soc`         : B   SoC envelope (static / max / leakage)
 - **Test suites (`--suite`)** — 자주 쓰는 cases 조합 + 튜닝 파라미터의 *프리셋*. 사용자 explicit flag 는 suite default 를 항상 override.
+- 명시적인 `--suite`/`--cases`/legacy scope flag 없이 실행하면 기본 suite는 `full`이다. 즉 `./run_bench.sh --device 0`은 GPU 0에서 전체 component validation을 실행한다.
 
 | Suite | Cases | 추가 옵션 | 시간 |
 |---|---|---|---|
 | `smoke` | `elementwise` | `--quick` | ~5 분 |
-| `powermodel` | `elementwise + matmul` | (default) | ~30 분 |
+| `powermodel` | `elementwise + matmul` | legacy baseline | ~30 분 |
 | `cache` | `elementwise + matmul` | `--cache-sweep` | ~15 분 |
 | `dram` | `dram` | — | ~10 분 |
 | `llm` | `llm-matmul` | — | ~25 분 |
@@ -1208,6 +1209,7 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
 
 ```bash
 # 가장 자주 쓰는 길 — 5분 smoke → publication-quality full/all
+./run_bench.sh --device 0 --tag h100              # 기본 full: 모든 cases + fused
 ./run_bench.sh --suite smoke --tag h100_smoke
 ./run_bench.sh --suite all   --tag h100
 ./run_bench.sh --suite full --no-fused --tag h100_base  # fused dependency debug용 opt-out
@@ -1230,14 +1232,15 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
 `run_bench.sh` 는 sweep 끝나면 **자동으로 `analyze.py` 를 호출**해서 plot 까지 생성합니다 (single-GPU). multi-GPU 모드는 자동으로 `multi_gpu_analysis.py` 를 호출.
 
 ```bash
-./run_bench.sh                      # GPU 0 sweep + analyze 자동
+./run_bench.sh                      # GPU 0 full suite + analyze 자동
+./run_bench.sh --device 0           # GPU 0 full suite + analyze 자동
 ./run_bench.sh --no-auto-analyze    # CSV 만 만들고 종료
 ```
 
 ### 9.2 다중 GPU / 태깅
 
 ```bash
-./run_bench.sh --device 0 --tag a100        # 단일 GPU + auto-analyze
+./run_bench.sh --device 0 --tag a100        # 단일 GPU full suite + auto-analyze
 ./run_bench.sh --num-gpus 8  --tag h100     # 8 장 병렬 + multi_gpu_analysis 자동
 ./run_bench.sh --devices "0,2,4" --tag h100 --suite full
 ```
