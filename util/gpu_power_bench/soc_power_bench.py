@@ -713,9 +713,16 @@ def main() -> int:
                     help="GEMM stress duration per leakage cycle")
     ap.add_argument("--leakage-decay-s", type=float, default=15.0,
                     help="post-stress idle (cooldown) per leakage cycle")
-    ap.add_argument("--leak-window-s", type=float, default=1.0,
+    ap.add_argument("--leak-window-s", type=float, default=5.0,
                     help="how long after stress stop to average for hot-leakage "
-                         "power (kernel has stopped, silicon hot)")
+                         "power (kernel has stopped, silicon hot). Default 5.0 "
+                         "(was 1.0 pre-2026-05-10) — 1 s is too short on RTX "
+                         "3090 / Ampere : after the GEMM stops the GPU clocks "
+                         "stay near boost for ~2-3 s before gating to P8, so "
+                         "a 1 s window samples residual workload power, not "
+                         "thermal leakage. RTX 3090 audit measured 251 W "
+                         "leakage delta with --leak-window-s 1.0, vs "
+                         "physically expected 30-50 W for hot-cold leakage.")
 
     ap.add_argument("--matmul-K", type=int, default=16384,
                     help="square GEMM size M=N=K. Larger → more SMs busy → "
