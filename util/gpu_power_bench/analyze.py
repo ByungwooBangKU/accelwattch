@@ -3611,18 +3611,28 @@ def compute_dram_marginal(df: pd.DataFrame) -> pd.DataFrame:
 
     Cells where dyn_energy_j was clipped to 0 are excluded.
     """
+    out_cols = [
+        "op", "dtype",
+        "l2_slope_J_per_bit",
+        "dram_slope_J_per_bit",
+        "marginal_pJ_per_bit",
+        "direct_dram_pJ_per_bit",
+        "R2_l2", "R2_dram",
+        "n_l2_cells", "n_dram_cells",
+        "is_simple_memory_bound",
+    ]
     if ("pj_per_bit_traffic" not in df.columns
             or "bytes_traffic" not in df.columns):
-        return pd.DataFrame()
+        return pd.DataFrame(columns=out_cols)
     ew = df[df["category"].isin(DRAM_TRAFFIC_CATEGORIES)].copy()
     if ew.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=out_cols)
     ew["cache_regime"] = ew["cache_regime"].replace(LEGACY_REGIME_MAP)
     ew["dyn_energy_j"]  = pd.to_numeric(ew["dyn_energy_j"], errors="coerce")
     ew["bytes_traffic"] = pd.to_numeric(ew["bytes_traffic"], errors="coerce")
     ew = ew[(ew["dyn_energy_j"] > 0) & (ew["bytes_traffic"] > 0)]
     if ew.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=out_cols)
 
     # Simple memory-bound op set : marginal ≈ DRAM bit energy is only
     # justified for these. Reduction / compute-heavy ops have multi-pass
@@ -3682,7 +3692,10 @@ def compute_dram_marginal(df: pd.DataFrame) -> pd.DataFrame:
             n_l2_cells=n_l2, n_dram_cells=n_dr,
             is_simple_memory_bound=int(op in SIMPLE_OPS),
         ))
-    return pd.DataFrame(rows).sort_values(["op", "dtype"]).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=out_cols)
+    return pd.DataFrame(rows, columns=out_cols).sort_values(
+        ["op", "dtype"]).reset_index(drop=True)
 
 
 def plot_dram_rw_split(rw_df: pd.DataFrame, out_png: Path, gpu: str) -> None:
