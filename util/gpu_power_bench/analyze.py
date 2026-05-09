@@ -5521,11 +5521,19 @@ def main() -> int:
         l2_summary=l2_summary,
     )
     if not refill_summary.empty:
+        # `l2_refill_skip_reasons` is ALWAYS emitted (even when empty —
+        # header-only) so hbm_soc_energy.md §15 #5 stays satisfied as a
+        # consistent file presence; consumers can grep it deterministically.
+        # Other refill sidecars stay conditional (they're per-pair / per-cell
+        # data, not skip diagnostics).
+        always_emit = {"l2_refill_skip_reasons"}
         for name, table in (("l2_refill_summary", refill_summary),
                             ("l2_refill_fit_points", refill_points),
                             ("l2_refill_validation_summary", refill_validation),
                             ("l2_refill_skip_reasons", refill_skips)):
-            if table is not None and not table.empty:
+            if table is None:
+                continue
+            if not table.empty or name in always_emit:
                 path = out_dir / f"{stem}_02_{name}.csv"
                 table.to_csv(path, index=False)
                 print(f"[save] {path}")
