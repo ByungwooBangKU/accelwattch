@@ -194,18 +194,21 @@ SUITES: dict[str, dict] = {
         "cases": ("soc",),
     },
     "full": {
-        # Everything except SoC envelope, plus drift correction. ~75 min.
-        # The recommended suite for a publication-quality k_op measurement.
-        "_doc":             "everything except SoC + periodic re-baseline (~75 min)",
-        "cases":            ("elementwise", "matmul", "llm-matmul", "dram"),
+        # All built-in experiment cases, plus drift correction.  Fused
+        # variants remain controlled by --include-fused because they are an
+        # extra compare axis rather than a top-level case.
+        "_doc":             "all cases including L2 + SoC + periodic re-baseline",
+        "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc"),
         "rebaseline_every": 20,
+        "window_ms":        6000.0,
     },
     "all": {
-        # full + SoC envelope. The canonical "give me every measurement"
-        # suite for new GPU characterisation.
-        "_doc":             "full + SoC envelope (~80 min)",
-        "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "soc"),
+        # Alias of full kept for users who expect "all" to mean literally
+        # every built-in case.
+        "_doc":             "alias of full: all cases including L2 + SoC",
+        "cases":            ("elementwise", "matmul", "llm-matmul", "dram", "l2", "soc"),
         "rebaseline_every": 20,
+        "window_ms":        6000.0,
     },
     "fp8-mece": {
         # FP8-focused MECE characterisation. Long --window-ms because

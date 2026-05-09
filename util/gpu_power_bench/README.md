@@ -1203,11 +1203,11 @@ A100 / Blackwell 에선 fp8_te 가 K=512 부터도 측정 가능 (A100 은 FP16 
 | `dram` | `dram` | — | ~10 분 |
 | `llm` | `llm-matmul` | — | ~25 분 |
 | `soc` | `soc` | — | **~5 분** (SoC envelope only) |
-| `full` | `elementwise + matmul + llm-matmul + dram` | `--rebaseline-every 20` | ~75 분 |
-| `all` | `full + soc` | `--rebaseline-every 20` | ~80 분 |
+| `full` | `elementwise + matmul + llm-matmul + dram + l2 + soc` | `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
+| `all` | `full` alias | `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
 
 ```bash
-# 가장 자주 쓰는 길 — 5분 smoke → publication-quality full + SoC
+# 가장 자주 쓰는 길 — 5분 smoke → publication-quality full/all
 ./run_bench.sh --suite smoke --tag h100_smoke
 ./run_bench.sh --suite all   --tag h100
 

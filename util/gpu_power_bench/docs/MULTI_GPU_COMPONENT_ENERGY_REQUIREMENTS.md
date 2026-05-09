@@ -84,7 +84,8 @@ H100 SXM headline:
   --tag h100_sxm_component
 ```
 
-L2-only H100 validation:
+Focused L2-only H100 validation, optional when the full/all run needs to be
+repeated only for L2:
 
 ```bash
 ./run_bench.sh \

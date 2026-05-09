@@ -24,6 +24,7 @@
 
 - `gpu_power_bench.py`의 기본 profile은 `--gpu-profile h100_sxm`이다.
 - GPU profile은 `gpu_profiles.py`가 단일 기준이며 RTX 3090/A100 SXM/H100 SXM의 default dtype, L2 window, headline 가능 여부를 정의한다.
+- `--suite full`과 `--suite all`은 모두 `elementwise/matmul/llm-matmul/dram/l2/soc`를 포함하는 전체 suite다. L2만 다시 돌릴 때만 `--suite l2` 또는 `--cases l2`를 쓴다.
 - 각 run은 `_gpu_spec_snapshot.csv`와 row-level `headline_status`/`headline_reason`을 남긴다.
 - `component_validation_report.py`는 table output과 image report output을 분리하고, PNG는 `00_`부터 category 순번으로 저장한다.
 - report는 `pass/low_conf/not_headline/not_applicable/missing/fail`로 수치를 분류한다.

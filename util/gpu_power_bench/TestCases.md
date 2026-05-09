@@ -432,8 +432,8 @@ Counter CSV가 없는 power-only 분석은 `headline_source=logical_estimate_PRO
 | `llm` | `llm-matmul` | — | ~15 분 |
 | `l2` | `l2` | `--window-ms 8000`, `--rebaseline-every 10` | H100 설정에 따라 변동 |
 | `soc` | `soc` | — | **~5 분** (옛 `run_soc_bench.sh` 와 동등) |
-| `full` | `elementwise`, `matmul`, `llm-matmul`, `dram` | `--rebaseline-every 20` | ~75 분 |
-| `all` | `full` + `soc` | `--rebaseline-every 20` | ~80 분 |
+| `full` | `elementwise`, `matmul`, `llm-matmul`, `dram`, `l2`, `soc` | `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
+| `all` | `full` alias | `--rebaseline-every 20`, `--window-ms 6000` | 장시간 |
 
 표 의 시간은 H100 SXM 80GB 기준. 작은 GPU 는 `_filter_loads` 가 큰 셀 drop → 더 짧음.
 
@@ -442,7 +442,7 @@ Counter CSV가 없는 power-only 분석은 `headline_source=logical_estimate_PRO
 ```bash
 # Suite 한 줄
 ./run_bench.sh --suite all  --tag h100              # 모든 cases (sweep + SoC)
-./run_bench.sh --suite full --tag h100              # SoC 제외 모든 sweep
+./run_bench.sh --suite full --tag h100              # 모든 cases (all alias)
 ./run_bench.sh --suite soc  --device 0 --tag h100   # SoC 만 (~5분)
 ./run_bench.sh --suite l2   --device 0 --tag h100_l2 # L2/SRAM path probe
 
