@@ -230,10 +230,14 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
               phase_seconds: float, window_ms: float, poller: PowerPoller,
               idle_power_w: float) -> PhaseResult:
     phase = f"{mode}_{target}"
-    active_ms = window_ms * target / 100.0
-    ms_per_pass = 1000.0 / peak_passes_per_s
-    passes = max(1, int(round(active_ms / ms_per_pass)))
-    window_s = window_ms / 1000.0
+    if target == 0:
+        passes = 0
+        window_s = 0.0
+    else:
+        active_ms = window_ms * target / 100.0
+        ms_per_pass = 1000.0 / peak_passes_per_s
+        passes = max(1, int(round(active_ms / ms_per_pass)))
+        window_s = window_ms / 1000.0
     launches = 0
 
     with nvtx.annotate(phase, color="blue" if mode == "read" else "purple"):
@@ -241,17 +245,20 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
         t0_abs = time.perf_counter()
         t0 = t0_abs - poller.t0
         deadline = t0_abs + phase_seconds
-        while time.perf_counter() < deadline:
-            w0 = time.perf_counter()
-            with stream:
-                kernel((blocks,), (threads,),
-                       (buf, sink, np.uint64(n_f4), np.int32(passes)))
-            stream.synchronize()
-            launches += 1
-            if target < 100:
-                rest = window_s - (time.perf_counter() - w0)
-                if rest > 2e-4:
-                    time.sleep(rest)
+        if target == 0:
+            time.sleep(max(0.0, phase_seconds))
+        else:
+            while time.perf_counter() < deadline:
+                w0 = time.perf_counter()
+                with stream:
+                    kernel((blocks,), (threads,),
+                           (buf, sink, np.uint64(n_f4), np.int32(passes)))
+                stream.synchronize()
+                launches += 1
+                if target < 100:
+                    rest = window_s - (time.perf_counter() - w0)
+                    if rest > 2e-4:
+                        time.sleep(rest)
         t1 = time.perf_counter() - poller.t0
 
     wall_s = max(t1 - t0, 1e-12)
@@ -372,6 +379,9 @@ def main() -> None:
     ap.add_argument("--cal-passes", type=int, default=8)
     ap.add_argument("--cal-repeats", type=int, default=3)
     args = ap.parse_args()
+    bad_targets = [t for t in args.targets if t < 0 or t > 100]
+    if bad_targets:
+        raise SystemExit(f"--targets must be between 0 and 100: {bad_targets}")
 
     cp.cuda.Device(args.device).use()
     props = cp.cuda.runtime.getDeviceProperties(args.device)
