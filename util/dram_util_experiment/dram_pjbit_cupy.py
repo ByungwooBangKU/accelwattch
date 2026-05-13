@@ -335,6 +335,38 @@ def calibrate_kernel(kernel, stream, blocks: int, threads: int, buf, sink,
     return best_ms_per_pass, 1.0 / (best_ms_per_pass * 1e-3)
 
 
+def warn_window_quantization(targets: list[int], window_ms: float,
+                             calibration: dict[str, dict[str, float]]) -> None:
+    """Warn when a large buffer makes duty-cycle pass counts too coarse."""
+    nonzero_targets = [t for t in targets if t > 0]
+    if not nonzero_targets or window_ms <= 0:
+        return
+
+    min_target = min(nonzero_targets)
+    for mode, data in calibration.items():
+        ms_per_pass = data["ms_per_pass"]
+        min_desired_passes = window_ms * min_target / 100.0 / ms_per_pass
+        if min_desired_passes < 4.0:
+            recommended_ms = ms_per_pass * 4.0 * 100.0 / min_target
+            print(
+                f"[warn] {mode} duty window may quantize low targets: "
+                f"{min_target}% requests only {min_desired_passes:.2f} "
+                f"passes/window. Consider --window-ms >= {recommended_ms:.0f} "
+                "for cleaner 25/50/75/100 separation."
+            )
+
+        for target in nonzero_targets:
+            desired_passes = window_ms * target / 100.0 / ms_per_pass
+            actual_passes = max(1, int(round(desired_passes)))
+            nominal_target = actual_passes * ms_per_pass / window_ms * 100.0
+            if abs(nominal_target - target) > 5.0:
+                print(
+                    f"[warn] {mode} target {target}% is rounded to "
+                    f"{actual_passes} pass(es)/window, nominally "
+                    f"{nominal_target:.1f}% with --window-ms={window_ms:g}."
+                )
+
+
 def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
               buf, sink, n_f4: int, buf_bytes: int, peak_passes_per_s: float,
               phase_seconds: float, window_ms: float, poller: PowerPoller,
@@ -806,6 +838,8 @@ def main() -> None:
     sm_count = props["multiProcessorCount"]
     l2_bytes = props["l2CacheSize"]
     if args.buf_bytes is None:
+        # Heuristic, not a DRAM constant: keep the streaming reuse distance far
+        # beyond L2 while avoiding an unnecessarily huge allocation by default.
         args.buf_bytes = max(1 << 30, l2_bytes * 64)
     n_f4 = args.buf_bytes // 16
     args.buf_bytes = n_f4 * 16
@@ -854,6 +888,8 @@ def main() -> None:
         }
         print(f"[calib] {mode:<5} {ms_per_pass:.3f} ms/pass  "
               f"~{peak_bw:.1f} GB/s effective user-data BW")
+
+    warn_window_quantization(args.targets, args.window_ms, calibration)
 
     cp.cuda.runtime.deviceSynchronize()
     print(f"[idle] measuring baseline for {args.idle_seconds:.1f} s ...")

@@ -60,6 +60,14 @@ L2 크기는 반드시 고려해야 한다. `__ldcg` 는 L1을 우회하지만 L
 traffic이 섞인다. 따라서 H100처럼 L2가 큰 GPU에서는 RTX 3090 기준의 작은 버퍼를
 그대로 쓰지 말고, 최소한 `64 × L2` 이상의 working set을 사용한다.
 
+`64 × L2`는 물리 상수가 아니라 보수적인 휴리스틱이다. 목적은 한 pass 안의 reuse
+distance를 L2보다 훨씬 크게 만들어, 다음 pass에서 같은 cache line을 다시 읽기 전에
+대부분의 line이 이미 eviction되도록 하는 것이다. RTX 3090은 L2가 6 MiB라 `64 × L2`가
+384 MiB지만, 기본 하한 `1 GiB` 때문에 실제로는 약 170 × L2를 사용한다. H100은 L2가
+약 50 MiB라 `64 × L2`가 약 3.125 GiB가 되므로 RTX 3090의 1 GiB와 같은 절대 크기를
+그대로 쓰는 것보다 더 방어적이다. 단, `64` 자체가 충분한지는 GPU/메모리 구조에 따라
+달라질 수 있으므로 H100에서는 기본값과 8 GiB sensitivity run을 함께 비교한다.
+
 ## A. CuPy 버전 (권장, 빠른 재현)
 
 ### 설치 (이미 python 환경에 CuPy 가 있다면 `nvtx` 만 추가)
@@ -484,6 +492,9 @@ H100은 L2가 약 50 MiB이므로 기본 버퍼는 자동으로 약 3.125 GiB가
 주의할 점은 큰 buffer에서 `--window-ms` 가 너무 짧으면 한 번의 pass 시간이 duty-cycle window와
 비슷해져 target 25/50/75%가 모두 비슷한 bandwidth로 양자화될 수 있다는 것이다. 그런 경우에는
 `--window-ms 100` 또는 `--window-ms 200`처럼 window를 늘려야 한다.
+스크립트는 calibration 후 target별 pass/window가 너무 작으면 `[warn] ... duty window may quantize`
+경고를 출력한다. 이 경고가 보이면 해당 run의 25/50/75% pairwise 결과는 해석에서 제외하고
+window를 키워 다시 측정한다.
 
 ### 계산식
 
@@ -712,6 +723,35 @@ R2/residual을 함께 본다.
 즉 모든 pair가 30 pJ/bit로 나오지는 않는다. RTX 3090에서는 50% 이상 고부하 구간끼리의
 incremental cost만 약 30 pJ/bit이고, 0% 또는 25%를 포함하는 pair는 38-58 pJ/bit로 커진다.
 이는 낮은 utilization에서 memory subsystem/clock/P-state가 켜지는 비용이 같이 들어간다는 뜻이다.
+
+### RTX 3090 1 GiB vs 8 GiB 확인
+
+같은 RTX 3090에서 H100 실험과 맞추기 위해 8 GiB working set도 단일 run으로 확인했다.
+8 GiB에서는 1 pass가 약 10 ms라 기본 `--window-ms 20`으로는 25/50/75% target이 거칠게
+양자화되므로, 아래 결과는 `--window-ms 200`으로 다시 측정한 값이다.
+
+```bash
+./run_pjbit_cupy.sh --modes read write --targets 0 25 50 75 100 \
+  --buf-bytes 8589934592 \
+  --phase-seconds 20 \
+  --idle-seconds 15 \
+  --poll-hz 100 \
+  --window-ms 200 \
+  --tag rtx3090_8gib_h100criteria_w200
+```
+
+| mode | estimator | 1 GiB repeat mean ± std | 8 GiB single run | 해석 |
+|---|---:|---:|---:|---|
+| read | 100%-0% avg power | 44.368 ± 0.807 | 43.502 | 거의 동일 |
+| read | 50/75/100 slope | 30.487 ± 0.340 | 29.145 | 약 4.4% 낮음, 같은 30 pJ/bit 근방 |
+| write | 100%-0% avg power | 43.203 ± 1.068 | 43.845 | 거의 동일 |
+| write | 50/75/100 slope | 30.690 ± 0.855 | 31.065 | 거의 동일 |
+
+8 GiB 단일 run의 고부하 pairwise 값은 read `75-50=28.458`, `100-50=29.219`,
+`100-75=30.458` pJ/bit이고 write `75-50=31.199`, `100-50=31.055`,
+`100-75=30.850` pJ/bit이다. 따라서 buffer를 1 GiB에서 8 GiB로 키워도 결론은
+크게 바뀌지 않았다. 다만 read slope의 약 4% 차이는 단일 run 기준이므로, H100 최종
+보고에서는 기본 buffer와 8 GiB를 각각 3회 이상 반복해 평균/표준편차로 판단한다.
 
 ### 반복 run 요약
 
