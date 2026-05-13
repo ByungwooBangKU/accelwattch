@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import json
 import statistics
 import sys
 import threading
@@ -106,6 +107,11 @@ class PowerSample:
     power_w: float
     gpu_util_pct: int
     mem_util_pct: int
+    sm_clock_mhz: int
+    mem_clock_mhz: int
+    temp_gpu_c: int
+    pstate: int
+    throttle_reasons: int
     phase: str
 
 
@@ -134,6 +140,10 @@ class PhaseResult:
     power_p50_w: float
     power_p95_w: float
     power_max_w: float
+    sm_clock_mhz_mean: float
+    mem_clock_mhz_mean: float
+    temp_gpu_c_mean: float
+    pstate_p50: float
     mem_util_pct_mean: float
     gpu_util_pct_mean: float
 
@@ -170,11 +180,26 @@ class PowerPoller(threading.Thread):
             now = time.perf_counter() - self.t0
             power_mw = nvml_or(pynvml.nvmlDeviceGetPowerUsage, self.handle, default=-1)
             util = nvml_or(pynvml.nvmlDeviceGetUtilizationRates, self.handle, default=None)
+            sm_clock = nvml_or(
+                pynvml.nvmlDeviceGetClockInfo, self.handle, pynvml.NVML_CLOCK_SM, default=-1)
+            mem_clock = nvml_or(
+                pynvml.nvmlDeviceGetClockInfo, self.handle, pynvml.NVML_CLOCK_MEM, default=-1)
+            temp_gpu = nvml_or(
+                pynvml.nvmlDeviceGetTemperature, self.handle, pynvml.NVML_TEMPERATURE_GPU,
+                default=-1)
+            pstate = nvml_or(pynvml.nvmlDeviceGetPerformanceState, self.handle, default=-1)
+            throttle = nvml_or(
+                pynvml.nvmlDeviceGetCurrentClocksThrottleReasons, self.handle, default=-1)
             self.samples.append(PowerSample(
                 t_s=now,
                 power_w=power_mw / 1000.0 if power_mw >= 0 else -1.0,
                 gpu_util_pct=util.gpu if util is not None else -1,
                 mem_util_pct=util.memory if util is not None else -1,
+                sm_clock_mhz=sm_clock,
+                mem_clock_mhz=mem_clock,
+                temp_gpu_c=temp_gpu,
+                pstate=pstate,
+                throttle_reasons=throttle,
                 phase=self._phase,
             ))
             time.sleep(self.interval_s)
@@ -201,6 +226,13 @@ def nvml_or(fn, *args, default=None):
         return default
 
 
+def nvml_or_name(name: str, *args, default=None):
+    fn = getattr(pynvml, name, None)
+    if fn is None:
+        return default
+    return nvml_or(fn, *args, default=default)
+
+
 def prop(props: dict, key: str):
     v = props[key]
     return v.decode() if isinstance(v, (bytes, bytearray)) else v
@@ -218,6 +250,60 @@ def stdev_or_nan(vals: list[float]) -> float:
 
 def percentile_or_nan(vals: list[float], pct: float) -> float:
     return float(np.percentile(vals, pct)) if vals else float("nan")
+
+
+def decode_text(v) -> str:
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode(errors="replace")
+    return str(v)
+
+
+def nvml_watts(fn, handle) -> float | None:
+    v = nvml_or(fn, handle, default=None)
+    return v / 1000.0 if v is not None and v >= 0 else None
+
+
+def nvml_watts_name(name: str, handle) -> float | None:
+    v = nvml_or_name(name, handle, default=None)
+    return v / 1000.0 if v is not None and v >= 0 else None
+
+
+def nvml_snapshot(handle) -> dict:
+    """Best-effort device state snapshot for power experiment provenance."""
+    mig_mode = nvml_or_name("nvmlDeviceGetMigMode", handle, default=None)
+    ecc_mode = nvml_or_name("nvmlDeviceGetEccMode", handle, default=None)
+    mem_info = nvml_or(pynvml.nvmlDeviceGetMemoryInfo, handle, default=None)
+    util = nvml_or(pynvml.nvmlDeviceGetUtilizationRates, handle, default=None)
+    return {
+        "name": decode_text(nvml_or(pynvml.nvmlDeviceGetName, handle, default="")),
+        "uuid": decode_text(nvml_or(pynvml.nvmlDeviceGetUUID, handle, default="")),
+        "driver_version": decode_text(nvml_or(pynvml.nvmlSystemGetDriverVersion, default="")),
+        "vbios_version": decode_text(nvml_or(pynvml.nvmlDeviceGetVbiosVersion, handle, default="")),
+        "pstate": nvml_or(pynvml.nvmlDeviceGetPerformanceState, handle, default=None),
+        "sm_clock_mhz": nvml_or(
+            pynvml.nvmlDeviceGetClockInfo, handle, pynvml.NVML_CLOCK_SM, default=None),
+        "mem_clock_mhz": nvml_or(
+            pynvml.nvmlDeviceGetClockInfo, handle, pynvml.NVML_CLOCK_MEM, default=None),
+        "temperature_gpu_c": nvml_or(
+            pynvml.nvmlDeviceGetTemperature, handle, pynvml.NVML_TEMPERATURE_GPU,
+            default=None),
+        "power_usage_w": nvml_watts(pynvml.nvmlDeviceGetPowerUsage, handle),
+        "power_limit_w": nvml_watts_name("nvmlDeviceGetPowerManagementLimit", handle),
+        "power_default_limit_w": nvml_watts_name(
+            "nvmlDeviceGetPowerManagementDefaultLimit", handle),
+        "enforced_power_limit_w": nvml_watts_name("nvmlDeviceGetEnforcedPowerLimit", handle),
+        "throttle_reasons_hex": (
+            f"0x{nvml_or(pynvml.nvmlDeviceGetCurrentClocksThrottleReasons, handle, default=0):x}"
+        ),
+        "persistence_mode": nvml_or(pynvml.nvmlDeviceGetPersistenceMode, handle, default=None),
+        "compute_mode": nvml_or(pynvml.nvmlDeviceGetComputeMode, handle, default=None),
+        "mig_mode": list(mig_mode) if isinstance(mig_mode, tuple) else mig_mode,
+        "ecc_mode": list(ecc_mode) if isinstance(ecc_mode, tuple) else ecc_mode,
+        "memory_total_bytes": getattr(mem_info, "total", None),
+        "memory_used_bytes": getattr(mem_info, "used", None),
+        "gpu_util_pct": getattr(util, "gpu", None),
+        "mem_util_pct": getattr(util, "memory", None),
+    }
 
 
 def measure_idle_power(handle, seconds: float, hz: int) -> tuple[float, float, int]:
@@ -296,6 +382,10 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
                   if bytes_transferred > 0 else float("nan"))
     sl = poller.slice(t0, t1)
     power_vals = [s.power_w for s in sl if s.power_w >= 0]
+    sm_clock_vals = [s.sm_clock_mhz for s in sl if s.sm_clock_mhz >= 0]
+    mem_clock_vals = [s.mem_clock_mhz for s in sl if s.mem_clock_mhz >= 0]
+    temp_vals = [s.temp_gpu_c for s in sl if s.temp_gpu_c >= 0]
+    pstate_vals = [s.pstate for s in sl if s.pstate >= 0]
     return PhaseResult(
         mode=mode, target_pct=target, phase=phase, t0_s=t0, t1_s=t1,
         wall_s=wall_s, launches=launches, passes_per_launch=passes,
@@ -310,6 +400,10 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
         power_p50_w=percentile_or_nan(power_vals, 50),
         power_p95_w=percentile_or_nan(power_vals, 95),
         power_max_w=max(power_vals) if power_vals else float("nan"),
+        sm_clock_mhz_mean=mean_or_nan(sm_clock_vals),
+        mem_clock_mhz_mean=mean_or_nan(mem_clock_vals),
+        temp_gpu_c_mean=mean_or_nan(temp_vals),
+        pstate_p50=percentile_or_nan(pstate_vals, 50),
         mem_util_pct_mean=mean_or_nan([s.mem_util_pct for s in sl if s.mem_util_pct >= 0]),
         gpu_util_pct_mean=mean_or_nan([s.gpu_util_pct for s in sl if s.gpu_util_pct >= 0]),
     )
@@ -328,6 +422,7 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
             "idle_energy_j", "dynamic_energy_j", "pj_per_bit",
             "power_std_w", "power_min_w", "power_p05_w", "power_p50_w",
             "power_p95_w", "power_max_w",
+            "sm_clock_mhz_mean", "mem_clock_mhz_mean", "temp_gpu_c_mean", "pstate_p50",
             "mem_util_pct_mean", "gpu_util_pct_mean", "samples",
         ])
         for r in results:
@@ -340,15 +435,24 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
                 f"{r.pj_per_bit:.6f}", f"{r.power_std_w:.3f}",
                 f"{r.power_min_w:.3f}", f"{r.power_p05_w:.3f}",
                 f"{r.power_p50_w:.3f}", f"{r.power_p95_w:.3f}",
-                f"{r.power_max_w:.3f}", f"{r.mem_util_pct_mean:.3f}",
+                f"{r.power_max_w:.3f}", f"{r.sm_clock_mhz_mean:.3f}",
+                f"{r.mem_clock_mhz_mean:.3f}", f"{r.temp_gpu_c_mean:.3f}",
+                f"{r.pstate_p50:.3f}", f"{r.mem_util_pct_mean:.3f}",
                 f"{r.gpu_util_pct_mean:.3f}", r.samples,
             ])
     with open(trace_csv, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t_s", "power_w", "gpu_util_pct", "mem_util_pct", "phase"])
+        w.writerow([
+            "t_s", "power_w", "gpu_util_pct", "mem_util_pct",
+            "sm_clock_mhz", "mem_clock_mhz", "temp_gpu_c", "pstate",
+            "throttle_reasons_hex", "phase",
+        ])
         for s in samples:
             w.writerow([f"{s.t_s:.6f}", f"{s.power_w:.3f}",
-                        s.gpu_util_pct, s.mem_util_pct, s.phase])
+                        s.gpu_util_pct, s.mem_util_pct,
+                        s.sm_clock_mhz, s.mem_clock_mhz, s.temp_gpu_c, s.pstate,
+                        f"0x{s.throttle_reasons:x}" if s.throttle_reasons >= 0 else "",
+                        s.phase])
     return summary_csv, trace_csv
 
 
@@ -495,6 +599,13 @@ def save_analysis_csv(out_dir: Path, stem: str, rows: list[dict[str, str]]) -> P
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
+    return path
+
+
+def save_metadata_json(out_dir: Path, stem: str, metadata: dict) -> Path:
+    path = out_dir / f"{stem}_metadata.json"
+    with open(path, "w") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
     return path
 
 
@@ -674,6 +785,7 @@ def main() -> None:
 
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
+    metadata_before = nvml_snapshot(handle)
 
     print(f"[info] GPU={gpu_name} SMs={sm_count} L2={l2_bytes/(1<<20):.1f} MiB "
           f"buf={args.buf_bytes/(1<<30):.2f} GiB modes={args.modes}")
@@ -701,12 +813,18 @@ def main() -> None:
     stream.synchronize()
 
     peak_passes_per_s: dict[str, float] = {}
+    calibration: dict[str, dict[str, float]] = {}
     for mode in args.modes:
         ms_per_pass, passes_per_s = calibrate_kernel(
             kernels[mode], stream, blocks, threads, buf, sink, n_f4,
             args.cal_passes, args.cal_repeats)
         peak_passes_per_s[mode] = passes_per_s
         peak_bw = args.buf_bytes * passes_per_s / 1e9
+        calibration[mode] = {
+            "ms_per_pass": ms_per_pass,
+            "passes_per_second": passes_per_s,
+            "peak_bandwidth_gbps": peak_bw,
+        }
         print(f"[calib] {mode:<5} {ms_per_pass:.3f} ms/pass  "
               f"~{peak_bw:.1f} GB/s effective user-data BW")
 
@@ -718,6 +836,7 @@ def main() -> None:
 
     poller = PowerPoller(handle, args.poll_hz)
     results: list[PhaseResult] = []
+    metadata_after: dict = {}
     poller.start()
     try:
         for mode in args.modes:
@@ -737,6 +856,7 @@ def main() -> None:
                     time.sleep(0.5)
     finally:
         poller.stop()
+        metadata_after = nvml_snapshot(handle)
         pynvml.nvmlShutdown()
 
     out_dir = Path(args.out_dir)
@@ -748,6 +868,36 @@ def main() -> None:
     summary_csv, trace_csv = save_csvs(out_dir, stem, results, poller.samples)
     analysis_rows = make_analysis_rows(results)
     analysis_csv = save_analysis_csv(out_dir, stem, analysis_rows)
+    metadata = {
+        "args": vars(args),
+        "cuda": {
+            "runtime_version": cp.cuda.runtime.runtimeGetVersion(),
+            "driver_version": cp.cuda.runtime.driverGetVersion(),
+        },
+        "device": {
+            "name": gpu_name,
+            "sm_count": sm_count,
+            "l2_bytes": l2_bytes,
+            "buffer_bytes": args.buf_bytes,
+            "n_float4": n_f4,
+            "blocks": blocks,
+            "threads_per_block": threads,
+        },
+        "nvml_before": metadata_before,
+        "nvml_after": metadata_after,
+        "calibration": calibration,
+        "idle": {
+            "power_w_mean": idle_power_w,
+            "power_w_std": idle_std_w,
+            "samples": idle_n,
+        },
+        "notes": [
+            "NVML power is GPU/board plus associated circuitry, not DRAM-rail-only.",
+            "On GA10x Ampere, nvmlDeviceGetPowerUsage is documented as a 1-second average.",
+            "Use slope_avg_power_vs_bw as the preferred marginal board-energy estimate.",
+        ],
+    }
+    metadata_json = save_metadata_json(out_dir, stem, metadata)
     png = save_plot(out_dir, stem, gpu_name, idle_power_w, results, poller.samples)
     analysis_png = save_analysis_plot(
         out_dir, stem, gpu_name, results, poller.samples, analysis_rows)
@@ -756,6 +906,7 @@ def main() -> None:
     print(f"[save] {trace_csv}")
     if analysis_csv is not None:
         print(f"[save] {analysis_csv}")
+    print(f"[save] {metadata_json}")
     print(f"[save] {png}")
     if analysis_png is not None:
         print(f"[save] {analysis_png}")
