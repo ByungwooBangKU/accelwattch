@@ -46,7 +46,8 @@ RTX 3090 (WSL2) 에서 CuPy 버전으로 바로 검증 완료 — `reports/` 하
 ## GPU 자동 대응
 
 CuPy 가 `cudaGetDeviceProperties` 로 GPU 를 식별하므로 RTX 3090 / A100 / H100
-모두 별도 설정 없이 동작한다.
+모두 별도 설정 없이 동작한다. 별도 설정이 필요한 경우는 native CUDA 경로를 직접
+빌드할 때뿐이며, A100은 `SM=80`, H100은 `SM=90`처럼 architecture를 맞춰 빌드한다.
 
 - 버퍼 크기: `max(1 GiB, 64 × L2)` 자동 산정
   (RTX 3090 L2 6 MiB → 1 GiB, A100 L2 40 MiB → 2.5 GiB, H100 L2 50 MiB → 3.125 GiB)
@@ -424,6 +425,47 @@ nvidia-smi
 `run_pjbit_cupy.sh` 는 `/home/bang001/miniforge3/envs/ssc21env/bin/python` 과 `python3` 중
 필요 패키지를 import할 수 있는 Python을 자동으로 고른다.
 
+### A100 실행 예시
+
+A100도 CuPy 버전에서는 별도 설정이 필요 없다. 스크립트가 device property에서 L2 size,
+SM 수, effective peak bandwidth를 calibration으로 자동 확인한다. A100 L2는 보통 40 MiB라
+기본 buffer는 `64 × L2 = 2.5 GiB`가 된다. A100 40GB/80GB 모두 같은 방식으로 실행한다.
+
+```bash
+cd util/dram_util_experiment
+
+./run_pjbit_cupy.sh \
+  --modes read write \
+  --targets 0 25 50 75 100 \
+  --phase-seconds 20 \
+  --idle-seconds 15 \
+  --poll-hz 100 \
+  --window-ms 100 \
+  --tag a100_w100_rep1
+```
+
+더 방어적인 보고용 조건은 H100과 마찬가지로 `--window-ms 200`과 8 GiB sensitivity run을
+추가하는 것이다.
+
+```bash
+./run_pjbit_cupy.sh \
+  --modes read write \
+  --targets 0 25 50 75 100 \
+  --buf-bytes 8589934592 \
+  --phase-seconds 20 \
+  --idle-seconds 15 \
+  --poll-hz 100 \
+  --window-ms 200 \
+  --tag a100_8gib_w200_rep1
+```
+
+A100/H100 같은 datacenter GPU는 ECC on 상태가 일반적이다. 여기서 script가 사용하는 bandwidth는
+raw HBM bus peak가 아니라 **effective user-data bandwidth**다. 따라서 A100 80GB에서 raw
+2039 GB/s와 calibration peak 1700-1800 GB/s 수준을 직접 비교하면 안 된다.
+
+Native CUDA 버전(`dram_util.cu`)을 직접 쓸 때는 A100에서 `SM=80`으로 빌드한다. 이미 제공되는
+`run_nsys_a100.sh`는 A100 80GB 기준 `SM=80`, 8 GiB buffer preset을 사용한다.
+
 ### H100 실행 예시
 
 H100에서는 phase가 너무 짧으면 boost/thermal/power transition 영향이 커질 수 있으므로
@@ -495,6 +537,22 @@ H100은 L2가 약 50 MiB이므로 기본 버퍼는 자동으로 약 3.125 GiB가
 스크립트는 calibration 후 target별 pass/window가 너무 작으면 `[warn] ... duty window may quantize`
 경고를 출력한다. 이 경고가 보이면 해당 run의 25/50/75% pairwise 결과는 해석에서 제외하고
 window를 키워 다시 측정한다.
+
+다만 이 warning이 곧바로 "pJ/bit 계산 전체가 망가졌다"는 뜻은 아니다. 의미는 정수 pass scheduling
+때문에 요청한 duty target이 정확하지 않을 수 있다는 것이다. 해석은 목적별로 다르게 한다.
+
+| 목적 | warning 영향 | 권장 |
+|---|---|---|
+| `--targets 100` 단독 peak-load 측정 | 작음 | 가능. 단, 실제 `bandwidth_gbps`가 calibration peak에 가까운지 확인 |
+| 25/50/75/100 계단 모양 확인 | 있음 | A100/H100은 최소 `--window-ms 50`, 보고용은 `100` 또는 `200` 권장 |
+| target별 pJ/bit 비교 | 있음 | `target_pct` label 대신 실제 `bandwidth_gbps` 기준으로 분석 |
+| slope 기반 marginal pJ/bit | 중간 | 50/75/100의 실제 BW가 잘 분리되고 R2/residual이 좋아야 사용 |
+| DRAM rail-only pJ/bit | 별도 문제 | NVML로는 불가. 현재 값은 GPU/board marginal dynamic pJ/bit |
+
+`target=100`은 sleep 없이 kernel을 연속 실행하므로 25/50/75% duty target과 다르게 취급한다.
+따라서 100%만 실행하는 peak-load 실험에서는 warning 영향이 작다. 그래도 최종 판단은 target label이
+아니라 summary CSV의 실제 `bandwidth_gbps`, `avg_power_w`, analysis CSV의 `r2`,
+`max_abs_residual_w`를 기준으로 한다.
 
 ### 계산식
 

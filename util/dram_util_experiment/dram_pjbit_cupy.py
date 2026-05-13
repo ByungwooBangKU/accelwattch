@@ -338,11 +338,11 @@ def calibrate_kernel(kernel, stream, blocks: int, threads: int, buf, sink,
 def warn_window_quantization(targets: list[int], window_ms: float,
                              calibration: dict[str, dict[str, float]]) -> None:
     """Warn when a large buffer makes duty-cycle pass counts too coarse."""
-    nonzero_targets = [t for t in targets if t > 0]
-    if not nonzero_targets or window_ms <= 0:
+    duty_targets = [t for t in targets if 0 < t < 100]
+    if not duty_targets or window_ms <= 0:
         return
 
-    min_target = min(nonzero_targets)
+    min_target = min(duty_targets)
     for mode, data in calibration.items():
         ms_per_pass = data["ms_per_pass"]
         min_desired_passes = window_ms * min_target / 100.0 / ms_per_pass
@@ -352,10 +352,10 @@ def warn_window_quantization(targets: list[int], window_ms: float,
                 f"[warn] {mode} duty window may quantize low targets: "
                 f"{min_target}% requests only {min_desired_passes:.2f} "
                 f"passes/window. Consider --window-ms >= {recommended_ms:.0f} "
-                "for cleaner 25/50/75/100 separation."
+                "for cleaner non-100 target separation."
             )
 
-        for target in nonzero_targets:
+        for target in duty_targets:
             desired_passes = window_ms * target / 100.0 / ms_per_pass
             actual_passes = max(1, int(round(desired_passes)))
             nominal_target = actual_passes * ms_per_pass / window_ms * 100.0
