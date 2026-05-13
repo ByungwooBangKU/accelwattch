@@ -128,8 +128,22 @@ class PhaseResult:
     dynamic_power_w: float
     pj_per_bit: float
     samples: int
+    power_std_w: float
+    power_min_w: float
+    power_p05_w: float
+    power_p50_w: float
+    power_p95_w: float
+    power_max_w: float
     mem_util_pct_mean: float
     gpu_util_pct_mean: float
+
+
+@dataclass
+class LinearFit:
+    slope_w_per_gbps: float
+    intercept_power_w: float
+    r2: float
+    residuals: list[tuple[int, float, float, float]]
 
 
 class PowerPoller(threading.Thread):
@@ -194,6 +208,16 @@ def prop(props: dict, key: str):
 
 def mean_or_nan(vals: list[float]) -> float:
     return statistics.fmean(vals) if vals else float("nan")
+
+
+def stdev_or_nan(vals: list[float]) -> float:
+    if not vals:
+        return float("nan")
+    return statistics.pstdev(vals) if len(vals) > 1 else 0.0
+
+
+def percentile_or_nan(vals: list[float], pct: float) -> float:
+    return float(np.percentile(vals, pct)) if vals else float("nan")
 
 
 def measure_idle_power(handle, seconds: float, hz: int) -> tuple[float, float, int]:
@@ -271,6 +295,7 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
     pj_per_bit = (dynamic_energy_j / (bytes_transferred * 8.0) * 1e12
                   if bytes_transferred > 0 else float("nan"))
     sl = poller.slice(t0, t1)
+    power_vals = [s.power_w for s in sl if s.power_w >= 0]
     return PhaseResult(
         mode=mode, target_pct=target, phase=phase, t0_s=t0, t1_s=t1,
         wall_s=wall_s, launches=launches, passes_per_launch=passes,
@@ -279,6 +304,12 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
         dynamic_energy_j=dynamic_energy_j,
         avg_power_w=total_energy_j / wall_s if total_energy_j > 0 else float("nan"),
         dynamic_power_w=dynamic_power_w, pj_per_bit=pj_per_bit, samples=len(sl),
+        power_std_w=stdev_or_nan(power_vals),
+        power_min_w=min(power_vals) if power_vals else float("nan"),
+        power_p05_w=percentile_or_nan(power_vals, 5),
+        power_p50_w=percentile_or_nan(power_vals, 50),
+        power_p95_w=percentile_or_nan(power_vals, 95),
+        power_max_w=max(power_vals) if power_vals else float("nan"),
         mem_util_pct_mean=mean_or_nan([s.mem_util_pct for s in sl if s.mem_util_pct >= 0]),
         gpu_util_pct_mean=mean_or_nan([s.gpu_util_pct for s in sl if s.gpu_util_pct >= 0]),
     )
@@ -295,6 +326,8 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
             "passes_per_launch", "bytes_transferred", "bandwidth_gbps",
             "avg_power_w", "dynamic_power_w", "total_energy_j",
             "idle_energy_j", "dynamic_energy_j", "pj_per_bit",
+            "power_std_w", "power_min_w", "power_p05_w", "power_p50_w",
+            "power_p95_w", "power_max_w",
             "mem_util_pct_mean", "gpu_util_pct_mean", "samples",
         ])
         for r in results:
@@ -304,7 +337,10 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
                 f"{r.bandwidth_gbps:.3f}", f"{r.avg_power_w:.3f}",
                 f"{r.dynamic_power_w:.3f}", f"{r.total_energy_j:.6f}",
                 f"{r.idle_energy_j:.6f}", f"{r.dynamic_energy_j:.6f}",
-                f"{r.pj_per_bit:.6f}", f"{r.mem_util_pct_mean:.3f}",
+                f"{r.pj_per_bit:.6f}", f"{r.power_std_w:.3f}",
+                f"{r.power_min_w:.3f}", f"{r.power_p05_w:.3f}",
+                f"{r.power_p50_w:.3f}", f"{r.power_p95_w:.3f}",
+                f"{r.power_max_w:.3f}", f"{r.mem_util_pct_mean:.3f}",
                 f"{r.gpu_util_pct_mean:.3f}", r.samples,
             ])
     with open(trace_csv, "w", newline="") as f:
@@ -358,6 +394,249 @@ def save_plot(out_dir: Path, stem: str, gpu_name: str, idle_power_w: float,
     fig.savefig(png, dpi=140)
     plt.close(fig)
     return png
+
+
+def ordered_modes(results: list[PhaseResult]) -> list[str]:
+    modes: list[str] = []
+    for r in results:
+        if r.mode not in modes:
+            modes.append(r.mode)
+    return modes
+
+
+def linear_fit_power_vs_bw(points: list[tuple[int, float, float]]) -> LinearFit | None:
+    if len(points) < 2:
+        return None
+    n = len(points)
+    sx = sum(x for _, x, _ in points)
+    sy = sum(y for _, _, y in points)
+    sxx = sum(x * x for _, x, _ in points)
+    sxy = sum(x * y for _, x, y in points)
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-12:
+        return None
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    residuals = [(target, x, y, y - (slope * x + intercept)) for target, x, y in points]
+    ss_res = sum(resid * resid for _, _, _, resid in residuals)
+    y_mean = sy / n
+    ss_tot = sum((y - y_mean) * (y - y_mean) for _, _, y in points)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
+    return LinearFit(
+        slope_w_per_gbps=slope,
+        intercept_power_w=intercept,
+        r2=r2,
+        residuals=residuals,
+    )
+
+
+def make_analysis_rows(results: list[PhaseResult]) -> list[dict[str, str]]:
+    by = {(r.mode, r.target_pct): r for r in results}
+    rows: list[dict[str, str]] = []
+    for mode in ordered_modes(results):
+        r0 = by.get((mode, 0))
+        r100 = by.get((mode, 100))
+        if r0 is not None and r100 is not None and r100.bandwidth_gbps > 0:
+            delta_power_w = r100.avg_power_w - r0.avg_power_w
+            pj_per_bit = delta_power_w * 1000.0 / (8.0 * r100.bandwidth_gbps)
+            rows.append({
+                "mode": mode,
+                "method": "100_minus_0_avg_power",
+                "target_points": "0,100",
+                "baseline_power_w": f"{r0.avg_power_w:.6f}",
+                "active_power_w": f"{r100.avg_power_w:.6f}",
+                "delta_power_w": f"{delta_power_w:.6f}",
+                "bandwidth_gbps": f"{r100.bandwidth_gbps:.6f}",
+                "slope_w_per_gbps": "",
+                "intercept_power_w": "",
+                "r2": "",
+                "max_abs_residual_w": "",
+                "pj_per_bit": f"{pj_per_bit:.6f}",
+                "note": "phase-local avg_power delta; not DRAM-rail-only",
+            })
+
+        slope_targets = (50, 75, 100)
+        points = [
+            (t, by[(mode, t)].bandwidth_gbps, by[(mode, t)].avg_power_w)
+            for t in slope_targets
+            if (mode, t) in by and by[(mode, t)].bandwidth_gbps > 0
+        ]
+        fit = linear_fit_power_vs_bw(points)
+        if fit is not None:
+            max_abs_resid = max(abs(r[3]) for r in fit.residuals)
+            rows.append({
+                "mode": mode,
+                "method": "slope_avg_power_vs_bw",
+                "target_points": ",".join(str(t) for t in slope_targets if (mode, t) in by),
+                "baseline_power_w": "",
+                "active_power_w": "",
+                "delta_power_w": "",
+                "bandwidth_gbps": "",
+                "slope_w_per_gbps": f"{fit.slope_w_per_gbps:.9f}",
+                "intercept_power_w": f"{fit.intercept_power_w:.6f}",
+                "r2": f"{fit.r2:.6f}",
+                "max_abs_residual_w": f"{max_abs_resid:.6f}",
+                "pj_per_bit": f"{fit.slope_w_per_gbps * 1000.0 / 8.0:.6f}",
+                "note": "recommended marginal board-energy estimate",
+            })
+    return rows
+
+
+def save_analysis_csv(out_dir: Path, stem: str, rows: list[dict[str, str]]) -> Path | None:
+    if not rows:
+        return None
+    path = out_dir / f"{stem}_analysis.csv"
+    fields = [
+        "mode", "method", "target_points", "baseline_power_w", "active_power_w",
+        "delta_power_w", "bandwidth_gbps", "slope_w_per_gbps",
+        "intercept_power_w", "r2", "max_abs_residual_w", "pj_per_bit", "note",
+    ]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
+def analysis_value(rows: list[dict[str, str]], mode: str, method: str,
+                   field: str) -> float:
+    for row in rows:
+        if row["mode"] == mode and row["method"] == method and row[field]:
+            return float(row[field])
+    return float("nan")
+
+
+def save_analysis_plot(out_dir: Path, stem: str, gpu_name: str,
+                       results: list[PhaseResult], samples: list[PowerSample],
+                       analysis_rows: list[dict[str, str]]) -> Path | None:
+    if not results:
+        return None
+
+    png = out_dir / f"{stem}_analysis.png"
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    ax0, ax1, ax2, ax3 = axes.ravel()
+    modes = ordered_modes(results)
+    colors = {"read": "#2ca02c", "write": "#9467bd"}
+    markers = {"read": "o", "write": "s"}
+    by = {(r.mode, r.target_pct): r for r in results}
+
+    # Panel 1: average power versus achieved bandwidth, with the 50/75/100 fit.
+    for mode in modes:
+        mode_results = [r for r in results if r.mode == mode and r.bandwidth_gbps > 0]
+        if not mode_results:
+            continue
+        c = colors.get(mode, "#1f77b4")
+        ax0.scatter(
+            [r.bandwidth_gbps for r in mode_results],
+            [r.avg_power_w for r in mode_results],
+            color=c, marker=markers.get(mode, "o"), label=f"{mode} phases", zorder=3)
+        for r in mode_results:
+            ax0.annotate(str(r.target_pct), (r.bandwidth_gbps, r.avg_power_w),
+                         textcoords="offset points", xytext=(4, 4), fontsize=8)
+
+        fit_points = [
+            (t, by[(mode, t)].bandwidth_gbps, by[(mode, t)].avg_power_w)
+            for t in (50, 75, 100)
+            if (mode, t) in by and by[(mode, t)].bandwidth_gbps > 0
+        ]
+        fit = linear_fit_power_vs_bw(fit_points)
+        if fit is not None:
+            xs = np.linspace(min(p[1] for p in fit_points),
+                             max(p[1] for p in fit_points), 50)
+            ys = fit.slope_w_per_gbps * xs + fit.intercept_power_w
+            pj = fit.slope_w_per_gbps * 1000.0 / 8.0
+            ax0.plot(xs, ys, color=c, lw=1.6,
+                     label=f"{mode} slope={pj:.2f} pJ/bit R2={fit.r2:.3f}")
+    ax0.set_title("avg power vs bandwidth")
+    ax0.set_xlabel("bandwidth (GB/s)")
+    ax0.set_ylabel("avg power (W)")
+    ax0.grid(True, alpha=0.3)
+    ax0.legend(fontsize=8)
+
+    # Panel 2: compare phase-local 100%-0% estimate with slope estimate.
+    x = np.arange(len(modes))
+    width = 0.35
+    delta_vals = [
+        analysis_value(analysis_rows, mode, "100_minus_0_avg_power", "pj_per_bit")
+        for mode in modes
+    ]
+    slope_vals = [
+        analysis_value(analysis_rows, mode, "slope_avg_power_vs_bw", "pj_per_bit")
+        for mode in modes
+    ]
+    ax1.bar(x - width / 2, delta_vals, width, label="100%-0%", color="#4c78a8")
+    ax1.bar(x + width / 2, slope_vals, width, label="50/75/100 slope", color="#f58518")
+    ax1.set_title("pJ/bit estimator comparison")
+    ax1.set_ylabel("pJ/bit")
+    ax1.set_xticks(x, modes)
+    ax1.grid(True, axis="y", alpha=0.3)
+    ax1.legend(fontsize=8)
+
+    # Panel 3: residuals from the recommended avg_power~bandwidth fit.
+    for mode in modes:
+        fit_points = [
+            (t, by[(mode, t)].bandwidth_gbps, by[(mode, t)].avg_power_w)
+            for t in (50, 75, 100)
+            if (mode, t) in by and by[(mode, t)].bandwidth_gbps > 0
+        ]
+        fit = linear_fit_power_vs_bw(fit_points)
+        if fit is None:
+            continue
+        c = colors.get(mode, "#1f77b4")
+        targets = [r[0] for r in fit.residuals]
+        residuals = [r[3] for r in fit.residuals]
+        ax2.plot(targets, residuals, marker=markers.get(mode, "o"),
+                 color=c, label=mode)
+    ax2.axhline(0.0, color="black", lw=1.0, ls="--")
+    ax2.set_title("fit residuals")
+    ax2.set_xlabel("target (%)")
+    ax2.set_ylabel("avg power residual (W)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=8)
+
+    # Panel 4: phase-local power distribution from raw NVML samples.
+    phase_labels = [r.phase for r in results]
+    groups = [
+        [s.power_w for s in samples if s.phase == r.phase and s.power_w >= 0]
+        for r in results
+    ]
+    nonempty = [(label, vals) for label, vals in zip(phase_labels, groups) if vals]
+    if nonempty:
+        labels, vals = zip(*nonempty)
+        try:
+            ax3.boxplot(vals, tick_labels=labels, showfliers=False)
+        except TypeError:
+            ax3.boxplot(vals, labels=labels, showfliers=False)
+        ax3.tick_params(axis="x", labelrotation=35, labelsize=8)
+    ax3.set_title("phase power distribution")
+    ax3.set_ylabel("power (W)")
+    ax3.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle(f"DRAM pJ/bit analysis — {gpu_name}", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(png, dpi=140)
+    plt.close(fig)
+    return png
+
+
+def print_analysis(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+    print()
+    print("post-analysis")
+    print("-" * 111)
+    print(f"{'mode':<6} {'method':<24} {'points':<10} {'P0(W)':>9} {'P100(W)':>9} "
+          f"{'dP(W)':>9} {'BW(GB/s)':>10} {'R^2':>8} {'max|res|W':>10} {'pJ/bit':>10}")
+    print("-" * 111)
+    for row in rows:
+        print(f"{row['mode']:<6} {row['method']:<24} {row['target_points']:<10} "
+              f"{row['baseline_power_w'] or '-':>9} {row['active_power_w'] or '-':>9} "
+              f"{row['delta_power_w'] or '-':>9} {row['bandwidth_gbps'] or '-':>10} "
+              f"{row['r2'] or '-':>8} {row['max_abs_residual_w'] or '-':>10} "
+              f"{row['pj_per_bit']:>10}")
+    print()
+    print("[note] 100_minus_0 uses phase-local avg_power delta. "
+          "slope_avg_power_vs_bw uses avg_power~bandwidth fit over available 50/75/100 points.")
 
 
 def main() -> None:
@@ -467,11 +746,19 @@ def main() -> None:
     safe_gpu = "".join(c.lower() if c.isalnum() else "_" for c in gpu_name).strip("_")
     stem = f"pjbit_cupy_{safe_gpu}_{stamp}{suffix}"
     summary_csv, trace_csv = save_csvs(out_dir, stem, results, poller.samples)
+    analysis_rows = make_analysis_rows(results)
+    analysis_csv = save_analysis_csv(out_dir, stem, analysis_rows)
     png = save_plot(out_dir, stem, gpu_name, idle_power_w, results, poller.samples)
+    analysis_png = save_analysis_plot(
+        out_dir, stem, gpu_name, results, poller.samples, analysis_rows)
 
     print(f"[save] {summary_csv}")
     print(f"[save] {trace_csv}")
+    if analysis_csv is not None:
+        print(f"[save] {analysis_csv}")
     print(f"[save] {png}")
+    if analysis_png is not None:
+        print(f"[save] {analysis_png}")
     print()
     print(f"{'phase':<10} {'BW(GB/s)':>10} {'Pavg(W)':>10} {'Pdyn(W)':>10} "
           f"{'Edyn(J)':>10} {'pJ/bit':>10}")
@@ -480,6 +767,7 @@ def main() -> None:
         print(f"{r.phase:<10} {r.bandwidth_gbps:>10.1f} {r.avg_power_w:>10.1f} "
               f"{r.dynamic_power_w:>10.1f} {r.dynamic_energy_j:>10.3f} "
               f"{r.pj_per_bit:>10.3f}")
+    print_analysis(analysis_rows)
 
 
 if __name__ == "__main__":
