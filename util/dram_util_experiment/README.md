@@ -753,6 +753,70 @@ incremental cost만 약 30 pJ/bit이고, 0% 또는 25%를 포함하는 pair는 3
 크게 바뀌지 않았다. 다만 read slope의 약 4% 차이는 단일 run 기준이므로, H100 최종
 보고에서는 기본 buffer와 8 GiB를 각각 3회 이상 반복해 평균/표준편차로 판단한다.
 
+### RTX 3090 buffer/window sweep
+
+2026-05-14에 confidence를 높이기 위해 buffer size와 duty-cycle window를 분리해서 추가 검증했다.
+이 sweep은 L2 hit가 결과를 지배하는지, 그리고 `--window-ms`가 target bandwidth를 왜곡하는지 확인하기
+위한 것이다. 현재 환경에는 `ncu`/`nsys`가 없어 L1/L2 hit-rate counter를 직접 읽지는 못했다.
+다만 커널이 read에서는 `__ldcg`로 L1을 우회하고, working set이 RTX 3090 L2 6 MiB보다 최소 1 GiB로
+매우 크기 때문에 L1/L2 hit rate는 설계상 거의 0에 가까워야 한다. H100 최종 실험에서는 Nsight Compute로
+`l1tex`/`lts` hit-rate counter를 추가 확인하는 것이 좋다.
+
+조건:
+
+- GPU: RTX 3090
+- targets: `0 25 50 75 100`
+- modes: `read write`
+- phase/idle: `--phase-seconds 20 --idle-seconds 15`
+- polling: `--poll-hz 100`
+- buffer sweep: `1/2/4/8 GiB`, `--window-ms 200`, 각 3회 반복
+- window sweep: `8 GiB`, `--window-ms 20/50/100/200/400`, 각 1회
+
+집계 CSV는 local `reports/` 아래에 남겨 둔다. `reports/`는 git ignore 대상이므로, 재현 가능한 요약은
+아래 표를 기준으로 문서화한다.
+
+| file | 내용 |
+|---|---|
+| `reports/pjbit_buffer_sweep_w200_summary.csv` | 1/2/4/8 GiB 반복 평균 |
+| `reports/pjbit_buffer_sweep_w200_runs.csv` | buffer sweep의 개별 run 값 |
+| `reports/pjbit_8gib_window_sweep_summary.csv` | 8 GiB window sweep 요약 |
+
+Buffer sweep 결과:
+
+| buffer | read slope pJ/bit | write slope pJ/bit | read 100%-0% | write 100%-0% | 해석 |
+|---:|---:|---:|---:|---:|---|
+| 1 GiB | 28.891 ± 0.271 | 30.907 ± 0.550 | 43.659 | 43.713 | RTX 3090 L2 대비 약 170배 |
+| 2 GiB | 30.127 ± 0.773 | 31.627 ± 0.164 | 44.498 | 44.527 | 1 GiB와 같은 범위 |
+| 4 GiB | 30.501 ± 1.195 | 32.380 ± 0.389 | 44.782 | 45.132 | write가 약간 높지만 결론 유지 |
+| 8 GiB | 30.063 ± 0.758 | 31.297 ± 0.405 | 44.631 | 44.113 | 큰 buffer에서도 결론 유지 |
+
+이 결과에서 buffer를 1 GiB에서 8 GiB로 키워도 slope 기반 marginal estimate는 read 약
+`29-30.5 pJ/bit`, write 약 `31-32.4 pJ/bit` 범위에 머문다. 만약 L2/cache hit가 결과를
+지배했다면 buffer size 증가에 따라 더 큰 변화가 보여야 한다. 따라서 RTX 3090 결과는
+working-set 크기에 대한 민감도가 작고, DRAM-dominant streaming 실험으로 보는 것이 타당하다.
+반면 `100%-0%`는 계속 약 `44-45 pJ/bit`로 높다. 이는 순수 DRAM cell/interface energy라기보다
+clock/P-state, memory controller, L2/NoC/SM path 활성화 비용이 섞인 상한성 sanity check로 해석한다.
+
+Window sweep 결과:
+
+| window-ms | read slope pJ/bit | write slope pJ/bit | 25% pass/window | 판단 |
+|---:|---:|---:|---:|---|
+| 20 | 28.945 | 28.522 | read 0.52, write 0.49 | invalid: 25/50/75% target quantization 발생 |
+| 50 | 32.094 | 31.324 | read 1.30, write 1.21 | marginal: low target 경고 |
+| 100 | 31.151 | 32.231 | read 2.60, write 2.43 | marginal: low target 경고 |
+| 200 | 29.637 | 31.966 | read 5.19, write 4.85 | valid |
+| 400 | 28.596 | 30.215 | read 10.38, write 9.71 | valid |
+
+8 GiB에서 `--window-ms 20`은 실제로 깨졌다. 예를 들어 read 25/50%가 각각 약
+`408/416 GB/s`, write 25/50/75%가 약 `410/417/417 GB/s`로 뭉쳐 target separation이
+사라졌다. `--window-ms 50`과 `100`도 low-target pass/window가 부족하다는 경고가 남는다.
+따라서 8 GiB 또는 H100처럼 큰 buffer를 쓰는 조건에서는 `--window-ms 200` 이상을 권장한다.
+`200`과 `400` 사이에서 slope 결론은 크게 바뀌지 않는다.
+
+최종적으로 RTX 3090 기준으로 confidence 높은 값은 NVML board-level marginal estimate로
+read 약 `30 pJ/bit`, write 약 `31-32 pJ/bit`이다. 이 값은 DRAM rail-only pJ/bit가 아니라,
+해당 DRAM traffic을 만들기 위해 GPU board power에서 증가한 marginal energy다.
+
 ### 반복 run 요약
 
 같은 조건을 최소 3회 반복하고 `slope_avg_power_vs_bw` 의 평균/표준편차를 확인한다.
