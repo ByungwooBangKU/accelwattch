@@ -32,7 +32,9 @@ RTX 3090 (WSL2) 에서 CuPy 버전으로 바로 검증 완료 — `reports/` 하
 | 파일 | 설명 |
 |---|---|
 | `dram_util_cupy.py` | **CuPy 버전** — NVRTC 로 커널 JIT + pynvml 폴링 + 자동 플롯 (GB/s + %) |
+| `dram_pjbit_cupy.py` | **Read/Write pJ/bit 측정** — streaming read/write + NVML power integration + CSV/PNG |
 | `run_cupy.sh` | CuPy 버전 launcher (`cupy/nvtx/pynvml` 있는 python 자동 탐지) |
+| `run_pjbit_cupy.sh` | pJ/bit 측정 launcher (`cupy/nvtx/pynvml/matplotlib` 환경 자동 탐지) |
 | `run_nsys_cupy.sh` | **CuPy 스크립트를 nsys 로 프로파일링** (NVTX + GPU Metrics) |
 | `dram_util.cu` | Native CUDA 스트리밍 read 커널 + 호스트 duty cycling |
 | `Makefile` | `SM` 변수로 arch 지정 (기본 `sm_86` = RTX 3090) |
@@ -270,3 +272,57 @@ util_100   DRAM Read Throughput                    100    99.2     0.8      1024
 - **phase 길이 변경**: CuPy 는 `--phase-seconds`, Native 는 `phase_ms`.
 - **duty 윈도우 변경**: CuPy 는 `--window-ms`, Native 는 `window_ms`
   (기본 20.0). 더 작게 하면 그래프가 더 평탄해지지만 런치 오버헤드 비중이 커짐.
+
+## B. Read/Write pJ/bit 측정 (CuPy)
+
+`dram_pjbit_cupy.py` 는 기존 read-utilization 실험을 확장해서 **read / write** 각각에 대해
+DRAM 스트리밍 bandwidth, NVML power trace, dynamic energy, pJ/bit 을 한 번에 계산한다.
+
+> 중요: 일반 NVIDIA GPU에서 NVML은 DRAM rail 전용 power를 제공하지 않는다. 따라서 여기서의
+> `dynamic_power_w` / `pJ_per_bit` 은 **idle baseline을 뺀 GPU/board marginal power**를
+> 해당 read/write traffic에 귀속한 값이다. DRAM rail-only 값을 의미하지 않는다.
+
+### 계산식
+
+1. L2보다 큰 버퍼를 만든다: `max(1 GiB, 64 × L2)`.
+2. `stream_read` 또는 `stream_write` 1 pass 시간을 calibration해서 각 mode의 peak GB/s를 구한다.
+3. idle baseline power `P_idle` 을 NVML로 먼저 측정한다.
+4. 각 phase에서 실제 실행한 `launches × passes × buffer_bytes` 를 byte 수로 기록한다.
+5. NVML power trace를 trapezoid integration해서 `E_total` 을 구하고, 다음을 계산한다.
+
+```text
+E_dyn      = max(0, E_total - P_idle × wall_time)
+BW_GBps    = transferred_bytes / wall_time / 1e9
+pJ_per_bit = E_dyn / (transferred_bytes × 8) × 1e12
+           = dynamic_power_W × 1000 / (8 × BW_GBps)
+```
+
+### 실행
+
+```bash
+cd util/dram_util_experiment
+./run_pjbit_cupy.sh --modes read write --targets 100 --phase-seconds 5 --idle-seconds 5
+```
+
+여러 utilization point를 같이 보고 싶으면 다음처럼 실행한다.
+
+```bash
+./run_pjbit_cupy.sh --modes read write --targets 25 50 75 100 --phase-seconds 10
+```
+
+### 출력
+
+- `reports/pjbit_cupy_<gpu>_<timestamp>_summary.csv`
+  - `mode,target_pct,bandwidth_gbps,avg_power_w,dynamic_power_w,dynamic_energy_j,pj_per_bit,...`
+- `reports/pjbit_cupy_<gpu>_<timestamp>_trace.csv`
+  - `t_s,power_w,gpu_util_pct,mem_util_pct,phase`
+- `reports/pjbit_cupy_<gpu>_<timestamp>.png`
+  - power timeline, phase별 bandwidth, phase별 dynamic pJ/bit bar plot
+- `reports/pjbit_method.png`
+  - pJ/bit 계산 flow를 확인하기 위한 구현/계산식 요약 이미지
+
+### Read vs Write 커널
+
+- `read`: `__ldcg` 로 `float4` buffer를 streaming load한다. L1을 우회하고 L2/DRAM 경로에 pressure를 준다.
+- `write`: 같은 크기의 `float4` buffer 전체를 streaming store한다. 계산되는 byte 수는 user-data write byte 기준이다.
+- 두 경우 모두 기본 working set이 L2보다 훨씬 크기 때문에 DRAM-dominant access가 되도록 설계되어 있다.

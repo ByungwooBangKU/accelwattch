@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Measure DRAM read/write bandwidth, marginal power, and pJ/bit via CuPy.
+
+The benchmark uses streaming DRAM kernels on a buffer much larger than L2 and
+NVML power polling.  Reported energy is a *marginal GPU/board dynamic* estimate:
+
+    pJ/bit = (E_total - P_idle * wall_time) / (transferred_bytes * 8) * 1e12
+
+NVIDIA NVML does not expose a DRAM-rail-only power sensor on typical GPUs, so the
+reported dynamic power is the workload-attributed GPU/board power above idle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import ctypes
+import statistics
+import sys
+import threading
+import time
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def _preload_nvrtc() -> str | None:
+    """Preload libnvrtc from pip wheels when CuPy cannot find it by soname."""
+    targets = ["libnvrtc.so.12", "libnvrtc.so.11.2", "libnvrtc.so"]
+    roots = [Path(sp) for sp in sys.path if sp]
+    extra = [
+        Path.home() / ".local/lib/python3.10/site-packages",
+        Path.home() / ".local/lib/python3.11/site-packages",
+        Path.home() / ".local/lib/python3.12/site-packages",
+    ]
+    seen = set()
+    for base in list(roots) + extra:
+        sub = base / "nvidia" / "cuda_nvrtc" / "lib"
+        if not sub.exists() or sub in seen:
+            continue
+        seen.add(sub)
+        for name in targets:
+            p = sub / name
+            if not p.exists():
+                continue
+            try:
+                ctypes.CDLL(str(p), mode=ctypes.RTLD_GLOBAL)
+                return str(p)
+            except OSError:
+                pass
+    return None
+
+
+_nvrtc_path = _preload_nvrtc()
+
+import cupy as cp
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import nvtx
+
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    import pynvml
+
+
+KERNEL_CODE = r"""
+extern "C" __global__
+void stream_read(const float4* __restrict__ in,
+                 float4* __restrict__ sink,
+                 unsigned long long n, int passes) {
+    unsigned long long tid    = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int p = 0; p < passes; ++p) {
+        for (unsigned long long i = tid; i < n; i += stride) {
+            float4 v = __ldcg(in + i);  // cache-global load: bypass L1, probe L2/DRAM
+            acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+        }
+    }
+    if (acc.x == 1.2345e-30f) sink[tid % 1024] = acc;
+}
+
+extern "C" __global__
+void stream_write(float4* __restrict__ out,
+                  float4* __restrict__ sink,
+                  unsigned long long n, int passes) {
+    unsigned long long tid    = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (int p = 0; p < passes; ++p) {
+        float x = (float)((p & 255) + 1);
+        float4 v = make_float4(x, x + 1.f, x + 2.f, x + 3.f);
+        for (unsigned long long i = tid; i < n; i += stride) {
+            out[i] = v;
+        }
+    }
+    if (n == 0) sink[0] = make_float4(0.f, 0.f, 0.f, 0.f);
+}
+"""
+
+
+@dataclass
+class PowerSample:
+    t_s: float
+    power_w: float
+    gpu_util_pct: int
+    mem_util_pct: int
+    phase: str
+
+
+@dataclass
+class PhaseResult:
+    mode: str
+    target_pct: int
+    phase: str
+    t0_s: float
+    t1_s: float
+    wall_s: float
+    launches: int
+    passes_per_launch: int
+    bytes_transferred: int
+    bandwidth_gbps: float
+    total_energy_j: float
+    idle_energy_j: float
+    dynamic_energy_j: float
+    avg_power_w: float
+    dynamic_power_w: float
+    pj_per_bit: float
+    samples: int
+    mem_util_pct_mean: float
+    gpu_util_pct_mean: float
+
+
+class PowerPoller(threading.Thread):
+    """Background NVML poller with phase labels and trapezoid integration."""
+
+    def __init__(self, handle, hz: int):
+        super().__init__(daemon=True)
+        self.handle = handle
+        self.interval_s = 1.0 / hz
+        self.samples: list[PowerSample] = []
+        self._stop_ev = threading.Event()
+        self._phase = ""
+        self.t0 = 0.0
+
+    def set_phase(self, phase: str) -> None:
+        self._phase = phase
+
+    def start(self) -> None:
+        self.t0 = time.perf_counter()
+        super().start()
+
+    def run(self) -> None:
+        while not self._stop_ev.is_set():
+            now = time.perf_counter() - self.t0
+            power_mw = nvml_or(pynvml.nvmlDeviceGetPowerUsage, self.handle, default=-1)
+            util = nvml_or(pynvml.nvmlDeviceGetUtilizationRates, self.handle, default=None)
+            self.samples.append(PowerSample(
+                t_s=now,
+                power_w=power_mw / 1000.0 if power_mw >= 0 else -1.0,
+                gpu_util_pct=util.gpu if util is not None else -1,
+                mem_util_pct=util.memory if util is not None else -1,
+                phase=self._phase,
+            ))
+            time.sleep(self.interval_s)
+
+    def stop(self) -> None:
+        self._stop_ev.set()
+        self.join(timeout=2.0)
+
+    def slice(self, t0_s: float, t1_s: float) -> list[PowerSample]:
+        return [s for s in self.samples if t0_s <= s.t_s <= t1_s and s.power_w >= 0]
+
+    def energy_j(self, t0_s: float, t1_s: float) -> float:
+        sl = self.slice(t0_s, t1_s)
+        if len(sl) < 2:
+            return 0.0
+        return sum(0.5 * (a.power_w + b.power_w) * (b.t_s - a.t_s)
+                   for a, b in zip(sl[:-1], sl[1:]))
+
+
+def nvml_or(fn, *args, default=None):
+    try:
+        return fn(*args)
+    except pynvml.NVMLError:
+        return default
+
+
+def prop(props: dict, key: str):
+    v = props[key]
+    return v.decode() if isinstance(v, (bytes, bytearray)) else v
+
+
+def mean_or_nan(vals: list[float]) -> float:
+    return statistics.fmean(vals) if vals else float("nan")
+
+
+def measure_idle_power(handle, seconds: float, hz: int) -> tuple[float, float, int]:
+    poller = PowerPoller(handle, hz)
+    poller.start()
+    poller.set_phase("idle_baseline")
+    time.sleep(seconds)
+    poller.stop()
+    ps = [s.power_w for s in poller.samples if s.power_w >= 0]
+    if not ps:
+        return 0.0, 0.0, 0
+    return statistics.fmean(ps), statistics.pstdev(ps) if len(ps) > 1 else 0.0, len(ps)
+
+
+def calibrate_kernel(kernel, stream, blocks: int, threads: int, buf, sink,
+                     n_f4: int, cal_passes: int, repeats: int) -> tuple[float, float]:
+    start = cp.cuda.Event()
+    end = cp.cuda.Event()
+    best_ms_per_pass = float("inf")
+    for _ in range(repeats):
+        with stream:
+            start.record(stream=stream)
+            kernel((blocks,), (threads,),
+                   (buf, sink, np.uint64(n_f4), np.int32(cal_passes)))
+            end.record(stream=stream)
+        end.synchronize()
+        best_ms_per_pass = min(best_ms_per_pass,
+                               cp.cuda.get_elapsed_time(start, end) / cal_passes)
+    return best_ms_per_pass, 1.0 / (best_ms_per_pass * 1e-3)
+
+
+def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
+              buf, sink, n_f4: int, buf_bytes: int, peak_passes_per_s: float,
+              phase_seconds: float, window_ms: float, poller: PowerPoller,
+              idle_power_w: float) -> PhaseResult:
+    phase = f"{mode}_{target}"
+    active_ms = window_ms * target / 100.0
+    ms_per_pass = 1000.0 / peak_passes_per_s
+    passes = max(1, int(round(active_ms / ms_per_pass)))
+    window_s = window_ms / 1000.0
+    launches = 0
+
+    with nvtx.annotate(phase, color="blue" if mode == "read" else "purple"):
+        poller.set_phase(phase)
+        t0_abs = time.perf_counter()
+        t0 = t0_abs - poller.t0
+        deadline = t0_abs + phase_seconds
+        while time.perf_counter() < deadline:
+            w0 = time.perf_counter()
+            with stream:
+                kernel((blocks,), (threads,),
+                       (buf, sink, np.uint64(n_f4), np.int32(passes)))
+            stream.synchronize()
+            launches += 1
+            if target < 100:
+                rest = window_s - (time.perf_counter() - w0)
+                if rest > 2e-4:
+                    time.sleep(rest)
+        t1 = time.perf_counter() - poller.t0
+
+    wall_s = max(t1 - t0, 1e-12)
+    bytes_transferred = int(launches * passes * buf_bytes)
+    bandwidth_gbps = bytes_transferred / wall_s / 1e9
+    total_energy_j = poller.energy_j(t0, t1)
+    idle_energy_j = idle_power_w * wall_s
+    dynamic_energy_j = max(0.0, total_energy_j - idle_energy_j)
+    dynamic_power_w = dynamic_energy_j / wall_s
+    pj_per_bit = (dynamic_energy_j / (bytes_transferred * 8.0) * 1e12
+                  if bytes_transferred > 0 else float("nan"))
+    sl = poller.slice(t0, t1)
+    return PhaseResult(
+        mode=mode, target_pct=target, phase=phase, t0_s=t0, t1_s=t1,
+        wall_s=wall_s, launches=launches, passes_per_launch=passes,
+        bytes_transferred=bytes_transferred, bandwidth_gbps=bandwidth_gbps,
+        total_energy_j=total_energy_j, idle_energy_j=idle_energy_j,
+        dynamic_energy_j=dynamic_energy_j,
+        avg_power_w=total_energy_j / wall_s if total_energy_j > 0 else float("nan"),
+        dynamic_power_w=dynamic_power_w, pj_per_bit=pj_per_bit, samples=len(sl),
+        mem_util_pct_mean=mean_or_nan([s.mem_util_pct for s in sl if s.mem_util_pct >= 0]),
+        gpu_util_pct_mean=mean_or_nan([s.gpu_util_pct for s in sl if s.gpu_util_pct >= 0]),
+    )
+
+
+def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
+              samples: list[PowerSample]) -> tuple[Path, Path]:
+    summary_csv = out_dir / f"{stem}_summary.csv"
+    trace_csv = out_dir / f"{stem}_trace.csv"
+    with open(summary_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "mode", "target_pct", "phase", "wall_s", "launches",
+            "passes_per_launch", "bytes_transferred", "bandwidth_gbps",
+            "avg_power_w", "dynamic_power_w", "total_energy_j",
+            "idle_energy_j", "dynamic_energy_j", "pj_per_bit",
+            "mem_util_pct_mean", "gpu_util_pct_mean", "samples",
+        ])
+        for r in results:
+            w.writerow([
+                r.mode, r.target_pct, r.phase, f"{r.wall_s:.6f}", r.launches,
+                r.passes_per_launch, r.bytes_transferred,
+                f"{r.bandwidth_gbps:.3f}", f"{r.avg_power_w:.3f}",
+                f"{r.dynamic_power_w:.3f}", f"{r.total_energy_j:.6f}",
+                f"{r.idle_energy_j:.6f}", f"{r.dynamic_energy_j:.6f}",
+                f"{r.pj_per_bit:.6f}", f"{r.mem_util_pct_mean:.3f}",
+                f"{r.gpu_util_pct_mean:.3f}", r.samples,
+            ])
+    with open(trace_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_s", "power_w", "gpu_util_pct", "mem_util_pct", "phase"])
+        for s in samples:
+            w.writerow([f"{s.t_s:.6f}", f"{s.power_w:.3f}",
+                        s.gpu_util_pct, s.mem_util_pct, s.phase])
+    return summary_csv, trace_csv
+
+
+def save_plot(out_dir: Path, stem: str, gpu_name: str, idle_power_w: float,
+              results: list[PhaseResult], samples: list[PowerSample]) -> Path:
+    png = out_dir / f"{stem}.png"
+    fig, (ax0, ax1, ax2) = plt.subplots(3, 1, figsize=(11, 9), sharex=False)
+
+    t = [s.t_s for s in samples if s.power_w >= 0]
+    p = [s.power_w for s in samples if s.power_w >= 0]
+    ax0.plot(t, p, lw=0.9, color="#1f77b4", label="NVML total GPU/board power")
+    ax0.axhline(idle_power_w, color="black", ls="--", lw=1.0,
+                label=f"idle baseline {idle_power_w:.1f} W")
+    for r in results:
+        ax0.axvspan(r.t0_s, r.t1_s, alpha=0.10,
+                    color="#2ca02c" if r.mode == "read" else "#9467bd")
+        ax0.text((r.t0_s + r.t1_s) / 2, max(p) if p else idle_power_w,
+                 r.phase, ha="center", va="bottom", fontsize=8, rotation=0)
+    ax0.set_ylabel("power (W)")
+    ax0.set_title(f"DRAM read/write pJ/bit — {gpu_name}")
+    ax0.legend(loc="upper left")
+    ax0.grid(True, alpha=0.3)
+
+    labels = [r.phase for r in results]
+    x = np.arange(len(results))
+    colors = ["#2ca02c" if r.mode == "read" else "#9467bd" for r in results]
+    ax1.bar(x, [r.bandwidth_gbps for r in results], color=colors, alpha=0.75)
+    ax1.set_ylabel("BW (GB/s)")
+    ax1.set_xticks(x, labels, rotation=30, ha="right")
+    ax1.grid(True, axis="y", alpha=0.3)
+
+    ax2.bar(x, [r.pj_per_bit for r in results], color=colors, alpha=0.75)
+    ax2.set_ylabel("dynamic pJ/bit")
+    ax2.set_xticks(x, labels, rotation=30, ha="right")
+    ax2.grid(True, axis="y", alpha=0.3)
+    ax2.set_xlabel("phase")
+
+    fig.text(0.01, 0.01,
+             "pJ/bit = max(0, integrated NVML power - idle baseline × time) / "
+             "(streamed bytes × 8). NVML is not DRAM-rail-only power.",
+             fontsize=8)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.savefig(png, dpi=140)
+    plt.close(fig)
+    return png
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--modes", nargs="+", choices=["read", "write"],
+                    default=["read", "write"], help="traffic types to measure")
+    ap.add_argument("--targets", type=int, nargs="+", default=[100],
+                    help="duty-cycle targets as percent of calibrated mode peak")
+    ap.add_argument("--phase-seconds", type=float, default=5.0)
+    ap.add_argument("--idle-seconds", type=float, default=5.0,
+                    help="idle baseline duration before active phases")
+    ap.add_argument("--window-ms", type=float, default=20.0)
+    ap.add_argument("--poll-hz", type=int, default=100)
+    ap.add_argument("--buf-bytes", type=int, default=None,
+                    help="default: max(1 GiB, 64 * L2)")
+    ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--out-dir", default="reports")
+    ap.add_argument("--tag", default="")
+    ap.add_argument("--cal-passes", type=int, default=8)
+    ap.add_argument("--cal-repeats", type=int, default=3)
+    args = ap.parse_args()
+
+    cp.cuda.Device(args.device).use()
+    props = cp.cuda.runtime.getDeviceProperties(args.device)
+    gpu_name = prop(props, "name")
+    sm_count = props["multiProcessorCount"]
+    l2_bytes = props["l2CacheSize"]
+    if args.buf_bytes is None:
+        args.buf_bytes = max(1 << 30, l2_bytes * 64)
+    n_f4 = args.buf_bytes // 16
+    args.buf_bytes = n_f4 * 16
+
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
+
+    print(f"[info] GPU={gpu_name} SMs={sm_count} L2={l2_bytes/(1<<20):.1f} MiB "
+          f"buf={args.buf_bytes/(1<<30):.2f} GiB modes={args.modes}")
+    if _nvrtc_path:
+        print(f"[info] preloaded nvrtc: {_nvrtc_path}")
+
+    buf = cp.empty(n_f4 * 4, dtype=cp.float32)
+    sink = cp.empty(1024 * 4, dtype=cp.float32)
+    buf.fill(1.0)
+    module = cp.RawModule(code=KERNEL_CODE, options=("--std=c++14",))
+    kernels = {
+        "read": module.get_function("stream_read"),
+        "write": module.get_function("stream_write"),
+    }
+    threads = 256
+    blocks = sm_count * 32
+    stream = cp.cuda.Stream(non_blocking=True)
+
+    # Warm up both kernels so compilation and first-touch costs are outside phases.
+    with stream:
+        kernels["read"]((blocks,), (threads,),
+                        (buf, sink, np.uint64(n_f4), np.int32(1)))
+        kernels["write"]((blocks,), (threads,),
+                         (buf, sink, np.uint64(n_f4), np.int32(1)))
+    stream.synchronize()
+
+    peak_passes_per_s: dict[str, float] = {}
+    for mode in args.modes:
+        ms_per_pass, passes_per_s = calibrate_kernel(
+            kernels[mode], stream, blocks, threads, buf, sink, n_f4,
+            args.cal_passes, args.cal_repeats)
+        peak_passes_per_s[mode] = passes_per_s
+        peak_bw = args.buf_bytes * passes_per_s / 1e9
+        print(f"[calib] {mode:<5} {ms_per_pass:.3f} ms/pass  "
+              f"~{peak_bw:.1f} GB/s effective user-data BW")
+
+    cp.cuda.runtime.deviceSynchronize()
+    print(f"[idle] measuring baseline for {args.idle_seconds:.1f} s ...")
+    idle_power_w, idle_std_w, idle_n = measure_idle_power(
+        handle, args.idle_seconds, args.poll_hz)
+    print(f"[idle] {idle_power_w:.2f} W ± {idle_std_w:.2f} W  n={idle_n}")
+
+    poller = PowerPoller(handle, args.poll_hz)
+    results: list[PhaseResult] = []
+    poller.start()
+    try:
+        for mode in args.modes:
+            for target in args.targets:
+                print(f"[phase] {mode}_{target} start")
+                result = run_phase(
+                    mode, target, kernels[mode], stream, blocks, threads,
+                    buf, sink, n_f4, args.buf_bytes, peak_passes_per_s[mode],
+                    args.phase_seconds, args.window_ms, poller, idle_power_w)
+                results.append(result)
+                print(f"[phase] {result.phase:<9} BW={result.bandwidth_gbps:.1f} GB/s  "
+                      f"Pdyn={result.dynamic_power_w:.1f} W  "
+                      f"E={result.dynamic_energy_j:.3f} J  "
+                      f"pJ/bit={result.pj_per_bit:.3f}")
+                with nvtx.annotate("gap", color="gray"):
+                    poller.set_phase("gap")
+                    time.sleep(0.5)
+    finally:
+        poller.stop()
+        pynvml.nvmlShutdown()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{args.tag}" if args.tag else ""
+    safe_gpu = "".join(c.lower() if c.isalnum() else "_" for c in gpu_name).strip("_")
+    stem = f"pjbit_cupy_{safe_gpu}_{stamp}{suffix}"
+    summary_csv, trace_csv = save_csvs(out_dir, stem, results, poller.samples)
+    png = save_plot(out_dir, stem, gpu_name, idle_power_w, results, poller.samples)
+
+    print(f"[save] {summary_csv}")
+    print(f"[save] {trace_csv}")
+    print(f"[save] {png}")
+    print()
+    print(f"{'phase':<10} {'BW(GB/s)':>10} {'Pavg(W)':>10} {'Pdyn(W)':>10} "
+          f"{'Edyn(J)':>10} {'pJ/bit':>10}")
+    print("-" * 66)
+    for r in results:
+        print(f"{r.phase:<10} {r.bandwidth_gbps:>10.1f} {r.avg_power_w:>10.1f} "
+              f"{r.dynamic_power_w:>10.1f} {r.dynamic_energy_j:>10.3f} "
+              f"{r.pj_per_bit:>10.3f}")
+
+
+if __name__ == "__main__":
+    main()
