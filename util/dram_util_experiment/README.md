@@ -534,8 +534,8 @@ cd util/dram_util_experiment
 - `reports/pjbit_cupy_<gpu>_<timestamp>_trace.csv`
   - `t_s,power_w,gpu_util_pct,mem_util_pct,sm_clock_mhz,mem_clock_mhz,temp_gpu_c,pstate,throttle_reasons_hex,phase`
 - `reports/pjbit_cupy_<gpu>_<timestamp>_analysis.csv`
-  - 실험 종료 후 자동 계산한 `100%-0%` phase-local pJ/bit, `50/75/100` slope 기반 pJ/bit,
-    slope fit의 `R²`, maximum residual
+  - 실험 종료 후 자동 계산한 `100%-0%` phase-local pJ/bit, 모든 target pair의
+    `pair_delta_avg_power`, `50/75/100` slope 기반 pJ/bit, slope fit의 `R²`, maximum residual
 - `reports/pjbit_cupy_<gpu>_<timestamp>_metadata.json`
   - GPU name/UUID, driver/CUDA version, L2/buffer size, clocks, P-state, temperature,
     power limit, throttle reasons, calibration peak BW, idle power statistics
@@ -557,7 +557,7 @@ cd util/dram_util_experiment
 
 CSV의 `pj_per_bit` 는 pre-idle baseline `P_idle` 을 뺀 값이다. 하지만 GPU power는 phase 순서,
 P-state, display load, thermal 상태에 따라 흔들릴 수 있으므로 아래 세 가지 관점으로 같이 본다.
-스크립트는 실험 종료 후 아래 2번과 3번의 값을 자동으로 계산해서 콘솔에 `post-analysis` 표로
+스크립트는 실험 종료 후 아래 2-4번의 값을 자동으로 계산해서 콘솔에 `post-analysis` 표로
 출력하고, 같은 내용을 `*_analysis.csv` 로 저장한다. 또한 `*_analysis.png` 에서 회귀선,
 estimator 비교, residual, phase별 power 분포를 함께 확인할 수 있다.
 
@@ -586,6 +586,25 @@ pJ_per_bit_100_minus_0 = delta_power_W × 1000 / (8 × bandwidth_gbps(target=100
 다만 `100%` 에서 추가로 바뀌는 clock, memory controller state, SM issue, L2 path power까지
 함께 포함하므로 여전히 DRAM rail-only 값은 아니다.
 
+#### 3. 모든 target pair delta
+
+`100%-0%` 한 점만 보면 0% phase의 power 상태에 민감할 수 있다. 그래서 스크립트는
+모든 target pair에 대해 다음 값을 `pair_delta_avg_power` 로 저장한다.
+
+```text
+delta_power_W = avg_power_w(target=high) - avg_power_w(target=low)
+delta_bw_GBps = bandwidth_gbps(target=high) - bandwidth_gbps(target=low)
+pJ_per_bit_pair = delta_power_W x 1000 / (8 x delta_bw_GBps)
+```
+
+해석은 다음과 같다.
+
+- `75-50`, `100-75`, `100-50` 이 slope 값과 비슷하면 고부하 구간의 marginal cost가 안정적이다.
+- `50-25`, `50-0`, `75-0`, `100-0` 이 더 크면 저부하에서 clock/P-state/memory-controller
+  wake-up cost가 함께 들어간다는 뜻이다.
+- 모든 pair가 같은 값이어야만 하는 것은 아니다. 오히려 pair별 차이가 크면 단일 DRAM rail-only
+  pJ/bit로 해석하면 안 된다는 경고 신호다.
+
 계산 예시:
 
 ```bash
@@ -608,7 +627,7 @@ for mode in ["read", "write"]:
 PY
 ```
 
-#### 3. 권장 보고값: multi-point slope
+#### 4. 권장 보고값: multi-point slope
 
 논문/보고서용으로는 `avg_power_w = intercept + slope × bandwidth_gbps` 를
 50/75/100% 또는 25/50/75/100% point에 fitting하고, slope를 pJ/bit로 바꾸는 방식을 권장한다.
@@ -663,18 +682,36 @@ PY
 
 `reports/rtx3090_repeat_summary.csv` 요약:
 
-| mode | method | runs | pJ/bit mean | pJ/bit std | R2 mean | mean max residual |
-|---|---|---:|---:|---:|---:|---:|
-| read | 100%-0% avg power | 3 | 44.368 | 0.807 | - | - |
-| read | 50/75/100 slope | 3 | 30.487 | 0.340 | 0.999431 | 1.386 W |
-| write | 100%-0% avg power | 3 | 43.203 | 1.068 | - | - |
-| write | 50/75/100 slope | 3 | 30.690 | 0.855 | 0.999906 | 0.439 W |
+| mode | method | points | runs | pJ/bit mean | pJ/bit std | R2 mean | mean max residual |
+|---|---|---:|---:|---:|---:|---:|---:|
+| read | 100%-0% avg power | 0,100 | 3 | 44.368 | 0.807 | - | - |
+| read | 50/75/100 slope | 50,75,100 | 3 | 30.487 | 0.340 | 0.999431 | 1.386 W |
+| write | 100%-0% avg power | 0,100 | 3 | 43.203 | 1.068 | - | - |
+| write | 50/75/100 slope | 50,75,100 | 3 | 30.690 | 0.855 | 0.999906 | 0.439 W |
 
 이 결과에서는 `100%-0%` 방식이 read/write 모두 약 43-44 pJ/bit로 더 크게 나오고,
 multi-point slope는 약 30.5-30.7 pJ/bit로 더 안정적이다. 해석상 최종 calibration에는
 slope 기반 값을 우선 사용하고, `100%-0%` 값은 phase-local baseline sanity check로 같이 보고한다.
 H100 결과도 같은 방식으로 두 estimator를 모두 저장하되, 최종 판단은 반복 run의 slope 평균/표준편차와
 R2/residual을 함께 본다.
+
+동일한 3회 반복 run에서 pairwise delta를 모두 계산하면 다음과 같다.
+
+| pair | read mean pJ/bit | write mean pJ/bit | 해석 |
+|---|---:|---:|---|
+| 50-25 | 51.830 | 55.261 | 저부하 전이/clock state 영향이 큼 |
+| 50-0 | 58.098 | 54.258 | 0% baseline과 50% state 차이가 큼 |
+| 75-25 | 41.338 | 42.720 | 25% 구간 포함으로 slope보다 큼 |
+| 75-50 | 30.986 | 30.425 | 고부하 marginal cost, slope와 유사 |
+| 75-0 | 48.832 | 46.094 | 0% baseline 포함으로 큼 |
+| 100-25 | 37.772 | 39.699 | 25% 구간 포함으로 slope보다 큼 |
+| 100-50 | 30.491 | 30.712 | 고부하 marginal cost, slope와 유사 |
+| 100-75 | 30.023 | 31.139 | 고부하 marginal cost, slope와 유사 |
+| 100-0 | 44.368 | 43.203 | phase-local 0% 대비 값, slope보다 큼 |
+
+즉 모든 pair가 30 pJ/bit로 나오지는 않는다. RTX 3090에서는 50% 이상 고부하 구간끼리의
+incremental cost만 약 30 pJ/bit이고, 0% 또는 25%를 포함하는 pair는 38-58 pJ/bit로 커진다.
+이는 낮은 utilization에서 memory subsystem/clock/P-state가 켜지는 비용이 같이 들어간다는 뜻이다.
 
 ### 반복 run 요약
 

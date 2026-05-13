@@ -7,6 +7,7 @@ import argparse
 import csv
 import glob
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -39,15 +40,15 @@ def main() -> None:
     if not paths:
         raise SystemExit("no analysis CSV files matched")
 
-    groups: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
     for path in paths:
         with open(path, newline="") as f:
             for row in csv.DictReader(f):
                 row["_file"] = str(path)
-                groups[(row["mode"], row["method"])].append(row)
+                groups[(row["mode"], row["method"], row.get("target_points", ""))].append(row)
 
     out_rows: list[dict[str, str]] = []
-    for (mode, method), rows in sorted(groups.items()):
+    for (mode, method, target_points), rows in sorted(groups.items()):
         pj = [x for r in rows if (x := f_or_none(r.get("pj_per_bit", ""))) is not None]
         r2 = [x for r in rows if (x := f_or_none(r.get("r2", ""))) is not None]
         resid = [
@@ -57,6 +58,7 @@ def main() -> None:
         out_rows.append({
             "mode": mode,
             "method": method,
+            "target_points": target_points,
             "runs": str(len(rows)),
             "pj_per_bit_mean": f"{statistics.fmean(pj):.6f}" if pj else "",
             "pj_per_bit_std": (
@@ -68,13 +70,13 @@ def main() -> None:
         })
 
     fields = [
-        "mode", "method", "runs", "pj_per_bit_mean", "pj_per_bit_std",
+        "mode", "method", "target_points", "runs", "pj_per_bit_mean", "pj_per_bit_std",
         "r2_mean", "max_abs_residual_w_mean", "files",
     ]
 
-    print(",".join(fields))
-    for row in out_rows:
-        print(",".join(row[f] for f in fields))
+    stdout = csv.DictWriter(sys.stdout, fieldnames=fields)
+    stdout.writeheader()
+    stdout.writerows(out_rows)
 
     if args.out:
         out = Path(args.out)

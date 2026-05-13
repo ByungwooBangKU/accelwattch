@@ -559,6 +559,32 @@ def make_analysis_rows(results: list[PhaseResult]) -> list[dict[str, str]]:
                 "note": "phase-local avg_power delta; not DRAM-rail-only",
             })
 
+        targets = sorted(t for m, t in by if m == mode)
+        for lo_idx, lo in enumerate(targets):
+            for hi in targets[lo_idx + 1:]:
+                rlo = by[(mode, lo)]
+                rhi = by[(mode, hi)]
+                delta_bw = rhi.bandwidth_gbps - rlo.bandwidth_gbps
+                if delta_bw <= 0:
+                    continue
+                delta_power_w = rhi.avg_power_w - rlo.avg_power_w
+                pj_per_bit = delta_power_w * 1000.0 / (8.0 * delta_bw)
+                rows.append({
+                    "mode": mode,
+                    "method": "pair_delta_avg_power",
+                    "target_points": f"{hi}-{lo}",
+                    "baseline_power_w": f"{rlo.avg_power_w:.6f}",
+                    "active_power_w": f"{rhi.avg_power_w:.6f}",
+                    "delta_power_w": f"{delta_power_w:.6f}",
+                    "bandwidth_gbps": f"{delta_bw:.6f}",
+                    "slope_w_per_gbps": "",
+                    "intercept_power_w": "",
+                    "r2": "",
+                    "max_abs_residual_w": "",
+                    "pj_per_bit": f"{pj_per_bit:.6f}",
+                    "note": "all-pairs phase-local avg_power delta over delta bandwidth",
+                })
+
         slope_targets = (50, 75, 100)
         points = [
             (t, by[(mode, t)].bandwidth_gbps, by[(mode, t)].avg_power_w)
@@ -747,6 +773,7 @@ def print_analysis(rows: list[dict[str, str]]) -> None:
               f"{row['pj_per_bit']:>10}")
     print()
     print("[note] 100_minus_0 uses phase-local avg_power delta. "
+          "pair_delta_avg_power checks all target pairs. "
           "slope_avg_power_vs_bw uses avg_power~bandwidth fit over available 50/75/100 points.")
 
 
