@@ -554,6 +554,64 @@ window를 키워 다시 측정한다.
 아니라 summary CSV의 실제 `bandwidth_gbps`, `avg_power_w`, analysis CSV의 `r2`,
 `max_abs_residual_w`를 기준으로 한다.
 
+### H100 instant power cross-validation
+
+H100에서는 `nvidia-smi`와 NVML field API로 instantaneous power reading을 별도로 확인할 수 있다.
+NVIDIA 문서 기준으로 `power.draw`는 Ampere 이상에서 1초 평균 성격이고, `power.draw.instant`는
+마지막 instant board power reading이다. Hopper datacenter 제품에서는 module power reading도
+지원되며 `module.power.draw.instant`/`module.power.draw.average`를 조회할 수 있다.
+
+커맨드라인에서 먼저 지원 여부를 확인한다.
+
+```bash
+nvidia-smi --query-gpu=index,name,power.draw,power.draw.instant,power.draw.average \
+  --format=csv
+
+# Hopper datacenter module power가 보이는 환경이면 함께 확인
+nvidia-smi --query-gpu=index,name,module.power.draw.instant,module.power.draw.average \
+  --format=csv
+```
+
+Python/NVML에서는 field API를 쓴다. `pynvml` 또는 `nvidia-ml-py`에서 아래 상수가 보이면 사용할 수 있다.
+
+```python
+import pynvml
+
+pynvml.nvmlInit()
+handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+values = pynvml.nvmlDeviceGetFieldValues(handle, [
+    pynvml.NVML_FI_DEV_POWER_INSTANT,
+    pynvml.NVML_FI_DEV_POWER_AVERAGE,
+])
+
+for value in values:
+    if value.nvmlReturn == pynvml.NVML_SUCCESS:
+        print(value.fieldId, value.value.uiVal / 1000.0, "W")
+```
+
+`dram_pjbit_cupy.py`는 이 field API를 best-effort로 같이 polling한다. 지원되는 GPU/driver에서는
+trace CSV에 아래 컬럼이 추가된다.
+
+| column | 의미 |
+|---|---|
+| `power_w` | 기존 `nvmlDeviceGetPowerUsage()` 값. Ampere 이상에서는 1초 평균 성격 |
+| `power_instant_w` | `NVML_FI_DEV_POWER_INSTANT` field 값 |
+| `power_average_w` | `NVML_FI_DEV_POWER_AVERAGE` field 값 |
+| `power_instant_status` / `power_average_status` | field별 `nvmlReturn`; `0`이면 성공 |
+
+summary CSV에는 phase별 `avg_power_instant_w`, `avg_power_average_w`,
+`power_instant_samples`, `power_average_samples`가 기록된다. 기본 pJ/bit 계산은 기존
+`power_w` 기반으로 유지하고, H100에서는 field 기반 평균이 같은 phase ordering과 유사한
+delta를 보이는지 cross-validation한다. instant 값은 더 빠른 변화를 보여주지만 센서 자체의
+정확도와 sampling jitter가 있으므로, 최종값은 반복 run의 slope/R2/residual과 함께 판단한다.
+
+참고:
+
+- NVIDIA `nvidia-smi` 문서: GPU/module/memory power readings
+  <https://docs.nvidia.com/deploy/nvidia-smi/index.html>
+- NVIDIA NVML field query 문서: `nvmlDeviceGetFieldValues`
+  <https://docs.nvidia.com/deploy/nvml-api/group__nvmlFieldValueQueries.html>
+
 ### 계산식
 
 1. L2보다 큰 버퍼를 만든다: `max(1 GiB, 64 × L2)`.

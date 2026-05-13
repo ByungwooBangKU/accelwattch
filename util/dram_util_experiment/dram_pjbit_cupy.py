@@ -105,6 +105,10 @@ void stream_write(float4* __restrict__ out,
 class PowerSample:
     t_s: float
     power_w: float
+    power_instant_w: float
+    power_average_w: float
+    power_instant_status: int
+    power_average_status: int
     gpu_util_pct: int
     mem_util_pct: int
     sm_clock_mhz: int
@@ -146,6 +150,10 @@ class PhaseResult:
     pstate_p50: float
     mem_util_pct_mean: float
     gpu_util_pct_mean: float
+    avg_power_instant_w: float
+    avg_power_average_w: float
+    power_instant_samples: int
+    power_average_samples: int
 
 
 @dataclass
@@ -179,6 +187,7 @@ class PowerPoller(threading.Thread):
         while not self._stop_ev.is_set():
             now = time.perf_counter() - self.t0
             power_mw = nvml_or(pynvml.nvmlDeviceGetPowerUsage, self.handle, default=-1)
+            power_fields = nvml_power_field_values(self.handle)
             util = nvml_or(pynvml.nvmlDeviceGetUtilizationRates, self.handle, default=None)
             sm_clock = nvml_or(
                 pynvml.nvmlDeviceGetClockInfo, self.handle, pynvml.NVML_CLOCK_SM, default=-1)
@@ -193,6 +202,10 @@ class PowerPoller(threading.Thread):
             self.samples.append(PowerSample(
                 t_s=now,
                 power_w=power_mw / 1000.0 if power_mw >= 0 else -1.0,
+                power_instant_w=float(power_fields["instant_w"]),
+                power_average_w=float(power_fields["average_w"]),
+                power_instant_status=int(power_fields["instant_status"]),
+                power_average_status=int(power_fields["average_status"]),
                 gpu_util_pct=util.gpu if util is not None else -1,
                 mem_util_pct=util.memory if util is not None else -1,
                 sm_clock_mhz=sm_clock,
@@ -266,6 +279,42 @@ def nvml_watts(fn, handle) -> float | None:
 def nvml_watts_name(name: str, handle) -> float | None:
     v = nvml_or_name(name, handle, default=None)
     return v / 1000.0 if v is not None and v >= 0 else None
+
+
+def nvml_power_field_values(handle) -> dict[str, float | int]:
+    """Best-effort query of explicit NVML power fields for cross-validation."""
+    out = {
+        "instant_w": -1.0,
+        "average_w": -1.0,
+        "instant_status": -1,
+        "average_status": -1,
+    }
+    get_fields = getattr(pynvml, "nvmlDeviceGetFieldValues", None)
+    instant_id = getattr(pynvml, "NVML_FI_DEV_POWER_INSTANT", None)
+    average_id = getattr(pynvml, "NVML_FI_DEV_POWER_AVERAGE", None)
+    if get_fields is None or instant_id is None or average_id is None:
+        return out
+
+    try:
+        values = get_fields(handle, [instant_id, average_id])
+    except pynvml.NVMLError:
+        return out
+
+    for value in values:
+        field_id = getattr(value, "fieldId", None)
+        status = int(getattr(value, "nvmlReturn", -1))
+        if field_id == instant_id:
+            key = "instant"
+        elif field_id == average_id:
+            key = "average"
+        else:
+            continue
+        out[f"{key}_status"] = status
+        if status != getattr(pynvml, "NVML_SUCCESS", 0):
+            continue
+        raw_mw = getattr(value.value, "uiVal", -1)
+        out[f"{key}_w"] = raw_mw / 1000.0 if raw_mw >= 0 else -1.0
+    return out
 
 
 def nvml_snapshot(handle) -> dict:
@@ -414,6 +463,8 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
                   if bytes_transferred > 0 else float("nan"))
     sl = poller.slice(t0, t1)
     power_vals = [s.power_w for s in sl if s.power_w >= 0]
+    power_instant_vals = [s.power_instant_w for s in sl if s.power_instant_w >= 0]
+    power_average_vals = [s.power_average_w for s in sl if s.power_average_w >= 0]
     sm_clock_vals = [s.sm_clock_mhz for s in sl if s.sm_clock_mhz >= 0]
     mem_clock_vals = [s.mem_clock_mhz for s in sl if s.mem_clock_mhz >= 0]
     temp_vals = [s.temp_gpu_c for s in sl if s.temp_gpu_c >= 0]
@@ -438,6 +489,10 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
         pstate_p50=percentile_or_nan(pstate_vals, 50),
         mem_util_pct_mean=mean_or_nan([s.mem_util_pct for s in sl if s.mem_util_pct >= 0]),
         gpu_util_pct_mean=mean_or_nan([s.gpu_util_pct for s in sl if s.gpu_util_pct >= 0]),
+        avg_power_instant_w=mean_or_nan(power_instant_vals),
+        avg_power_average_w=mean_or_nan(power_average_vals),
+        power_instant_samples=len(power_instant_vals),
+        power_average_samples=len(power_average_vals),
     )
 
 
@@ -455,7 +510,9 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
             "power_std_w", "power_min_w", "power_p05_w", "power_p50_w",
             "power_p95_w", "power_max_w",
             "sm_clock_mhz_mean", "mem_clock_mhz_mean", "temp_gpu_c_mean", "pstate_p50",
-            "mem_util_pct_mean", "gpu_util_pct_mean", "samples",
+            "mem_util_pct_mean", "gpu_util_pct_mean",
+            "avg_power_instant_w", "avg_power_average_w",
+            "power_instant_samples", "power_average_samples", "samples",
         ])
         for r in results:
             w.writerow([
@@ -470,17 +527,23 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
                 f"{r.power_max_w:.3f}", f"{r.sm_clock_mhz_mean:.3f}",
                 f"{r.mem_clock_mhz_mean:.3f}", f"{r.temp_gpu_c_mean:.3f}",
                 f"{r.pstate_p50:.3f}", f"{r.mem_util_pct_mean:.3f}",
-                f"{r.gpu_util_pct_mean:.3f}", r.samples,
+                f"{r.gpu_util_pct_mean:.3f}", f"{r.avg_power_instant_w:.3f}",
+                f"{r.avg_power_average_w:.3f}", r.power_instant_samples,
+                r.power_average_samples, r.samples,
             ])
     with open(trace_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "t_s", "power_w", "gpu_util_pct", "mem_util_pct",
+            "t_s", "power_w", "power_instant_w", "power_average_w",
+            "power_instant_status", "power_average_status",
+            "gpu_util_pct", "mem_util_pct",
             "sm_clock_mhz", "mem_clock_mhz", "temp_gpu_c", "pstate",
             "throttle_reasons_hex", "phase",
         ])
         for s in samples:
             w.writerow([f"{s.t_s:.6f}", f"{s.power_w:.3f}",
+                        f"{s.power_instant_w:.3f}", f"{s.power_average_w:.3f}",
+                        s.power_instant_status, s.power_average_status,
                         s.gpu_util_pct, s.mem_util_pct,
                         s.sm_clock_mhz, s.mem_clock_mhz, s.temp_gpu_c, s.pstate,
                         f"0x{s.throttle_reasons:x}" if s.throttle_reasons >= 0 else "",
@@ -957,6 +1020,7 @@ def main() -> None:
         "notes": [
             "NVML power is GPU/board plus associated circuitry, not DRAM-rail-only.",
             "On GA10x Ampere, nvmlDeviceGetPowerUsage is documented as a 1-second average.",
+            "Trace CSV includes NVML_FI_DEV_POWER_INSTANT/AVERAGE when supported.",
             "Use slope_avg_power_vs_bw as the preferred marginal board-energy estimate.",
         ],
     }
