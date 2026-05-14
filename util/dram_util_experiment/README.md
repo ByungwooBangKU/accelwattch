@@ -13,7 +13,7 @@ Nsight profiling 도구는 12장 부록에 요약한다.
 4. `100%-0%`는 read/write 모두 약 `44-45 pJ/bit`로 더 크다. 이 값은 clock/P-state, controller, L2/NoC/SM path 활성화 비용이 포함된 sanity check로 본다.
 5. CuPy 경로는 RTX 3090, A100, H100에서 별도 arch 설정 없이 동작한다. Native CUDA 경로만 A100 `SM=80`, H100 `SM=90`처럼 직접 맞춘다.
 6. 기본 buffer는 `max(1 GiB, 64 x L2)`다. H100/A100에서는 8 GiB sensitivity run도 권장한다.
-7. 큰 buffer에서는 `--window-ms`가 중요하다. 8 GiB/H100 계열 보고용은 `--window-ms 100` 또는 `200`을 권장한다.
+7. 큰 buffer에서는 `--window-ms`가 중요하다. 8 GiB/A100/H100 계열 보고용은 `--window-ms 100` 또는 `200`을 권장한다.
 8. H100에서는 `NVML_FI_DEV_POWER_INSTANT`/`AVERAGE` field API를 같이 기록해서 cross-validation할 수 있다.
 9. H100 write 해석은 `--write-patterns zero const address random toggle` sweep으로 data pattern/compression 영향을 분리한다.
 
@@ -214,7 +214,7 @@ nvidia-smi
 | `--idle-seconds` | `5` | active phase 전 pre-idle baseline 측정 시간 | 보고용은 15초 이상 권장. `summary.csv`의 dynamic pJ/bit baseline으로 쓰인다. 이 단계는 지정한 초 수 정도만 걸리는 것이 정상이다. |
 | `--window-ms` | `20` | 25/50/75% duty-cycle 제어 window | 큰 buffer에서는 너무 작으면 pass quantization warning 발생. A100/H100 보고용은 `100` 또는 `200` 권장. |
 | `--poll-hz` | `100` | NVML power/state polling 요청 주파수 | 기본 100 Hz는 10 ms마다 NVML 값을 요청한다는 뜻이다. 실제 sensor update/window는 더 느릴 수 있다. |
-| `--gap-seconds` | `1.0` | phase 사이 idle gap | phase 경계의 sensor averaging/transition bleed-through를 줄이기 위한 구간이다. H100에서 0% power가 의심스러우면 `2`로 늘려 비교한다. |
+| `--gap-seconds` | `1.0` | phase 사이 idle gap | phase 경계의 sensor averaging/transition bleed-through를 줄이기 위한 구간이다. A100/H100에서 0% power가 의심스러우면 `2`로 늘려 비교한다. |
 | `--phase-order` | `target-major` | phase 실행 순서 | `target-major`는 모든 0% phase를 active phase보다 먼저 실행한다. 예전 방식처럼 read sweep 전체 뒤 write sweep을 돌리려면 `workload-major`를 쓴다. |
 | `--buf-bytes` | 자동 | mode별 GPU buffer 크기 | 기본값은 `max(1 GiB, 64 x L2)`. 8 GiB는 `8589934592`. read/write를 같이 돌리면 read buffer와 write buffer를 분리하므로 총 할당량은 약 2배다. |
 | `--out-dir` | `reports` | 결과 파일 저장 디렉터리 | `reports/`는 git ignore 대상이다. |
@@ -229,7 +229,7 @@ nvidia-smi
 3. H100 write 해석이면 `--write-patterns zero const address random toggle`로 pattern sensitivity를 같이 본다.
 4. `--targets 0 25 50 75 100`으로 utilization sweep을 만들되, 최종 계산은 실제 `bandwidth_gbps`와 slope를 우선한다.
 5. `--window-ms` warning이 나오면 A100/H100은 `100` 또는 `200`으로 올린다.
-6. H100에서 0% power가 이전 active phase의 영향을 받는 것처럼 보이면 `--gap-seconds 2`로 늘리고 `--phase-order target-major`를 유지한다.
+6. A100/H100에서 0% power가 이전 active phase의 영향을 받는 것처럼 보이면 `--gap-seconds 2`로 늘리고 `--phase-order target-major`를 유지한다.
 7. 최종 보고는 같은 조건을 `rep1/rep2/rep3`으로 반복하고 `summarize_pjbit_repeats.py`로 평균/표준편차를 낸다.
 
 write pattern 의미:
@@ -468,7 +468,7 @@ bandwidth_gbps    = bytes_transferred / wall_s / 1e9
 
 `target=0` phase는 baseline 관찰용이다. byte 전송량이 0이므로 pJ/bit 분모가 없고, 따라서 `write_0` 또는 `read_0`의 pJ/bit는 해석 대상이 아니다. 만약 예전 이미지에서 `write_0` pJ/bit 막대가 크게 보인다면 그 막대는 유효한 DRAM energy 값이 아니므로 최신 스크립트로 다시 생성해야 한다.
 
-H100처럼 power API의 update/window가 길게 보이는 환경에서는 이전 active phase가 다음 0% phase의 `avg_power_w`에 일부 남을 수 있다. 기본 실행은 `--phase-order target-major`로 0% phase를 먼저 돌리고, phase 사이에는 `--gap-seconds 1.0`을 둔다. 그래도 `write_0` baseline이 높게 보이면 `--gap-seconds 2`로 재실행하고 `trace.csv`의 `power_w`, `power_instant_w`, `power_average_w`를 같이 확인한다.
+A100/H100처럼 power API의 update/window가 길게 보이는 환경에서는 이전 active phase가 다음 0% phase의 `avg_power_w`에 일부 남을 수 있다. 기본 실행은 `--phase-order target-major`로 0% phase를 먼저 돌리고, phase 사이에는 `--gap-seconds 1.0`을 둔다. 그래도 `write_0` baseline이 높게 보이면 `--gap-seconds 2`로 재실행하고 `trace.csv`의 `power_w`, `power_instant_w`, `power_average_w`를 같이 확인한다.
 
 장점:
 

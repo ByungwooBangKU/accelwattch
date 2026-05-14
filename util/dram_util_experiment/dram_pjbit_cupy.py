@@ -1567,7 +1567,7 @@ def main() -> None:
         },
         "notes": [
             "NVML power is GPU/board plus associated circuitry, not DRAM-rail-only.",
-            "On GA10x Ampere, nvmlDeviceGetPowerUsage is documented as a 1-second average.",
+            "NVML power readings may be internally averaged/windowed depending on GPU and driver.",
             "Trace CSV includes NVML_FI_DEV_POWER_INSTANT/AVERAGE when supported.",
             "Use slope_avg_power_vs_bw as the preferred marginal board-energy estimate.",
             "target=0 phases transfer no bytes, so pJ/bit is undefined for those phases.",
