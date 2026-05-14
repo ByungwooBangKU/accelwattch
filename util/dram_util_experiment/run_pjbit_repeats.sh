@@ -28,8 +28,9 @@ Options:
   --ncu-profile          Run separate Nsight Compute DRAM/L2 validation after repeats
   --ncu-only             Skip NVML repeats and run only Nsight Compute validation
   --ncu-bin PATH         Nsight Compute CLI. Default: ncu
-  --ncu-set NAME         NCU metric set when --ncu-metrics is empty. Default: full
-  --ncu-metrics CSV      Explicit NCU metric list. Overrides --ncu-set.
+  --ncu-set NAME         NCU metric set fallback when auto metrics are unavailable. Default: full
+  --ncu-metrics CSV      Explicit metric CSV, "auto", or empty for --ncu-set. Default: auto
+  --ncu-repeat-scope S   rep1, all, or once. Default: rep1
   --ncu-phase-seconds N  NCU validation phase length. Default: 1
   --ncu-buf-bytes N      NCU validation buffer bytes. Default: same as --buf-bytes
   --ncu-launch-skip N    Kernel launches to skip before profiling. Default: 2
@@ -57,7 +58,8 @@ NCU_PROFILE="0"
 NCU_ONLY="0"
 NCU_BIN="${NCU_BIN:-ncu}"
 NCU_SET="full"
-NCU_METRICS=""
+NCU_METRICS="auto"
+NCU_REPEAT_SCOPE="rep1"
 NCU_PHASE_SECONDS="1"
 NCU_BUF_BYTES=""
 NCU_LAUNCH_SKIP="2"
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
         --ncu-bin) NCU_BIN="$2"; shift 2 ;;
         --ncu-set) NCU_SET="$2"; shift 2 ;;
         --ncu-metrics) NCU_METRICS="$2"; shift 2 ;;
+        --ncu-repeat-scope) NCU_REPEAT_SCOPE="$2"; shift 2 ;;
         --ncu-phase-seconds) NCU_PHASE_SECONDS="$2"; shift 2 ;;
         --ncu-buf-bytes) NCU_BUF_BYTES="$2"; shift 2 ;;
         --ncu-launch-skip) NCU_LAUNCH_SKIP="$2"; shift 2 ;;
@@ -223,7 +226,15 @@ echo "[info] targets=${TARGETS[*]}"
 echo "[info] write-patterns=${WRITE_PATTERNS[*]}"
 echo "[info] phase-seconds=$PHASE_SECONDS idle-seconds=$IDLE_SECONDS window-ms=$WINDOW_MS poll-hz=$POLL_HZ gap-seconds=$GAP_SECONDS phase-order=$PHASE_ORDER"
 if [[ "$NCU_PROFILE" == "1" ]]; then
-    echo "[info] ncu-profile=on ncu-only=$NCU_ONLY ncu-bin=$NCU_BIN ncu-set=$NCU_SET ncu-phase-seconds=$NCU_PHASE_SECONDS"
+    case "$NCU_REPEAT_SCOPE" in
+        rep1|first|all|once) ;;
+        *)
+            echo "[err] unknown --ncu-repeat-scope: $NCU_REPEAT_SCOPE" >&2
+            echo "      valid values: rep1, first, all, once" >&2
+            exit 2
+            ;;
+    esac
+    echo "[info] ncu-profile=on ncu-only=$NCU_ONLY ncu-repeat-scope=$NCU_REPEAT_SCOPE ncu-bin=$NCU_BIN ncu-metrics=${NCU_METRICS:-set:$NCU_SET} ncu-phase-seconds=$NCU_PHASE_SECONDS"
 fi
 if [[ -n "$BUF_BYTES" ]]; then
     echo "[info] buf-bytes=$BUF_BYTES"
@@ -278,29 +289,48 @@ fi
 
 if [[ "$NCU_PROFILE" == "1" ]]; then
     NCU_EFFECTIVE_BUF_BYTES="${NCU_BUF_BYTES:-$BUF_BYTES}"
-    ncu_cmd=(
-        "$NCU_RUNNER"
-        --device "$DEVICE"
-        --tag "${TAG}_ncu"
-        --modes "read write"
-        --write-patterns "$WRITE_PATTERNS_STR"
-        --phase-seconds "$NCU_PHASE_SECONDS"
-        --out-dir "$OUT_DIR"
-        --flat-out-dir
-        --ncu-bin "$NCU_BIN"
-        --ncu-set "$NCU_SET"
-        --launch-skip "$NCU_LAUNCH_SKIP"
-        --launch-count "$NCU_LAUNCH_COUNT"
-        --window-ms "$WINDOW_MS"
-    )
-    if [[ -n "$NCU_METRICS" ]]; then
-        ncu_cmd+=(--ncu-metrics "$NCU_METRICS")
-    fi
-    if [[ -n "$NCU_EFFECTIVE_BUF_BYTES" ]]; then
-        ncu_cmd+=(--buf-bytes "$NCU_EFFECTIVE_BUF_BYTES")
-    fi
+    run_ncu_validation() {
+        local ncu_tag="$1"
+        local ncu_cmd=(
+            "$NCU_RUNNER"
+            --device "$DEVICE"
+            --tag "$ncu_tag"
+            --modes "read write"
+            --write-patterns "$WRITE_PATTERNS_STR"
+            --phase-seconds "$NCU_PHASE_SECONDS"
+            --out-dir "$OUT_DIR"
+            --flat-out-dir
+            --ncu-bin "$NCU_BIN"
+            --ncu-set "$NCU_SET"
+            --ncu-metrics "$NCU_METRICS"
+            --launch-skip "$NCU_LAUNCH_SKIP"
+            --launch-count "$NCU_LAUNCH_COUNT"
+            --window-ms "$WINDOW_MS"
+        )
+        if [[ -n "$NCU_EFFECTIVE_BUF_BYTES" ]]; then
+            ncu_cmd+=(--buf-bytes "$NCU_EFFECTIVE_BUF_BYTES")
+        fi
 
-    echo
-    echo "[ncu] DRAM/L2 counter validation"
-    "${ncu_cmd[@]}"
+        echo
+        echo "[ncu] DRAM/L2 counter validation tag=$ncu_tag"
+        "${ncu_cmd[@]}"
+    }
+
+    if [[ "$NCU_ONLY" == "1" ]]; then
+        run_ncu_validation "${TAG}_ncu"
+    else
+        case "$NCU_REPEAT_SCOPE" in
+            rep1|first)
+                run_ncu_validation "${TAG}_rep1_ncu"
+                ;;
+            once)
+                run_ncu_validation "${TAG}_ncu"
+                ;;
+            all)
+                for rep in $(seq 1 "$REPEATS"); do
+                    run_ncu_validation "${TAG}_rep${rep}_ncu"
+                done
+                ;;
+        esac
+    fi
 fi

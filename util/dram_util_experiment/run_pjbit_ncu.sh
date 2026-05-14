@@ -25,8 +25,8 @@ Options:
   --window-ms N          Duty window. Default: 200
   --out-dir DIR          Output directory. Default: reports
   --ncu-bin PATH         Nsight Compute CLI. Default: ncu
-  --ncu-set NAME         NCU metric set when --ncu-metrics is empty. Default: full
-  --ncu-metrics CSV      Explicit NCU metric list. Overrides --ncu-set.
+  --ncu-set NAME         NCU metric set fallback when auto metrics are unavailable. Default: full
+  --ncu-metrics CSV      Explicit metric CSV, "auto", or empty for --ncu-set. Default: auto
   --launch-skip N        Kernel launches to skip before profiling. Default: 2
   --launch-count N       Kernel launches to profile. Default: 1
   --flat-out-dir         Write directly to --out-dir instead of DIR/<gpu>_<YYYYMMDDHHMM>
@@ -46,7 +46,7 @@ WINDOW_MS="200"
 OUT_DIR="reports"
 NCU_BIN="${NCU_BIN:-ncu}"
 NCU_SET="full"
-NCU_METRICS=""
+NCU_METRICS="auto"
 LAUNCH_SKIP="2"
 LAUNCH_COUNT="1"
 FLAT_OUT_DIR="0"
@@ -95,6 +95,51 @@ gpu_name_for_output() {
     printf '%s' "$name"
 }
 
+join_by_comma() {
+    local IFS=,
+    printf '%s' "$*"
+}
+
+metric_is_available() {
+    local metric="$1"
+    local escaped="${metric//./\\.}"
+    grep -Eq "(^|[[:space:]])${escaped}([[:space:]]|$)" <<< "$AVAILABLE_NCU_METRICS"
+}
+
+select_auto_ncu_metrics() {
+    local selected=()
+    local candidates=(
+        gpu__time_duration.sum
+        dram__bytes_read.sum
+        dram__bytes_write.sum
+        dram__sectors_read.sum
+        dram__sectors_write.sum
+        dram__throughput.avg.pct_of_peak_sustained_elapsed
+        lts__t_sectors_op_read.sum
+        lts__t_sectors_op_write.sum
+        lts__t_sectors_srcunit_tex_op_read.sum
+        lts__t_sectors_srcunit_tex_op_write.sum
+        lts__t_sectors_srcunit_l1_op_read.sum
+        lts__t_sectors_srcunit_l1_op_write.sum
+        l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum
+        l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum
+        sm__inst_executed_pipe_lsu.sum
+        sm__inst_executed_pipe_fma.sum
+        sm__inst_executed_pipe_tensor.sum
+        smsp__inst_executed_pipe_lsu.sum
+        smsp__inst_executed_pipe_fma.sum
+        smsp__inst_executed_pipe_tensor.sum
+    )
+
+    for metric in "${candidates[@]}"; do
+        if metric_is_available "$metric"; then
+            selected+=("$metric")
+        fi
+    done
+
+    join_by_comma "${selected[@]}"
+}
+
 if ! command -v "$NCU_BIN" >/dev/null 2>&1; then
     echo "[err] Nsight Compute CLI not found: $NCU_BIN" >&2
     echo "      Install Nsight Compute or pass --ncu-bin /path/to/ncu." >&2
@@ -136,6 +181,24 @@ echo "[info] output=$OUT_DIR"
 read -r -a MODES <<< "$MODES_STR"
 read -r -a WRITE_PATTERNS <<< "$WRITE_PATTERNS_STR"
 
+NCU_METRIC_ARGS=()
+if [[ "$NCU_METRICS" == "auto" ]]; then
+    AVAILABLE_NCU_METRICS="$("$NCU_BIN" --query-metrics 2>/dev/null || true)"
+    AUTO_NCU_METRICS="$(select_auto_ncu_metrics)"
+    if [[ -n "$AUTO_NCU_METRICS" ]]; then
+        NCU_METRIC_ARGS=(--metrics "$AUTO_NCU_METRICS")
+        echo "[info] ncu-metrics=auto selected compact metric list"
+        echo "[info] ncu-metrics=$AUTO_NCU_METRICS"
+    else
+        NCU_METRIC_ARGS=(--set "$NCU_SET")
+        echo "[warn] ncu-metrics=auto found no known metrics; falling back to --set $NCU_SET" >&2
+    fi
+elif [[ -n "$NCU_METRICS" ]]; then
+    NCU_METRIC_ARGS=(--metrics "$NCU_METRICS")
+else
+    NCU_METRIC_ARGS=(--set "$NCU_SET")
+fi
+
 common_app_args=(
     --device "$DEVICE"
     --targets "$TARGET"
@@ -169,11 +232,7 @@ run_one() {
         --force-overwrite
         --export "$report_base"
     )
-    if [[ -n "$NCU_METRICS" ]]; then
-        ncu_args+=(--metrics "$NCU_METRICS")
-    else
-        ncu_args+=(--set "$NCU_SET")
-    fi
+    ncu_args+=("${NCU_METRIC_ARGS[@]}")
 
     echo
     echo "[ncu] $label kernel=$kernel report=${report_base}.ncu-rep"
