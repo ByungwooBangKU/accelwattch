@@ -35,6 +35,7 @@ Options:
   --ncu-launch-skip N    Kernel launches to skip before profiling. Default: 2
   --ncu-launch-count N   Kernel launches to profile. Default: 1
   --out-dir DIR          Default: reports
+  --flat-out-dir         Write directly to --out-dir instead of DIR/<gpu>_<YYYYMMDDHHMM>
   --                    Extra args passed to run_pjbit_cupy.sh
 EOF
 }
@@ -62,6 +63,7 @@ NCU_BUF_BYTES=""
 NCU_LAUNCH_SKIP="2"
 NCU_LAUNCH_COUNT="1"
 OUT_DIR="reports"
+FLAT_OUT_DIR="0"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -89,11 +91,31 @@ while [[ $# -gt 0 ]]; do
         --ncu-launch-skip) NCU_LAUNCH_SKIP="$2"; shift 2 ;;
         --ncu-launch-count) NCU_LAUNCH_COUNT="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
+        --flat-out-dir) FLAT_OUT_DIR="1"; shift ;;
         --help|-h) usage; exit 0 ;;
         --) shift; EXTRA_ARGS+=("$@"); break ;;
         *) echo "[err] unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+sanitize_name() {
+    local value="$1"
+    local safe
+    safe="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    safe="${safe//[^a-z0-9]/_}"
+    while [[ "$safe" == _* ]]; do safe="${safe#_}"; done
+    while [[ "$safe" == *_ ]]; do safe="${safe%_}"; done
+    printf '%s' "${safe:-gpu}"
+}
+
+gpu_name_for_output() {
+    local name
+    name="$(nvidia-smi --id="$DEVICE" --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$name" ]]; then
+        name="gpu${DEVICE}"
+    fi
+    printf '%s' "$name"
+}
 
 if [[ "$PROFILE" == "auto" ]]; then
     GPU_NAME="$(nvidia-smi --id="$DEVICE" --query-gpu=name --format=csv,noheader 2>/dev/null || true)"
@@ -163,6 +185,12 @@ if [[ -z "$PY" ]]; then
     exit 1
 fi
 
+BASE_OUT_DIR="$OUT_DIR"
+GPU_OUTPUT_NAME="$(gpu_name_for_output)"
+if [[ "$FLAT_OUT_DIR" != "1" ]]; then
+    RUN_STAMP="$(date +%Y%m%d%H%M)"
+    OUT_DIR="$BASE_OUT_DIR/$(sanitize_name "$GPU_OUTPUT_NAME")_${RUN_STAMP}"
+fi
 mkdir -p "$OUT_DIR"
 
 CUPY_RUNNER="$SCRIPT_DIR/run_pjbit_cupy.sh"
@@ -179,6 +207,7 @@ if [[ "$NCU_PROFILE" == "1" && ! -x "$NCU_RUNNER" ]]; then
 fi
 
 echo "[info] profile=$PROFILE device=$DEVICE repeats=$REPEATS tag=$TAG"
+echo "[info] output=$OUT_DIR"
 echo "[info] targets=${TARGETS[*]}"
 echo "[info] write-patterns=${WRITE_PATTERNS[*]}"
 echo "[info] phase-seconds=$PHASE_SECONDS idle-seconds=$IDLE_SECONDS window-ms=$WINDOW_MS poll-hz=$POLL_HZ gap-seconds=$GAP_SECONDS phase-order=$PHASE_ORDER"
@@ -207,6 +236,7 @@ if [[ "$NCU_ONLY" != "1" ]]; then
             --phase-order "$PHASE_ORDER"
             --window-ms "$WINDOW_MS"
             --out-dir "$OUT_DIR"
+            --flat-output
             --tag "$REP_TAG"
         )
         if [[ -n "$BUF_BYTES" ]]; then
@@ -245,6 +275,7 @@ if [[ "$NCU_PROFILE" == "1" ]]; then
         --write-patterns "$WRITE_PATTERNS_STR"
         --phase-seconds "$NCU_PHASE_SECONDS"
         --out-dir "$OUT_DIR"
+        --flat-out-dir
         --ncu-bin "$NCU_BIN"
         --ncu-set "$NCU_SET"
         --launch-skip "$NCU_LAUNCH_SKIP"

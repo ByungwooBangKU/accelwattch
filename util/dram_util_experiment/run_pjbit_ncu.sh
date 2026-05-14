@@ -29,6 +29,7 @@ Options:
   --ncu-metrics CSV      Explicit NCU metric list. Overrides --ncu-set.
   --launch-skip N        Kernel launches to skip before profiling. Default: 2
   --launch-count N       Kernel launches to profile. Default: 1
+  --flat-out-dir         Write directly to --out-dir instead of DIR/<gpu>_<YYYYMMDDHHMM>
   --                    Extra args passed to run_pjbit_cupy.sh
 EOF
 }
@@ -48,6 +49,7 @@ NCU_SET="full"
 NCU_METRICS=""
 LAUNCH_SKIP="2"
 LAUNCH_COUNT="1"
+FLAT_OUT_DIR="0"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -67,11 +69,31 @@ while [[ $# -gt 0 ]]; do
         --ncu-metrics) NCU_METRICS="$2"; shift 2 ;;
         --launch-skip) LAUNCH_SKIP="$2"; shift 2 ;;
         --launch-count) LAUNCH_COUNT="$2"; shift 2 ;;
+        --flat-out-dir) FLAT_OUT_DIR="1"; shift ;;
         --help|-h) usage; exit 0 ;;
         --) shift; EXTRA_ARGS+=("$@"); break ;;
         *) echo "[err] unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+sanitize_name() {
+    local value="$1"
+    local safe
+    safe="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    safe="${safe//[^a-z0-9]/_}"
+    while [[ "$safe" == _* ]]; do safe="${safe#_}"; done
+    while [[ "$safe" == *_ ]]; do safe="${safe%_}"; done
+    printf '%s' "${safe:-gpu}"
+}
+
+gpu_name_for_output() {
+    local name
+    name="$(nvidia-smi --id="$DEVICE" --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$name" ]]; then
+        name="gpu${DEVICE}"
+    fi
+    printf '%s' "$name"
+}
 
 if ! command -v "$NCU_BIN" >/dev/null 2>&1; then
     echo "[err] Nsight Compute CLI not found: $NCU_BIN" >&2
@@ -103,7 +125,14 @@ print_ncu_permission_help() {
 EOF
 }
 
+BASE_OUT_DIR="$OUT_DIR"
+GPU_OUTPUT_NAME="$(gpu_name_for_output)"
+if [[ "$FLAT_OUT_DIR" != "1" ]]; then
+    RUN_STAMP="$(date +%Y%m%d%H%M)"
+    OUT_DIR="$BASE_OUT_DIR/$(sanitize_name "$GPU_OUTPUT_NAME")_${RUN_STAMP}"
+fi
 mkdir -p "$OUT_DIR"
+echo "[info] output=$OUT_DIR"
 read -r -a MODES <<< "$MODES_STR"
 read -r -a WRITE_PATTERNS <<< "$WRITE_PATTERNS_STR"
 
@@ -119,6 +148,7 @@ common_app_args=(
     --cal-passes 1
     --cal-repeats 1
     --out-dir "$OUT_DIR"
+    --flat-output
 )
 if [[ -n "$BUF_BYTES" ]]; then
     common_app_args+=(--buf-bytes "$BUF_BYTES")

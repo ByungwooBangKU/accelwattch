@@ -322,6 +322,20 @@ def fmt_or_na(v: float, fmt: str = ".3f") -> str:
     return format(v, fmt) if math.isfinite(v) else "n/a"
 
 
+def safe_name(value: str) -> str:
+    safe = "".join(c.lower() if c.isalnum() else "_" for c in value).strip("_")
+    return safe or "gpu"
+
+
+def resolve_output_dir(
+        base_out_dir: str, gpu_name: str, flat_output: bool, stamp_minute: str) -> Path:
+    out_dir = Path(base_out_dir)
+    if not flat_output:
+        out_dir = out_dir / f"{safe_name(gpu_name)}_{stamp_minute}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
 def workload_label(mode: str, pattern: str) -> str:
     return "read" if mode == "read" else f"write:{pattern}"
 
@@ -1358,6 +1372,8 @@ def main() -> None:
                     help="default: max(1 GiB, 64 * L2)")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--out-dir", default="reports")
+    ap.add_argument("--flat-output", action="store_true",
+                    help="write files directly to --out-dir instead of reports/<gpu>_<YYYYMMDDHHMM>")
     ap.add_argument("--tag", default="")
     ap.add_argument("--cal-passes", type=int, default=8)
     ap.add_argument("--cal-repeats", type=int, default=3)
@@ -1383,6 +1399,7 @@ def main() -> None:
     cp.cuda.Device(args.device).use()
     props = cp.cuda.runtime.getDeviceProperties(args.device)
     gpu_name = prop(props, "name")
+    run_stamp_minute = time.strftime("%Y%m%d%H%M")
     sm_count = props["multiProcessorCount"]
     l2_bytes = props["l2CacheSize"]
     if args.buf_bytes is None:
@@ -1513,11 +1530,11 @@ def main() -> None:
         metadata_after = nvml_snapshot(handle)
         pynvml.nvmlShutdown()
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = resolve_output_dir(
+        args.out_dir, gpu_name, args.flat_output, run_stamp_minute)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     suffix = f"_{args.tag}" if args.tag else ""
-    safe_gpu = "".join(c.lower() if c.isalnum() else "_" for c in gpu_name).strip("_")
+    safe_gpu = safe_name(gpu_name)
     stem = f"pjbit_cupy_{safe_gpu}_{stamp}{suffix}"
     summary_csv, trace_csv = save_csvs(out_dir, stem, results, poller.samples)
     analysis_rows = make_analysis_rows(results)
