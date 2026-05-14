@@ -24,6 +24,7 @@ Nsight profiling 도구는 12장 부록에 요약한다.
 | `dram_pjbit_cupy.py` | read/write pJ/bit 주 실험 스크립트 |
 | `run_pjbit_cupy.sh` | pJ/bit 실험 launcher. 필요한 Python 환경 자동 탐색 |
 | `run_pjbit_repeats.sh` | 3회 반복 실험, per-run 이미지, 반복 요약 CSV/PNG 자동 생성 |
+| `run_pjbit_ncu.sh` | Nsight Compute 기반 L2/DRAM counter validation 자동 실행 |
 | `summarize_pjbit_repeats.py` | 여러 `*_analysis.csv` 반복 run 평균/표준편차 요약 및 요약 PNG 생성 |
 | `dram_util_cupy.py` | legacy read-utilization 계단 실험 |
 | `run_cupy.sh` | legacy CuPy read-utilization launcher |
@@ -222,6 +223,20 @@ nvidia-smi
 | `--cal-passes` | `8` | calibration에서 repeat당 streaming pass 수 | calibration bandwidth가 흔들릴 때만 늘린다. 보통 기본값 유지. |
 | `--cal-repeats` | `3` | calibration 반복 횟수 | peak 추정이 흔들리면 늘린다. 보통 기본값 유지. |
 
+`run_pjbit_repeats.sh` 전용 Nsight Compute 옵션:
+
+| 파라미터 | 기본값 | 의미 | 권장/주의 |
+|---|---:|---|---|
+| `--ncu-profile` | off | 반복 power 실험 뒤 별도 Nsight Compute validation run 실행 | pJ/bit 계산 run과 분리해서 실행한다. |
+| `--ncu-only` | off | 반복 power 실험을 건너뛰고 NCU validation만 실행 | 이미 power run을 끝낸 뒤 counter만 확인할 때 사용한다. |
+| `--ncu-bin` | `ncu` | Nsight Compute CLI 경로 | PATH에 없으면 `/path/to/ncu`를 직접 준다. |
+| `--ncu-set` | `full` | `--ncu-metrics`가 비어 있을 때 사용할 NCU metric set | metric 이름 호환성을 우선해 기본은 `full`이다. |
+| `--ncu-metrics` | 빈 문자열 | 명시적 metric CSV | 예: `dram__bytes_read.sum,dram__bytes_write.sum`. NCU 버전별 이름 차이에 주의한다. |
+| `--ncu-phase-seconds` | `1` | NCU validation phase 길이 | NCU는 kernel replay 때문에 느리므로 짧게 둔다. |
+| `--ncu-buf-bytes` | `--buf-bytes`와 동일 | NCU validation buffer 크기 | 8 GiB profiling이 너무 느리면 작게 줄여 counter sanity만 확인한다. |
+| `--ncu-launch-skip` | `2` | profiling 전 skip할 kernel launch 수 | 각 validation process의 warmup 1회와 calibration 1회를 건너뛰기 위한 기본값이다. |
+| `--ncu-launch-count` | `1` | profiling할 kernel launch 수 | read/write를 각각 별도 process로 실행하므로 기본 1회면 충분하다. |
+
 파라미터 선택 순서:
 
 1. `--device`와 `--modes`로 측정 GPU와 read/write 범위를 정한다.
@@ -267,6 +282,29 @@ cd util/dram_util_experiment
 ./run_pjbit_repeats.sh --profile h100-8gib --device 0
 ```
 
+A100 8 GiB + NCU validation:
+
+```bash
+cd util/dram_util_experiment
+./run_pjbit_repeats.sh \
+  --profile a100-8gib \
+  --device 0 \
+  --tag a100_with_ncu \
+  --gap-seconds 2 \
+  --ncu-profile
+```
+
+이미 power 반복 실험을 끝냈고 NCU counter만 확인할 때:
+
+```bash
+cd util/dram_util_experiment
+./run_pjbit_repeats.sh \
+  --profile a100-8gib \
+  --device 0 \
+  --tag a100_ncu_only \
+  --ncu-only
+```
+
 자동 GPU profile 선택:
 
 ```bash
@@ -279,6 +317,7 @@ cd util/dram_util_experiment
 ```text
 reports/<tag>_repeat_summary.csv
 reports/<tag>_repeat_summary.png
+reports/<tag>_ncu_*.ncu-rep        # --ncu-profile 또는 --ncu-only 사용 시
 reports/*<tag>_rep1*.png
 reports/*<tag>_rep2*.png
 reports/*<tag>_rep3*.png
@@ -715,30 +754,45 @@ nsys-ui reports/nsys_cupy_*.nsys-rep
 
 NVML power 실험과 Nsight Compute profiling은 목적이 다르므로 분리해서 실행한다. Nsight Compute는 replay/profiling overhead가 크고, power trace를 왜곡할 수 있다. 이 단계의 목적은 pJ/bit를 다시 재는 것이 아니라 cache/DRAM traffic이 의도대로 발생했는지 확인하는 것이다.
 
+자동 실행:
+
+```bash
+./run_pjbit_repeats.sh \
+  --profile a100-8gib \
+  --device 0 \
+  --tag a100_with_ncu \
+  --ncu-profile
+```
+
+이 명령은 정상 NVML power 반복 실험을 끝낸 뒤 별도 validation process로 `run_pjbit_ncu.sh`를 호출한다. `read`와 각 write pattern을 따로 실행하며, 기본적으로 각 process에서 warmup 1회와 calibration 1회를 `--ncu-launch-skip 2`로 건너뛰고 active 100% phase의 첫 kernel launch 1개만 profile한다. 결과는 `reports/<tag>_ncu_*.ncu-rep`에 저장된다.
+
+NCU만 따로 실행:
+
+```bash
+./run_pjbit_ncu.sh \
+  --device 0 \
+  --tag a100_ncu \
+  --modes "read write" \
+  --write-patterns "random toggle" \
+  --buf-bytes 8589934592
+```
+
 먼저 metric 이름을 현재 Nsight Compute 버전에서 확인한다.
 
 ```bash
 ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hit|l1tex__.*hit"
 ```
 
-버전에 따라 metric 이름이 다르다. 아래 명령은 예시이며, 실제 환경에서는 `--query-metrics` 결과에 맞게 조정한다.
+버전에 따라 metric 이름이 다르다. 자동화 wrapper의 기본값은 metric 이름 호환성을 위해 `--set full`을 쓴다. 더 짧게 돌리고 싶으면 `--ncu-metrics`로 필요한 metric만 지정한다.
 
 ```bash
-ncu \
-  --target-processes all \
-  --kernel-name regex:stream_write \
-  --launch-skip 2 \
-  --launch-count 1 \
-  --metrics l2_tex_write_hit_rate,l2_tex_write_transactions,dram__bytes_write.sum,dram__bytes_read.sum \
-  ./run_pjbit_cupy.sh \
-    --modes write \
-    --write-patterns random \
-    --targets 100 \
-    --buf-bytes 8589934592 \
-    --phase-seconds 2 \
-    --cal-passes 1 \
-    --cal-repeats 1 \
-    --tag ncu_write_random
+./run_pjbit_ncu.sh \
+  --device 0 \
+  --tag a100_ncu_metrics \
+  --modes write \
+  --write-patterns random \
+  --buf-bytes 8589934592 \
+  --ncu-metrics dram__bytes_write.sum,dram__bytes_read.sum
 ```
 
 확인 기준:
