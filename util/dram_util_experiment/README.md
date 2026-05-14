@@ -232,7 +232,7 @@ nvidia-smi
 | `--ncu-only` | off | 반복 power 실험을 건너뛰고 NCU validation만 실행 | 이미 power run을 끝낸 뒤 counter만 확인할 때 사용한다. GPU performance counter 권한이 필요하다. |
 | `--ncu-bin` | `ncu` | Nsight Compute CLI 경로 | PATH에 없으면 `/path/to/ncu`를 직접 준다. |
 | `--ncu-set` | `full` | auto metric 선택 실패 또는 `--ncu-metrics ""`일 때 사용할 fallback metric set | `full`은 호환성은 좋지만 파일이 매우 커질 수 있다. |
-| `--ncu-metrics` | `auto` | compact metric 자동 선택, 명시적 metric CSV, 또는 빈 문자열 | 기본 `auto`는 DRAM/L2/SM 관련 후보 metric만 골라 `.ncu-rep` 크기를 줄인다. |
+| `--ncu-metrics` | `auto` | compact metric 자동 선택, 명시적 metric CSV, 또는 `set` | 기본 `auto`는 DRAM/L2/SM 관련 후보 metric만 골라 `.ncu-rep` 크기를 줄인다. `set`은 `--ncu-set`을 강제로 사용한다. |
 | `--ncu-repeat-scope` | `rep1` | `--ncu-profile`에서 NCU validation을 어느 repeat에 붙일지 선택 | `rep1`: 대표 1회만 생성. `all`: repeat마다 생성. `once`: 기존처럼 `<tag>_ncu` 1회 생성. |
 | `--ncu-phase-seconds` | `1` | NCU validation phase 길이 | NCU는 kernel replay 때문에 느리므로 짧게 둔다. |
 | `--ncu-buf-bytes` | `--buf-bytes`와 동일 | NCU validation buffer 크기 | 8 GiB profiling이 너무 느리면 작게 줄여 counter sanity만 확인한다. |
@@ -821,7 +821,7 @@ NCU만 따로 실행:
 ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hit|l1tex__.*hit"
 ```
 
-버전에 따라 metric 이름이 다르다. 자동화 wrapper의 기본값은 `--ncu-metrics auto`이며, 현재 NCU 버전에서 사용 가능한 DRAM/L2/SM 후보 metric만 골라 file size를 줄인다. 자동 선택이 실패하면 `--ncu-set full`로 fallback한다. 더 엄격하게 제어하려면 `--ncu-metrics`로 필요한 metric만 직접 지정한다.
+버전에 따라 metric 이름이 다르다. 자동화 wrapper의 기본값은 `--ncu-metrics auto`이며, 현재 NCU 버전에서 사용 가능한 DRAM/L2/SM 후보 metric만 골라 file size를 줄인다. 자동 선택이 실패하면 `--ncu-set full`로 fallback한다. 더 엄격하게 제어하려면 `--ncu-metrics`로 필요한 metric만 직접 지정한다. NCU 전체 set을 강제로 쓰려면 `--ncu-metrics set --ncu-set full`을 쓴다.
 
 ```bash
 ./run_pjbit_ncu.sh \

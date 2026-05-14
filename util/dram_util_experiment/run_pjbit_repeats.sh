@@ -29,7 +29,7 @@ Options:
   --ncu-only             Skip NVML repeats and run only Nsight Compute validation
   --ncu-bin PATH         Nsight Compute CLI. Default: ncu
   --ncu-set NAME         NCU metric set fallback when auto metrics are unavailable. Default: full
-  --ncu-metrics CSV      Explicit metric CSV, "auto", or empty for --ncu-set. Default: auto
+  --ncu-metrics CSV      Explicit metric CSV, "auto", or "set" for --ncu-set. Default: auto
   --ncu-repeat-scope S   rep1, all, or once. Default: rep1
   --ncu-phase-seconds N  NCU validation phase length. Default: 1
   --ncu-buf-bytes N      NCU validation buffer bytes. Default: same as --buf-bytes

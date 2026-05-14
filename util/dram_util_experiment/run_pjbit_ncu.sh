@@ -26,7 +26,7 @@ Options:
   --out-dir DIR          Output directory. Default: reports
   --ncu-bin PATH         Nsight Compute CLI. Default: ncu
   --ncu-set NAME         NCU metric set fallback when auto metrics are unavailable. Default: full
-  --ncu-metrics CSV      Explicit metric CSV, "auto", or empty for --ncu-set. Default: auto
+  --ncu-metrics CSV      Explicit metric CSV, "auto", or "set" for --ncu-set. Default: auto
   --launch-skip N        Kernel launches to skip before profiling. Default: 2
   --launch-count N       Kernel launches to profile. Default: 1
   --flat-out-dir         Write directly to --out-dir instead of DIR/<gpu>_<YYYYMMDDHHMM>
@@ -193,6 +193,8 @@ if [[ "$NCU_METRICS" == "auto" ]]; then
         NCU_METRIC_ARGS=(--set "$NCU_SET")
         echo "[warn] ncu-metrics=auto found no known metrics; falling back to --set $NCU_SET" >&2
     fi
+elif [[ "$NCU_METRICS" == "set" ]]; then
+    NCU_METRIC_ARGS=(--set "$NCU_SET")
 elif [[ -n "$NCU_METRICS" ]]; then
     NCU_METRIC_ARGS=(--metrics "$NCU_METRICS")
 else
