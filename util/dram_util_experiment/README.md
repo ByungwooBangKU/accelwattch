@@ -211,7 +211,7 @@ nvidia-smi
 | `--write-patterns` | `const` | write phase에서 쓸 data pattern 목록 | H100 write 해석은 `zero const address random toggle` sweep 권장. read mode에는 영향 없다. |
 | `--targets` | `100` | calibration peak 대비 duty target percent | 보고용 sweep은 `0 25 50 75 100`. 단, 해석은 label보다 실제 `bandwidth_gbps` 기준으로 한다. |
 | `--phase-seconds` | `5` | 각 mode/target phase를 유지하는 시간 | smoke test는 5초도 가능하지만 보고용은 최소 20초 권장. |
-| `--idle-seconds` | `5` | active phase 전 pre-idle baseline 측정 시간 | 보고용은 15초 이상 권장. `summary.csv`의 dynamic pJ/bit baseline으로 쓰인다. |
+| `--idle-seconds` | `5` | active phase 전 pre-idle baseline 측정 시간 | 보고용은 15초 이상 권장. `summary.csv`의 dynamic pJ/bit baseline으로 쓰인다. 이 단계는 지정한 초 수 정도만 걸리는 것이 정상이다. |
 | `--window-ms` | `20` | 25/50/75% duty-cycle 제어 window | 큰 buffer에서는 너무 작으면 pass quantization warning 발생. A100/H100 보고용은 `100` 또는 `200` 권장. |
 | `--poll-hz` | `100` | NVML power/state polling 요청 주파수 | 기본 100 Hz는 10 ms마다 NVML 값을 요청한다는 뜻이다. 실제 sensor update/window는 더 느릴 수 있다. |
 | `--gap-seconds` | `1.0` | phase 사이 idle gap | phase 경계의 sensor averaging/transition bleed-through를 줄이기 위한 구간이다. H100에서 0% power가 의심스러우면 `2`로 늘려 비교한다. |

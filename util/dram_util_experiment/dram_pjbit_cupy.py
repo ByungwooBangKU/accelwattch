@@ -451,12 +451,16 @@ def nvml_snapshot(handle) -> dict:
 
 
 def measure_idle_power(handle, seconds: float, hz: int) -> tuple[float, float, int]:
-    poller = PowerPoller(handle, hz)
-    poller.start()
-    poller.set_phase("idle_baseline")
-    time.sleep(seconds)
-    poller.stop()
-    ps = [s.power_w for s in poller.samples if s.power_w >= 0]
+    interval_s = 1.0 / hz
+    deadline = time.perf_counter() + max(0.0, seconds)
+    ps: list[float] = []
+    while time.perf_counter() < deadline:
+        power_mw = nvml_or(pynvml.nvmlDeviceGetPowerUsage, handle, default=-1)
+        if power_mw >= 0:
+            ps.append(power_mw / 1000.0)
+        sleep_s = min(interval_s, max(0.0, deadline - time.perf_counter()))
+        if sleep_s > 0:
+            time.sleep(sleep_s)
     if not ps:
         return 0.0, 0.0, 0
     return statistics.fmean(ps), statistics.pstdev(ps) if len(ps) > 1 else 0.0, len(ps)
@@ -1463,10 +1467,10 @@ def main() -> None:
     warn_window_quantization(args.targets, args.window_ms, calibration)
 
     cp.cuda.runtime.deviceSynchronize()
-    print(f"[idle] measuring baseline for {args.idle_seconds:.1f} s ...")
+    print(f"[idle] measuring baseline for {args.idle_seconds:.1f} s ...", flush=True)
     idle_power_w, idle_std_w, idle_n = measure_idle_power(
         handle, args.idle_seconds, args.poll_hz)
-    print(f"[idle] {idle_power_w:.2f} W ± {idle_std_w:.2f} W  n={idle_n}")
+    print(f"[idle] {idle_power_w:.2f} W ± {idle_std_w:.2f} W  n={idle_n}", flush=True)
 
     poller = PowerPoller(handle, args.poll_hz)
     results: list[PhaseResult] = []
