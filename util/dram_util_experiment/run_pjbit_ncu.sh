@@ -24,7 +24,7 @@ Options:
   --idle-seconds N       Idle baseline length inside validation process. Default: 0.2
   --window-ms N          Duty window. Default: 200
   --out-dir DIR          Output directory. Default: reports
-  --ncu-bin PATH         Nsight Compute CLI. Default: ncu
+  --ncu-bin PATH         Nsight Compute CLI. Default: ncu; common install paths are auto-detected
   --ncu-set NAME         NCU metric set fallback when auto metrics are unavailable. Default: full
   --ncu-metrics CSV      Explicit metric CSV, "auto", or "set" for --ncu-set. Default: auto
   --launch-skip N        Kernel launches to skip before profiling. Default: 2
@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
         --idle-seconds) IDLE_SECONDS="$2"; shift 2 ;;
         --window-ms) WINDOW_MS="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
-        --ncu-bin) NCU_BIN="$2"; shift 2 ;;
+        --ncu-bin|--ncubin|--ncu_bin) NCU_BIN="$2"; shift 2 ;;
         --ncu-set) NCU_SET="$2"; shift 2 ;;
         --ncu-metrics) NCU_METRICS="$2"; shift 2 ;;
         --launch-skip) LAUNCH_SKIP="$2"; shift 2 ;;
@@ -93,6 +93,47 @@ gpu_name_for_output() {
         name="gpu${DEVICE}"
     fi
     printf '%s' "$name"
+}
+
+resolve_ncu_bin() {
+    local requested="$1"
+    local found
+
+    if [[ "$requested" == */* ]]; then
+        if [[ -x "$requested" ]]; then
+            printf '%s' "$requested"
+            return 0
+        fi
+        return 1
+    fi
+
+    found="$(command -v "$requested" 2>/dev/null || true)"
+    if [[ -n "$found" && -x "$found" ]]; then
+        printf '%s' "$found"
+        return 0
+    fi
+
+    local old_nullglob
+    old_nullglob="$(shopt -p nullglob || true)"
+    shopt -s nullglob
+    local candidates=(
+        /usr/local/cuda/bin/ncu
+        /usr/local/cuda-*/bin/ncu
+        /usr/local/cuda/nsight-compute-*/ncu
+        /usr/local/cuda-*/nsight-compute-*/ncu
+        /opt/nvidia/nsight-compute/ncu
+        /opt/nvidia/nsight-compute/*/ncu
+        /usr/local/NVIDIA-Nsight-Compute*/ncu
+    )
+    eval "$old_nullglob"
+
+    for found in "${candidates[@]}"; do
+        if [[ -x "$found" ]]; then
+            printf '%s' "$found"
+            return 0
+        fi
+    done
+    return 1
 }
 
 join_by_comma() {
@@ -140,11 +181,20 @@ select_auto_ncu_metrics() {
     join_by_comma "${selected[@]}"
 }
 
-if ! command -v "$NCU_BIN" >/dev/null 2>&1; then
+if ! RESOLVED_NCU_BIN="$(resolve_ncu_bin "$NCU_BIN")"; then
     echo "[err] Nsight Compute CLI not found: $NCU_BIN" >&2
     echo "      Install Nsight Compute or pass --ncu-bin /path/to/ncu." >&2
+    echo "      The option name is --ncu-bin; --ncubin is also accepted as an alias." >&2
+    echo "      Useful checks:" >&2
+    echo "        command -v ncu" >&2
+    echo "        find /usr/local /opt -name ncu -type f 2>/dev/null" >&2
+    echo "      To skip NCU and run only NVML power/pJ-bit repeats, remove --ncu-profile." >&2
     exit 1
 fi
+if [[ "$RESOLVED_NCU_BIN" != "$NCU_BIN" ]]; then
+    echo "[info] ncu-bin auto-detected: $RESOLVED_NCU_BIN"
+fi
+NCU_BIN="$RESOLVED_NCU_BIN"
 
 CUPY_RUNNER="$SCRIPT_DIR/run_pjbit_cupy.sh"
 if [[ ! -x "$CUPY_RUNNER" ]]; then

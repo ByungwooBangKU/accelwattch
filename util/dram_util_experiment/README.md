@@ -230,7 +230,7 @@ nvidia-smi
 |---|---:|---|---|
 | `--ncu-profile` | off | 반복 power 실험 뒤 별도 Nsight Compute validation run 실행 | pJ/bit 계산 run과 분리해서 실행한다. GPU performance counter 권한이 필요하다. |
 | `--ncu-only` | off | 반복 power 실험을 건너뛰고 NCU validation만 실행 | 이미 power run을 끝낸 뒤 counter만 확인할 때 사용한다. GPU performance counter 권한이 필요하다. |
-| `--ncu-bin` | `ncu` | Nsight Compute CLI 경로 | PATH에 없으면 `/path/to/ncu`를 직접 준다. |
+| `--ncu-bin` | `ncu` | Nsight Compute CLI 경로 | PATH에 없으면 흔한 CUDA/Nsight Compute 설치 경로를 자동 탐색한다. 그래도 못 찾으면 `/path/to/ncu`를 직접 준다. `--ncubin` alias도 허용된다. |
 | `--ncu-set` | `full` | auto metric 선택 실패 또는 `--ncu-metrics ""`일 때 사용할 fallback metric set | `full`은 호환성은 좋지만 파일이 매우 커질 수 있다. |
 | `--ncu-metrics` | `auto` | compact metric 자동 선택, 명시적 metric CSV, 또는 `set` | 기본 `auto`는 DRAM/L2/SM 관련 후보 metric만 골라 `.ncu-rep` 크기를 줄인다. `set`은 `--ncu-set`을 강제로 사용한다. |
 | `--ncu-repeat-scope` | `rep1` | `--ncu-profile`에서 NCU validation을 어느 repeat에 붙일지 선택 | `rep1`: 대표 1회만 생성. `all`: repeat마다 생성. `once`: 기존처럼 `<tag>_ncu` 1회 생성. |
@@ -815,6 +815,26 @@ NCU만 따로 실행:
   --buf-bytes 8589934592
 ```
 
+`ncu`가 PATH에 없으면 먼저 위치를 찾는다.
+
+```bash
+command -v ncu
+find /usr/local /opt -name ncu -type f 2>/dev/null
+```
+
+찾은 경로를 명시한다.
+
+```bash
+./run_pjbit_repeats.sh \
+  --profile a100-8gib \
+  --device 0 \
+  --tag a100_with_ncu \
+  --ncu-profile \
+  --ncu-bin /path/to/ncu
+```
+
+NCU validation이 당장 필요 없으면 `--ncu-profile`을 빼고 NVML power/pJ-bit 실험만 먼저 진행한다.
+
 먼저 metric 이름을 현재 Nsight Compute 버전에서 확인한다.
 
 ```bash
@@ -838,6 +858,7 @@ ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hi
 1. 단기 해결: Linux에서 NCU wrapper를 관리자 권한으로 실행한다.
 
    ```bash
+   sudo -v
    sudo env PY="$VIRTUAL_ENV/bin/python" ./run_pjbit_ncu.sh \
      --device 0 \
      --tag a100_ncu \
@@ -847,6 +868,7 @@ ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hi
    ```
 
    venv가 아니라 conda를 쓴다면 `PY="$CONDA_PREFIX/bin/python"`을 사용한다. 절대경로를 알고 있으면 `PY=/path/to/env/bin/python`처럼 직접 지정해도 된다.
+   `Time out waiting for input`이 나오면 보통 `sudo` password prompt가 비대화형 실행에서 막힌 것이다. 먼저 터미널에서 `sudo -v`로 인증을 끝내고, 그 다음 실험 명령을 실행한다.
 
 2. 장기 해결: 관리자에게 non-admin performance counter 접근을 열어달라고 요청한다. NVIDIA 문서 기준으로 `/etc/modprobe.d/*.conf`에 다음 설정을 추가한 뒤 reboot 또는 NVIDIA kernel module reload가 필요하다.
 

@@ -27,7 +27,7 @@ Options:
   --phase-order NAME     target-major or workload-major. Default: target-major
   --ncu-profile          Run separate Nsight Compute DRAM/L2 validation after repeats
   --ncu-only             Skip NVML repeats and run only Nsight Compute validation
-  --ncu-bin PATH         Nsight Compute CLI. Default: ncu
+  --ncu-bin PATH         Nsight Compute CLI. Default: ncu; common install paths are auto-detected
   --ncu-set NAME         NCU metric set fallback when auto metrics are unavailable. Default: full
   --ncu-metrics CSV      Explicit metric CSV, "auto", or "set" for --ncu-set. Default: auto
   --ncu-repeat-scope S   rep1, all, or once. Default: rep1
@@ -85,7 +85,7 @@ while [[ $# -gt 0 ]]; do
         --phase-order) PHASE_ORDER="$2"; shift 2 ;;
         --ncu-profile) NCU_PROFILE="1"; shift ;;
         --ncu-only) NCU_ONLY="1"; NCU_PROFILE="1"; shift ;;
-        --ncu-bin) NCU_BIN="$2"; shift 2 ;;
+        --ncu-bin|--ncubin|--ncu_bin) NCU_BIN="$2"; shift 2 ;;
         --ncu-set) NCU_SET="$2"; shift 2 ;;
         --ncu-metrics) NCU_METRICS="$2"; shift 2 ;;
         --ncu-repeat-scope) NCU_REPEAT_SCOPE="$2"; shift 2 ;;
