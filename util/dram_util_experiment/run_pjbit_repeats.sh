@@ -172,18 +172,29 @@ read -r -a WRITE_PATTERNS <<< "$WRITE_PATTERNS_STR"
 PY="${PY:-}"
 if [[ -z "$PY" ]]; then
     for cand in \
+        "${VIRTUAL_ENV:-}/bin/python" \
+        "${CONDA_PREFIX:-}/bin/python" \
         /home/bang001/miniforge3/envs/ssc21env/bin/python \
         "$(command -v python3 || true)"; do
-        if [[ -x "$cand" ]] && "$cand" -c "import matplotlib" >/dev/null 2>&1; then
+        if [[ -x "$cand" ]] && "$cand" -c "import cupy, nvtx, pynvml, matplotlib" >/dev/null 2>&1; then
             PY="$cand"
             break
         fi
     done
-fi
-if [[ -z "$PY" ]]; then
-    echo "[err] Python with matplotlib is required for repeat summary plotting" >&2
+elif ! "$PY" -c "import cupy, nvtx, pynvml, matplotlib" >/dev/null 2>&1; then
+    echo "[err] PY does not provide cupy/nvtx/pynvml/matplotlib: $PY" >&2
+    echo "      If using sudo with a venv, run:" >&2
+    echo "      sudo env PY=/path/to/venv/bin/python ./run_pjbit_repeats.sh ..." >&2
     exit 1
 fi
+if [[ -z "$PY" ]]; then
+    echo "[err] Python with cupy/nvtx/pynvml/matplotlib is required" >&2
+    echo "      sudo resets venv/conda PATH in many environments." >&2
+    echo "      Prefer running NVML power repeats without sudo, or pass the venv explicitly:" >&2
+    echo "      sudo env PY=/path/to/venv/bin/python ./run_pjbit_repeats.sh ..." >&2
+    exit 1
+fi
+export PY
 
 BASE_OUT_DIR="$OUT_DIR"
 GPU_OUTPUT_NAME="$(gpu_name_for_output)"

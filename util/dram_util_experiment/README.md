@@ -296,6 +296,18 @@ cd util/dram_util_experiment
   --ncu-profile
 ```
 
+NCU 권한 때문에 `sudo`가 필요하고 venv/conda에 패키지를 설치했다면 `PY`를 명시한다. `sudo`는 venv의 `PATH`를 지울 수 있다.
+
+```bash
+cd util/dram_util_experiment
+sudo env PY="$VIRTUAL_ENV/bin/python" ./run_pjbit_repeats.sh \
+  --profile a100-8gib \
+  --device 0 \
+  --tag a100_with_ncu \
+  --gap-seconds 2 \
+  --ncu-profile
+```
+
 이미 power 반복 실험을 끝냈고 NCU counter만 확인할 때:
 
 ```bash
@@ -812,13 +824,15 @@ ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hi
 1. 단기 해결: Linux에서 NCU wrapper를 관리자 권한으로 실행한다.
 
    ```bash
-   sudo ./run_pjbit_ncu.sh \
+   sudo env PY="$VIRTUAL_ENV/bin/python" ./run_pjbit_ncu.sh \
      --device 0 \
      --tag a100_ncu \
      --modes "read write" \
      --write-patterns "random toggle" \
      --buf-bytes 8589934592
    ```
+
+   venv가 아니라 conda를 쓴다면 `PY="$CONDA_PREFIX/bin/python"`을 사용한다. 절대경로를 알고 있으면 `PY=/path/to/env/bin/python`처럼 직접 지정해도 된다.
 
 2. 장기 해결: 관리자에게 non-admin performance counter 접근을 열어달라고 요청한다. NVIDIA 문서 기준으로 `/etc/modprobe.d/*.conf`에 다음 설정을 추가한 뒤 reboot 또는 NVIDIA kernel module reload가 필요하다.
 
