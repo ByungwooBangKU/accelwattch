@@ -85,6 +85,24 @@ if [[ ! -x "$CUPY_RUNNER" ]]; then
     exit 1
 fi
 
+print_ncu_permission_help() {
+    cat >&2 <<'EOF'
+[err] Nsight Compute cannot access NVIDIA GPU performance counters.
+      This is ERR_NVGPUCTRPERM, not a DRAM experiment failure.
+
+      The NVML power experiment still works without --ncu-profile.
+      To run NCU validation on Linux, use one of:
+        1. Run the NCU wrapper with elevated privilege, e.g. sudo ./run_pjbit_ncu.sh ...
+        2. Ask the system administrator to enable non-admin performance counters:
+           options nvidia NVreg_RestrictProfilingToAdminUsers=0
+           in a /etc/modprobe.d/*.conf file, then reboot or reload the NVIDIA module.
+        3. In a container, enable counters on the host and launch the container with SYS_ADMIN capability.
+
+      Check the current driver setting:
+        grep RmProfilingAdminOnly /proc/driver/nvidia/params
+EOF
+}
+
 mkdir -p "$OUT_DIR"
 read -r -a MODES <<< "$MODES_STR"
 read -r -a WRITE_PATTERNS <<< "$WRITE_PATTERNS_STR"
@@ -129,7 +147,24 @@ run_one() {
 
     echo
     echo "[ncu] $label kernel=$kernel report=${report_base}.ncu-rep"
-    "${ncu_args[@]}" "$CUPY_RUNNER" "${common_app_args[@]}" "$@" "${EXTRA_ARGS[@]}"
+    local log_file="${report_base}.ncu.log"
+
+    set +e
+    "${ncu_args[@]}" "$CUPY_RUNNER" "${common_app_args[@]}" "$@" "${EXTRA_ARGS[@]}" 2>&1 | tee "$log_file"
+    local ncu_status=${PIPESTATUS[0]}
+    set -e
+
+    if grep -q "ERR_NVGPUCTRPERM" "$log_file"; then
+        print_ncu_permission_help
+        echo "[err] NCU log: $log_file" >&2
+        exit 13
+    fi
+
+    if [[ "$ncu_status" -ne 0 ]]; then
+        echo "[err] Nsight Compute failed with exit code $ncu_status" >&2
+        echo "[err] NCU log: $log_file" >&2
+        exit "$ncu_status"
+    fi
 }
 
 for mode in "${MODES[@]}"; do

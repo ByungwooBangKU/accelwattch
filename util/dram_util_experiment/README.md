@@ -227,8 +227,8 @@ nvidia-smi
 
 | 파라미터 | 기본값 | 의미 | 권장/주의 |
 |---|---:|---|---|
-| `--ncu-profile` | off | 반복 power 실험 뒤 별도 Nsight Compute validation run 실행 | pJ/bit 계산 run과 분리해서 실행한다. |
-| `--ncu-only` | off | 반복 power 실험을 건너뛰고 NCU validation만 실행 | 이미 power run을 끝낸 뒤 counter만 확인할 때 사용한다. |
+| `--ncu-profile` | off | 반복 power 실험 뒤 별도 Nsight Compute validation run 실행 | pJ/bit 계산 run과 분리해서 실행한다. GPU performance counter 권한이 필요하다. |
+| `--ncu-only` | off | 반복 power 실험을 건너뛰고 NCU validation만 실행 | 이미 power run을 끝낸 뒤 counter만 확인할 때 사용한다. GPU performance counter 권한이 필요하다. |
 | `--ncu-bin` | `ncu` | Nsight Compute CLI 경로 | PATH에 없으면 `/path/to/ncu`를 직접 준다. |
 | `--ncu-set` | `full` | `--ncu-metrics`가 비어 있을 때 사용할 NCU metric set | metric 이름 호환성을 우선해 기본은 `full`이다. |
 | `--ncu-metrics` | 빈 문자열 | 명시적 metric CSV | 예: `dram__bytes_read.sum,dram__bytes_write.sum`. NCU 버전별 이름 차이에 주의한다. |
@@ -754,6 +754,14 @@ nsys-ui reports/nsys_cupy_*.nsys-rep
 
 NVML power 실험과 Nsight Compute profiling은 목적이 다르므로 분리해서 실행한다. Nsight Compute는 replay/profiling overhead가 크고, power trace를 왜곡할 수 있다. 이 단계의 목적은 pJ/bit를 다시 재는 것이 아니라 cache/DRAM traffic이 의도대로 발생했는지 확인하는 것이다.
 
+주의: NCU validation은 NVIDIA GPU performance counter 권한이 필요하다. 권한이 없으면 다음 오류가 나온다.
+
+```text
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device
+```
+
+이 오류는 NVML power 실험 실패가 아니라 NCU counter 접근 권한 문제다. `--ncu-profile`을 빼면 pJ/bit power 실험은 계속 실행할 수 있다.
+
 자동 실행:
 
 ```bash
@@ -794,6 +802,38 @@ ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hi
   --buf-bytes 8589934592 \
   --ncu-metrics dram__bytes_write.sum,dram__bytes_read.sum
 ```
+
+권한 오류 해결 방법:
+
+1. 단기 해결: Linux에서 NCU wrapper를 관리자 권한으로 실행한다.
+
+   ```bash
+   sudo ./run_pjbit_ncu.sh \
+     --device 0 \
+     --tag a100_ncu \
+     --modes "read write" \
+     --write-patterns "random toggle" \
+     --buf-bytes 8589934592
+   ```
+
+2. 장기 해결: 관리자에게 non-admin performance counter 접근을 열어달라고 요청한다. NVIDIA 문서 기준으로 `/etc/modprobe.d/*.conf`에 다음 설정을 추가한 뒤 reboot 또는 NVIDIA kernel module reload가 필요하다.
+
+   ```text
+   options nvidia NVreg_RestrictProfilingToAdminUsers=0
+   ```
+
+   현재 제한 여부는 다음으로 확인한다.
+
+   ```bash
+   grep RmProfilingAdminOnly /proc/driver/nvidia/params
+   ```
+
+   `RmProfilingAdminOnly: 1`이면 일반 사용자 counter 접근이 제한된 상태이고, `0`이면 일반 사용자도 접근 가능하다.
+
+3. container에서 실행 중이면 host에서 counter 접근이 열려 있어야 하고, container도 `--cap-add=SYS_ADMIN` 같은 권한으로 실행되어야 한다.
+
+   참고: NVIDIA ERR_NVGPUCTRPERM 안내 문서
+   <https://developer.nvidia.com/ERR_NVGPUCTRPERM>
 
 확인 기준:
 
