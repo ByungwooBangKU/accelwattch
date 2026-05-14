@@ -1349,7 +1349,7 @@ def main() -> None:
                     help="idle gap between phases to reduce transition bleed-through")
     ap.add_argument("--phase-order", choices=["target-major", "workload-major"],
                     default="target-major",
-                    help="target-major runs all 0% phases before active phases")
+                    help="target-major runs all zero-target phases before active phases")
     ap.add_argument("--buf-bytes", type=int, default=None,
                     help="default: max(1 GiB, 64 * L2)")
     ap.add_argument("--device", type=int, default=0)
