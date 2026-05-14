@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run read/write DRAM bandwidth + marginal-power pJ/bit measurement.
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 PY="${PY:-}"
 if [[ -z "$PY" ]]; then

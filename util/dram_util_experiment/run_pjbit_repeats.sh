@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run repeated DRAM pJ/bit experiments and generate repeat summary CSV/PNG.
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 usage() {
     cat <<'EOF'
@@ -137,6 +138,13 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+CUPY_RUNNER="$SCRIPT_DIR/run_pjbit_cupy.sh"
+if [[ ! -x "$CUPY_RUNNER" ]]; then
+    echo "[err] missing executable: $CUPY_RUNNER" >&2
+    echo "      Check that util/dram_util_experiment/run_pjbit_cupy.sh exists after git pull." >&2
+    exit 1
+fi
+
 echo "[info] profile=$PROFILE device=$DEVICE repeats=$REPEATS tag=$TAG"
 echo "[info] targets=${TARGETS[*]}"
 echo "[info] write-patterns=${WRITE_PATTERNS[*]}"
@@ -150,7 +158,7 @@ fi
 for rep in $(seq 1 "$REPEATS"); do
     REP_TAG="${TAG}_rep${rep}"
     cmd=(
-        ./run_pjbit_cupy.sh
+        "$CUPY_RUNNER"
         --device "$DEVICE"
         --modes read write
         --write-patterns "${WRITE_PATTERNS[@]}"
