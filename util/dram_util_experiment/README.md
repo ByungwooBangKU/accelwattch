@@ -116,7 +116,7 @@ pJ_per_bit = E_dyn / (transferred_bytes x 8) x 1e12
 ### 3.3 read/write 커널
 
 1. `read`: 큰 `float4` buffer를 `__ldcg`로 streaming load한다. L1은 우회하고 L2/DRAM 경로에 pressure를 준다.
-2. `write`: 같은 크기의 `float4` buffer 전체를 streaming store한다. byte 수는 user-data write byte 기준이다.
+2. `write`: 같은 크기의 `float4` buffer 전체를 streaming store한다. byte 수는 user-data write byte 기준이다. 현재 구현은 일반 global store를 사용하며, L2를 완전히 bypass한다고 가정하지 않는다.
 3. read와 write를 같이 측정할 때는 buffer를 분리한다. write pattern calibration이 read buffer 내용을 덮어 read energy를 오염시키지 않게 하기 위해서다.
 4. working set은 L2보다 훨씬 크게 잡기 때문에 DRAM-dominant access가 되도록 설계한다.
 
@@ -149,15 +149,23 @@ Native CUDA 버전은 직접 arch를 맞춰야 한다.
 3. H100은 L2 50 MiB라 기본 buffer가 약 3.125 GiB다.
 4. H100/A100은 page/channel/bank interleaving과 controller 정책 확인을 위해 8 GiB sensitivity run을 추가하는 것이 좋다.
 
-### 4.3 L1/L2 hit-rate에 대한 기대
+### 4.3 L1/L2 hit-rate와 eviction 가정
 
-설계상 L1/L2 hit-rate는 거의 0에 가까워야 한다.
+설계상 read 재사용 hit-rate는 거의 0에 가까워야 한다.
 
 1. read는 `__ldcg`로 L1을 우회한다.
 2. working set이 L2보다 훨씬 크다.
 3. RTX 3090 sweep에서 1/2/4/8 GiB로 buffer를 키워도 slope 결과가 크게 바뀌지 않았다.
 
-단, 이 환경에서는 `ncu`/`nsys`가 없어 hit-rate counter를 직접 확인하지 못했다. H100/A100 최종 실험에서는 Nsight Compute로 `l1tex`/`lts` hit-rate를 cross-check하는 것이 좋다.
+하지만 이것은 직접 counter 검증이 아니라 설계상 기대다. 특히 write는 read와 다르게 해석해야 한다.
+
+1. NVIDIA GPU에서 일반 CUDA 옵션으로 global memory access가 L2를 완전히 bypass하도록 L2를 disable하는 방법은 없다.
+2. PTX의 `ld/st` cache operator는 성능 hint다. `st.cg`, `st.cs`, `st.wt`, `L1::no_allocate`, eviction priority hint는 cache 동작을 유도할 수 있지만 L2 bypass를 보장하는 장치가 아니다.
+3. `st.cs`는 streaming store에 적합한 evict-first 성격의 후보지만, 현재 `dram_pjbit_cupy.py`에는 별도 `--write-cache-op` 옵션을 구현하지 않았다.
+4. `discard.global.L2`는 L2 line을 무효화할 수 있지만 data를 writeback하지 않고 해당 address range의 값이 undetermined가 될 수 있다. 따라서 pJ/bit write 실험의 정상 store traffic 검증 수단으로 쓰면 안 된다.
+5. write의 L2 hit-rate는 read miss-rate와 같은 의미가 아니다. store는 L2에 hit/allocate된 뒤 dirty line이 나중에 DRAM으로 writeback될 수 있으므로, 최종 검증은 `dram write bytes` 또는 memory-controller write counter가 기대 byte와 맞는지를 봐야 한다.
+
+따라서 최종 H100/A100 보고에서는 Nsight Compute로 L2/DRAM counter를 별도 validation run에서 확인하는 것이 좋다. NVML power 측정 run과 Nsight Compute profiling run은 분리한다.
 
 ## 5. 환경 준비
 
@@ -441,6 +449,20 @@ H100에서 read pJ/bit이 write보다 크게 보이면 곧바로 HBM device의 r
 3. `random`/`toggle` write가 read와 같거나 더 높아지면 기존 `const` write pattern이 H100 write energy를 낮게 보이게 만든 것이다.
 4. 최종 보고는 `read`, `write:const`, `write:random`, `write:toggle`를 분리해서 적고, DRAM rail-only 값이 아니라 board/module marginal pJ/bit임을 명시한다.
 
+### 8.6 write cache/eviction 해석
+
+write phase가 DRAM traffic을 만들었는지 판단할 때는 "L2 hit-rate가 0인가?"만 보면 부족하다. store는 L2에 hit하거나 allocate된 뒤 나중에 dirty writeback으로 DRAM traffic을 만들 수 있기 때문이다.
+
+권장 판단 순서:
+
+1. `bandwidth_gbps`가 calibration peak의 85-95% 수준으로 나오고 target별 bandwidth가 잘 분리되는지 확인한다.
+2. `--buf-bytes`가 L2보다 충분히 큰지 확인한다. RTX 3090 1 GiB는 약 `170 x L2`, H100 8 GiB는 약 `160 x L2` 수준이다.
+3. `zero/const/address/random/toggle` pattern별 slope가 다르게 나오는지 확인한다. pattern 차이가 보이면 단순 cache-hit artifact보다 data pattern/toggle/compression sensitivity가 섞였을 가능성이 크다.
+4. Nsight Compute가 있으면 별도 profiling run에서 DRAM write byte counter를 확인한다. 기대값은 대략 `launches x passes_per_launch x buf_bytes`와 같은 order여야 한다.
+5. Nsight Compute가 없으면 현재 문서의 값은 "DRAM-dominant로 설계된 board-level marginal estimate"로 표현하고, cache eviction 직접 검증은 미완료라고 명시한다.
+
+현재 구현은 L2를 끄거나 완전히 bypass하지 않는다. 따라서 read/write 비교에서 가장 안전한 문장은 "large working set과 pattern sweep으로 DRAM-dominant write를 유도했고, Nsight Compute counter가 있으면 이를 별도로 검증한다"이다.
+
 ## 9. `--window-ms` warning 해석
 
 ### 9.1 warning의 의미
@@ -612,7 +634,45 @@ nsys-ui reports/nsys_cupy_*.nsys-rep
 2. GPU metrics: DRAM read throughput 계단.
 3. CUDA kernels: `stream_read` duty-cycle 패턴.
 
-### 12.3 Native CUDA + Nsight Systems
+### 12.3 Nsight Compute L2/DRAM counter validation
+
+NVML power 실험과 Nsight Compute profiling은 목적이 다르므로 분리해서 실행한다. Nsight Compute는 replay/profiling overhead가 크고, power trace를 왜곡할 수 있다. 이 단계의 목적은 pJ/bit를 다시 재는 것이 아니라 cache/DRAM traffic이 의도대로 발생했는지 확인하는 것이다.
+
+먼저 metric 이름을 현재 Nsight Compute 버전에서 확인한다.
+
+```bash
+ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hit|l1tex__.*hit"
+```
+
+버전에 따라 metric 이름이 다르다. 아래 명령은 예시이며, 실제 환경에서는 `--query-metrics` 결과에 맞게 조정한다.
+
+```bash
+ncu \
+  --target-processes all \
+  --kernel-name regex:stream_write \
+  --launch-skip 2 \
+  --launch-count 1 \
+  --metrics l2_tex_write_hit_rate,l2_tex_write_transactions,dram__bytes_write.sum,dram__bytes_read.sum \
+  ./run_pjbit_cupy.sh \
+    --modes write \
+    --write-patterns random \
+    --targets 100 \
+    --buf-bytes 8589934592 \
+    --phase-seconds 2 \
+    --cal-passes 1 \
+    --cal-repeats 1 \
+    --tag ncu_write_random
+```
+
+확인 기준:
+
+1. write phase에서 DRAM write byte counter가 기대 byte 수와 같은 order인지 본다.
+2. write phase에서 예상 밖의 DRAM read byte가 큰지 확인한다. write allocate, compression, ECC, controller 동작 때문에 0이 아닐 수 있지만, read-dominant이면 해석에 주의한다.
+3. L2 hit-rate는 보조 지표로만 본다. store hit가 곧 DRAM write 부재를 뜻하지 않는다.
+4. read phase는 `stream_read`를 같은 방식으로 profiling해서 DRAM read byte와 L2 hit/miss 지표를 확인한다.
+5. 이 validation 결과가 없으면 보고서에 "Nsight Compute L2/DRAM counter cross-check는 미수행"이라고 명시한다.
+
+### 12.4 Native CUDA + Nsight Systems
 
 요구사항:
 
@@ -673,7 +733,15 @@ GPU별 기대 범위:
 1. GPUWattch는 microbenchmark와 실제 hardware power 측정을 함께 써서 GPU power model을 검증했다. 이 실험도 제어된 DRAM traffic과 board-level power marginal slope를 사용한다.
 2. AccelWattch는 modern GPU의 cycle-level power와 constant/static power까지 모델링한다. 본 측정값은 DRAM rail-only 상수가 아니라 memory-subsystem calibration anchor로 쓰는 것이 안전하다.
 3. MEMPower는 GPU memory access energy가 data pattern, core, channel에 따라 달라질 수 있음을 보인다. data-dependent energy가 필요하면 all-zero, all-one, random, high-toggle pattern을 별도 run으로 추가한다.
-4. Nsight Systems GPU Metrics가 있으면 DRAM read/write throughput counter로 NVML 기반 effective BW와 계단 모양을 cross-check한다.
+4. NVIDIA PTX 문서 기준 cache operator는 memory consistency를 바꾸지 않는 performance hint다. `st.cs`/evict-first 계열은 streaming write에 유용한 후보지만 L2 bypass 보장은 아니다.
+5. `discard.global.L2`는 L2 line을 invalidate할 수 있지만 writeback 없이 데이터를 버리므로 정상 write energy 측정에는 적합하지 않다.
+6. Nsight Compute GPU Metrics가 있으면 DRAM read/write byte counter와 L2 counter로 NVML 기반 effective BW와 계단 모양을 cross-check한다.
+
+참고 문서:
+
+1. PTX ISA cache operators: <https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#cache-operators>
+2. PTX ISA `discard.global.L2`: <https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-discard>
+3. Nsight Compute metric aliases: <https://archive.docs.nvidia.com/nsight-compute/2022.1/NsightComputeCli/index.html>
 
 ## 15. 최종 보고 체크리스트
 
@@ -686,6 +754,8 @@ GPU별 기대 범위:
 7. 3회 이상 반복 평균/표준편차를 냈는가?
 8. H100이면 `power_instant_w`/`power_average_w` field를 cross-validation했는가?
 9. H100 write 해석이면 `zero/const/address/random/toggle` pattern 결과를 분리해서 봤는가?
-10. `*_quality_checks.csv`에 warning이 있으면 해석에서 반영했는가?
-11. `100%-0%`와 slope 값을 구분해서 보고했는가?
-12. DRAM rail-only가 아니라 GPU/board marginal dynamic pJ/bit임을 명시했는가?
+10. Nsight Compute가 있으면 DRAM read/write byte counter와 L2 counter를 별도 validation run으로 확인했는가?
+11. Nsight Compute validation을 하지 못했다면 cache eviction 직접 검증이 미완료임을 보고서에 적었는가?
+12. `*_quality_checks.csv`에 warning이 있으면 해석에서 반영했는가?
+13. `100%-0%`와 slope 값을 구분해서 보고했는가?
+14. DRAM rail-only가 아니라 GPU/board marginal dynamic pJ/bit임을 명시했는가?
