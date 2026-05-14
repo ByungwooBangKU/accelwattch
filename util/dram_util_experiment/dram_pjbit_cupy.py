@@ -67,6 +67,52 @@ with warnings.catch_warnings():
 
 
 KERNEL_CODE = r"""
+__device__ __forceinline__
+unsigned int mix32(unsigned int x) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return x;
+}
+
+__device__ __forceinline__
+uint4 write_pattern_value(unsigned long long i, int p, int pattern) {
+    unsigned int lo = (unsigned int)i;
+    unsigned int hi = (unsigned int)(i >> 32);
+    unsigned int seed = lo ^ (hi * 0x9e3779b9U) ^ ((unsigned int)p * 0x85ebca6bU);
+
+    // 0: all-zero.  Strongest compression/toggle-minimum stress case.
+    if (pattern == 0) {
+        return make_uint4(0U, 0U, 0U, 0U);
+    }
+
+    // 1: legacy spatially constant float4, varied only by pass.
+    if (pattern == 1) {
+        float x = (float)((p & 255) + 1);
+        return make_uint4(__float_as_uint(x), __float_as_uint(x + 1.f),
+                          __float_as_uint(x + 2.f), __float_as_uint(x + 3.f));
+    }
+
+    // 2: deterministic address-ramp bits.  Low compute overhead, non-constant data.
+    if (pattern == 2) {
+        unsigned int a = lo ^ (hi * 0x9e3779b9U) ^ ((unsigned int)p * 0x10001U);
+        return make_uint4(a, a + 0x3c6ef372U, a + 0xdaa66d2bU, a + 0x78dde6e4U);
+    }
+
+    // 3: deterministic pseudo-random bits.  High-entropy stress case.
+    if (pattern == 3) {
+        unsigned int a = mix32(seed);
+        unsigned int b = mix32(seed ^ 0x9e3779b9U);
+        unsigned int c = mix32(seed ^ 0x7f4a7c15U);
+        unsigned int d = mix32(seed ^ 0x94d049bbU);
+        return make_uint4(a, b, c, d);
+    }
+
+    // 4: checker/toggle pattern.  Maximizes simple 0/1 bit transitions.
+    unsigned int a = ((lo + (unsigned int)p) & 1U) ? 0xffffffffU : 0U;
+    return make_uint4(a, ~a, a ^ 0xaaaaaaaaU, a ^ 0x55555555U);
+}
+
 extern "C" __global__
 void stream_read(const float4* __restrict__ in,
                  float4* __restrict__ sink,
@@ -86,19 +132,27 @@ void stream_read(const float4* __restrict__ in,
 extern "C" __global__
 void stream_write(float4* __restrict__ out,
                   float4* __restrict__ sink,
-                  unsigned long long n, int passes) {
+                  unsigned long long n, int passes, int pattern) {
     unsigned long long tid    = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    uint4* out_u = reinterpret_cast<uint4*>(out);
     for (int p = 0; p < passes; ++p) {
-        float x = (float)((p & 255) + 1);
-        float4 v = make_float4(x, x + 1.f, x + 2.f, x + 3.f);
         for (unsigned long long i = tid; i < n; i += stride) {
-            out[i] = v;
+            out_u[i] = write_pattern_value(i, p, pattern);
         }
     }
     if (n == 0) sink[0] = make_float4(0.f, 0.f, 0.f, 0.f);
 }
 """
+
+
+WRITE_PATTERN_CODES = {
+    "zero": 0,
+    "const": 1,
+    "address": 2,
+    "random": 3,
+    "toggle": 4,
+}
 
 
 @dataclass
@@ -122,6 +176,8 @@ class PowerSample:
 @dataclass
 class PhaseResult:
     mode: str
+    pattern: str
+    workload: str
     target_pct: int
     phase: str
     t0_s: float
@@ -261,6 +317,40 @@ def stdev_or_nan(vals: list[float]) -> float:
     return statistics.pstdev(vals) if len(vals) > 1 else 0.0
 
 
+def workload_label(mode: str, pattern: str) -> str:
+    return "read" if mode == "read" else f"write:{pattern}"
+
+
+def phase_label(mode: str, pattern: str, target: int) -> str:
+    return f"read_{target}" if mode == "read" else f"write_{pattern}_{target}"
+
+
+def workload_color(workload: str) -> str:
+    if workload == "read":
+        return "#2ca02c"
+    palette = {
+        "write:zero": "#4c78a8",
+        "write:const": "#9467bd",
+        "write:address": "#f58518",
+        "write:random": "#e45756",
+        "write:toggle": "#72b7b2",
+    }
+    return palette.get(workload, "#1f77b4")
+
+
+def workload_marker(workload: str) -> str:
+    if workload == "read":
+        return "o"
+    markers = {
+        "write:zero": "s",
+        "write:const": "^",
+        "write:address": "D",
+        "write:random": "X",
+        "write:toggle": "P",
+    }
+    return markers.get(workload, "s")
+
+
 def percentile_or_nan(vals: list[float], pct: float) -> float:
     return float(np.percentile(vals, pct)) if vals else float("nan")
 
@@ -367,17 +457,31 @@ def measure_idle_power(handle, seconds: float, hz: int) -> tuple[float, float, i
     return statistics.fmean(ps), statistics.pstdev(ps) if len(ps) > 1 else 0.0, len(ps)
 
 
-def calibrate_kernel(kernel, stream, blocks: int, threads: int, buf, sink,
-                     n_f4: int, cal_passes: int, repeats: int) -> tuple[float, float]:
+def launch_stream_kernel(mode: str, kernel, stream, blocks: int, threads: int,
+                         buf, sink, n_f4: int, passes: int,
+                         pattern_code: int) -> None:
+    with stream:
+        if mode == "write":
+            kernel((blocks,), (threads,),
+                   (buf, sink, np.uint64(n_f4), np.int32(passes),
+                    np.int32(pattern_code)))
+        else:
+            kernel((blocks,), (threads,),
+                   (buf, sink, np.uint64(n_f4), np.int32(passes)))
+
+
+def calibrate_kernel(mode: str, kernel, stream, blocks: int, threads: int,
+                     buf, sink, n_f4: int, cal_passes: int, repeats: int,
+                     pattern_code: int) -> tuple[float, float]:
     start = cp.cuda.Event()
     end = cp.cuda.Event()
     best_ms_per_pass = float("inf")
     for _ in range(repeats):
-        with stream:
-            start.record(stream=stream)
-            kernel((blocks,), (threads,),
-                   (buf, sink, np.uint64(n_f4), np.int32(cal_passes)))
-            end.record(stream=stream)
+        start.record(stream=stream)
+        launch_stream_kernel(
+            mode, kernel, stream, blocks, threads, buf, sink, n_f4,
+            cal_passes, pattern_code)
+        end.record(stream=stream)
         end.synchronize()
         best_ms_per_pass = min(best_ms_per_pass,
                                cp.cuda.get_elapsed_time(start, end) / cal_passes)
@@ -416,11 +520,14 @@ def warn_window_quantization(targets: list[int], window_ms: float,
                 )
 
 
-def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
+def run_phase(mode: str, pattern: str, target: int, kernel, stream,
+              blocks: int, threads: int,
               buf, sink, n_f4: int, buf_bytes: int, peak_passes_per_s: float,
               phase_seconds: float, window_ms: float, poller: PowerPoller,
               idle_power_w: float) -> PhaseResult:
-    phase = f"{mode}_{target}"
+    workload = workload_label(mode, pattern)
+    phase = phase_label(mode, pattern, target)
+    pattern_code = WRITE_PATTERN_CODES.get(pattern, 0) if mode == "write" else 0
     if target == 0:
         passes = 0
         window_s = 0.0
@@ -441,9 +548,9 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
         else:
             while time.perf_counter() < deadline:
                 w0 = time.perf_counter()
-                with stream:
-                    kernel((blocks,), (threads,),
-                           (buf, sink, np.uint64(n_f4), np.int32(passes)))
+                launch_stream_kernel(
+                    mode, kernel, stream, blocks, threads, buf, sink, n_f4,
+                    passes, pattern_code)
                 stream.synchronize()
                 launches += 1
                 if target < 100:
@@ -470,7 +577,8 @@ def run_phase(mode: str, target: int, kernel, stream, blocks: int, threads: int,
     temp_vals = [s.temp_gpu_c for s in sl if s.temp_gpu_c >= 0]
     pstate_vals = [s.pstate for s in sl if s.pstate >= 0]
     return PhaseResult(
-        mode=mode, target_pct=target, phase=phase, t0_s=t0, t1_s=t1,
+        mode=mode, pattern=pattern, workload=workload,
+        target_pct=target, phase=phase, t0_s=t0, t1_s=t1,
         wall_s=wall_s, launches=launches, passes_per_launch=passes,
         bytes_transferred=bytes_transferred, bandwidth_gbps=bandwidth_gbps,
         total_energy_j=total_energy_j, idle_energy_j=idle_energy_j,
@@ -503,7 +611,7 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
     with open(summary_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "mode", "target_pct", "phase", "wall_s", "launches",
+            "workload", "mode", "pattern", "target_pct", "phase", "wall_s", "launches",
             "passes_per_launch", "bytes_transferred", "bandwidth_gbps",
             "avg_power_w", "dynamic_power_w", "total_energy_j",
             "idle_energy_j", "dynamic_energy_j", "pj_per_bit",
@@ -516,7 +624,8 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
         ])
         for r in results:
             w.writerow([
-                r.mode, r.target_pct, r.phase, f"{r.wall_s:.6f}", r.launches,
+                r.workload, r.mode, r.pattern, r.target_pct, r.phase,
+                f"{r.wall_s:.6f}", r.launches,
                 r.passes_per_launch, r.bytes_transferred,
                 f"{r.bandwidth_gbps:.3f}", f"{r.avg_power_w:.3f}",
                 f"{r.dynamic_power_w:.3f}", f"{r.total_energy_j:.6f}",
@@ -554,7 +663,8 @@ def save_csvs(out_dir: Path, stem: str, results: list[PhaseResult],
 def save_plot(out_dir: Path, stem: str, gpu_name: str, idle_power_w: float,
               results: list[PhaseResult], samples: list[PowerSample]) -> Path:
     png = out_dir / f"{stem}.png"
-    fig, (ax0, ax1, ax2) = plt.subplots(3, 1, figsize=(11, 9), sharex=False)
+    fig_w = max(11, min(18, 0.45 * len(results) + 8))
+    fig, (ax0, ax1, ax2) = plt.subplots(3, 1, figsize=(fig_w, 9), sharex=False)
 
     t = [s.t_s for s in samples if s.power_w >= 0]
     p = [s.power_w for s in samples if s.power_w >= 0]
@@ -563,7 +673,7 @@ def save_plot(out_dir: Path, stem: str, gpu_name: str, idle_power_w: float,
                 label=f"idle baseline {idle_power_w:.1f} W")
     for r in results:
         ax0.axvspan(r.t0_s, r.t1_s, alpha=0.10,
-                    color="#2ca02c" if r.mode == "read" else "#9467bd")
+                    color=workload_color(r.workload))
         ax0.text((r.t0_s + r.t1_s) / 2, max(p) if p else idle_power_w,
                  r.phase, ha="center", va="bottom", fontsize=8, rotation=0)
     ax0.set_ylabel("power (W)")
@@ -573,7 +683,7 @@ def save_plot(out_dir: Path, stem: str, gpu_name: str, idle_power_w: float,
 
     labels = [r.phase for r in results]
     x = np.arange(len(results))
-    colors = ["#2ca02c" if r.mode == "read" else "#9467bd" for r in results]
+    colors = [workload_color(r.workload) for r in results]
     ax1.bar(x, [r.bandwidth_gbps for r in results], color=colors, alpha=0.75)
     ax1.set_ylabel("BW (GB/s)")
     ax1.set_xticks(x, labels, rotation=30, ha="right")
@@ -603,6 +713,18 @@ def ordered_modes(results: list[PhaseResult]) -> list[str]:
     return modes
 
 
+def ordered_workloads(results: list[PhaseResult]) -> list[str]:
+    workloads: list[str] = []
+    for r in results:
+        if r.workload not in workloads:
+            workloads.append(r.workload)
+    return workloads
+
+
+def result_by_workload_target(results: list[PhaseResult]) -> dict[tuple[str, int], PhaseResult]:
+    return {(r.workload, r.target_pct): r for r in results}
+
+
 def linear_fit_power_vs_bw(points: list[tuple[int, float, float]]) -> LinearFit | None:
     if len(points) < 2:
         return None
@@ -630,16 +752,20 @@ def linear_fit_power_vs_bw(points: list[tuple[int, float, float]]) -> LinearFit 
 
 
 def make_analysis_rows(results: list[PhaseResult]) -> list[dict[str, str]]:
-    by = {(r.mode, r.target_pct): r for r in results}
+    by = result_by_workload_target(results)
+    representative = {r.workload: r for r in results}
     rows: list[dict[str, str]] = []
-    for mode in ordered_modes(results):
-        r0 = by.get((mode, 0))
-        r100 = by.get((mode, 100))
+    for workload in ordered_workloads(results):
+        rep = representative[workload]
+        r0 = by.get((workload, 0))
+        r100 = by.get((workload, 100))
         if r0 is not None and r100 is not None and r100.bandwidth_gbps > 0:
             delta_power_w = r100.avg_power_w - r0.avg_power_w
             pj_per_bit = delta_power_w * 1000.0 / (8.0 * r100.bandwidth_gbps)
             rows.append({
-                "mode": mode,
+                "workload": workload,
+                "mode": rep.mode,
+                "pattern": rep.pattern,
                 "method": "100_minus_0_avg_power",
                 "target_points": "0,100",
                 "baseline_power_w": f"{r0.avg_power_w:.6f}",
@@ -654,18 +780,20 @@ def make_analysis_rows(results: list[PhaseResult]) -> list[dict[str, str]]:
                 "note": "phase-local avg_power delta; not DRAM-rail-only",
             })
 
-        targets = sorted(t for m, t in by if m == mode)
+        targets = sorted(t for w, t in by if w == workload)
         for lo_idx, lo in enumerate(targets):
             for hi in targets[lo_idx + 1:]:
-                rlo = by[(mode, lo)]
-                rhi = by[(mode, hi)]
+                rlo = by[(workload, lo)]
+                rhi = by[(workload, hi)]
                 delta_bw = rhi.bandwidth_gbps - rlo.bandwidth_gbps
                 if delta_bw <= 0:
                     continue
                 delta_power_w = rhi.avg_power_w - rlo.avg_power_w
                 pj_per_bit = delta_power_w * 1000.0 / (8.0 * delta_bw)
                 rows.append({
-                    "mode": mode,
+                    "workload": workload,
+                    "mode": rep.mode,
+                    "pattern": rep.pattern,
                     "method": "pair_delta_avg_power",
                     "target_points": f"{hi}-{lo}",
                     "baseline_power_w": f"{rlo.avg_power_w:.6f}",
@@ -682,17 +810,19 @@ def make_analysis_rows(results: list[PhaseResult]) -> list[dict[str, str]]:
 
         slope_targets = (50, 75, 100)
         points = [
-            (t, by[(mode, t)].bandwidth_gbps, by[(mode, t)].avg_power_w)
+            (t, by[(workload, t)].bandwidth_gbps, by[(workload, t)].avg_power_w)
             for t in slope_targets
-            if (mode, t) in by and by[(mode, t)].bandwidth_gbps > 0
+            if (workload, t) in by and by[(workload, t)].bandwidth_gbps > 0
         ]
         fit = linear_fit_power_vs_bw(points)
         if fit is not None:
             max_abs_resid = max(abs(r[3]) for r in fit.residuals)
             rows.append({
-                "mode": mode,
+                "workload": workload,
+                "mode": rep.mode,
+                "pattern": rep.pattern,
                 "method": "slope_avg_power_vs_bw",
-                "target_points": ",".join(str(t) for t in slope_targets if (mode, t) in by),
+                "target_points": ",".join(str(t) for t in slope_targets if (workload, t) in by),
                 "baseline_power_w": "",
                 "active_power_w": "",
                 "delta_power_w": "",
@@ -712,8 +842,9 @@ def save_analysis_csv(out_dir: Path, stem: str, rows: list[dict[str, str]]) -> P
         return None
     path = out_dir / f"{stem}_analysis.csv"
     fields = [
-        "mode", "method", "target_points", "baseline_power_w", "active_power_w",
-        "delta_power_w", "bandwidth_gbps", "slope_w_per_gbps",
+        "workload", "mode", "pattern", "method", "target_points",
+        "baseline_power_w", "active_power_w", "delta_power_w",
+        "bandwidth_gbps", "slope_w_per_gbps",
         "intercept_power_w", "r2", "max_abs_residual_w", "pj_per_bit", "note",
     ]
     with open(path, "w", newline="") as f:
@@ -730,10 +861,13 @@ def save_metadata_json(out_dir: Path, stem: str, metadata: dict) -> Path:
     return path
 
 
-def analysis_value(rows: list[dict[str, str]], mode: str, method: str,
+def analysis_value(rows: list[dict[str, str]], workload: str, method: str,
                    field: str) -> float:
     for row in rows:
-        if row["mode"] == mode and row["method"] == method and row[field]:
+        row_workload = row.get("workload") or (
+            "read" if row.get("mode") == "read" else f"write:{row.get('pattern', '')}"
+        )
+        if row_workload == workload and row["method"] == method and row[field]:
             return float(row[field])
     return float("nan")
 
@@ -747,29 +881,29 @@ def save_analysis_plot(out_dir: Path, stem: str, gpu_name: str,
     png = out_dir / f"{stem}_analysis.png"
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     ax0, ax1, ax2, ax3 = axes.ravel()
-    modes = ordered_modes(results)
-    colors = {"read": "#2ca02c", "write": "#9467bd"}
-    markers = {"read": "o", "write": "s"}
-    by = {(r.mode, r.target_pct): r for r in results}
+    workloads = ordered_workloads(results)
+    by = result_by_workload_target(results)
 
     # Panel 1: average power versus achieved bandwidth, with the 50/75/100 fit.
-    for mode in modes:
-        mode_results = [r for r in results if r.mode == mode and r.bandwidth_gbps > 0]
-        if not mode_results:
+    for workload in workloads:
+        workload_results = [
+            r for r in results if r.workload == workload and r.bandwidth_gbps > 0
+        ]
+        if not workload_results:
             continue
-        c = colors.get(mode, "#1f77b4")
+        c = workload_color(workload)
         ax0.scatter(
-            [r.bandwidth_gbps for r in mode_results],
-            [r.avg_power_w for r in mode_results],
-            color=c, marker=markers.get(mode, "o"), label=f"{mode} phases", zorder=3)
-        for r in mode_results:
+            [r.bandwidth_gbps for r in workload_results],
+            [r.avg_power_w for r in workload_results],
+            color=c, marker=workload_marker(workload), label=f"{workload} phases", zorder=3)
+        for r in workload_results:
             ax0.annotate(str(r.target_pct), (r.bandwidth_gbps, r.avg_power_w),
                          textcoords="offset points", xytext=(4, 4), fontsize=8)
 
         fit_points = [
-            (t, by[(mode, t)].bandwidth_gbps, by[(mode, t)].avg_power_w)
+            (t, by[(workload, t)].bandwidth_gbps, by[(workload, t)].avg_power_w)
             for t in (50, 75, 100)
-            if (mode, t) in by and by[(mode, t)].bandwidth_gbps > 0
+            if (workload, t) in by and by[(workload, t)].bandwidth_gbps > 0
         ]
         fit = linear_fit_power_vs_bw(fit_points)
         if fit is not None:
@@ -778,7 +912,7 @@ def save_analysis_plot(out_dir: Path, stem: str, gpu_name: str,
             ys = fit.slope_w_per_gbps * xs + fit.intercept_power_w
             pj = fit.slope_w_per_gbps * 1000.0 / 8.0
             ax0.plot(xs, ys, color=c, lw=1.6,
-                     label=f"{mode} slope={pj:.2f} pJ/bit R2={fit.r2:.3f}")
+                     label=f"{workload} slope={pj:.2f} pJ/bit R2={fit.r2:.3f}")
     ax0.set_title("avg power vs bandwidth")
     ax0.set_xlabel("bandwidth (GB/s)")
     ax0.set_ylabel("avg power (W)")
@@ -786,45 +920,48 @@ def save_analysis_plot(out_dir: Path, stem: str, gpu_name: str,
     ax0.legend(fontsize=8)
 
     # Panel 2: compare phase-local 100%-0% estimate with slope estimate.
-    x = np.arange(len(modes))
+    x = np.arange(len(workloads))
     width = 0.35
     delta_vals = [
-        analysis_value(analysis_rows, mode, "100_minus_0_avg_power", "pj_per_bit")
-        for mode in modes
+        analysis_value(analysis_rows, workload, "100_minus_0_avg_power", "pj_per_bit")
+        for workload in workloads
     ]
     slope_vals = [
-        analysis_value(analysis_rows, mode, "slope_avg_power_vs_bw", "pj_per_bit")
-        for mode in modes
+        analysis_value(analysis_rows, workload, "slope_avg_power_vs_bw", "pj_per_bit")
+        for workload in workloads
     ]
     ax1.bar(x - width / 2, delta_vals, width, label="100%-0%", color="#4c78a8")
     ax1.bar(x + width / 2, slope_vals, width, label="50/75/100 slope", color="#f58518")
     ax1.set_title("pJ/bit estimator comparison")
     ax1.set_ylabel("pJ/bit")
-    ax1.set_xticks(x, modes)
+    ax1.set_xticks(x, workloads, rotation=20, ha="right")
     ax1.grid(True, axis="y", alpha=0.3)
     ax1.legend(fontsize=8)
 
     # Panel 3: residuals from the recommended avg_power~bandwidth fit.
-    for mode in modes:
+    residual_plotted = False
+    for workload in workloads:
         fit_points = [
-            (t, by[(mode, t)].bandwidth_gbps, by[(mode, t)].avg_power_w)
+            (t, by[(workload, t)].bandwidth_gbps, by[(workload, t)].avg_power_w)
             for t in (50, 75, 100)
-            if (mode, t) in by and by[(mode, t)].bandwidth_gbps > 0
+            if (workload, t) in by and by[(workload, t)].bandwidth_gbps > 0
         ]
         fit = linear_fit_power_vs_bw(fit_points)
         if fit is None:
             continue
-        c = colors.get(mode, "#1f77b4")
+        c = workload_color(workload)
         targets = [r[0] for r in fit.residuals]
         residuals = [r[3] for r in fit.residuals]
-        ax2.plot(targets, residuals, marker=markers.get(mode, "o"),
-                 color=c, label=mode)
+        ax2.plot(targets, residuals, marker=workload_marker(workload),
+                 color=c, label=workload)
+        residual_plotted = True
     ax2.axhline(0.0, color="black", lw=1.0, ls="--")
     ax2.set_title("fit residuals")
     ax2.set_xlabel("target (%)")
     ax2.set_ylabel("avg power residual (W)")
     ax2.grid(True, alpha=0.3)
-    ax2.legend(fontsize=8)
+    if residual_plotted:
+        ax2.legend(fontsize=8)
 
     # Panel 4: phase-local power distribution from raw NVML samples.
     phase_labels = [r.phase for r in results]
@@ -851,17 +988,239 @@ def save_analysis_plot(out_dir: Path, stem: str, gpu_name: str,
     return png
 
 
+def save_write_pattern_plot(out_dir: Path, stem: str, gpu_name: str,
+                            results: list[PhaseResult],
+                            analysis_rows: list[dict[str, str]]) -> Path | None:
+    write_results = [r for r in results if r.mode == "write"]
+    patterns = []
+    for r in write_results:
+        if r.pattern not in patterns:
+            patterns.append(r.pattern)
+    if len(patterns) < 2:
+        return None
+
+    png = out_dir / f"{stem}_write_patterns.png"
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    ax0, ax1, ax2, ax3 = axes.ravel()
+    by = result_by_workload_target(write_results)
+
+    for pattern in patterns:
+        workload = workload_label("write", pattern)
+        c = workload_color(workload)
+        marker = workload_marker(workload)
+        points = [
+            r for r in write_results
+            if r.pattern == pattern and r.bandwidth_gbps > 0
+        ]
+        if not points:
+            continue
+        ax0.scatter([r.bandwidth_gbps for r in points],
+                    [r.avg_power_w for r in points],
+                    color=c, marker=marker, label=pattern, zorder=3)
+        for r in points:
+            ax0.annotate(str(r.target_pct), (r.bandwidth_gbps, r.avg_power_w),
+                         textcoords="offset points", xytext=(4, 4), fontsize=8)
+        fit_points = [
+            (t, by[(workload, t)].bandwidth_gbps, by[(workload, t)].avg_power_w)
+            for t in (50, 75, 100)
+            if (workload, t) in by and by[(workload, t)].bandwidth_gbps > 0
+        ]
+        fit = linear_fit_power_vs_bw(fit_points)
+        if fit is not None:
+            xs = np.linspace(min(p[1] for p in fit_points),
+                             max(p[1] for p in fit_points), 50)
+            ys = fit.slope_w_per_gbps * xs + fit.intercept_power_w
+            pj = fit.slope_w_per_gbps * 1000.0 / 8.0
+            ax0.plot(xs, ys, color=c, lw=1.5, label=f"{pattern} slope={pj:.2f}")
+    ax0.set_title("write pattern: avg power vs bandwidth")
+    ax0.set_xlabel("bandwidth (GB/s)")
+    ax0.set_ylabel("avg power (W)")
+    ax0.grid(True, alpha=0.3)
+    ax0.legend(fontsize=8)
+
+    x = np.arange(len(patterns))
+    width = 0.35
+    slope_vals = [
+        analysis_value(
+            analysis_rows, workload_label("write", p),
+            "slope_avg_power_vs_bw", "pj_per_bit")
+        for p in patterns
+    ]
+    delta_vals = [
+        analysis_value(
+            analysis_rows, workload_label("write", p),
+            "100_minus_0_avg_power", "pj_per_bit")
+        for p in patterns
+    ]
+    ax1.bar(x - width / 2, slope_vals, width, label="50/75/100 slope",
+            color="#f58518")
+    ax1.bar(x + width / 2, delta_vals, width, label="100%-0%",
+            color="#4c78a8")
+    ax1.set_title("write pJ/bit by pattern")
+    ax1.set_ylabel("pJ/bit")
+    ax1.set_xticks(x, patterns, rotation=20, ha="right")
+    ax1.grid(True, axis="y", alpha=0.3)
+    ax1.legend(fontsize=8)
+
+    for pattern in patterns:
+        workload = workload_label("write", pattern)
+        rows = sorted(
+            [r for r in write_results if r.pattern == pattern and r.bandwidth_gbps > 0],
+            key=lambda r: r.target_pct)
+        ax2.plot([r.target_pct for r in rows], [r.bandwidth_gbps for r in rows],
+                 marker=workload_marker(workload), color=workload_color(workload),
+                 label=pattern)
+    ax2.set_title("achieved bandwidth separation")
+    ax2.set_xlabel("requested target (%)")
+    ax2.set_ylabel("bandwidth (GB/s)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=8)
+
+    p100_vals = []
+    for pattern in patterns:
+        r100 = by.get((workload_label("write", pattern), 100))
+        p100_vals.append(r100.avg_power_w if r100 is not None else float("nan"))
+    ax3.bar(x, p100_vals, color=[workload_color(workload_label("write", p)) for p in patterns])
+    ax3.set_title("100% write phase avg power")
+    ax3.set_ylabel("avg power (W)")
+    ax3.set_xticks(x, patterns, rotation=20, ha="right")
+    ax3.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle(f"Write-pattern sensitivity — {gpu_name}", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(png, dpi=140)
+    plt.close(fig)
+    return png
+
+
+def make_quality_checks(gpu_name: str, results: list[PhaseResult],
+                        analysis_rows: list[dict[str, str]],
+                        calibration: dict[str, dict[str, float]],
+                        write_patterns: list[str]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    by = result_by_workload_target(results)
+    row_by_workload_method = {
+        (r.get("workload", ""), r.get("method", "")): r for r in analysis_rows
+    }
+
+    def add(level: str, workload: str, check: str, detail: str) -> None:
+        rows.append({
+            "level": level,
+            "workload": workload,
+            "check": check,
+            "detail": detail,
+        })
+
+    for workload in ordered_workloads(results):
+        workload_results = [r for r in results if r.workload == workload]
+        targets = sorted(r.target_pct for r in workload_results)
+        missing = [t for t in (0, 50, 75, 100) if t not in targets]
+        if missing:
+            add("warn", workload, "target_coverage",
+                f"missing targets used by recommended analysis: {missing}")
+        else:
+            add("ok", workload, "target_coverage", "0/50/75/100 present")
+
+        samples_low = [r.phase for r in workload_results if r.samples < 3]
+        if samples_low:
+            add("warn", workload, "power_samples",
+                f"low NVML sample count phases: {samples_low}")
+        else:
+            add("ok", workload, "power_samples", "all phases have >=3 power samples")
+
+        r100 = by.get((workload, 100))
+        cal = calibration.get(workload)
+        if r100 is not None and cal is not None:
+            peak = cal["peak_bandwidth_gbps"]
+            ratio = r100.bandwidth_gbps / peak if peak > 0 else float("nan")
+            if ratio < 0.85:
+                add("warn", workload, "peak_target",
+                    f"100% achieved {ratio:.2%} of calibration peak; inspect throttling/window")
+            else:
+                add("ok", workload, "peak_target",
+                    f"100% achieved {ratio:.2%} of calibration peak")
+
+        slope_row = row_by_workload_method.get((workload, "slope_avg_power_vs_bw"))
+        if slope_row is not None:
+            r2 = float(slope_row["r2"]) if slope_row.get("r2") else float("nan")
+            resid = (
+                float(slope_row["max_abs_residual_w"])
+                if slope_row.get("max_abs_residual_w") else float("nan")
+            )
+            if r2 < 0.99:
+                add("warn", workload, "slope_fit",
+                    f"R2={r2:.6f}; slope pJ/bit may be unstable")
+            elif resid > 5.0:
+                add("warn", workload, "slope_fit",
+                    f"max residual={resid:.3f} W; inspect target separation")
+            else:
+                add("ok", workload, "slope_fit",
+                    f"R2={r2:.6f}, max residual={resid:.3f} W")
+
+        slope_targets = [by[(workload, t)] for t in (50, 75, 100) if (workload, t) in by]
+        if len(slope_targets) >= 2:
+            bws = [r.bandwidth_gbps for r in slope_targets]
+            min_sep = min(b - a for a, b in zip(bws[:-1], bws[1:]))
+            ref = max(bws[-1], 1e-9)
+            if min_sep / ref < 0.05:
+                add("warn", workload, "bandwidth_separation",
+                    f"50/75/100 bandwidths are close: {', '.join(f'{b:.1f}' for b in bws)} GB/s")
+            else:
+                add("ok", workload, "bandwidth_separation",
+                    f"50/75/100 bandwidths: {', '.join(f'{b:.1f}' for b in bws)} GB/s")
+
+    gpu_upper = gpu_name.upper()
+    if "H100" in gpu_upper and "write" in {r.mode for r in results}:
+        high_entropy = {"address", "random", "toggle"} & set(write_patterns)
+        if len(write_patterns) == 1 or not high_entropy:
+            add("warn", "write", "h100_write_pattern_coverage",
+                "H100 write interpretation should include address/random/toggle patterns")
+        else:
+            add("ok", "write", "h100_write_pattern_coverage",
+                f"patterns include high-entropy cases: {sorted(high_entropy)}")
+
+    return rows
+
+
+def save_quality_checks(out_dir: Path, stem: str,
+                        rows: list[dict[str, str]]) -> Path | None:
+    if not rows:
+        return None
+    path = out_dir / f"{stem}_quality_checks.csv"
+    fields = ["level", "workload", "check", "detail"]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
+def print_quality_checks(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+    warns = [r for r in rows if r["level"] != "ok"]
+    print()
+    print("quality checks")
+    print("-" * 80)
+    if not warns:
+        print("ok: no quality-check warnings")
+        return
+    for row in warns:
+        print(f"{row['level']}: {row['workload']} {row['check']} - {row['detail']}")
+
+
 def print_analysis(rows: list[dict[str, str]]) -> None:
     if not rows:
         return
     print()
     print("post-analysis")
-    print("-" * 111)
-    print(f"{'mode':<6} {'method':<24} {'points':<10} {'P0(W)':>9} {'P100(W)':>9} "
+    print("-" * 121)
+    print(f"{'workload':<14} {'method':<24} {'points':<10} {'P0(W)':>9} {'P100(W)':>9} "
           f"{'dP(W)':>9} {'BW(GB/s)':>10} {'R^2':>8} {'max|res|W':>10} {'pJ/bit':>10}")
-    print("-" * 111)
+    print("-" * 121)
     for row in rows:
-        print(f"{row['mode']:<6} {row['method']:<24} {row['target_points']:<10} "
+        print(f"{row.get('workload', row['mode']):<14} "
+              f"{row['method']:<24} {row['target_points']:<10} "
               f"{row['baseline_power_w'] or '-':>9} {row['active_power_w'] or '-':>9} "
               f"{row['delta_power_w'] or '-':>9} {row['bandwidth_gbps'] or '-':>10} "
               f"{row['r2'] or '-':>8} {row['max_abs_residual_w'] or '-':>10} "
@@ -876,6 +1235,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--modes", nargs="+", choices=["read", "write"],
                     default=["read", "write"], help="traffic types to measure")
+    ap.add_argument("--write-patterns", nargs="+", choices=sorted(WRITE_PATTERN_CODES),
+                    default=["const"],
+                    help="write data patterns to sweep when --modes includes write")
     ap.add_argument("--targets", type=int, nargs="+", default=[100],
                     help="duty-cycle targets as percent of calibrated mode peak")
     ap.add_argument("--phase-seconds", type=float, default=5.0)
@@ -894,6 +1256,16 @@ def main() -> None:
     bad_targets = [t for t in args.targets if t < 0 or t > 100]
     if bad_targets:
         raise SystemExit(f"--targets must be between 0 and 100: {bad_targets}")
+    args.write_patterns = list(dict.fromkeys(args.write_patterns))
+    if "write" not in args.modes and args.write_patterns != ["const"]:
+        print("[warn] --write-patterns is ignored because --modes does not include write")
+    workloads: list[tuple[str, str]] = []
+    for mode in args.modes:
+        if mode == "write":
+            for pattern in args.write_patterns:
+                workloads.append((mode, pattern))
+        else:
+            workloads.append((mode, "default"))
 
     cp.cuda.Device(args.device).use()
     props = cp.cuda.runtime.getDeviceProperties(args.device)
@@ -911,14 +1283,32 @@ def main() -> None:
     handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
     metadata_before = nvml_snapshot(handle)
 
+    workload_names = [workload_label(mode, pattern) for mode, pattern in workloads]
     print(f"[info] GPU={gpu_name} SMs={sm_count} L2={l2_bytes/(1<<20):.1f} MiB "
-          f"buf={args.buf_bytes/(1<<30):.2f} GiB modes={args.modes}")
+          f"buf={args.buf_bytes/(1<<30):.2f} GiB workloads={workload_names}")
     if _nvrtc_path:
         print(f"[info] preloaded nvrtc: {_nvrtc_path}")
 
-    buf = cp.empty(n_f4 * 4, dtype=cp.float32)
+    planned_buffer_bytes = args.buf_bytes * (
+        (1 if "read" in args.modes else 0) + (1 if "write" in args.modes else 0)
+    )
+    mem_total = metadata_before.get("memory_total_bytes")
+    mem_used = metadata_before.get("memory_used_bytes")
+    if mem_total is not None and mem_used is not None:
+        mem_free = max(0, int(mem_total) - int(mem_used))
+        if planned_buffer_bytes > 0.85 * mem_free:
+            print(
+                f"[warn] planned read/write buffers use {planned_buffer_bytes/(1<<30):.2f} GiB, "
+                f"free memory is {mem_free/(1<<30):.2f} GiB; reduce --buf-bytes if OOM occurs"
+            )
+
+    read_buf = cp.empty(n_f4 * 4, dtype=cp.float32) if "read" in args.modes else None
+    write_buf = cp.empty(n_f4 * 4, dtype=cp.float32) if "write" in args.modes else None
     sink = cp.empty(1024 * 4, dtype=cp.float32)
-    buf.fill(1.0)
+    if read_buf is not None:
+        read_buf.fill(1.0)
+    if write_buf is not None:
+        write_buf.fill(1.0)
     module = cp.RawModule(code=KERNEL_CODE, options=("--std=c++14",))
     kernels = {
         "read": module.get_function("stream_read"),
@@ -928,28 +1318,37 @@ def main() -> None:
     blocks = sm_count * 32
     stream = cp.cuda.Stream(non_blocking=True)
 
-    # Warm up both kernels so compilation and first-touch costs are outside phases.
-    with stream:
-        kernels["read"]((blocks,), (threads,),
-                        (buf, sink, np.uint64(n_f4), np.int32(1)))
-        kernels["write"]((blocks,), (threads,),
-                         (buf, sink, np.uint64(n_f4), np.int32(1)))
+    # Warm up all requested workloads so compilation and first-touch costs are outside phases.
+    for mode, pattern in workloads:
+        buf = read_buf if mode == "read" else write_buf
+        if buf is None:
+            raise RuntimeError(f"missing buffer for mode {mode}")
+        launch_stream_kernel(
+            mode, kernels[mode], stream, blocks, threads, buf, sink, n_f4, 1,
+            WRITE_PATTERN_CODES.get(pattern, 0) if mode == "write" else 0)
     stream.synchronize()
 
     peak_passes_per_s: dict[str, float] = {}
     calibration: dict[str, dict[str, float]] = {}
-    for mode in args.modes:
+    for mode, pattern in workloads:
+        workload = workload_label(mode, pattern)
+        pattern_code = WRITE_PATTERN_CODES.get(pattern, 0) if mode == "write" else 0
+        buf = read_buf if mode == "read" else write_buf
+        if buf is None:
+            raise RuntimeError(f"missing buffer for mode {mode}")
         ms_per_pass, passes_per_s = calibrate_kernel(
-            kernels[mode], stream, blocks, threads, buf, sink, n_f4,
-            args.cal_passes, args.cal_repeats)
-        peak_passes_per_s[mode] = passes_per_s
+            mode, kernels[mode], stream, blocks, threads, buf, sink, n_f4,
+            args.cal_passes, args.cal_repeats, pattern_code)
+        peak_passes_per_s[workload] = passes_per_s
         peak_bw = args.buf_bytes * passes_per_s / 1e9
-        calibration[mode] = {
+        calibration[workload] = {
+            "mode": mode,
+            "pattern": pattern,
             "ms_per_pass": ms_per_pass,
             "passes_per_second": passes_per_s,
             "peak_bandwidth_gbps": peak_bw,
         }
-        print(f"[calib] {mode:<5} {ms_per_pass:.3f} ms/pass  "
+        print(f"[calib] {workload:<14} {ms_per_pass:.3f} ms/pass  "
               f"~{peak_bw:.1f} GB/s effective user-data BW")
 
     warn_window_quantization(args.targets, args.window_ms, calibration)
@@ -965,15 +1364,19 @@ def main() -> None:
     metadata_after: dict = {}
     poller.start()
     try:
-        for mode in args.modes:
+        for mode, pattern in workloads:
+            workload = workload_label(mode, pattern)
+            buf = read_buf if mode == "read" else write_buf
+            if buf is None:
+                raise RuntimeError(f"missing buffer for mode {mode}")
             for target in args.targets:
-                print(f"[phase] {mode}_{target} start")
+                print(f"[phase] {phase_label(mode, pattern, target)} start")
                 result = run_phase(
-                    mode, target, kernels[mode], stream, blocks, threads,
-                    buf, sink, n_f4, args.buf_bytes, peak_passes_per_s[mode],
+                    mode, pattern, target, kernels[mode], stream, blocks, threads,
+                    buf, sink, n_f4, args.buf_bytes, peak_passes_per_s[workload],
                     args.phase_seconds, args.window_ms, poller, idle_power_w)
                 results.append(result)
-                print(f"[phase] {result.phase:<9} BW={result.bandwidth_gbps:.1f} GB/s  "
+                print(f"[phase] {result.phase:<18} BW={result.bandwidth_gbps:.1f} GB/s  "
                       f"Pdyn={result.dynamic_power_w:.1f} W  "
                       f"E={result.dynamic_energy_j:.3f} J  "
                       f"pJ/bit={result.pj_per_bit:.3f}")
@@ -994,8 +1397,22 @@ def main() -> None:
     summary_csv, trace_csv = save_csvs(out_dir, stem, results, poller.samples)
     analysis_rows = make_analysis_rows(results)
     analysis_csv = save_analysis_csv(out_dir, stem, analysis_rows)
+    quality_rows = make_quality_checks(
+        gpu_name, results, analysis_rows, calibration, args.write_patterns)
+    quality_csv = save_quality_checks(out_dir, stem, quality_rows)
     metadata = {
         "args": vars(args),
+        "workloads": [
+            {"mode": mode, "pattern": pattern, "label": workload_label(mode, pattern)}
+            for mode, pattern in workloads
+        ],
+        "write_pattern_notes": {
+            "zero": "all-zero data; useful for compression/toggle-minimum sensitivity",
+            "const": "legacy pass-dependent constant float4 pattern",
+            "address": "deterministic address-ramp bits",
+            "random": "xorshift deterministic pseudo-random bits; includes small generator ALU cost",
+            "toggle": "checker/toggle bit pattern",
+        },
         "cuda": {
             "runtime_version": cp.cuda.runtime.runtimeGetVersion(),
             "driver_version": cp.cuda.runtime.driverGetVersion(),
@@ -1005,6 +1422,12 @@ def main() -> None:
             "sm_count": sm_count,
             "l2_bytes": l2_bytes,
             "buffer_bytes": args.buf_bytes,
+            "read_buffer_allocated": read_buf is not None,
+            "write_buffer_allocated": write_buf is not None,
+            "total_benchmark_buffer_bytes": (
+                (args.buf_bytes if read_buf is not None else 0)
+                + (args.buf_bytes if write_buf is not None else 0)
+            ),
             "n_float4": n_f4,
             "blocks": blocks,
             "threads_per_block": threads,
@@ -1028,24 +1451,31 @@ def main() -> None:
     png = save_plot(out_dir, stem, gpu_name, idle_power_w, results, poller.samples)
     analysis_png = save_analysis_plot(
         out_dir, stem, gpu_name, results, poller.samples, analysis_rows)
+    write_pattern_png = save_write_pattern_plot(
+        out_dir, stem, gpu_name, results, analysis_rows)
 
     print(f"[save] {summary_csv}")
     print(f"[save] {trace_csv}")
     if analysis_csv is not None:
         print(f"[save] {analysis_csv}")
+    if quality_csv is not None:
+        print(f"[save] {quality_csv}")
     print(f"[save] {metadata_json}")
     print(f"[save] {png}")
     if analysis_png is not None:
         print(f"[save] {analysis_png}")
+    if write_pattern_png is not None:
+        print(f"[save] {write_pattern_png}")
     print()
-    print(f"{'phase':<10} {'BW(GB/s)':>10} {'Pavg(W)':>10} {'Pdyn(W)':>10} "
+    print(f"{'phase':<18} {'BW(GB/s)':>10} {'Pavg(W)':>10} {'Pdyn(W)':>10} "
           f"{'Edyn(J)':>10} {'pJ/bit':>10}")
-    print("-" * 66)
+    print("-" * 74)
     for r in results:
-        print(f"{r.phase:<10} {r.bandwidth_gbps:>10.1f} {r.avg_power_w:>10.1f} "
+        print(f"{r.phase:<18} {r.bandwidth_gbps:>10.1f} {r.avg_power_w:>10.1f} "
               f"{r.dynamic_power_w:>10.1f} {r.dynamic_energy_j:>10.3f} "
               f"{r.pj_per_bit:>10.3f}")
     print_analysis(analysis_rows)
+    print_quality_checks(quality_rows)
 
 
 if __name__ == "__main__":

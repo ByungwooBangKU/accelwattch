@@ -15,6 +15,7 @@ Nsight profiling 도구는 12장 부록에 요약한다.
 6. 기본 buffer는 `max(1 GiB, 64 x L2)`다. H100/A100에서는 8 GiB sensitivity run도 권장한다.
 7. 큰 buffer에서는 `--window-ms`가 중요하다. 8 GiB/H100 계열 보고용은 `--window-ms 100` 또는 `200`을 권장한다.
 8. H100에서는 `NVML_FI_DEV_POWER_INSTANT`/`AVERAGE` field API를 같이 기록해서 cross-validation할 수 있다.
+9. H100 write 해석은 `--write-patterns zero const address random toggle` sweep으로 data pattern/compression 영향을 분리한다.
 
 ## 1. 파일 구성
 
@@ -86,6 +87,7 @@ Nsight profiling 도구는 12장 부록에 요약한다.
 [6] target phase 실행
     - 예: 0/25/50/75/100%
     - target은 raw bus peak가 아니라 calibration peak 대비 duty target
+    - write는 필요 시 zero/const/address/random/toggle pattern별로 분리
         |
         v
 [7] phase별 raw data 저장
@@ -115,7 +117,8 @@ pJ_per_bit = E_dyn / (transferred_bytes x 8) x 1e12
 
 1. `read`: 큰 `float4` buffer를 `__ldcg`로 streaming load한다. L1은 우회하고 L2/DRAM 경로에 pressure를 준다.
 2. `write`: 같은 크기의 `float4` buffer 전체를 streaming store한다. byte 수는 user-data write byte 기준이다.
-3. working set은 L2보다 훨씬 크게 잡기 때문에 DRAM-dominant access가 되도록 설계한다.
+3. read와 write를 같이 측정할 때는 buffer를 분리한다. write pattern calibration이 read buffer 내용을 덮어 read energy를 오염시키지 않게 하기 위해서다.
+4. working set은 L2보다 훨씬 크게 잡기 때문에 DRAM-dominant access가 되도록 설계한다.
 
 ## 4. GPU 지원과 기본값
 
@@ -196,12 +199,13 @@ nvidia-smi
 |---|---:|---|---|
 | `--device` | `0` | CUDA/NVML GPU index | 다중 GPU 시스템에서는 `nvidia-smi`의 index와 맞춰 명시한다. |
 | `--modes` | `read write` | 측정할 traffic 종류 | read만 볼 때는 `--modes read`, write만 볼 때는 `--modes write`. |
+| `--write-patterns` | `const` | write phase에서 쓸 data pattern 목록 | H100 write 해석은 `zero const address random toggle` sweep 권장. read mode에는 영향 없다. |
 | `--targets` | `100` | calibration peak 대비 duty target percent | 보고용 sweep은 `0 25 50 75 100`. 단, 해석은 label보다 실제 `bandwidth_gbps` 기준으로 한다. |
 | `--phase-seconds` | `5` | 각 mode/target phase를 유지하는 시간 | smoke test는 5초도 가능하지만 보고용은 최소 20초 권장. |
 | `--idle-seconds` | `5` | active phase 전 pre-idle baseline 측정 시간 | 보고용은 15초 이상 권장. `summary.csv`의 dynamic pJ/bit baseline으로 쓰인다. |
 | `--window-ms` | `20` | 25/50/75% duty-cycle 제어 window | 큰 buffer에서는 너무 작으면 pass quantization warning 발생. A100/H100 보고용은 `100` 또는 `200` 권장. |
 | `--poll-hz` | `100` | NVML power/state polling 요청 주파수 | NVML 자체 update window가 더 느릴 수 있다. 값이 커져도 sensor 분해능이 무한히 좋아지지는 않는다. |
-| `--buf-bytes` | 자동 | GPU buffer 크기 | 기본값은 `max(1 GiB, 64 x L2)`. 8 GiB는 `8589934592`. L2보다 충분히 커야 DRAM-dominant가 된다. |
+| `--buf-bytes` | 자동 | mode별 GPU buffer 크기 | 기본값은 `max(1 GiB, 64 x L2)`. 8 GiB는 `8589934592`. read/write를 같이 돌리면 read buffer와 write buffer를 분리하므로 총 할당량은 약 2배다. |
 | `--out-dir` | `reports` | 결과 파일 저장 디렉터리 | `reports/`는 git ignore 대상이다. |
 | `--tag` | 빈 문자열 | 출력 파일명 suffix | 반복 run 구분을 위해 `baseline_w200_rep1`처럼 명시한다. |
 | `--cal-passes` | `8` | calibration에서 repeat당 streaming pass 수 | calibration bandwidth가 흔들릴 때만 늘린다. 보통 기본값 유지. |
@@ -211,9 +215,20 @@ nvidia-smi
 
 1. `--device`와 `--modes`로 측정 GPU와 read/write 범위를 정한다.
 2. `--buf-bytes`는 기본값으로 시작하고, H100/A100 보고용이면 8 GiB sensitivity run을 추가한다.
-3. `--targets 0 25 50 75 100`으로 utilization sweep을 만들되, 최종 계산은 실제 `bandwidth_gbps`와 slope를 우선한다.
-4. `--window-ms` warning이 나오면 A100/H100은 `100` 또는 `200`으로 올린다.
-5. 최종 보고는 같은 조건을 `rep1/rep2/rep3`으로 반복하고 `summarize_pjbit_repeats.py`로 평균/표준편차를 낸다.
+3. H100 write 해석이면 `--write-patterns zero const address random toggle`로 pattern sensitivity를 같이 본다.
+4. `--targets 0 25 50 75 100`으로 utilization sweep을 만들되, 최종 계산은 실제 `bandwidth_gbps`와 slope를 우선한다.
+5. `--window-ms` warning이 나오면 A100/H100은 `100` 또는 `200`으로 올린다.
+6. 최종 보고는 같은 조건을 `rep1/rep2/rep3`으로 반복하고 `summarize_pjbit_repeats.py`로 평균/표준편차를 낸다.
+
+write pattern 의미:
+
+| pattern | 의미 | 목적 |
+|---|---|---|
+| `zero` | 모든 bit가 0 | compression/toggle-minimum 하한성 case |
+| `const` | 기존 방식. pass별 constant `float4` | 과거 결과와 비교하는 legacy case |
+| `address` | address-ramp bit pattern | constant-write 최적화 여부 확인 |
+| `random` | xorshift 기반 deterministic pseudo-random bits | compression이 거의 안 되는 write stress. pattern 생성 ALU가 약간 섞일 수 있음 |
+| `toggle` | checker/toggle bit pattern | 단순 0/1 전환과 bit-toggle sensitivity 확인 |
 
 ### 6.2 빠른 smoke test
 
@@ -323,16 +338,36 @@ H100은 기본 buffer가 약 3.125 GiB다. 다중 GPU 시스템에서는 `--devi
   --tag h100_8gib_w200_rep1
 ```
 
+H100 write-pattern sweep:
+
+```bash
+./run_pjbit_cupy.sh \
+  --device 0 \
+  --modes read write \
+  --write-patterns zero const address random toggle \
+  --targets 0 50 75 100 \
+  --buf-bytes 8589934592 \
+  --phase-seconds 20 \
+  --idle-seconds 15 \
+  --poll-hz 100 \
+  --window-ms 200 \
+  --tag h100_8gib_patterns_rep1
+```
+
+read/write order 영향을 확인하려면 같은 조건을 `--modes write read`로 한 번 더 돌린다.
+
 ## 7. 출력 파일
 
 | 파일 | 내용 |
 |---|---|
-| `*_summary.csv` | phase별 BW, power, energy, pJ/bit, clocks, temp, P-state |
+| `*_summary.csv` | phase별 workload/pattern, BW, power, energy, pJ/bit, clocks, temp, P-state |
 | `*_trace.csv` | time-series power/util/clocks/temp/phase |
-| `*_analysis.csv` | `100%-0%`, all-pair delta, slope pJ/bit, R2, residual |
+| `*_analysis.csv` | workload/pattern별 `100%-0%`, all-pair delta, slope pJ/bit, R2, residual |
+| `*_quality_checks.csv` | target coverage, bandwidth separation, fit quality, H100 pattern coverage 자동 점검 |
 | `*_metadata.json` | GPU, driver, CUDA, L2, buffer, calibration, power limit |
 | `*.png` | power timeline 및 phase별 pJ/bit |
 | `*_analysis.png` | power-vs-bandwidth fit, residual, estimator 비교 |
+| `*_write_patterns.png` | write pattern별 power/BW fit, pJ/bit, 100% power 비교. pattern이 2개 이상일 때 생성 |
 
 `trace.csv`는 NVML field API가 지원되면 아래 컬럼도 포함한다.
 
@@ -396,6 +431,15 @@ pJ_per_bit_slope = slope_W_per_GBps x 1000 / 8
 2. `r2`가 1에 가깝고 `max_abs_residual_w`가 작아야 한다.
 3. 25% point는 launch overhead와 power-state transition 영향이 크면 제외한다.
 4. 최종 보고는 최소 3회 반복 평균/표준편차로 한다.
+
+### 8.5 H100 write pattern 해석
+
+H100에서 read pJ/bit이 write보다 크게 보이면 곧바로 HBM device의 read/write energy 순서가 뒤집혔다고 해석하면 안 된다. 먼저 write pattern sensitivity를 본다.
+
+1. `zero`/`const` write가 낮고 `random`/`toggle` write가 높으면 data pattern, compression, bit-toggle 영향이 섞인 것이다.
+2. 모든 write pattern이 read보다 낮으면 read-return path, L2 fill, SM load path, read kernel accumulation 비용이 NVML board-level power에 더 크게 잡혔을 가능성이 있다.
+3. `random`/`toggle` write가 read와 같거나 더 높아지면 기존 `const` write pattern이 H100 write energy를 낮게 보이게 만든 것이다.
+4. 최종 보고는 `read`, `write:const`, `write:random`, `write:toggle`를 분리해서 적고, DRAM rail-only 값이 아니라 board/module marginal pJ/bit임을 명시한다.
 
 ## 9. `--window-ms` warning 해석
 
@@ -641,5 +685,7 @@ GPU별 기대 범위:
 6. `slope_avg_power_vs_bw`의 R2가 충분히 높고 residual이 작은가?
 7. 3회 이상 반복 평균/표준편차를 냈는가?
 8. H100이면 `power_instant_w`/`power_average_w` field를 cross-validation했는가?
-9. `100%-0%`와 slope 값을 구분해서 보고했는가?
-10. DRAM rail-only가 아니라 GPU/board marginal dynamic pJ/bit임을 명시했는가?
+9. H100 write 해석이면 `zero/const/address/random/toggle` pattern 결과를 분리해서 봤는가?
+10. `*_quality_checks.csv`에 warning이 있으면 해석에서 반영했는가?
+11. `100%-0%`와 slope 값을 구분해서 보고했는가?
+12. DRAM rail-only가 아니라 GPU/board marginal dynamic pJ/bit임을 명시했는가?

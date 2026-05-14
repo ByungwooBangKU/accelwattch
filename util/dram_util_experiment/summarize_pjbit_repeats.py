@@ -40,15 +40,22 @@ def main() -> None:
     if not paths:
         raise SystemExit("no analysis CSV files matched")
 
-    groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, str]]] = defaultdict(list)
     for path in paths:
         with open(path, newline="") as f:
             for row in csv.DictReader(f):
                 row["_file"] = str(path)
-                groups[(row["mode"], row["method"], row.get("target_points", ""))].append(row)
+                mode = row["mode"]
+                pattern = row.get("pattern", "")
+                workload = row.get("workload") or (
+                    "read" if mode == "read" else f"write:{pattern}"
+                )
+                groups[(
+                    workload, mode, pattern, row["method"], row.get("target_points", "")
+                )].append(row)
 
     out_rows: list[dict[str, str]] = []
-    for (mode, method, target_points), rows in sorted(groups.items()):
+    for (workload, mode, pattern, method, target_points), rows in sorted(groups.items()):
         pj = [x for r in rows if (x := f_or_none(r.get("pj_per_bit", ""))) is not None]
         r2 = [x for r in rows if (x := f_or_none(r.get("r2", ""))) is not None]
         resid = [
@@ -56,7 +63,9 @@ def main() -> None:
             if (x := f_or_none(r.get("max_abs_residual_w", ""))) is not None
         ]
         out_rows.append({
+            "workload": workload,
             "mode": mode,
+            "pattern": pattern,
             "method": method,
             "target_points": target_points,
             "runs": str(len(rows)),
@@ -70,8 +79,9 @@ def main() -> None:
         })
 
     fields = [
-        "mode", "method", "target_points", "runs", "pj_per_bit_mean", "pj_per_bit_std",
-        "r2_mean", "max_abs_residual_w_mean", "files",
+        "workload", "mode", "pattern", "method", "target_points", "runs",
+        "pj_per_bit_mean", "pj_per_bit_std", "r2_mean",
+        "max_abs_residual_w_mean", "files",
     ]
 
     stdout = csv.DictWriter(sys.stdout, fieldnames=fields)
