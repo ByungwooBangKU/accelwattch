@@ -374,6 +374,7 @@ read/write order 영향을 확인하려면 같은 조건을 `--modes write read`
 | `*_quality_checks.csv` | target coverage, bandwidth separation, fit quality, H100 pattern coverage 자동 점검 |
 | `*_metadata.json` | GPU, driver, CUDA, L2, buffer, calibration, power limit |
 | `*.png` | power timeline 및 phase별 pJ/bit |
+| `*_bandwidth.png` | target별 실제 measured bandwidth와 100% 실측값 대비 calibration peak 비교 |
 | `*_analysis.png` | power-vs-bandwidth fit, residual, estimator 비교 |
 | `*_write_patterns.png` | write pattern별 power/BW fit, pJ/bit, 100% power 비교. pattern이 2개 이상일 때 생성 |
 
@@ -388,6 +389,17 @@ read/write order 영향을 확인하려면 같은 조건을 `--modes write read`
 | `power_average_status` | average field `nvmlReturn`; `0`이면 성공 |
 
 ## 8. 결과 해석
+
+### 8.0 bandwidth normalization
+
+`target_pct`는 요청한 duty target label이다. pJ/bit 계산에는 이 label이나 calibration peak를 분모로 쓰지 않는다. 항상 phase에서 실제 실행한 byte와 실제 걸린 시간을 사용한다.
+
+```text
+bytes_transferred = launches x passes_per_launch x buf_bytes
+bandwidth_gbps    = bytes_transferred / wall_s / 1e9
+```
+
+따라서 `100%` phase도 calibration peak와 같을 필요가 없다. 예를 들어 calibration이 893 GB/s이고 `100%` phase 실측이 834 GB/s라면 pJ/bit 계산에는 834 GB/s가 들어간다. `*_bandwidth.png`는 이 차이를 매 run마다 시각화한다.
 
 ### 8.1 pre-idle baseline pJ/bit
 

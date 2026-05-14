@@ -705,6 +705,84 @@ def save_plot(out_dir: Path, stem: str, gpu_name: str, idle_power_w: float,
     return png
 
 
+def save_bandwidth_plot(out_dir: Path, stem: str, gpu_name: str,
+                        results: list[PhaseResult],
+                        calibration: dict[str, dict[str, float]]) -> Path | None:
+    if not results:
+        return None
+
+    png = out_dir / f"{stem}_bandwidth.png"
+    workloads = ordered_workloads(results)
+    targets = sorted({r.target_pct for r in results})
+    by = result_by_workload_target(results)
+    fig, (ax0, ax1) = plt.subplots(
+        1, 2, figsize=(15, 6), gridspec_kw={"width_ratios": [1.35, 1.0]})
+
+    for workload in workloads:
+        ys = [by[(workload, t)].bandwidth_gbps for t in targets if (workload, t) in by]
+        xs = [t for t in targets if (workload, t) in by]
+        if not xs:
+            continue
+        ax0.plot(xs, ys, marker=workload_marker(workload),
+                 color=workload_color(workload), linewidth=2, label=workload)
+        for x, y in zip(xs, ys):
+            if x in (50, 100) and y > 0:
+                ax0.annotate(f"{y:.0f}", (x, y), textcoords="offset points",
+                             xytext=(0, 6), ha="center", fontsize=8)
+    ax0.set_title("measured bandwidth by requested target")
+    ax0.set_xlabel("requested target (%)")
+    ax0.set_ylabel("measured bandwidth (GB/s)")
+    ax0.set_xticks(targets)
+    max_bw = max((r.bandwidth_gbps for r in results), default=1.0)
+    ax0.set_ylim(0, max_bw * 1.12)
+    ax0.grid(True, alpha=0.3)
+    ax0.legend(fontsize=8, loc="upper left")
+
+    x = np.arange(len(workloads))
+    measured_100 = [
+        by[(workload, 100)].bandwidth_gbps if (workload, 100) in by else float("nan")
+        for workload in workloads
+    ]
+    cal_peak = [
+        calibration.get(workload, {}).get("peak_bandwidth_gbps", float("nan"))
+        for workload in workloads
+    ]
+    bars = ax1.bar(
+        x, measured_100,
+        color=[workload_color(workload) for workload in workloads],
+        alpha=0.82, label="measured 100% phase")
+    ax1.scatter(x, cal_peak, marker="_", s=500, color="black",
+                linewidths=2, label="calibration peak")
+    for bar, actual, peak in zip(bars, measured_100, cal_peak):
+        if actual != actual:
+            continue
+        pct = actual / peak * 100.0 if peak == peak and peak > 0 else float("nan")
+        label = f"{actual:.1f}"
+        if pct == pct:
+            label += f"\n({pct:.1f}%)"
+        ax1.annotate(label, (bar.get_x() + bar.get_width() / 2.0, actual),
+                     textcoords="offset points", xytext=(0, 6),
+                     ha="center", va="bottom", fontsize=8)
+    ax1.set_title("100% phase: measured vs calibration")
+    ax1.set_ylabel("bandwidth (GB/s)")
+    ax1.set_xticks(x, workloads, rotation=30, ha="right")
+    max_peak = max(
+        [v for v in measured_100 + cal_peak if v == v],
+        default=1.0)
+    ax1.set_ylim(0, max_peak * 1.15)
+    ax1.grid(True, axis="y", alpha=0.3)
+    ax1.legend(fontsize=8, loc="upper right")
+
+    fig.suptitle(
+        f"Measured DRAM bandwidth — {gpu_name}\n"
+        "pJ/bit normalization uses measured bytes / measured wall time, not target labels.",
+        fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    fig.savefig(png, dpi=160)
+    plt.close(fig)
+    return png
+
+
 def ordered_modes(results: list[PhaseResult]) -> list[str]:
     modes: list[str] = []
     for r in results:
@@ -1445,10 +1523,13 @@ def main() -> None:
             "On GA10x Ampere, nvmlDeviceGetPowerUsage is documented as a 1-second average.",
             "Trace CSV includes NVML_FI_DEV_POWER_INSTANT/AVERAGE when supported.",
             "Use slope_avg_power_vs_bw as the preferred marginal board-energy estimate.",
+            "pJ/bit normalization uses measured bytes_transferred and measured wall_s; "
+            "requested target labels and calibration peak are not used as the denominator.",
         ],
     }
     metadata_json = save_metadata_json(out_dir, stem, metadata)
     png = save_plot(out_dir, stem, gpu_name, idle_power_w, results, poller.samples)
+    bandwidth_png = save_bandwidth_plot(out_dir, stem, gpu_name, results, calibration)
     analysis_png = save_analysis_plot(
         out_dir, stem, gpu_name, results, poller.samples, analysis_rows)
     write_pattern_png = save_write_pattern_plot(
@@ -1462,6 +1543,8 @@ def main() -> None:
         print(f"[save] {quality_csv}")
     print(f"[save] {metadata_json}")
     print(f"[save] {png}")
+    if bandwidth_png is not None:
+        print(f"[save] {bandwidth_png}")
     if analysis_png is not None:
         print(f"[save] {analysis_png}")
     if write_pattern_png is not None:
