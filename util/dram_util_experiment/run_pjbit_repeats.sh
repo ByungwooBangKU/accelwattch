@@ -22,6 +22,8 @@ Options:
   --idle-seconds N       Default: 15
   --window-ms N          Default: 200
   --poll-hz N            Default: 100
+  --gap-seconds N        Default: 1.0
+  --phase-order NAME     target-major or workload-major. Default: target-major
   --out-dir DIR          Default: reports
   --                    Extra args passed to run_pjbit_cupy.sh
 EOF
@@ -38,6 +40,8 @@ PHASE_SECONDS="20"
 IDLE_SECONDS="15"
 WINDOW_MS="200"
 POLL_HZ="100"
+GAP_SECONDS="1.0"
+PHASE_ORDER="target-major"
 OUT_DIR="reports"
 EXTRA_ARGS=()
 
@@ -54,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --idle-seconds) IDLE_SECONDS="$2"; shift 2 ;;
         --window-ms) WINDOW_MS="$2"; shift 2 ;;
         --poll-hz) POLL_HZ="$2"; shift 2 ;;
+        --gap-seconds) GAP_SECONDS="$2"; shift 2 ;;
+        --phase-order) PHASE_ORDER="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         --) shift; EXTRA_ARGS+=("$@"); break ;;
@@ -134,6 +140,7 @@ mkdir -p "$OUT_DIR"
 echo "[info] profile=$PROFILE device=$DEVICE repeats=$REPEATS tag=$TAG"
 echo "[info] targets=${TARGETS[*]}"
 echo "[info] write-patterns=${WRITE_PATTERNS[*]}"
+echo "[info] phase-seconds=$PHASE_SECONDS idle-seconds=$IDLE_SECONDS window-ms=$WINDOW_MS poll-hz=$POLL_HZ gap-seconds=$GAP_SECONDS phase-order=$PHASE_ORDER"
 if [[ -n "$BUF_BYTES" ]]; then
     echo "[info] buf-bytes=$BUF_BYTES"
 else
@@ -151,6 +158,8 @@ for rep in $(seq 1 "$REPEATS"); do
         --phase-seconds "$PHASE_SECONDS"
         --idle-seconds "$IDLE_SECONDS"
         --poll-hz "$POLL_HZ"
+        --gap-seconds "$GAP_SECONDS"
+        --phase-order "$PHASE_ORDER"
         --window-ms "$WINDOW_MS"
         --out-dir "$OUT_DIR"
         --tag "$REP_TAG"

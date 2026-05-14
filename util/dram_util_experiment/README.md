@@ -112,7 +112,7 @@ pJ_per_bit = E_dyn / (transferred_bytes x 8) x 1e12
            = dynamic_power_W x 1000 / (8 x BW_GBps)
 ```
 
-`target=0`은 kernel launch 없이 같은 phase 길이 동안 power만 기록한다. CSV에는 `bandwidth_gbps=0`, `bytes_transferred=0`, `pj_per_bit=nan`으로 남는다.
+`target=0`은 kernel launch 없이 같은 phase 길이 동안 power만 기록한다. CSV에는 `bandwidth_gbps=0`, `bytes_transferred=0`, `pj_per_bit=nan`으로 남는다. 전송 bit가 0이므로 0% phase의 pJ/bit는 정의되지 않는다. 최신 `*.png`의 dynamic pJ/bit plot은 0% phase를 막대에서 제외하고 active phase만 표시한다.
 
 ### 3.3 read/write 커널
 
@@ -213,7 +213,9 @@ nvidia-smi
 | `--phase-seconds` | `5` | 각 mode/target phase를 유지하는 시간 | smoke test는 5초도 가능하지만 보고용은 최소 20초 권장. |
 | `--idle-seconds` | `5` | active phase 전 pre-idle baseline 측정 시간 | 보고용은 15초 이상 권장. `summary.csv`의 dynamic pJ/bit baseline으로 쓰인다. |
 | `--window-ms` | `20` | 25/50/75% duty-cycle 제어 window | 큰 buffer에서는 너무 작으면 pass quantization warning 발생. A100/H100 보고용은 `100` 또는 `200` 권장. |
-| `--poll-hz` | `100` | NVML power/state polling 요청 주파수 | NVML 자체 update window가 더 느릴 수 있다. 값이 커져도 sensor 분해능이 무한히 좋아지지는 않는다. |
+| `--poll-hz` | `100` | NVML power/state polling 요청 주파수 | 기본 100 Hz는 10 ms마다 NVML 값을 요청한다는 뜻이다. 실제 sensor update/window는 더 느릴 수 있다. |
+| `--gap-seconds` | `1.0` | phase 사이 idle gap | phase 경계의 sensor averaging/transition bleed-through를 줄이기 위한 구간이다. H100에서 0% power가 의심스러우면 `2`로 늘려 비교한다. |
+| `--phase-order` | `target-major` | phase 실행 순서 | `target-major`는 모든 0% phase를 active phase보다 먼저 실행한다. 예전 방식처럼 read sweep 전체 뒤 write sweep을 돌리려면 `workload-major`를 쓴다. |
 | `--buf-bytes` | 자동 | mode별 GPU buffer 크기 | 기본값은 `max(1 GiB, 64 x L2)`. 8 GiB는 `8589934592`. read/write를 같이 돌리면 read buffer와 write buffer를 분리하므로 총 할당량은 약 2배다. |
 | `--out-dir` | `reports` | 결과 파일 저장 디렉터리 | `reports/`는 git ignore 대상이다. |
 | `--tag` | 빈 문자열 | 출력 파일명 suffix | 반복 run 구분을 위해 `baseline_w200_rep1`처럼 명시한다. |
@@ -227,7 +229,8 @@ nvidia-smi
 3. H100 write 해석이면 `--write-patterns zero const address random toggle`로 pattern sensitivity를 같이 본다.
 4. `--targets 0 25 50 75 100`으로 utilization sweep을 만들되, 최종 계산은 실제 `bandwidth_gbps`와 slope를 우선한다.
 5. `--window-ms` warning이 나오면 A100/H100은 `100` 또는 `200`으로 올린다.
-6. 최종 보고는 같은 조건을 `rep1/rep2/rep3`으로 반복하고 `summarize_pjbit_repeats.py`로 평균/표준편차를 낸다.
+6. H100에서 0% power가 이전 active phase의 영향을 받는 것처럼 보이면 `--gap-seconds 2`로 늘리고 `--phase-order target-major`를 유지한다.
+7. 최종 보고는 같은 조건을 `rep1/rep2/rep3`으로 반복하고 `summarize_pjbit_repeats.py`로 평균/표준편차를 낸다.
 
 write pattern 의미:
 
@@ -429,7 +432,7 @@ read/write order 영향을 확인하려면 같은 조건을 `--modes write read`
 | `*_analysis.csv` | workload/pattern별 `100%-0%`, all-pair delta, slope pJ/bit, R2, residual |
 | `*_quality_checks.csv` | target coverage, bandwidth separation, fit quality, H100 pattern coverage 자동 점검 |
 | `*_metadata.json` | GPU, driver, CUDA, L2, buffer, calibration, power limit |
-| `*.png` | power timeline 및 phase별 pJ/bit |
+| `*.png` | power timeline, phase별 BW, active phase별 pJ/bit. power timeline x축은 poller 시작 이후 경과 시간(`t_s`)이며 단위는 second |
 | `*_bandwidth.png` | target별 실제 measured bandwidth와 100% 실측값 대비 calibration peak 비교 |
 | `*_analysis.png` | power-vs-bandwidth fit, residual, estimator 비교 |
 | `*_write_patterns.png` | write pattern별 power/BW fit, pJ/bit, 100% power 비교. pattern이 2개 이상일 때 생성 |
@@ -462,6 +465,10 @@ bandwidth_gbps    = bytes_transferred / wall_s / 1e9
 ### 8.1 pre-idle baseline pJ/bit
 
 `summary.csv`의 `dynamic_power_w`, `dynamic_energy_j`, `pj_per_bit`는 pre-idle baseline 기준이다.
+
+`target=0` phase는 baseline 관찰용이다. byte 전송량이 0이므로 pJ/bit 분모가 없고, 따라서 `write_0` 또는 `read_0`의 pJ/bit는 해석 대상이 아니다. 만약 예전 이미지에서 `write_0` pJ/bit 막대가 크게 보인다면 그 막대는 유효한 DRAM energy 값이 아니므로 최신 스크립트로 다시 생성해야 한다.
+
+H100처럼 power API의 update/window가 길게 보이는 환경에서는 이전 active phase가 다음 0% phase의 `avg_power_w`에 일부 남을 수 있다. 기본 실행은 `--phase-order target-major`로 0% phase를 먼저 돌리고, phase 사이에는 `--gap-seconds 1.0`을 둔다. 그래도 `write_0` baseline이 높게 보이면 `--gap-seconds 2`로 재실행하고 `trace.csv`의 `power_w`, `power_instant_w`, `power_average_w`를 같이 확인한다.
 
 장점:
 

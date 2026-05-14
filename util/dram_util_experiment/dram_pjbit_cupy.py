@@ -16,6 +16,7 @@ import argparse
 import csv
 import ctypes
 import json
+import math
 import statistics
 import sys
 import threading
@@ -315,6 +316,10 @@ def stdev_or_nan(vals: list[float]) -> float:
     if not vals:
         return float("nan")
     return statistics.pstdev(vals) if len(vals) > 1 else 0.0
+
+
+def fmt_or_na(v: float, fmt: str = ".3f") -> str:
+    return format(v, fmt) if math.isfinite(v) else "n/a"
 
 
 def workload_label(mode: str, pattern: str) -> str:
@@ -689,11 +694,28 @@ def save_plot(out_dir: Path, stem: str, gpu_name: str, idle_power_w: float,
     ax1.set_xticks(x, labels, rotation=30, ha="right")
     ax1.grid(True, axis="y", alpha=0.3)
 
-    ax2.bar(x, [r.pj_per_bit for r in results], color=colors, alpha=0.75)
-    ax2.set_ylabel("dynamic pJ/bit")
-    ax2.set_xticks(x, labels, rotation=30, ha="right")
+    active_results = [
+        r for r in results if r.bytes_transferred > 0 and math.isfinite(r.pj_per_bit)
+    ]
+    if active_results:
+        active_labels = [r.phase for r in active_results]
+        active_x = np.arange(len(active_results))
+        active_colors = [workload_color(r.workload) for r in active_results]
+        ax2.bar(active_x, [r.pj_per_bit for r in active_results],
+                color=active_colors, alpha=0.75)
+        ax2.set_xticks(active_x, active_labels, rotation=30, ha="right")
+        ax2.text(0.01, 0.96,
+                 "0% phases transfer no bytes; pJ/bit is undefined and omitted.",
+                 transform=ax2.transAxes, ha="left", va="top", fontsize=8,
+                 bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "0.8",
+                       "alpha": 0.9})
+    else:
+        ax2.text(0.5, 0.5, "No active phase with finite pJ/bit",
+                 transform=ax2.transAxes, ha="center", va="center")
+        ax2.set_xticks([])
+    ax2.set_ylabel("dynamic pJ/bit\n(active only)")
     ax2.grid(True, axis="y", alpha=0.3)
-    ax2.set_xlabel("phase")
+    ax2.set_xlabel("active phase")
 
     fig.text(0.01, 0.01,
              "pJ/bit = max(0, integrated NVML power - idle baseline × time) / "
@@ -1323,6 +1345,11 @@ def main() -> None:
                     help="idle baseline duration before active phases")
     ap.add_argument("--window-ms", type=float, default=20.0)
     ap.add_argument("--poll-hz", type=int, default=100)
+    ap.add_argument("--gap-seconds", type=float, default=1.0,
+                    help="idle gap between phases to reduce transition bleed-through")
+    ap.add_argument("--phase-order", choices=["target-major", "workload-major"],
+                    default="target-major",
+                    help="target-major runs all 0% phases before active phases")
     ap.add_argument("--buf-bytes", type=int, default=None,
                     help="default: max(1 GiB, 64 * L2)")
     ap.add_argument("--device", type=int, default=0)
@@ -1334,6 +1361,10 @@ def main() -> None:
     bad_targets = [t for t in args.targets if t < 0 or t > 100]
     if bad_targets:
         raise SystemExit(f"--targets must be between 0 and 100: {bad_targets}")
+    if args.poll_hz <= 0:
+        raise SystemExit("--poll-hz must be positive")
+    if args.gap_seconds < 0:
+        raise SystemExit("--gap-seconds must be non-negative")
     args.write_patterns = list(dict.fromkeys(args.write_patterns))
     if "write" not in args.modes and args.write_patterns != ["const"]:
         print("[warn] --write-patterns is ignored because --modes does not include write")
@@ -1442,25 +1473,37 @@ def main() -> None:
     metadata_after: dict = {}
     poller.start()
     try:
-        for mode, pattern in workloads:
+        if args.phase_order == "target-major":
+            phase_sequence = [
+                (mode, pattern, target)
+                for target in args.targets
+                for mode, pattern in workloads
+            ]
+        else:
+            phase_sequence = [
+                (mode, pattern, target)
+                for mode, pattern in workloads
+                for target in args.targets
+            ]
+
+        for mode, pattern, target in phase_sequence:
             workload = workload_label(mode, pattern)
             buf = read_buf if mode == "read" else write_buf
             if buf is None:
                 raise RuntimeError(f"missing buffer for mode {mode}")
-            for target in args.targets:
-                print(f"[phase] {phase_label(mode, pattern, target)} start")
-                result = run_phase(
-                    mode, pattern, target, kernels[mode], stream, blocks, threads,
-                    buf, sink, n_f4, args.buf_bytes, peak_passes_per_s[workload],
-                    args.phase_seconds, args.window_ms, poller, idle_power_w)
-                results.append(result)
-                print(f"[phase] {result.phase:<18} BW={result.bandwidth_gbps:.1f} GB/s  "
-                      f"Pdyn={result.dynamic_power_w:.1f} W  "
-                      f"E={result.dynamic_energy_j:.3f} J  "
-                      f"pJ/bit={result.pj_per_bit:.3f}")
-                with nvtx.annotate("gap", color="gray"):
-                    poller.set_phase("gap")
-                    time.sleep(0.5)
+            print(f"[phase] {phase_label(mode, pattern, target)} start")
+            result = run_phase(
+                mode, pattern, target, kernels[mode], stream, blocks, threads,
+                buf, sink, n_f4, args.buf_bytes, peak_passes_per_s[workload],
+                args.phase_seconds, args.window_ms, poller, idle_power_w)
+            results.append(result)
+            print(f"[phase] {result.phase:<18} BW={result.bandwidth_gbps:.1f} GB/s  "
+                  f"Pdyn={result.dynamic_power_w:.1f} W  "
+                  f"E={result.dynamic_energy_j:.3f} J  "
+                  f"pJ/bit={fmt_or_na(result.pj_per_bit)}")
+            with nvtx.annotate("gap", color="gray"):
+                poller.set_phase("gap")
+                time.sleep(max(0.0, args.gap_seconds))
     finally:
         poller.stop()
         metadata_after = nvml_snapshot(handle)
@@ -1523,6 +1566,7 @@ def main() -> None:
             "On GA10x Ampere, nvmlDeviceGetPowerUsage is documented as a 1-second average.",
             "Trace CSV includes NVML_FI_DEV_POWER_INSTANT/AVERAGE when supported.",
             "Use slope_avg_power_vs_bw as the preferred marginal board-energy estimate.",
+            "target=0 phases transfer no bytes, so pJ/bit is undefined for those phases.",
             "pJ/bit normalization uses measured bytes_transferred and measured wall_s; "
             "requested target labels and calibration peak are not used as the denominator.",
         ],
@@ -1556,7 +1600,7 @@ def main() -> None:
     for r in results:
         print(f"{r.phase:<18} {r.bandwidth_gbps:>10.1f} {r.avg_power_w:>10.1f} "
               f"{r.dynamic_power_w:>10.1f} {r.dynamic_energy_j:>10.3f} "
-              f"{r.pj_per_bit:>10.3f}")
+              f"{fmt_or_na(r.pj_per_bit):>10}")
     print_analysis(analysis_rows)
     print_quality_checks(quality_rows)
 
