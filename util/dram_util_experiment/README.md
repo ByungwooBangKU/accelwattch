@@ -823,6 +823,7 @@ reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_bandwidth.png
 3. A100/H100 비교는 `dram_pj_per_nominal_bit`보다 `dram_minus_control_pj_per_nominal_bit`를 우선한다.
 4. `write:random`은 최종 DRAM 비교에서 제외하거나 별도 compute-mixed 결과로 보고한다.
 5. NCU로 `dram__bytes_*`, `lts__t_sectors_*`, `smsp__inst_executed_pipe_*`를 확인해 physical traffic과 compute 혼입을 검증한다.
+6. `l2_minus_control_pj_per_nominal_bit`가 작게 음수이면 L2 energy가 음수라는 뜻이 아니라 matched-control이 active L2 phase보다 더 높은 board dynamic power를 보인 over-subtraction이다. 이 경우 lower-bound 해석에서는 `l2_minus_control_clamped_pj_per_nominal_bit=0`으로 보고 `dram_over_l2_clamped_pj_per_nominal_bit`를 함께 사용한다.
 
 diagnostic 옵션:
 

@@ -46,6 +46,17 @@ unsigned int mix32(unsigned int x) {
 }
 
 __device__ __forceinline__
+uint4 consume_write_value(uint4 acc, uint4 v, unsigned long long i) {
+    unsigned int lo = (unsigned int)i;
+    unsigned int hi = (unsigned int)(i >> 32);
+    acc.x ^= v.x ^ lo;
+    acc.y += v.y ^ hi;
+    acc.z ^= v.z + (lo * 0x9e3779b9U);
+    acc.w += v.w ^ (hi * 0x85ebca6bU);
+    return acc;
+}
+
+__device__ __forceinline__
 uint4 write_pattern_value(unsigned long long i, int p, int pattern) {
     unsigned int lo = (unsigned int)i;
     unsigned int hi = (unsigned int)(i >> 32);
@@ -126,10 +137,7 @@ void hierarchy_control_write(uint4* __restrict__ sink,
     for (int p = 0; p < passes; ++p) {
         for (unsigned long long i = tid; i < n; i += stride) {
             uint4 v = write_pattern_value(i, p, pattern);
-            acc.x ^= v.x;
-            acc.y ^= v.y;
-            acc.z += v.z;
-            acc.w += v.w;
+            acc = consume_write_value(acc, v, i);
         }
     }
     sink[tid & 1023U] = acc;
@@ -141,6 +149,7 @@ void hierarchy_write(uint4* __restrict__ out,
                      unsigned long long n, int passes, int pattern) {
     unsigned long long tid    = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    uint4 acc = make_uint4(0U, 0U, 0U, 0U);
     for (int p = 0; p < passes; ++p) {
         for (unsigned long long i = tid; i < n; i += stride) {
             uint4 v = write_pattern_value(i, p, pattern);
@@ -148,9 +157,10 @@ void hierarchy_write(uint4* __restrict__ out,
             asm volatile("st.global.v4.u32 [%0], {%1,%2,%3,%4};"
                          :
                          : "l"(ptr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+            acc = consume_write_value(acc, v, i);
         }
     }
-    sink[tid & 1023U] = write_pattern_value(tid, passes, pattern);
+    sink[tid & 1023U] = acc;
 }
 """
 
@@ -374,6 +384,13 @@ def make_analysis_rows(rows: list[dict]) -> list[dict]:
         l2_pj_delta = pj_per_bit_from_power(l2_power_delta, l2["nominal_bandwidth_gbs"])
         dram_pj_delta = pj_per_bit_from_power(
             dram_power_delta, dram["nominal_bandwidth_gbs"])
+        l2_pj_delta_clamped = max(0.0, l2_pj_delta) if math.isfinite(l2_pj_delta) else l2_pj_delta
+        dram_over_l2 = dram_pj_delta - l2_pj_delta
+        dram_over_l2_clamped = (
+            dram_pj_delta - l2_pj_delta_clamped
+            if math.isfinite(dram_pj_delta) and math.isfinite(l2_pj_delta_clamped)
+            else float("nan")
+        )
         out.append({
             "mode": mode,
             "pattern": pattern,
@@ -384,12 +401,15 @@ def make_analysis_rows(rows: list[dict]) -> list[dict]:
             "l2_minus_control_power_w": l2_power_delta,
             "dram_minus_control_power_w": dram_power_delta,
             "l2_minus_control_pj_per_nominal_bit": l2_pj_delta,
+            "l2_minus_control_clamped_pj_per_nominal_bit": l2_pj_delta_clamped,
             "dram_minus_control_pj_per_nominal_bit": dram_pj_delta,
-            "dram_over_l2_pj_per_nominal_bit": dram_pj_delta - l2_pj_delta,
+            "dram_over_l2_pj_per_nominal_bit": dram_over_l2,
+            "dram_over_l2_clamped_pj_per_nominal_bit": dram_over_l2_clamped,
             "dram_nominal_bandwidth_gbs": dram["nominal_bandwidth_gbs"],
             "l2_nominal_bandwidth_gbs": l2["nominal_bandwidth_gbs"],
             "notes": (
                 "Power deltas are board-level dynamic lower-bound estimates. "
+                "Use clamped columns when L2-control is negative from over-subtraction/noise. "
                 "Use NCU physical DRAM/L2 bytes for final denominator checks."
             ),
         })
@@ -557,8 +577,8 @@ def save_decomposition_plot(path: Path, gpu_name: str,
                [r["dram_minus_control_pj_per_nominal_bit"] for r in analysis_rows],
                width=0.25, label="DRAM - ctrl DRAM", color="#e45756")
         ax.bar(np.arange(len(a_labels)) + 0.25,
-               [r["dram_over_l2_pj_per_nominal_bit"] for r in analysis_rows],
-               width=0.25, label="DRAM over L2", color="#b279a2")
+               [r["dram_over_l2_clamped_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.25, label="DRAM over max(L2, 0)", color="#b279a2")
         ax.set_title("Control-subtracted lower-bound estimates")
         ax.set_ylabel("pJ/nominal bit")
         ax.set_xticks(np.arange(len(a_labels)))
@@ -843,14 +863,15 @@ def main() -> None:
               f"{base.fmt_or_na(row['pj_per_nominal_bit']):>10}")
     print()
     print(f"{'mode/pattern':<18} {'L2-control':>12} {'DRAM-control':>14} "
-          f"{'DRAM-over-L2':>14}")
-    print("-" * 62)
+          f"{'DRAM-over-L2':>14} {'clamped':>10}")
+    print("-" * 73)
     for row in analysis_rows:
         label = row["mode"] if row["mode"] == "read" else f"write:{row['pattern']}"
         print(f"{label:<18} "
               f"{base.fmt_or_na(row['l2_minus_control_pj_per_nominal_bit']):>12} "
               f"{base.fmt_or_na(row['dram_minus_control_pj_per_nominal_bit']):>14} "
-              f"{base.fmt_or_na(row['dram_over_l2_pj_per_nominal_bit']):>14}")
+              f"{base.fmt_or_na(row['dram_over_l2_pj_per_nominal_bit']):>14} "
+              f"{base.fmt_or_na(row['dram_over_l2_clamped_pj_per_nominal_bit']):>10}")
 
 
 if __name__ == "__main__":
