@@ -3,7 +3,7 @@
 이 디렉터리는 GPU DRAM read/write traffic을 제어해서 bandwidth, NVML power trace,
 board-level marginal pJ/bit을 측정하는 실험 도구 모음이다. 현재 문서는
 `dram_pjbit_cupy.py` 기반 pJ/bit 실험을 중심으로 정리한다. 기존 read-utilization 및
-Nsight profiling 도구는 12장 부록에 요약한다.
+Nsight profiling 도구는 13장 부록에 요약한다.
 
 ## 0. 요약
 
@@ -16,6 +16,7 @@ Nsight profiling 도구는 12장 부록에 요약한다.
 7. 큰 buffer에서는 `--window-ms`가 중요하다. 8 GiB/A100/H100 계열 보고용은 `--window-ms 100` 또는 `200`을 권장한다.
 8. H100에서는 `NVML_FI_DEV_POWER_INSTANT`/`AVERAGE` field API를 같이 기록해서 cross-validation할 수 있다.
 9. H100 write 해석은 `--write-patterns zero const address random toggle` sweep으로 data pattern/compression 영향을 분리한다.
+10. A100/H100처럼 세대 간 비교가 이상하면 `hierarchy_pjbit_cupy.py`로 control/L2/DRAM-stream lower-bound 실험을 추가 수행한다.
 
 ## 1. 파일 구성
 
@@ -25,6 +26,9 @@ Nsight profiling 도구는 12장 부록에 요약한다.
 | `run_pjbit_cupy.sh` | pJ/bit 실험 launcher. 필요한 Python 환경 자동 탐색 |
 | `run_pjbit_repeats.sh` | 3회 반복 실험, per-run 이미지, 반복 요약 CSV/PNG 자동 생성 |
 | `run_pjbit_ncu.sh` | Nsight Compute 기반 L2/DRAM counter validation 자동 실행 |
+| `hierarchy_pjbit_cupy.py` | control/L2/DRAM-stream lower-bound 분리 실험 |
+| `run_hierarchy_pjbit.sh` | hierarchy lower-bound 실험 launcher |
+| `run_hierarchy_ncu.sh` | hierarchy workload별 Nsight Compute counter validation launcher |
 | `summarize_pjbit_repeats.py` | 여러 `*_analysis.csv` 반복 run 평균/표준편차 요약 및 요약 PNG 생성 |
 | `dram_util_cupy.py` | legacy read-utilization 계단 실험 |
 | `run_cupy.sh` | legacy CuPy read-utilization launcher |
@@ -734,9 +738,140 @@ for value in values:
 2. `100%-0%`: 약 `44-45 pJ/bit`, 상한성 sanity check.
 3. 현재 값은 DRAM rail-only가 아니라 NVML board-level marginal dynamic pJ/bit.
 
-## 12. Legacy read-utilization 및 Nsight 부록
+## 12. Memory Hierarchy Lower-Bound 실험
 
-### 12.1 CuPy read-utilization
+`hierarchy_pjbit_cupy.py`는 A100/H100처럼 세대 간 pJ/bit 결과가 직관과 다를 때 원인을 좁히기 위한 새 실험이다. 논문식 접근에 맞춰 DRAM stream 한 점만 보지 않고, 같은 loop/address/pattern 구조를 다음 네 단계로 분리한다.
+
+```text
+control_l2
+  L2 크기 working set에 해당하는 loop/address/pattern 생성만 수행
+  global memory access 없음
+
+l2
+  L2보다 작은 buffer를 반복 접근
+  read는 L2-resident hit를 의도
+  write는 L2/store path resident case로 보고 NCU writeback 확인 필요
+
+control_dram
+  DRAM stream 크기 working set에 해당하는 loop/address/pattern 생성만 수행
+  global memory access 없음
+
+dram
+  L2보다 훨씬 큰 buffer를 streaming 접근
+```
+
+이 실험의 목적은 다음 값을 분리해서 보는 것이다.
+
+```text
+L2 path lower bound
+  l2 - control_l2
+
+DRAM stream lower bound
+  dram - control_dram
+
+DRAM over L2 rough estimate
+  (dram - control_dram) - (l2 - control_l2)
+```
+
+주의: 이 값도 DRAM rail-only pJ/bit은 아니다. NVML GPU/board dynamic power 기반 lower-bound 성격이며, 최종 해석은 NCU의 physical DRAM/L2 bytes와 함께 확인해야 한다. 특히 `write:random`은 xorshift pattern generation ALU가 포함되므로 compute-mixed case로 분리해서 본다.
+
+기본 실행:
+
+```bash
+cd util/dram_util_experiment
+./run_hierarchy_pjbit.sh \
+  --device 0 \
+  --tag a100_hierarchy \
+  --dram-buf-bytes 8589934592 \
+  --phase-seconds 12
+```
+
+H100도 같은 조건으로 실행한다.
+
+```bash
+./run_hierarchy_pjbit.sh \
+  --device 0 \
+  --tag h100_hierarchy \
+  --dram-buf-bytes 8589934592 \
+  --phase-seconds 12
+```
+
+출력:
+
+```text
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_summary.csv
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_analysis.csv
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_trace.csv
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_metadata.json
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*.png
+```
+
+해석 순서:
+
+1. `summary.csv`에서 `control_*`의 pJ/nominal-bit가 너무 크면 loop/address/pattern overhead가 결과를 지배하는 것이다.
+2. `analysis.csv`의 `l2_minus_control_pj_per_nominal_bit`와 `dram_minus_control_pj_per_nominal_bit`를 비교한다.
+3. A100/H100 비교는 `dram_pj_per_nominal_bit`보다 `dram_minus_control_pj_per_nominal_bit`를 우선한다.
+4. `write:random`은 최종 DRAM 비교에서 제외하거나 별도 compute-mixed 결과로 보고한다.
+5. NCU로 `dram__bytes_*`, `lts__t_sectors_*`, `smsp__inst_executed_pipe_*`를 확인해 physical traffic과 compute 혼입을 검증한다.
+
+diagnostic 옵션:
+
+```bash
+# random 포함. compute-mixed sensitivity 용도
+./run_hierarchy_pjbit.sh \
+  --device 0 \
+  --tag h100_hierarchy_random \
+  --dram-buf-bytes 8589934592 \
+  --write-patterns zero const address toggle random
+
+# block/occupancy sensitivity
+./run_hierarchy_pjbit.sh \
+  --device 0 \
+  --tag h100_hierarchy_blocks64 \
+  --dram-buf-bytes 8589934592 \
+  --blocks 64
+
+# NCU에서 특정 workload만 짧게 profile할 때
+./run_hierarchy_pjbit.sh \
+  --device 0 \
+  --tag h100_hierarchy_ncu_probe \
+  --dram-buf-bytes 8589934592 \
+  --only-workload dram_read \
+  --phase-seconds 1 \
+  --idle-seconds 0.2
+```
+
+NCU counter validation까지 같이 할 때는 별도 wrapper를 쓴다. 이 wrapper는 대표 workload를 하나씩 짧게 실행하고 `.ncu-rep`와 `.ncu.log`를 저장한다.
+
+```bash
+sudo -v
+sudo env PY="$VIRTUAL_ENV/bin/python" ./run_hierarchy_ncu.sh \
+  --device 0 \
+  --tag h100_hierarchy_ncu \
+  --dram-buf-bytes 8589934592 \
+  --workloads "l2_read dram_read l2_write_zero dram_write_zero"
+```
+
+NCU에서 우선 확인할 항목은 `dram__bytes_*`, `lts__t_sectors_*`, `l1tex__t_sectors_*`, `smsp__inst_executed_pipe_lsu.sum`이다. 이 값으로 `l2_*`가 실제로 DRAM traffic을 거의 만들지 않았는지, `dram_*`의 denominator가 nominal bytes와 크게 다르지 않은지 확인한다. `ERR_NVGPUCTRPERM`이 나오면 profiler 권한 문제이며, 측정 코드 실패가 아니다.
+
+대표 workload 이름:
+
+```text
+control_l2_read
+l2_read
+control_dram_read
+dram_read
+control_l2_write_zero
+l2_write_zero
+control_dram_write_zero
+dram_write_zero
+```
+
+write pattern은 `zero`, `const`, `address`, `toggle`, `random`을 지원한다.
+
+## 13. Legacy read-utilization 및 Nsight 부록
+
+### 13.1 CuPy read-utilization
 
 기존 `dram_util_cupy.py`는 DRAM read utilization을 25/50/75/100% 계단으로 만드는 도구다. pJ/bit 계산은 하지 않는다.
 
@@ -752,7 +887,7 @@ python3 dram_util_cupy.py --targets 25 50 75 100 --phase-seconds 10
 1. `reports/util_cupy_<gpu_slug>_<timestamp>.csv`
 2. `reports/util_cupy_<gpu_slug>_<timestamp>.png`
 
-### 12.2 CuPy + Nsight Systems
+### 13.2 CuPy + Nsight Systems
 
 ```bash
 ./run_nsys_cupy.sh
@@ -768,7 +903,7 @@ nsys-ui reports/nsys_cupy_*.nsys-rep
 2. GPU metrics: DRAM read throughput 계단.
 3. CUDA kernels: `stream_read` duty-cycle 패턴.
 
-### 12.3 Nsight Compute L2/DRAM counter validation
+### 13.3 Nsight Compute L2/DRAM counter validation
 
 NVML power 실험과 Nsight Compute profiling은 목적이 다르므로 분리해서 실행한다. Nsight Compute는 replay/profiling overhead가 크고, power trace를 왜곡할 수 있다. 이 단계의 목적은 pJ/bit를 다시 재는 것이 아니라 cache/DRAM traffic이 의도대로 발생했는지 확인하는 것이다.
 
@@ -897,7 +1032,7 @@ ncu --query-metrics | grep -E "dram__.*write|dram__.*read|lts__.*write|lts__.*hi
 4. read phase는 `stream_read`를 같은 방식으로 profiling해서 DRAM read byte와 L2 hit/miss 지표를 확인한다.
 5. 이 validation 결과가 없으면 보고서에 "Nsight Compute L2/DRAM counter cross-check는 미수행"이라고 명시한다.
 
-### 12.4 Native CUDA + Nsight Systems
+### 13.4 Native CUDA + Nsight Systems
 
 요구사항:
 
@@ -922,9 +1057,9 @@ DRAM_BUF_BYTES=$((8*1024*1024*1024)) make SM=80
 DRAM_BUF_BYTES=$((8*1024*1024*1024)) ./run_nsys.sh
 ```
 
-## 13. Bandwidth 용어와 공개 pJ/bit 비교
+## 14. Bandwidth 용어와 공개 pJ/bit 비교
 
-### 13.1 Raw-bus peak vs effective peak
+### 14.1 Raw-bus peak vs effective peak
 
 두 수치를 혼동하면 A100 80GB의 1779 GB/s calibration peak를 2039 GB/s raw peak보다 낮다고 잘못 해석하게 된다.
 
@@ -942,7 +1077,7 @@ GPU별 기대 범위:
 | A100 80GB HBM2e ECC on | 2039 GB/s | 1700-1800 GB/s | 83-88% |
 | H100 SXM HBM3 ECC on | 3350 GB/s | 2700-3000 GB/s | 80-90% |
 
-### 13.2 공개 memory pJ/bit와 비교
+### 14.2 공개 memory pJ/bit와 비교
 
 | Memory | 공개/문헌상 대략 범위 | 주의 |
 |---|---:|---|
@@ -953,7 +1088,7 @@ GPU별 기대 범위:
 
 이 표는 device/PHY 관점이다. 본 실험의 RTX 3090 `30 pJ/bit` 수준 값은 board-level marginal 값이라 직접 비교하면 안 된다.
 
-## 14. 관련 연구와 방법론 체크
+## 15. 관련 연구와 방법론 체크
 
 1. GPUWattch는 microbenchmark와 실제 hardware power 측정을 함께 써서 GPU power model을 검증했다. 이 실험도 제어된 DRAM traffic과 board-level power marginal slope를 사용한다.
 2. AccelWattch는 modern GPU의 cycle-level power와 constant/static power까지 모델링한다. 본 측정값은 DRAM rail-only 상수가 아니라 memory-subsystem calibration anchor로 쓰는 것이 안전하다.
@@ -961,14 +1096,17 @@ GPU별 기대 범위:
 4. NVIDIA PTX 문서 기준 cache operator는 memory consistency를 바꾸지 않는 performance hint다. `st.cs`/evict-first 계열은 streaming write에 유용한 후보지만 L2 bypass 보장은 아니다.
 5. `discard.global.L2`는 L2 line을 invalidate할 수 있지만 writeback 없이 데이터를 버리므로 정상 write energy 측정에는 적합하지 않다.
 6. Nsight Compute GPU Metrics가 있으면 DRAM read/write byte counter와 L2 counter로 NVML 기반 effective BW와 계단 모양을 cross-check한다.
+7. Delestrac et al.의 ASAP 2024 data movement/storage energy 연구는 GPU 내부 power sensor와 microbenchmark로 memory hierarchy lower bound를 추정한다. 이 문서의 12장 실험은 같은 취지로 control/L2/DRAM-stream phase를 분리하되, NVIDIA 공개 장비에서 접근 가능한 NVML/NCU 조합으로 구현한다.
 
 참고 문서:
 
-1. PTX ISA cache operators: <https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#cache-operators>
-2. PTX ISA `discard.global.L2`: <https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-discard>
-3. Nsight Compute metric aliases: <https://archive.docs.nvidia.com/nsight-compute/2022.1/NsightComputeCli/index.html>
+1. Delestrac et al., "Analyzing GPU Energy Consumption in Data Movement and Storage", ASAP 2024: <https://doi.org/10.1109/ASAP61560.2024.00038>
+2. IEEE/imec publication metadata: <https://imec-publications.be/handle/20.500.12860/44658.2>
+3. PTX ISA cache operators: <https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#cache-operators>
+4. PTX ISA `discard.global.L2`: <https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-discard>
+5. Nsight Compute metric aliases: <https://archive.docs.nvidia.com/nsight-compute/2022.1/NsightComputeCli/index.html>
 
-## 15. 최종 보고 체크리스트
+## 16. 최종 보고 체크리스트
 
 1. `nvidia-smi`로 다른 compute process가 없음을 확인했는가?
 2. GPU name, driver, CUDA runtime, L2, buffer size가 metadata에 남았는가?
