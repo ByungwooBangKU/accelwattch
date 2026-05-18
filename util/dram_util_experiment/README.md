@@ -804,7 +804,17 @@ reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_analysis.csv
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_trace.csv
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_metadata.json
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*.png
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_power_trace.png
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_decomposition.png
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_bandwidth.png
 ```
+
+이미지 해석:
+
+1. 기본 `*.png`: phase별 dynamic power, raw pJ/nominal-bit, nominal throughput, control-subtracted estimate를 한 장에 요약한다.
+2. `*_power_trace.png`: NVML power timeline과 phase span을 함께 보여준다. baseline 분리, phase 안정화, gap 구간 이상 여부를 확인한다.
+3. `*_decomposition.png`: `L2-control`, `DRAM-control`, `DRAM-over-L2`를 비교하는 핵심 이미지다. A100/H100/RTX 3090 세대 비교는 이 그림을 우선 본다.
+4. `*_bandwidth.png`: pJ/bit denominator로 들어간 nominal bandwidth를 phase별로 표시한다. NCU physical bytes와 denominator가 어긋나는지 확인할 때 같이 본다.
 
 해석 순서:
 

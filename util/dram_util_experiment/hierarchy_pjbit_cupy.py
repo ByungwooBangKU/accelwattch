@@ -268,6 +268,8 @@ def run_phase(spec: WorkloadSpec, kernels: dict[str, object], stream,
         "n_uint4": spec.n_u4,
         "passes_per_launch": passes,
         "launches": launches,
+        "t0_s": t0,
+        "t1_s": t1,
         "wall_s": wall_s,
         "nominal_bytes": nominal_bytes,
         "nominal_bandwidth_gbs": bandwidth_gbs,
@@ -394,6 +396,31 @@ def make_analysis_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
+def stage_color(stage: str) -> str:
+    return {
+        "control_l2": "#8c8c8c",
+        "l2": "#4c78a8",
+        "control_dram": "#bab0ac",
+        "dram": "#e45756",
+    }.get(stage, "#6f6f6f")
+
+
+def short_row_label(row: dict) -> str:
+    stage_label = {
+        "control_l2": "ctrl L2",
+        "l2": "L2",
+        "control_dram": "ctrl DRAM",
+        "dram": "DRAM",
+    }.get(str(row["stage"]), str(row["stage"]))
+    if row["mode"] == "read":
+        return f"read\n{stage_label}"
+    return f"write:{row['pattern']}\n{stage_label}"
+
+
+def analysis_label(row: dict) -> str:
+    return row["mode"] if row["mode"] == "read" else f"write:{row['pattern']}"
+
+
 def save_plot(path: Path, gpu_name: str, rows: list[dict], analysis_rows: list[dict]) -> None:
     if not rows:
         return
@@ -451,6 +478,150 @@ def save_plot(path: Path, gpu_name: str, rows: list[dict], analysis_rows: list[d
         axes[1, 1].axis("off")
 
     fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def save_power_trace_plot(path: Path, gpu_name: str, idle_power_w: float,
+                          rows: list[dict], samples: list[base.PowerSample]) -> None:
+    if not samples:
+        return
+    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
+    power_samples = [s for s in samples if s.power_w >= 0]
+    t = [s.t_s for s in power_samples]
+    p = [s.power_w for s in power_samples]
+    ax0.plot(t, p, lw=0.8, color="#1f77b4", label="NVML total power")
+    ax0.axhline(idle_power_w, color="black", ls="--", lw=1.0,
+                label=f"idle {idle_power_w:.1f} W")
+    ymax = max(p, default=idle_power_w)
+    for row in rows:
+        color = stage_color(str(row["stage"]))
+        ax0.axvspan(row["t0_s"], row["t1_s"], color=color, alpha=0.12)
+        ax0.text((row["t0_s"] + row["t1_s"]) / 2, ymax,
+                 str(row["name"]), ha="center", va="bottom",
+                 fontsize=7, rotation=75)
+    ax0.set_title(f"Power trace by hierarchy phase - {gpu_name}")
+    ax0.set_ylabel("power (W)")
+    ax0.grid(True, alpha=0.3)
+    ax0.legend(loc="upper left")
+
+    util_samples = [s for s in samples if s.gpu_util_pct >= 0 or s.mem_util_pct >= 0]
+    ax1.plot([s.t_s for s in util_samples], [max(s.gpu_util_pct, 0) for s in util_samples],
+             lw=0.9, color="#54a24b", label="GPU util")
+    ax1.plot([s.t_s for s in util_samples], [max(s.mem_util_pct, 0) for s in util_samples],
+             lw=0.9, color="#f58518", label="memory util")
+    for row in rows:
+        ax1.axvspan(row["t0_s"], row["t1_s"], color=stage_color(str(row["stage"])),
+                    alpha=0.08)
+    ax1.set_xlabel("time since poller start (s)")
+    ax1.set_ylabel("utilization (%)")
+    ax1.set_ylim(0, 105)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="upper left")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def save_decomposition_plot(path: Path, gpu_name: str,
+                            rows: list[dict], analysis_rows: list[dict]) -> None:
+    if not rows:
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(17, 10))
+    labels = [short_row_label(r) for r in rows]
+    x = np.arange(len(rows))
+    colors = [stage_color(str(r["stage"])) for r in rows]
+
+    axes[0, 0].bar(x, [r["dynamic_power_w"] for r in rows], color=colors)
+    axes[0, 0].set_title("Dynamic power by matched phase")
+    axes[0, 0].set_ylabel("W above idle")
+    axes[0, 0].set_xticks(x)
+    axes[0, 0].set_xticklabels(labels, rotation=75, ha="right", fontsize=8)
+    axes[0, 0].grid(axis="y", alpha=0.25)
+
+    axes[0, 1].bar(x, [r["pj_per_nominal_bit"] for r in rows], color=colors)
+    axes[0, 1].set_title("Raw board dynamic pJ / nominal bit")
+    axes[0, 1].set_ylabel("pJ/nominal bit")
+    axes[0, 1].set_xticks(x)
+    axes[0, 1].set_xticklabels(labels, rotation=75, ha="right", fontsize=8)
+    axes[0, 1].grid(axis="y", alpha=0.25)
+
+    if analysis_rows:
+        a_labels = [analysis_label(r) for r in analysis_rows]
+        ax = axes[1, 0]
+        ax.bar(np.arange(len(a_labels)) - 0.25,
+               [r["l2_minus_control_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.25, label="L2 - ctrl L2", color="#4c78a8")
+        ax.bar(np.arange(len(a_labels)),
+               [r["dram_minus_control_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.25, label="DRAM - ctrl DRAM", color="#e45756")
+        ax.bar(np.arange(len(a_labels)) + 0.25,
+               [r["dram_over_l2_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.25, label="DRAM over L2", color="#b279a2")
+        ax.set_title("Control-subtracted lower-bound estimates")
+        ax.set_ylabel("pJ/nominal bit")
+        ax.set_xticks(np.arange(len(a_labels)))
+        ax.set_xticklabels(a_labels, rotation=45, ha="right")
+        ax.axhline(0, color="black", lw=0.8)
+        ax.legend(fontsize=8)
+        ax.grid(axis="y", alpha=0.25)
+
+        ax = axes[1, 1]
+        ax.scatter(
+            [r["l2_nominal_bandwidth_gbs"] for r in analysis_rows],
+            [r["l2_minus_control_power_w"] for r in analysis_rows],
+            s=70, color="#4c78a8", label="L2 - control")
+        ax.scatter(
+            [r["dram_nominal_bandwidth_gbs"] for r in analysis_rows],
+            [r["dram_minus_control_power_w"] for r in analysis_rows],
+            s=70, color="#e45756", label="DRAM - control")
+        for r in analysis_rows:
+            label = analysis_label(r)
+            ax.annotate(label, (r["dram_nominal_bandwidth_gbs"],
+                                r["dram_minus_control_power_w"]),
+                        textcoords="offset points", xytext=(5, 4), fontsize=8)
+        ax.set_title("Control-subtracted power vs nominal bandwidth")
+        ax.set_xlabel("nominal bandwidth (GB/s)")
+        ax.set_ylabel("W above matched control")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+    else:
+        axes[1, 0].axis("off")
+        axes[1, 1].axis("off")
+
+    fig.suptitle(
+        f"Hierarchy energy decomposition - {gpu_name}\n"
+        "NVML GPU/board dynamic lower-bound, not DRAM-rail-only.",
+        fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def save_bandwidth_plot(path: Path, gpu_name: str, rows: list[dict]) -> None:
+    if not rows:
+        return
+    labels = [short_row_label(r) for r in rows]
+    x = np.arange(len(rows))
+    colors = [stage_color(str(r["stage"])) for r in rows]
+    fig, ax = plt.subplots(figsize=(max(13, min(22, 0.65 * len(rows) + 8)), 6))
+    bars = ax.bar(x, [r["nominal_bandwidth_gbs"] for r in rows], color=colors)
+    for bar, row in zip(bars, rows):
+        bw = row["nominal_bandwidth_gbs"]
+        ax.annotate(f"{bw:.0f}", (bar.get_x() + bar.get_width() / 2, bw),
+                    textcoords="offset points", xytext=(0, 4),
+                    ha="center", va="bottom", fontsize=8)
+    ax.set_title(f"Nominal bandwidth used for pJ/bit denominator - {gpu_name}")
+    ax.set_ylabel("GB/s")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=75, ha="right", fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    fig.text(0.01, 0.02,
+             "control phases use loop-equivalent nominal bytes; NCU physical bytes "
+             "should be used for final cache/DRAM denominator validation.",
+             fontsize=8)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
     fig.savefig(path, dpi=160)
     plt.close(fig)
 
@@ -603,12 +774,18 @@ def main() -> None:
     analysis_csv = out_dir / f"{stem}_analysis.csv"
     metadata_json = out_dir / f"{stem}_metadata.json"
     png = out_dir / f"{stem}.png"
+    power_trace_png = out_dir / f"{stem}_power_trace.png"
+    decomposition_png = out_dir / f"{stem}_decomposition.png"
+    bandwidth_png = out_dir / f"{stem}_bandwidth.png"
 
     analysis_rows = make_analysis_rows(rows)
     save_rows(summary_csv, rows)
     save_trace(trace_csv, poller.samples)
     save_rows(analysis_csv, analysis_rows)
     save_plot(png, gpu_name, rows, analysis_rows)
+    save_power_trace_plot(power_trace_png, gpu_name, idle_power_w, rows, poller.samples)
+    save_decomposition_plot(decomposition_png, gpu_name, rows, analysis_rows)
+    save_bandwidth_plot(bandwidth_png, gpu_name, rows)
 
     metadata = {
         "args": vars(args),
@@ -632,6 +809,12 @@ def main() -> None:
         "calibration": calibration,
         "nvml_before": metadata_before,
         "nvml_after": metadata_after,
+        "plots": {
+            "overview": str(png),
+            "power_trace": str(power_trace_png),
+            "decomposition": str(decomposition_png),
+            "bandwidth": str(bandwidth_png),
+        },
         "notes": [
             "This is not DRAM rail-only energy.",
             "control phases normalize loop/address/pattern overhead to the same nominal bytes.",
@@ -648,6 +831,9 @@ def main() -> None:
     print(f"[save] {trace_csv}")
     print(f"[save] {metadata_json}")
     print(f"[save] {png}")
+    print(f"[save] {power_trace_png}")
+    print(f"[save] {decomposition_png}")
+    print(f"[save] {bandwidth_png}")
     print()
     print(f"{'name':<30} {'BW(GB/s)':>10} {'Pdyn(W)':>10} {'pJ/bit':>10}")
     print("-" * 66)
