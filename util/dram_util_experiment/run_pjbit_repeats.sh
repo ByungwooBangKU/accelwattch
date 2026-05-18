@@ -30,7 +30,7 @@ Options:
   --ncu-bin PATH         Nsight Compute CLI. Default: ncu; common install paths are auto-detected
   --ncu-set NAME         NCU metric set fallback when auto metrics are unavailable. Default: full
   --ncu-metrics CSV      Explicit metric CSV, "auto", or "set" for --ncu-set. Default: auto
-  --ncu-repeat-scope S   rep1, all, or once. Default: rep1
+  --ncu-repeat-scope S   middle, rep1, all, or once. Default: middle
   --ncu-phase-seconds N  NCU validation phase length. Default: 1
   --ncu-buf-bytes N      NCU validation buffer bytes. Default: same as --buf-bytes
   --ncu-launch-skip N    Kernel launches to skip before profiling. Default: 2
@@ -59,7 +59,7 @@ NCU_ONLY="0"
 NCU_BIN="${NCU_BIN:-ncu}"
 NCU_SET="full"
 NCU_METRICS="auto"
-NCU_REPEAT_SCOPE="rep1"
+NCU_REPEAT_SCOPE="middle"
 NCU_PHASE_SECONDS="1"
 NCU_BUF_BYTES=""
 NCU_LAUNCH_SKIP="2"
@@ -227,10 +227,10 @@ echo "[info] write-patterns=${WRITE_PATTERNS[*]}"
 echo "[info] phase-seconds=$PHASE_SECONDS idle-seconds=$IDLE_SECONDS window-ms=$WINDOW_MS poll-hz=$POLL_HZ gap-seconds=$GAP_SECONDS phase-order=$PHASE_ORDER"
 if [[ "$NCU_PROFILE" == "1" ]]; then
     case "$NCU_REPEAT_SCOPE" in
-        rep1|first|all|once) ;;
+        middle|rep1|first|all|once) ;;
         *)
             echo "[err] unknown --ncu-repeat-scope: $NCU_REPEAT_SCOPE" >&2
-            echo "      valid values: rep1, first, all, once" >&2
+            echo "      valid values: middle, rep1, first, all, once" >&2
             exit 2
             ;;
     esac
@@ -320,6 +320,13 @@ if [[ "$NCU_PROFILE" == "1" ]]; then
         run_ncu_validation "${TAG}_ncu"
     else
         case "$NCU_REPEAT_SCOPE" in
+            middle)
+                NCU_MIDDLE_REP=$(( (REPEATS + 1) / 2 ))
+                if [[ "$NCU_MIDDLE_REP" -lt 1 ]]; then
+                    NCU_MIDDLE_REP=1
+                fi
+                run_ncu_validation "${TAG}_rep${NCU_MIDDLE_REP}_ncu"
+                ;;
             rep1|first)
                 run_ncu_validation "${TAG}_rep1_ncu"
                 ;;
