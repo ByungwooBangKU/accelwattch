@@ -1,0 +1,60 @@
+{
+  "description": "P0 primary FP16 compute energy matrix. Keep memory traffic out of the timed loop; validate with Nsight Compute separately.",
+  "defaults": {
+    "blocks": 0,
+    "blocks_per_sm": 8,
+    "threads": 256,
+    "warmup": 2,
+    "repeats": 1,
+    "unroll": 8
+  },
+  "conditions": [
+    {
+      "name": "p0_cuda_core_half2_vs_nop",
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 2000000,
+        "repeats": 5
+      },
+      "test": {
+        "kernel": "fp16_half2",
+        "iters": 2000000
+      }
+    },
+    {
+      "name": "p0_cuda_core_half2_vs_regmove",
+      "baseline": {
+        "kernel": "baseline_regmove",
+        "iters": 2000000
+      },
+      "test": {
+        "kernel": "fp16_half2",
+        "iters": 2000000
+      }
+    },
+    {
+      "name": "p0_tensor_mma_f16acc",
+      "baseline": {
+        "kernel": "tensor_baseline_u32",
+        "iters": 1000000,
+        "repeats": 3
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "p0_tensor_mma_f32acc",
+      "baseline": {
+        "kernel": "tensor_baseline_f32",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f32acc",
+        "iters": 1000000
+      }
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "description": "FP16 Tensor Core matmul logical pJ/bit matrix. The pJ/bit denominator is logical MMA operand bits, not DRAM traffic bits.",
+  "defaults": {
+    "blocks": 0,
+    "blocks_per_sm": 8,
+    "threads": 256,
+    "warmup": 2,
+    "repeats": 1,
+    "unroll": 8
+  },
+  "conditions": [
+    {
+      "name": "matmul_tensor_mma_f16acc_vs_nop",
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "matmul_tensor_mma_f32acc_vs_nop",
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f32acc",
+        "iters": 1000000
+      }
+    }
+  ]
+}

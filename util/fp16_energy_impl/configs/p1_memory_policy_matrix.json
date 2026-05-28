@@ -1,0 +1,52 @@
+{
+  "description": "P1 memory/cache-policy sanity matrix. Computes total and baseline-subtracted pJ/bit for residual memory traffic calibration, not primary FP16 energy output.",
+  "defaults": {
+    "blocks": 0,
+    "blocks_per_sm": 8,
+    "threads": 256,
+    "warmup": 1,
+    "repeats": 1,
+    "unroll": 4,
+    "iters": 2048,
+    "mem_mib": 1024,
+    "mem_stride": 1
+  },
+  "conditions": [
+    {
+      "name": "p1_memory_default",
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 2000000,
+        "repeats": 5
+      },
+      "test": {
+        "kernel": "memory_default",
+        "repeats": 50
+      }
+    },
+    {
+      "name": "p1_memory_cg",
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 2000000,
+        "repeats": 5
+      },
+      "test": {
+        "kernel": "memory_cg",
+        "repeats": 50
+      }
+    },
+    {
+      "name": "p1_memory_cs",
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 2000000,
+        "repeats": 5
+      },
+      "test": {
+        "kernel": "memory_cs",
+        "repeats": 50
+      }
+    }
+  ]
+}
