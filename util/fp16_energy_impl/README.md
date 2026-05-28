@@ -28,8 +28,8 @@
 | P0 | `fp16_half2` | CUDA core 기반 `half2` FMA 반복 | timed loop 내부 global/shared memory 접근 없음 |
 | P0 | `baseline_nop` | loop/control baseline | 동일 launch/loop 구조, FP16 연산 없음 |
 | P0 | `baseline_regmove` | register/integer movement baseline | FP16 연산 없음, integer/register overhead 참고 |
-| P0 | `tensor_mma_f16acc` | `mma.sync.m16n8k16` FP16 input + FP16 accumulate | timed loop 내부 register operand 기반 |
-| P0 | `tensor_mma_f32acc` | `mma.sync.m16n8k16` FP16 input + FP32 accumulate | timed loop 내부 register operand 기반 |
+| P0 | `tensor_mma_f16acc` | logical `m16n16k16` FP16 input + FP16 accumulate | timed loop 내부 register operand 기반 |
+| P0 | `tensor_mma_f32acc` | logical `m16n16k16` FP16 input + FP32 accumulate | timed loop 내부 register operand 기반 |
 | P0 | `tensor_baseline_u32`, `tensor_baseline_f32` | Tensor kernel용 baseline | MMA 없음 |
 | P1 | `memory_default`, `memory_cg`, `memory_cs` | residual L1/L2/DRAM 보정 및 cache policy sanity check | default / `.cg` / `.cs`만 제한 반영 |
 
@@ -39,10 +39,10 @@
 N_FP16_ops = blocks × threads × repeats × iters × unroll × 4 half2-FMA × 4 FLOP/half2-FMA
 ```
 
-Tensor Core kernel은 `mma.sync.aligned.m16n8k16`을 사용하므로 warp-level MMA 1회당 `2 × 16 × 8 × 16 = 4096` FP16 FLOP으로 계산한다.
+Tensor Core kernel은 Ampere/Hopper에서 지원되는 `mma.sync.aligned.m16n8k16` 두 번으로 logical `m16n16k16` tile 하나를 구성한다. 따라서 logical MMA 1회당 `2 × 16 × 16 × 16 = 8192` FP16 FLOP으로 계산한다.
 
 ```text
-N_FP16_ops = warps × repeats × iters × unroll × 4096
+N_FP16_ops = warps × repeats × iters × unroll × 8192
 ```
 
 ## 3. Build
@@ -97,7 +97,7 @@ cmake --build build -j
 4. Nsight Compute performance counter 접근 권한 설정.
 5. GPU별 `iters`/`repeats` 조정으로 power sample 수 확보.
 
-H100에서도 현재 Tensor Core kernel은 `mma.sync.m16n8k16` warp-level 경로를 사용한다. 따라서 A100/H100/RTX 3090 간 같은 HMMA 계열 FP16 matmul path 비교에는 사용할 수 있지만, H100 고유 WGMMA/TMA 경로의 최대 matmul energy를 측정하는 실험은 아니다. H100 WGMMA 경로까지 측정하려면 별도 kernel과 validation matrix를 추가해야 한다.
+H100에서도 현재 Tensor Core kernel은 `mma.sync.m16n8k16` 두 개로 logical `m16n16k16`을 만드는 warp-level 경로를 사용한다. 따라서 A100/H100/RTX 3090 간 같은 HMMA 계열 FP16 matmul path 비교에는 사용할 수 있지만, H100 고유 WGMMA/TMA 경로의 최대 matmul energy를 측정하는 실험은 아니다. H100 WGMMA 경로까지 측정하려면 별도 kernel과 validation matrix를 추가해야 한다.
 
 ## 5. 실험 전 환경 수집
 
@@ -185,13 +185,13 @@ python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_fine
 
 여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 선택 기준은 max SM utilization에서 0.1 percentage point 이내로 포화된 후보 중 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다.
 
-2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 `mma.sync.m16n8k16`이며, pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*8) * 16 = 6144 bit/MMA`다. Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다.
+2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 logical `m16n16k16`이며, 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*16) * 16 = 8192 bit/logical MMA`다. Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다.
 
 | Sweep | 후보 threads/block | Selected threads/SM | Selected threads/block | valid no-L2 | Avg SM util (%) | TFLOPS | `matmul_input_pj_per_bit` |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Fine + dmon SM util | 32,64,96,128,160,192,224,256,288,320,384 | 256 | 32 | 10/10 | 100.000 +/- 0.000 | 154.2 | 0.1431 +/- 0.0358 pJ/bit |
+| Fine + dmon SM util | 32,64,96,128,160,192,224,256,288,320,384 | 512 | 64 | 9/10 | 100.000 +/- 0.000 | 159.1 | 0.2514 +/- 0.0142 pJ/bit |
 
-Fine + dmon run에서는 `threads_per_sm=256`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 target thread count는 256 threads/SM, 즉 32 threads/block로 지정한다. 다만 32-thread point의 dmon SM sample은 run당 1개라 sampling granularity caveat가 있고, pJ/bit 자체는 224/256 threads/block 후보가 더 낮게 관찰된다. 이 값들은 board-level `nvidia-smi` power trace와 baseline subtraction 기반 estimate이므로, 최종 수치 채택 전에는 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
+Fine + dmon run에서는 `threads_per_sm=512`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 target thread count는 512 threads/SM, 즉 64 threads/block로 지정한다. pJ/bit 자체는 224 threads/block 후보에서 `0.0819 +/- 0.0121 pJ/bit`로 더 낮게 관찰되었지만, valid no-L2 count가 5/10이고 incremental power가 3.23 W 수준이라 target saturation point로 채택하지 않았다. 256 threads/block 이상 후보는 baseline subtraction 후 incremental power가 음수로 나와 `all_runs_no_valid`로 집계되었다. 이 값들은 board-level `nvidia-smi` power trace와 baseline subtraction 기반 estimate이므로, 최종 수치 채택 전에는 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
 
 For memory/cache-policy calibration and DRAM pJ/bit estimates:
 
@@ -365,14 +365,14 @@ incremental_pJ_per_FLOP = incremental_energy / fp16_ops * 1e12
 Tensor Core FP16 matmul logical pJ/bit:
 
 ```text
-mma_count                    = fp16_ops / 4096
-matmul_input_bits            = mma_count * (16*16 + 16*8) * 16
+mma_count                    = fp16_ops / 8192
+matmul_input_bits            = mma_count * (16*16 + 16*16) * 16
 matmul_input_pJ_per_bit      = incremental_energy / matmul_input_bits * 1e12
-matmul_arithmetic_read_bits  = matmul_input_bits + mma_count * 16*8 * accumulator_bits
-matmul_register_rw_bits      = matmul_arithmetic_read_bits + mma_count * 16*8 * accumulator_bits
+matmul_arithmetic_read_bits  = matmul_input_bits + mma_count * 16*16 * accumulator_bits
+matmul_register_rw_bits      = matmul_arithmetic_read_bits + mma_count * 16*16 * accumulator_bits
 ```
 
-`matmul_input_pJ_per_bit`는 DRAM bit energy가 아니라 `mma.sync.m16n8k16`의 logical A/B FP16 operand bit 기준 compute energy estimate다. `accumulator_bits`는 `tensor_mma_f16acc`에서 16, `tensor_mma_f32acc`에서 32다.
+`matmul_input_pJ_per_bit`는 DRAM bit energy가 아니라 logical `m16n16k16`의 A/B FP16 operand bit 기준 compute energy estimate다. 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. `accumulator_bits`는 `tensor_mma_f16acc`에서 16, `tensor_mma_f32acc`에서 32다.
 
 P1 memory/cache-policy energy:
 

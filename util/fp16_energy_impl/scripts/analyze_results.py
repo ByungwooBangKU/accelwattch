@@ -169,7 +169,7 @@ def sort_key(run: Dict[str, Any]) -> Tuple[int, str]:
 
 
 def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, float]:
-    """Return logical m16n8k16 matmul bit counts, not memory traffic bits."""
+    """Return logical Tensor Core matmul bit counts, not memory traffic bits."""
     kernel = str(run.get("kernel", ""))
     if kernel not in {"tensor_mma_f16acc", "tensor_mma_f32acc"} or ops <= 0:
         return {
@@ -180,10 +180,17 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, float]:
             "matmul_register_read_write_bits": 0.0,
         }
 
-    mma_count = ops / 4096.0
-    input_bits = mma_count * (16 * 16 + 16 * 8) * 16
+    mma_m = finite_float(run.get("mma_m"), 16.0)
+    mma_n = finite_float(run.get("mma_n"), 8.0)
+    mma_k = finite_float(run.get("mma_k"), 16.0)
+    flops_per_logical_mma = finite_float(run.get("mma_flops_per_logical_mma"), 2.0 * mma_m * mma_n * mma_k)
+    if not math.isfinite(flops_per_logical_mma) or flops_per_logical_mma <= 0:
+        flops_per_logical_mma = 2.0 * 16.0 * 8.0 * 16.0
+
+    mma_count = ops / flops_per_logical_mma
+    input_bits = mma_count * (mma_m * mma_k + mma_k * mma_n) * 16
     acc_bits = 16 if kernel == "tensor_mma_f16acc" else 32
-    accumulator_read_bits = mma_count * 16 * 8 * acc_bits
+    accumulator_read_bits = mma_count * mma_m * mma_n * acc_bits
     output_bits = accumulator_read_bits
     arithmetic_read_bits = input_bits + accumulator_read_bits
     register_read_write_bits = arithmetic_read_bits + output_bits
@@ -398,8 +405,14 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     keys = list(rows[0].keys())
+    seen = set(keys)
+    for row in rows[1:]:
+        for key in row.keys():
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=keys, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 

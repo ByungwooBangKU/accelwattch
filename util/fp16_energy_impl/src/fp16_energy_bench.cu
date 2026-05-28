@@ -173,6 +173,12 @@ __device__ __forceinline__ void consume_float(float x) {
   asm volatile("" :: "f"(x));
 }
 
+constexpr uint64_t kTensorLogicalM = 16;
+constexpr uint64_t kTensorLogicalN = 16;
+constexpr uint64_t kTensorLogicalK = 16;
+constexpr uint64_t kTensorFlopsPerLogicalMma =
+    2ull * kTensorLogicalM * kTensorLogicalN * kTensorLogicalK;
+
 template <int UNROLL>
 __global__ void fp16_half2_kernel(const half2* __restrict__ in, half2* __restrict__ out,
                                   int iters) {
@@ -261,30 +267,47 @@ __global__ void tensor_mma_f16acc_kernel(uint32_t* __restrict__ out, int iters,
   uint32_t a3 = 0x3c003c00u;
   uint32_t b0 = 0x3c003c00u;
   uint32_t b1 = 0x3c003c00u;
+  uint32_t b2 = 0x3c003c00u;
+  uint32_t b3 = 0x3c003c00u;
   uint32_t c0 = static_cast<uint32_t>(tid & 1) ? 0x00010001u : 0x00000000u;
   uint32_t c1 = static_cast<uint32_t>(tid & 2) ? 0x00010001u : 0x00000000u;
+  uint32_t c2 = static_cast<uint32_t>(tid & 4) ? 0x00010001u : 0x00000000u;
+  uint32_t c3 = static_cast<uint32_t>(tid & 8) ? 0x00010001u : 0x00000000u;
 
 #pragma unroll 1
   for (int i = 0; i < iters; ++i) {
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u) {
-      uint32_t d0, d1;
+      uint32_t d0, d1, d2, d3;
       asm volatile(
           "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
           "{%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%8, %9};\n"
           : "=r"(d0), "=r"(d1)
           : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(c0),
             "r"(c1));
+      asm volatile(
+          "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+          "{%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%8, %9};\n"
+          : "=r"(d2), "=r"(d3)
+          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b2), "r"(b3), "r"(c2),
+            "r"(c3));
       c0 = d0;
       c1 = d1;
+      c2 = d2;
+      c3 = d3;
     }
   }
   if (suppress_output_store) {
     consume_u32(c0);
     consume_u32(c1);
+    consume_u32(c2);
+    consume_u32(c3);
   } else {
-    out[static_cast<size_t>(tid) * 2 + 0] = c0;
-    out[static_cast<size_t>(tid) * 2 + 1] = c1;
+    const size_t base = static_cast<size_t>(tid) * 4;
+    out[base + 0] = c0;
+    out[base + 1] = c1;
+    out[base + 2] = c2;
+    out[base + 3] = c3;
   }
 #else
   if (tid == 0) out[0] = 0u;
@@ -302,26 +325,42 @@ __global__ void tensor_mma_f32acc_kernel(float* __restrict__ out, int iters,
   uint32_t a3 = 0x3c003c00u;
   uint32_t b0 = 0x3c003c00u;
   uint32_t b1 = 0x3c003c00u;
+  uint32_t b2 = 0x3c003c00u;
+  uint32_t b3 = 0x3c003c00u;
   float c0 = static_cast<float>(tid & 31) * 0.001f;
   float c1 = c0 + 0.01f;
   float c2 = c0 + 0.02f;
   float c3 = c0 + 0.03f;
+  float c4 = c0 + 0.04f;
+  float c5 = c0 + 0.05f;
+  float c6 = c0 + 0.06f;
+  float c7 = c0 + 0.07f;
 
 #pragma unroll 1
   for (int i = 0; i < iters; ++i) {
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u) {
-      float d0, d1, d2, d3;
+      float d0, d1, d2, d3, d4, d5, d6, d7;
       asm volatile(
           "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
           "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
           : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
           : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0),
             "f"(c1), "f"(c2), "f"(c3));
+      asm volatile(
+          "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+          "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+          : "=f"(d4), "=f"(d5), "=f"(d6), "=f"(d7)
+          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b2), "r"(b3), "f"(c4),
+            "f"(c5), "f"(c6), "f"(c7));
       c0 = d0;
       c1 = d1;
       c2 = d2;
       c3 = d3;
+      c4 = d4;
+      c5 = d5;
+      c6 = d6;
+      c7 = d7;
     }
   }
   if (suppress_output_store) {
@@ -329,12 +368,20 @@ __global__ void tensor_mma_f32acc_kernel(float* __restrict__ out, int iters,
     consume_float(c1);
     consume_float(c2);
     consume_float(c3);
+    consume_float(c4);
+    consume_float(c5);
+    consume_float(c6);
+    consume_float(c7);
   } else {
-    const size_t base = static_cast<size_t>(tid) * 4;
+    const size_t base = static_cast<size_t>(tid) * 8;
     out[base + 0] = c0;
     out[base + 1] = c1;
     out[base + 2] = c2;
     out[base + 3] = c3;
+    out[base + 4] = c4;
+    out[base + 5] = c5;
+    out[base + 6] = c6;
+    out[base + 7] = c7;
   }
 #else
   if (tid == 0) out[0] = 0.0f;
@@ -347,20 +394,29 @@ __global__ void tensor_baseline_u32_kernel(uint32_t* __restrict__ out, int iters
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t c0 = 0x00010001u ^ static_cast<uint32_t>(tid);
   uint32_t c1 = 0x00020002u ^ static_cast<uint32_t>(tid << 1);
+  uint32_t c2 = 0x00030003u ^ static_cast<uint32_t>(tid << 2);
+  uint32_t c3 = 0x00040004u ^ static_cast<uint32_t>(tid << 3);
 #pragma unroll 1
   for (int i = 0; i < iters; ++i) {
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u) {
       c0 = control_step(c0, i, u);
       c1 ^= c0;
+      c2 = control_step(c2, i, u + 1);
+      c3 ^= c2;
     }
   }
   if (suppress_output_store) {
     consume_u32(c0);
     consume_u32(c1);
+    consume_u32(c2);
+    consume_u32(c3);
   } else {
-    out[static_cast<size_t>(tid) * 2 + 0] = c0;
-    out[static_cast<size_t>(tid) * 2 + 1] = c1;
+    const size_t base = static_cast<size_t>(tid) * 4;
+    out[base + 0] = c0;
+    out[base + 1] = c1;
+    out[base + 2] = c2;
+    out[base + 3] = c3;
   }
 }
 
@@ -372,6 +428,10 @@ __global__ void tensor_baseline_f32_kernel(float* __restrict__ out, int iters,
   float c1 = c0 + 0.01f;
   float c2 = c0 + 0.02f;
   float c3 = c0 + 0.03f;
+  float c4 = c0 + 0.04f;
+  float c5 = c0 + 0.05f;
+  float c6 = c0 + 0.06f;
+  float c7 = c0 + 0.07f;
   uint32_t marker = static_cast<uint32_t>(tid);
 #pragma unroll 1
   for (int i = 0; i < iters; ++i) {
@@ -385,12 +445,20 @@ __global__ void tensor_baseline_f32_kernel(float* __restrict__ out, int iters,
     consume_float(c1);
     consume_float(c2);
     consume_float(c3);
+    consume_float(c4);
+    consume_float(c5);
+    consume_float(c6);
+    consume_float(c7);
   } else {
-    const size_t base = static_cast<size_t>(tid) * 4;
+    const size_t base = static_cast<size_t>(tid) * 8;
     out[base + 0] = static_cast<float>(marker);
     out[base + 1] = c1;
     out[base + 2] = c2;
     out[base + 3] = c3;
+    out[base + 4] = c4;
+    out[base + 5] = c5;
+    out[base + 6] = c6;
+    out[base + 7] = c7;
   }
 }
 
@@ -507,8 +575,8 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
     CUDA_CHECK(cudaFree(d_out));
   } else if (is_tensor_u32_kernel(args.kernel)) {
     uint32_t* d_out = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_out, total_threads * 2 * sizeof(uint32_t)));
-    init_u32_kernel<<<blocks, threads>>>(d_out, total_threads * 2, 0x12345678u);
+    CUDA_CHECK(cudaMalloc(&d_out, total_threads * 4 * sizeof(uint32_t)));
+    init_u32_kernel<<<blocks, threads>>>(d_out, total_threads * 4, 0x12345678u);
     CUDA_KERNEL_CHECK();
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -543,8 +611,8 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
     CUDA_CHECK(cudaFree(d_out));
   } else if (is_tensor_f32_kernel(args.kernel)) {
     float* d_out = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_out, total_threads * 4 * sizeof(float)));
-    init_float_kernel<<<blocks, threads>>>(d_out, total_threads * 4, 0.0f);
+    CUDA_CHECK(cudaMalloc(&d_out, total_threads * 8 * sizeof(float)));
+    init_float_kernel<<<blocks, threads>>>(d_out, total_threads * 8, 0.0f);
     CUDA_KERNEL_CHECK();
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -652,9 +720,9 @@ uint64_t fp16_ops_estimate(const Args& args, int blocks, int threads) {
     return total_threads * repeats * iters * unroll * 4ull * 4ull;
   }
   if (args.kernel == "tensor_mma_f16acc" || args.kernel == "tensor_mma_f32acc") {
-    // mma.sync.aligned.m16n8k16 does 2*M*N*K = 4096 FP16 FLOP per warp-level instruction.
+    // One logical m16n16k16 tile is implemented as two m16n8k16 warp-level MMA instructions.
     const uint64_t warps = total_threads / 32ull;
-    return warps * repeats * iters * unroll * 4096ull;
+    return warps * repeats * iters * unroll * kTensorFlopsPerLogicalMma;
   }
   return 0ull;
 }
@@ -677,8 +745,8 @@ std::string cache_policy_label(const std::string& kernel) {
 
 std::string fp16_path_label(const std::string& kernel) {
   if (kernel == "fp16_half2") return "cuda_core_half2_fma";
-  if (kernel == "tensor_mma_f16acc") return "tensor_core_mma_f16acc";
-  if (kernel == "tensor_mma_f32acc") return "tensor_core_mma_f32acc";
+  if (kernel == "tensor_mma_f16acc") return "tensor_core_mma_m16n16k16_f16acc";
+  if (kernel == "tensor_mma_f32acc") return "tensor_core_mma_m16n16k16_f32acc";
   return "baseline_or_memory";
 }
 
@@ -766,6 +834,13 @@ int main(int argc, char** argv) {
   os << "  \"mem_mib\": " << args.mem_mib << ",\n";
   os << "  \"mem_stride\": " << args.mem_stride << ",\n";
   os << "  \"suppress_output_store\": " << (args.suppress_output_store ? "true" : "false") << ",\n";
+  if (args.kernel == "tensor_mma_f16acc" || args.kernel == "tensor_mma_f32acc") {
+    os << "  \"mma_m\": " << kTensorLogicalM << ",\n";
+    os << "  \"mma_n\": " << kTensorLogicalN << ",\n";
+    os << "  \"mma_k\": " << kTensorLogicalK << ",\n";
+    os << "  \"mma_instructions_per_logical_mma\": 2,\n";
+    os << "  \"mma_flops_per_logical_mma\": " << kTensorFlopsPerLogicalMma << ",\n";
+  }
   os << "  \"host_start_unix_ns\": " << host_start_ns << ",\n";
   os << "  \"host_end_unix_ns\": " << host_end_ns << ",\n";
   os << "  \"cuda_elapsed_ms\": " << elapsed_ms << ",\n";

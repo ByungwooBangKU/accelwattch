@@ -1,5 +1,5 @@
 {
-  "description": "Thread-count sweep for FP16 Tensor Core matmul. Output stores are suppressed so timed kernels do not intentionally touch L2/global memory.",
+  "description": "Thread-count sweep for FP16 Tensor Core logical m16n16k16 matmul. Output stores are suppressed so timed kernels do not intentionally touch L2/global memory.",
   "defaults": {
     "blocks": 0,
     "blocks_per_sm": 8,

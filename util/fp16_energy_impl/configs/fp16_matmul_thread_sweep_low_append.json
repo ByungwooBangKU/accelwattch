@@ -1,5 +1,5 @@
 {
-  "description": "Low thread-count extension for FP16 Tensor Core m16n8k16 thread sweep. Intended to append 32/64/96/128 threads-per-block candidates to an existing fine sweep result directory.",
+  "description": "Low thread-count extension for FP16 Tensor Core logical m16n16k16 thread sweep. Intended to append 32/64/96/128 threads-per-block candidates to an existing fine sweep result directory.",
   "defaults": {
     "blocks": 0,
     "blocks_per_sm": 8,
