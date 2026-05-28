@@ -1,0 +1,182 @@
+{
+  "description": "Fine thread-count sweep around the valid FP16 Tensor Core m16n8k16 matmul point. Output stores are suppressed so timed kernels do not intentionally touch L2/global memory.",
+  "defaults": {
+    "blocks": 0,
+    "blocks_per_sm": 8,
+    "warmup": 2,
+    "repeats": 2,
+    "unroll": 8,
+    "suppress_output_store": true
+  },
+  "conditions": [
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t032",
+      "args": {
+        "threads": 32
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 100
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 10
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t064",
+      "args": {
+        "threads": 64
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 50
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 5
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t096",
+      "args": {
+        "threads": 96
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 34
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 4
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t128",
+      "args": {
+        "threads": 128
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 25
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 3
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t160",
+      "args": {
+        "threads": 160
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 20
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t192",
+      "args": {
+        "threads": 192
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 20
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t224",
+      "args": {
+        "threads": 224
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 20
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t256",
+      "args": {
+        "threads": 256
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 20
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t288",
+      "args": {
+        "threads": 288
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 20
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t320",
+      "args": {
+        "threads": 320
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 20
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t384",
+      "args": {
+        "threads": 384
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 20
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    }
+  ]
+}

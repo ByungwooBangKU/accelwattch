@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 
 
 def read_runs(path: Path) -> List[Dict[str, Any]]:
@@ -68,6 +69,31 @@ def read_power_csv(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def read_sm_util_csv(path: str) -> List[Dict[str, Any]]:
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with p.open() as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            try:
+                ns = int(r["sample_unix_ns"])
+            except Exception:
+                continue
+            rows.append(
+                {
+                    "sample_unix_ns": ns,
+                    "t_s": ns / 1e9,
+                    "sm_util_pct": parse_float(r.get("sm_util_pct")),
+                    "mem_util_pct": parse_float(r.get("mem_util_pct")),
+                }
+            )
+    return rows
+
+
 def integrate_power(samples: List[Dict[str, Any]], start_ns: int, end_ns: int) -> Tuple[float, float, int]:
     """Return (energy_j, avg_power_w, sample_count) inside [start_ns, end_ns].
 
@@ -94,27 +120,48 @@ def integrate_power(samples: List[Dict[str, Any]], start_ns: int, end_ns: int) -
 
 def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
     samples = read_power_csv(run.get("power_csv", ""))
+    sm_util_samples = read_sm_util_csv(run.get("sm_util_csv", ""))
     start_ns = int(run["host_start_unix_ns"])
     end_ns = int(run["host_end_unix_ns"])
     energy_j, avg_power_w, sample_count = integrate_power(samples, start_ns, end_ns)
     clocks = [s["sm_clock_mhz"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["sm_clock_mhz"] is not None]
     temps = [s["temp_c"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["temp_c"] is not None]
+    utils = [s["util_gpu_pct"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["util_gpu_pct"] is not None]
+    sm_utils = [
+        s["sm_util_pct"]
+        for s in sm_util_samples
+        if start_ns <= s["sample_unix_ns"] <= end_ns and s["sm_util_pct"] is not None
+    ]
     return {
         **run,
         "power_energy_j": energy_j,
         "avg_power_w": avg_power_w,
         "power_sample_count": sample_count,
+        "sm_util_sample_count": len(sm_utils),
         "avg_sm_clock_mhz": sum(clocks) / len(clocks) if clocks else math.nan,
         "min_sm_clock_mhz": min(clocks) if clocks else math.nan,
         "max_sm_clock_mhz": max(clocks) if clocks else math.nan,
         "avg_temp_c": sum(temps) / len(temps) if temps else math.nan,
         "max_temp_c": max(temps) if temps else math.nan,
+        "avg_gpu_util_pct": sum(utils) / len(utils) if utils else math.nan,
+        "max_gpu_util_pct": max(utils) if utils else math.nan,
+        "avg_sm_util_pct": sum(sm_utils) / len(sm_utils) if sm_utils else math.nan,
+        "max_sm_util_pct": max(sm_utils) if sm_utils else math.nan,
     }
 
 
 def finite_float(x: Any, default: float = math.nan) -> float:
     value = parse_float(x)
     return value if value is not None else default
+
+
+def estimate_threads_per_sm(run: Dict[str, Any]) -> float:
+    threads = finite_float(run.get("threads"))
+    blocks = finite_float(run.get("blocks"))
+    sm_count = finite_float(run.get("sm_count"))
+    if math.isfinite(threads) and math.isfinite(blocks) and math.isfinite(sm_count) and sm_count > 0:
+        return threads * blocks / sm_count
+    return math.nan
 
 
 def sort_key(run: Dict[str, Any]) -> Tuple[int, str]:
@@ -189,6 +236,7 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "baseline_kernel": "",
                 "blocks": s.get("blocks", ""),
                 "threads": s.get("threads", ""),
+                "threads_per_sm": estimate_threads_per_sm(s),
                 "iters": s.get("iters", ""),
                 "unroll": s.get("unroll", ""),
                 "elapsed_s": elapsed_s,
@@ -197,6 +245,8 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "memory_bytes": mem_bytes,
                 "memory_bits": mem_bits,
                 **matmul_bits,
+                "suppress_output_store": bool(s.get("suppress_output_store", False)),
+                "expected_l2_touch": bool(mem_bytes > 0 or not s.get("suppress_output_store", False)),
                 "tflops": finite_float(s.get("estimated_tflops", math.nan)),
                 "memory_gbps": memory_gbps,
                 "test_avg_power_w": s.get("avg_power_w", math.nan),
@@ -215,14 +265,22 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "matmul_register_read_write_pj_per_bit": math.nan,
                 "test_power_samples": s.get("power_sample_count", 0),
                 "baseline_power_samples": 0,
+                "test_sm_util_samples": s.get("sm_util_sample_count", 0),
+                "baseline_sm_util_samples": 0,
                 "avg_sm_clock_mhz": s.get("avg_sm_clock_mhz", math.nan),
                 "clock_span_mhz": finite_float(s.get("max_sm_clock_mhz")) - finite_float(s.get("min_sm_clock_mhz")),
                 "max_temp_c": s.get("max_temp_c", math.nan),
+                "avg_gpu_util_pct": s.get("avg_gpu_util_pct", math.nan),
+                "max_gpu_util_pct": s.get("max_gpu_util_pct", math.nan),
+                "avg_sm_util_pct": s.get("avg_sm_util_pct", math.nan),
+                "max_sm_util_pct": s.get("max_sm_util_pct", math.nan),
                 "valid_basic": False,
                 "test_run_id": s.get("run_id", ""),
                 "baseline_run_id": "",
                 "test_power_csv": s.get("power_csv", ""),
                 "baseline_power_csv": "",
+                "test_sm_util_csv": s.get("sm_util_csv", ""),
+                "baseline_sm_util_csv": "",
             }
         )
     return summaries
@@ -269,7 +327,14 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
     )
     has_work = ops > 0 or mem_bytes > 0
     enough_samples = int(t.get("power_sample_count", 0)) >= 3 and int(b.get("power_sample_count", 0)) >= 3
-    valid_basic = bool(has_work and enough_samples and math.isfinite(inc_power) and inc_power > 0)
+    valid_basic = bool(
+        has_work
+        and enough_samples
+        and math.isfinite(inc_power)
+        and inc_power > 0
+        and math.isfinite(inc_energy)
+        and inc_energy > 0
+    )
     return {
         "condition": cond,
         "pair_index": pair_index,
@@ -280,6 +345,7 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "baseline_kernel": b.get("kernel", ""),
         "blocks": t.get("blocks", ""),
         "threads": t.get("threads", ""),
+        "threads_per_sm": estimate_threads_per_sm(t),
         "iters": t.get("iters", ""),
         "unroll": t.get("unroll", ""),
         "elapsed_s": elapsed_s,
@@ -288,6 +354,8 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "memory_bytes": mem_bytes,
         "memory_bits": mem_bits,
         **matmul_bits,
+        "suppress_output_store": bool(t.get("suppress_output_store", False)),
+        "expected_l2_touch": bool(mem_bytes > 0 or not t.get("suppress_output_store", False)),
         "tflops": tflops,
         "memory_gbps": gbps,
         "test_avg_power_w": test_avg_power,
@@ -306,14 +374,22 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "matmul_register_read_write_pj_per_bit": matmul_register_read_write_pj_per_bit,
         "test_power_samples": t.get("power_sample_count", 0),
         "baseline_power_samples": b.get("power_sample_count", 0),
+        "test_sm_util_samples": t.get("sm_util_sample_count", 0),
+        "baseline_sm_util_samples": b.get("sm_util_sample_count", 0),
         "avg_sm_clock_mhz": t.get("avg_sm_clock_mhz", math.nan),
         "clock_span_mhz": finite_float(t.get("max_sm_clock_mhz")) - finite_float(t.get("min_sm_clock_mhz")),
         "max_temp_c": t.get("max_temp_c", math.nan),
+        "avg_gpu_util_pct": t.get("avg_gpu_util_pct", math.nan),
+        "max_gpu_util_pct": t.get("max_gpu_util_pct", math.nan),
+        "avg_sm_util_pct": t.get("avg_sm_util_pct", math.nan),
+        "max_sm_util_pct": t.get("max_sm_util_pct", math.nan),
         "valid_basic": valid_basic,
         "test_run_id": t.get("run_id", ""),
         "baseline_run_id": b.get("run_id", ""),
         "test_power_csv": t.get("power_csv", ""),
         "baseline_power_csv": b.get("power_csv", ""),
+        "test_sm_util_csv": t.get("sm_util_csv", ""),
+        "baseline_sm_util_csv": b.get("sm_util_csv", ""),
     }
 
 
@@ -364,6 +440,10 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "avg_sm_clock_mhz",
         "clock_span_mhz",
         "max_temp_c",
+        "avg_gpu_util_pct",
+        "max_gpu_util_pct",
+        "avg_sm_util_pct",
+        "max_sm_util_pct",
     ]
     out: List[Dict[str, Any]] = []
     for cond, group in by_cond.items():
@@ -401,6 +481,115 @@ def grouped_metric_stats(rows: List[Dict[str, Any]], metric: str) -> List[Dict[s
         if stats["n"] > 0:
             out.append({"condition": cond, **stats})
     return out
+
+
+def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    thread_values = {int(r["threads"]) for r in rows if str(r.get("threads", "")).isdigit()}
+    if len(thread_values) < 2:
+        return []
+
+    by_variant: Dict[Tuple[str, str, str, int], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        try:
+            threads = int(row["threads"])
+        except Exception:
+            continue
+        key = (
+            str(row.get("fp16_path", "")),
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+            threads,
+        )
+        by_variant[key].append(row)
+
+    metrics = [
+        "avg_gpu_util_pct",
+        "max_gpu_util_pct",
+        "avg_sm_util_pct",
+        "max_sm_util_pct",
+        "tflops",
+        "matmul_input_pj_per_bit",
+        "pj_per_flop",
+        "incremental_power_w",
+        "avg_sm_clock_mhz",
+        "clock_span_mhz",
+        "max_temp_c",
+    ]
+    out: List[Dict[str, Any]] = []
+    for (fp16_path, test_kernel, baseline_kernel, threads), group in by_variant.items():
+        valid_no_l2 = [
+            r for r in group
+            if bool(r.get("valid_basic", False)) and not bool(r.get("expected_l2_touch", True))
+        ]
+        valid = [r for r in group if bool(r.get("valid_basic", False))]
+        stats_source = valid_no_l2 or valid or group
+        row: Dict[str, Any] = {
+            "fp16_path": fp16_path,
+            "test_kernel": test_kernel,
+            "baseline_kernel": baseline_kernel,
+            "threads": threads,
+            "threads_per_sm": finite_float(group[0].get("threads_per_sm")),
+            "run_count": len(group),
+            "valid_count": len(valid),
+            "valid_no_l2_count": len(valid_no_l2),
+            "stats_scope": "valid_no_l2" if valid_no_l2 else ("valid_basic" if valid else "all_runs_no_valid"),
+            "expected_l2_touch": any(bool(r.get("expected_l2_touch", True)) for r in stats_source),
+        }
+        for metric in metrics:
+            stats = metric_stats([finite_float(r.get(metric)) for r in stats_source])
+            for key, value in stats.items():
+                row[f"{metric}_{key}"] = value
+        row["selected_optimal"] = False
+        out.append(row)
+
+    by_kernel: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in out:
+        by_kernel[(row["fp16_path"], row["test_kernel"], row["baseline_kernel"])].append(row)
+
+    for group in by_kernel.values():
+        def has_enough_valid(row: Dict[str, Any], key: str) -> bool:
+            run_count = int(row.get("run_count", 0))
+            valid_count = int(row.get(key, 0))
+            min_count = 1 if run_count <= 1 else max(3, math.ceil(run_count * 0.5))
+            return valid_count >= min_count
+
+        eligible = [r for r in group if has_enough_valid(r, "valid_no_l2_count")]
+        if not eligible:
+            eligible = [r for r in group if int(r.get("valid_no_l2_count", 0)) > 0]
+        if not eligible:
+            eligible = [r for r in group if has_enough_valid(r, "valid_count")]
+        if not eligible:
+            eligible = [r for r in group if int(r.get("valid_count", 0)) > 0]
+        if not eligible:
+            eligible = group
+
+        def util_score(row: Dict[str, Any]) -> float:
+            util = finite_float(row.get("avg_sm_util_pct_mean"), -math.inf)
+            if not math.isfinite(util):
+                util = finite_float(row.get("avg_gpu_util_pct_mean"), -math.inf)
+            return util if math.isfinite(util) else -math.inf
+
+        max_util = max(util_score(row) for row in eligible)
+        saturated = [row for row in eligible if util_score(row) >= max_util - 0.1]
+        target_pool = saturated if saturated else eligible
+
+        def target_score(row: Dict[str, Any]) -> Tuple[float, float, float]:
+            threads_per_sm = finite_float(row.get("threads_per_sm"), math.inf)
+            if not math.isfinite(threads_per_sm):
+                threads_per_sm = finite_float(row.get("threads"), math.inf)
+            tflops = finite_float(row.get("tflops_mean"), -math.inf)
+            if not math.isfinite(tflops):
+                tflops = -math.inf
+            clock_span = finite_float(row.get("clock_span_mhz_mean"), math.inf)
+            if not math.isfinite(clock_span):
+                clock_span = math.inf
+            # Select the first utilization-saturation point; use throughput only as a tie-break.
+            return (threads_per_sm, -tflops, clock_span)
+
+        best = min(target_pool, key=target_score)
+        best["selected_optimal"] = True
+
+    return sorted(out, key=lambda r: (str(r["test_kernel"]), int(r["threads"])))
 
 
 def plot_power_trace(summary: Dict[str, Any], figdir: Path) -> None:
@@ -488,6 +677,102 @@ def plot_matmul_pj_per_bit_bar(summary_rows: List[Dict[str, Any]], figdir: Path)
     plt.close()
 
 
+def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
+    if not thread_rows:
+        return
+    by_kernel: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in thread_rows:
+        by_kernel[(str(row["test_kernel"]), str(row["baseline_kernel"]))].append(row)
+
+    for (test_kernel, baseline_kernel), rows in by_kernel.items():
+        rows = sorted(rows, key=lambda r: int(r["threads"]))
+        xs = []
+        for r in rows:
+            threads_per_sm = finite_float(r.get("threads_per_sm"))
+            xs.append(threads_per_sm if math.isfinite(threads_per_sm) else float(r["threads"]))
+        sm_util = [finite_float(r.get("avg_sm_util_pct_mean")) for r in rows]
+        has_sm_util = any(math.isfinite(v) for v in sm_util)
+        util = sm_util if has_sm_util else [finite_float(r.get("avg_gpu_util_pct_mean")) for r in rows]
+        tflops = [finite_float(r.get("tflops_mean")) for r in rows]
+        selected = [r for r in rows if bool(r.get("selected_optimal", False))]
+
+        fig, ax1 = plt.subplots(figsize=(8, 4.8))
+        util_label = "avg SM util" if has_sm_util else "avg GPU util"
+        ylabel = "Avg SM utilization (%)" if has_sm_util else "Avg GPU utilization (%)"
+        ax1.plot(xs, util, marker="o", label=util_label)
+        ax1.set_xlabel("Launched threads per SM")
+        ax1.set_ylabel(ylabel)
+        ax1.set_xticks(xs)
+        ax1.get_xaxis().set_major_formatter(ScalarFormatter())
+        ax1.grid(True, axis="y", alpha=0.3)
+        for x, y, row in zip(xs, util, rows):
+            if math.isfinite(y):
+                ax1.annotate(
+                    str(row["threads"]),
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(0, 6),
+                    ha="center",
+                    fontsize=8,
+                )
+
+        ax2 = ax1.twinx()
+        ax2.plot(xs, tflops, marker="s", color="tab:orange", label="TFLOPS")
+        ax2.set_ylabel("TFLOPS")
+
+        if selected:
+            sx = finite_float(selected[0].get("threads_per_sm"))
+            if not math.isfinite(sx):
+                sx = float(selected[0]["threads"])
+            ax1.axvline(sx, color="tab:green", linestyle="--", linewidth=1.2, label="selected")
+
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines + lines2, labels + labels2, loc="best")
+        plt.title(f"Thread sweep: {test_kernel} vs {baseline_kernel} (labels: threads/block)")
+        plt.tight_layout()
+        safe_name = f"thread_sweep_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
+        plt.savefig(figdir / safe_name, dpi=160)
+        plt.close(fig)
+
+        pjbit = [finite_float(r.get("matmul_input_pj_per_bit_mean")) for r in rows]
+        if any(math.isfinite(v) for v in pjbit):
+            pjbit_ci = []
+            for r in rows:
+                ci = finite_float(r.get("matmul_input_pj_per_bit_ci95"), 0.0)
+                pjbit_ci.append(ci if math.isfinite(ci) and ci >= 0.0 else 0.0)
+
+            fig, ax = plt.subplots(figsize=(8, 4.8))
+            ax.errorbar(xs, pjbit, yerr=pjbit_ci, marker="D", capsize=3, color="tab:purple", label="pJ/bit")
+            ax.axhline(0.0, color="0.3", linewidth=0.8, alpha=0.6)
+            ax.set_xlabel("Launched threads per SM")
+            ax.set_ylabel("pJ/logical input bit")
+            ax.set_xticks(xs)
+            ax.get_xaxis().set_major_formatter(ScalarFormatter())
+            ax.grid(True, axis="y", alpha=0.3)
+            for x, y, row in zip(xs, pjbit, rows):
+                if math.isfinite(y):
+                    ax.annotate(
+                        f"{row['threads']}\n{y:.3g}",
+                        (x, y),
+                        textcoords="offset points",
+                        xytext=(0, 7 if y >= 0 else -18),
+                        ha="center",
+                        fontsize=8,
+                    )
+            if selected:
+                sx = finite_float(selected[0].get("threads_per_sm"))
+                if not math.isfinite(sx):
+                    sx = float(selected[0]["threads"])
+                ax.axvline(sx, color="tab:green", linestyle="--", linewidth=1.2, label="selected")
+            ax.legend(loc="best")
+            plt.title(f"Thread sweep pJ/bit: {test_kernel} vs {baseline_kernel}")
+            plt.tight_layout()
+            safe_name = f"thread_sweep_pjbit_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
+            plt.savefig(figdir / safe_name, dpi=160)
+            plt.close(fig)
+
+
 def plot_scatter(summary_rows: List[Dict[str, Any]], figdir: Path) -> None:
     rows = [r for r in summary_rows if r.get("pj_per_flop") == r.get("pj_per_flop") and r.get("tflops") == r.get("tflops")]
     if not rows:
@@ -549,16 +834,20 @@ def main() -> int:
     enriched = [summarize_run(r) for r in raw_runs]
     summary = group_pairs(enriched)
     condition_summary = aggregate_conditions(summary)
+    thread_sweep_summary = aggregate_thread_sweep(summary)
 
     write_csv(args.input / "run_level_summary.csv", enriched)
     write_csv(args.input / "summary.csv", summary)
     write_csv(args.input / "condition_summary.csv", condition_summary)
+    if thread_sweep_summary:
+        write_csv(args.input / "thread_sweep_summary.csv", thread_sweep_summary)
 
     figdir = args.input / "figures"
     figdir.mkdir(exist_ok=True)
     plot_bar(summary, figdir)
     plot_pj_per_bit_bar(summary, figdir)
     plot_matmul_pj_per_bit_bar(summary, figdir)
+    plot_thread_sweep(thread_sweep_summary, figdir)
     plot_scatter(summary, figdir)
     for s in summary:
         plot_power_trace(s, figdir)
@@ -566,6 +855,8 @@ def main() -> int:
 
     print(f"Wrote: {args.input / 'summary.csv'}")
     print(f"Wrote: {args.input / 'condition_summary.csv'}")
+    if thread_sweep_summary:
+        print(f"Wrote: {args.input / 'thread_sweep_summary.csv'}")
     print(f"Wrote figures under: {figdir}")
     return 0
 

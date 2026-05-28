@@ -28,6 +28,7 @@ struct Args {
   int repeats = 1;
   int mem_mib = 256;
   int mem_stride = 1;
+  bool suppress_output_store = false;
   std::string json_out;
   bool help = false;
 };
@@ -69,6 +70,7 @@ void usage(const char* argv0) {
       << "  --repeats N              timed launches enclosed by one CUDA event interval [1]\n"
       << "  --mem-mib N              memory working set size for memory_* kernels [256]\n"
       << "  --mem-stride N           stride for memory_* kernels [1]\n"
+      << "  --suppress-output-store  skip final compute-kernel global store for no-L2 validation\n"
       << "  --json-out PATH          write JSON result to file instead of stdout\n"
       << "  --help                   show this message\n";
 }
@@ -118,6 +120,8 @@ Args parse_args(int argc, char** argv) {
       a.mem_mib = parse_int(need_value("--mem-mib"), "--mem-mib");
     } else if (k == "--mem-stride") {
       a.mem_stride = parse_int(need_value("--mem-stride"), "--mem-stride");
+    } else if (k == "--suppress-output-store") {
+      a.suppress_output_store = true;
     } else if (k == "--json-out") {
       a.json_out = need_value("--json-out");
     } else {
@@ -161,6 +165,14 @@ __device__ __forceinline__ uint32_t control_step(uint32_t x, int i, int u) {
   return x;
 }
 
+__device__ __forceinline__ void consume_u32(uint32_t x) {
+  asm volatile("" :: "r"(x));
+}
+
+__device__ __forceinline__ void consume_float(float x) {
+  asm volatile("" :: "f"(x));
+}
+
 template <int UNROLL>
 __global__ void fp16_half2_kernel(const half2* __restrict__ in, half2* __restrict__ out,
                                   int iters) {
@@ -189,10 +201,10 @@ __global__ void fp16_half2_kernel(const half2* __restrict__ in, half2* __restric
 
 template <int UNROLL>
 __global__ void baseline_nop_kernel(const half2* __restrict__ in, half2* __restrict__ out,
-                                    int iters) {
+                                    int iters, bool suppress_output_store) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t* in_u32 = reinterpret_cast<const uint32_t*>(in);
-  uint32_t seed = in_u32[tid];
+  uint32_t seed = suppress_output_store ? static_cast<uint32_t>(tid) * 0x9e3779b9u : in_u32[tid];
   uint32_t marker = static_cast<uint32_t>(tid);
 #pragma unroll 1
   for (int i = 0; i < iters; ++i) {
@@ -201,8 +213,12 @@ __global__ void baseline_nop_kernel(const half2* __restrict__ in, half2* __restr
       marker = control_step(marker, i, u);
     }
   }
-  uint32_t* out_u32 = reinterpret_cast<uint32_t*>(out);
-  out_u32[tid] = seed ^ marker;
+  if (suppress_output_store) {
+    consume_u32(seed ^ marker);
+  } else {
+    uint32_t* out_u32 = reinterpret_cast<uint32_t*>(out);
+    out_u32[tid] = seed ^ marker;
+  }
 }
 
 template <int UNROLL>
@@ -235,7 +251,8 @@ __global__ void baseline_regmove_kernel(const half2* __restrict__ in, half2* __r
 }
 
 template <int UNROLL>
-__global__ void tensor_mma_f16acc_kernel(uint32_t* __restrict__ out, int iters) {
+__global__ void tensor_mma_f16acc_kernel(uint32_t* __restrict__ out, int iters,
+                                         bool suppress_output_store) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
 #if __CUDA_ARCH__ >= 800
   uint32_t a0 = 0x3c003c00u;  // half2(1.0, 1.0)
@@ -262,15 +279,21 @@ __global__ void tensor_mma_f16acc_kernel(uint32_t* __restrict__ out, int iters) 
       c1 = d1;
     }
   }
-  out[static_cast<size_t>(tid) * 2 + 0] = c0;
-  out[static_cast<size_t>(tid) * 2 + 1] = c1;
+  if (suppress_output_store) {
+    consume_u32(c0);
+    consume_u32(c1);
+  } else {
+    out[static_cast<size_t>(tid) * 2 + 0] = c0;
+    out[static_cast<size_t>(tid) * 2 + 1] = c1;
+  }
 #else
   if (tid == 0) out[0] = 0u;
 #endif
 }
 
 template <int UNROLL>
-__global__ void tensor_mma_f32acc_kernel(float* __restrict__ out, int iters) {
+__global__ void tensor_mma_f32acc_kernel(float* __restrict__ out, int iters,
+                                         bool suppress_output_store) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
 #if __CUDA_ARCH__ >= 800
   uint32_t a0 = 0x3c003c00u;  // half2(1.0, 1.0)
@@ -301,18 +324,26 @@ __global__ void tensor_mma_f32acc_kernel(float* __restrict__ out, int iters) {
       c3 = d3;
     }
   }
-  const size_t base = static_cast<size_t>(tid) * 4;
-  out[base + 0] = c0;
-  out[base + 1] = c1;
-  out[base + 2] = c2;
-  out[base + 3] = c3;
+  if (suppress_output_store) {
+    consume_float(c0);
+    consume_float(c1);
+    consume_float(c2);
+    consume_float(c3);
+  } else {
+    const size_t base = static_cast<size_t>(tid) * 4;
+    out[base + 0] = c0;
+    out[base + 1] = c1;
+    out[base + 2] = c2;
+    out[base + 3] = c3;
+  }
 #else
   if (tid == 0) out[0] = 0.0f;
 #endif
 }
 
 template <int UNROLL>
-__global__ void tensor_baseline_u32_kernel(uint32_t* __restrict__ out, int iters) {
+__global__ void tensor_baseline_u32_kernel(uint32_t* __restrict__ out, int iters,
+                                           bool suppress_output_store) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t c0 = 0x00010001u ^ static_cast<uint32_t>(tid);
   uint32_t c1 = 0x00020002u ^ static_cast<uint32_t>(tid << 1);
@@ -324,12 +355,18 @@ __global__ void tensor_baseline_u32_kernel(uint32_t* __restrict__ out, int iters
       c1 ^= c0;
     }
   }
-  out[static_cast<size_t>(tid) * 2 + 0] = c0;
-  out[static_cast<size_t>(tid) * 2 + 1] = c1;
+  if (suppress_output_store) {
+    consume_u32(c0);
+    consume_u32(c1);
+  } else {
+    out[static_cast<size_t>(tid) * 2 + 0] = c0;
+    out[static_cast<size_t>(tid) * 2 + 1] = c1;
+  }
 }
 
 template <int UNROLL>
-__global__ void tensor_baseline_f32_kernel(float* __restrict__ out, int iters) {
+__global__ void tensor_baseline_f32_kernel(float* __restrict__ out, int iters,
+                                           bool suppress_output_store) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   float c0 = static_cast<float>(tid & 31) * 0.001f;
   float c1 = c0 + 0.01f;
@@ -343,11 +380,18 @@ __global__ void tensor_baseline_f32_kernel(float* __restrict__ out, int iters) {
       marker = control_step(marker, i, u);
     }
   }
-  const size_t base = static_cast<size_t>(tid) * 4;
-  out[base + 0] = static_cast<float>(marker);
-  out[base + 1] = c1;
-  out[base + 2] = c2;
-  out[base + 3] = c3;
+  if (suppress_output_store) {
+    consume_u32(marker);
+    consume_float(c1);
+    consume_float(c2);
+    consume_float(c3);
+  } else {
+    const size_t base = static_cast<size_t>(tid) * 4;
+    out[base + 0] = static_cast<float>(marker);
+    out[base + 1] = c1;
+    out[base + 2] = c2;
+    out[base + 3] = c3;
+  }
 }
 
 template <int POLICY>
@@ -411,6 +455,10 @@ bool is_memory_kernel(const std::string& k) {
   return k == "memory_default" || k == "memory_cg" || k == "memory_cs";
 }
 
+bool supports_suppress_output_store(const std::string& k) {
+  return k == "baseline_nop" || is_tensor_u32_kernel(k) || is_tensor_f32_kernel(k);
+}
+
 template <int UNROLL>
 TimingResult launch_timed(const Args& args, int blocks, int threads, size_t total_threads, size_t mem_words) {
   float ms = 0.0f;
@@ -430,7 +478,8 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
       if (args.kernel == "fp16_half2") {
         fp16_half2_kernel<UNROLL><<<blocks, threads>>>(d_in, d_out, args.iters);
       } else if (args.kernel == "baseline_nop") {
-        baseline_nop_kernel<UNROLL><<<blocks, threads>>>(d_in, d_out, args.iters);
+        baseline_nop_kernel<UNROLL><<<blocks, threads>>>(d_in, d_out, args.iters,
+                                                         args.suppress_output_store);
       } else if (args.kernel == "baseline_regmove") {
         baseline_regmove_kernel<UNROLL><<<blocks, threads>>>(d_in, d_out, args.iters);
       }
@@ -465,9 +514,11 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
 
     auto run = [&]() {
       if (args.kernel == "tensor_mma_f16acc") {
-        tensor_mma_f16acc_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters);
+        tensor_mma_f16acc_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters,
+                                                             args.suppress_output_store);
       } else {
-        tensor_baseline_u32_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters);
+        tensor_baseline_u32_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters,
+                                                                args.suppress_output_store);
       }
       CUDA_KERNEL_CHECK();
     };
@@ -499,9 +550,11 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
 
     auto run = [&]() {
       if (args.kernel == "tensor_mma_f32acc") {
-        tensor_mma_f32acc_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters);
+        tensor_mma_f32acc_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters,
+                                                             args.suppress_output_store);
       } else {
-        tensor_baseline_f32_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters);
+        tensor_baseline_f32_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters,
+                                                                args.suppress_output_store);
       }
       CUDA_KERNEL_CHECK();
     };
@@ -665,6 +718,10 @@ int main(int argc, char** argv) {
     std::cerr << "Tensor MMA inline PTX kernels require compute capability >= 8.0.\n";
     return EXIT_FAILURE;
   }
+  if (args.suppress_output_store && !supports_suppress_output_store(args.kernel)) {
+    std::cerr << "--suppress-output-store is supported only for baseline_nop and Tensor kernels.\n";
+    return EXIT_FAILURE;
+  }
 
   const size_t total_threads = static_cast<size_t>(args.blocks) * args.threads;
   const size_t mem_words = (static_cast<size_t>(args.mem_mib) * 1024ull * 1024ull) / sizeof(uint32_t);
@@ -708,6 +765,7 @@ int main(int argc, char** argv) {
   os << "  \"repeats\": " << args.repeats << ",\n";
   os << "  \"mem_mib\": " << args.mem_mib << ",\n";
   os << "  \"mem_stride\": " << args.mem_stride << ",\n";
+  os << "  \"suppress_output_store\": " << (args.suppress_output_store ? "true" : "false") << ",\n";
   os << "  \"host_start_unix_ns\": " << host_start_ns << ",\n";
   os << "  \"host_end_unix_ns\": " << host_end_ns << ",\n";
   os << "  \"cuda_elapsed_ms\": " << elapsed_ms << ",\n";

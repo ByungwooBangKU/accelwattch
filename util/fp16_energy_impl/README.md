@@ -9,10 +9,14 @@
 | `src/fp16_energy_bench.cu` | CUDA microbenchmark binary. FP16 half2, Tensor Core MMA, baseline, memory policy kernel 포함 |
 | `configs/primary_matrix.json` | P0 primary FP16 실험 matrix |
 | `configs/fp16_matmul_pjbit_matrix.json` | Tensor Core FP16 matmul logical pJ/bit 전용 matrix |
+| `configs/fp16_matmul_thread_sweep.json` | L2/global output store를 억제한 Tensor Core thread-count sweep matrix |
+| `configs/fp16_matmul_thread_sweep_fine.json` | 낮은 thread 후보까지 포함한 Tensor Core fine thread-count sweep matrix |
+| `configs/fp16_matmul_thread_sweep_low_append.json` | 기존 fine sweep 결과 디렉터리에 32/64/96/128 후보를 append하는 matrix |
 | `configs/p1_memory_policy_matrix.json` | P1 memory/cache policy 보정용 matrix |
-| `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp logging |
+| `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
 | `scripts/analyze_results.py` | baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
+| `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
 | `scripts/lock_clocks.sh` | GPU clock lock helper |
 | `scripts/reset_clocks.sh` | GPU clock reset helper |
 | `scripts/query_env.sh` | 실험 환경 metadata 수집 |
@@ -82,8 +86,8 @@ cmake --build build -j
 1. `--blocks 0`일 때 GPU SM 개수를 감지해 `blocks = SM_count * blocks_per_sm`로 설정한다.
 2. matrix에 정의된 baseline/test 조건을 순서대로 실행한다.
 3. `--repeat N`으로 전체 matrix를 N회 반복한다.
-4. run별 `nvidia-smi` power/clock/temperature trace를 수집한다.
-5. `analyze_results.py`가 `summary.csv`, `condition_summary.csv`, figure를 생성한다.
+4. run별 `nvidia-smi` power/clock/temperature trace와 dmon SM utilization trace를 수집한다.
+5. `analyze_results.py`가 `summary.csv`, `condition_summary.csv`, thread sweep summary, figure를 생성한다.
 
 수동으로 맞춰야 하는 항목은 다음과 같다.
 
@@ -149,6 +153,46 @@ python3 scripts/run_experiment.py \
 python3 scripts/analyze_results.py --input results/fp16_matmul_pjbit_gpu0
 ```
 
+For FP16 Tensor Core thread-count sweep under no intended L2/global traffic:
+
+```bash
+python3 scripts/run_experiment.py \
+  --binary build/fp16_energy_bench \
+  --matrix configs/fp16_matmul_thread_sweep.json \
+  --gpu 0 \
+  --sample-ms 100 \
+  --repeat 10 \
+  --outdir results/fp16_matmul_thread_sweep_gpu0
+
+python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_gpu0
+```
+
+이 sweep은 `threads = 32, 64, 128, 256, 512, 1024`를 훑는다. Matrix default의 `suppress_output_store=true`가 test와 `baseline_nop` timed kernel의 final global store를 끄므로, 의도된 timed-loop L2/global memory traffic 없이 Tensor Core utilization만 비교한다. 분석기는 `thread_sweep_summary.csv`를 만들고, `valid_basic=True`이며 `expected_l2_touch=False`인 후보 중 dmon `avg_sm_util_pct_mean`이 포화되는 가장 작은 `threads_per_sm` point를 `selected_optimal=True`로 표시한다. SM utilization이 없으면 `avg_gpu_util_pct_mean`으로 fallback한다.
+
+Coarse sweep에서 유효 후보가 좁혀지면 fine sweep을 추가로 실행한다. Fine matrix는 `threads = 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384`를 훑는다. 160 이상 후보는 test `repeats=2`, baseline `repeats=20`을 사용한다. 32/64/96/128 후보는 duration과 sample 수를 맞추기 위해 각각 더 큰 repeats를 사용한다.
+
+```bash
+python3 scripts/run_experiment.py \
+  --binary build/fp16_energy_bench \
+  --matrix configs/fp16_matmul_thread_sweep_fine.json \
+  --gpu 0 \
+  --sample-ms 100 \
+  --repeat 10 \
+  --outdir results/fp16_matmul_thread_sweep_fine_gpu0
+
+python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_fine_gpu0
+```
+
+여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 선택 기준은 max SM utilization에서 0.1 percentage point 이내로 포화된 후보 중 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다.
+
+2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 `mma.sync.m16n8k16`이며, pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*8) * 16 = 6144 bit/MMA`다. Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다.
+
+| Sweep | 후보 threads/block | Selected threads/SM | Selected threads/block | valid no-L2 | Avg SM util (%) | TFLOPS | `matmul_input_pj_per_bit` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Fine + dmon SM util | 32,64,96,128,160,192,224,256,288,320,384 | 256 | 32 | 10/10 | 100.000 +/- 0.000 | 154.2 | 0.1431 +/- 0.0358 pJ/bit |
+
+Fine + dmon run에서는 `threads_per_sm=256`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 target thread count는 256 threads/SM, 즉 32 threads/block로 지정한다. 다만 32-thread point의 dmon SM sample은 run당 1개라 sampling granularity caveat가 있고, pJ/bit 자체는 224/256 threads/block 후보가 더 낮게 관찰된다. 이 값들은 board-level `nvidia-smi` power trace와 baseline subtraction 기반 estimate이므로, 최종 수치 채택 전에는 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
+
 For memory/cache-policy calibration and DRAM pJ/bit estimates:
 
 ```bash
@@ -169,11 +213,15 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 |---|---|
 | `results/p0_gpu0/runs.jsonl` | run별 benchmark metadata |
 | `results/p0_gpu0/raw/*/power.csv` | run별 power/clock/temp trace |
+| `results/p0_gpu0/raw/*/sm_util.csv` | run별 dmon SM utilization trace |
 | `results/p0_gpu0/summary.csv` | baseline/test pair별 baseline subtraction 결과 |
 | `results/p0_gpu0/condition_summary.csv` | condition별 반복 측정 통계(mean/std/min/max/95% CI) |
+| `results/p0_gpu0/thread_sweep_summary.csv` | thread-count sweep일 때 thread별 utilization/TFLOPS 집계와 `selected_optimal` 표시 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 power integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |
+| `results/p0_gpu0/figures/thread_sweep_*.png` | launched threads/SM별 SM utilization/TFLOPS plot |
+| `results/p0_gpu0/figures/thread_sweep_pjbit_*.png` | launched threads/SM별 matmul logical pJ/bit plot. label은 threads/block와 pJ/bit 값 |
 | `results/p0_gpu0/figures/power_trace_*.png` | baseline/test power trace 비교 |
 | `results/p0_gpu0/figures/clock_*.png`, `temperature_*.png` | clock/temperature timeline |
 
@@ -202,6 +250,18 @@ Power 실험과 별도로 짧은 validation run을 수행한다.
 ```bash
 ./scripts/ncu_validate.sh ./build/fp16_energy_bench results/ncu_gpu0 0
 ```
+
+Thread sweep에서 선택된 후보가 L2/global memory를 의도적으로 touch하지 않는지 확인하려면 no-L2 validation을 별도로 수행한다.
+
+```bash
+./scripts/ncu_validate_no_l2_thread_sweep.sh \
+  ./build/fp16_energy_bench \
+  results/ncu_no_l2_thread_sweep_gpu0 \
+  0 \
+  32,64,128,256,512,1024
+```
+
+이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 `baseline_nop`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
 
 P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 
@@ -234,7 +294,24 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `matmul_arithmetic_read_pj_per_bit` | A/B input bits + accumulator read bits 기준 incremental pJ/bit |
 | `matmul_register_read_write_pj_per_bit` | A/B input bits + accumulator read bits + output bits 기준 incremental pJ/bit |
 | `w_per_tflops` | incremental power / achieved TFLOPS |
-| `valid_basic` | power sample, work estimate, positive incremental power에 대한 최소 sanity flag. Nsight 검증을 대체하지 않음 |
+| `avg_gpu_util_pct`, `max_gpu_util_pct` | test interval 안의 `nvidia-smi utilization.gpu` 평균/최대값 |
+| `avg_sm_util_pct`, `max_sm_util_pct` | test interval 안의 `nvidia-smi dmon -s u` `sm` 컬럼 평균/최대값 |
+| `suppress_output_store` | compute kernel의 final global output store를 제거했는지 여부 |
+| `expected_l2_touch` | timed kernel이 의도적으로 global/L2 traffic을 만들 것으로 예상되는지 여부 |
+| `valid_basic` | power sample, work estimate, positive incremental power/energy에 대한 최소 sanity flag. Nsight 검증을 대체하지 않음 |
+
+`thread_sweep_summary.csv`의 핵심 컬럼은 다음이다.
+
+| 컬럼 | 의미 |
+|---|---|
+| `threads` | threads per block |
+| `threads_per_sm` | launched threads per SM. 기본 matrix에서는 `threads * blocks_per_sm`와 같음 |
+| `valid_no_l2_count` | `valid_basic=True`이고 `expected_l2_touch=False`인 반복 수 |
+| `avg_sm_util_pct_mean` | thread point별 평균 SM utilization |
+| `avg_gpu_util_pct_mean` | dmon SM utilization이 없을 때 fallback으로 쓰는 평균 GPU utilization |
+| `tflops_mean` | thread point별 평균 Tensor Core throughput |
+| `matmul_input_pj_per_bit_mean` | thread point별 logical input bit 기준 pJ/bit |
+| `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
 
 최종 보고서에는 `p0_cuda_core_half2_vs_nop`과 `p0_cuda_core_half2_vs_regmove`를 모두 제시하는 것이 좋다. 두 baseline 간 차이는 baseline sensitivity로 취급한다. Tensor Core는 `f16acc`와 `f32acc`를 분리 보고한다.
 

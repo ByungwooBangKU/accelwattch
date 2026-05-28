@@ -1,0 +1,103 @@
+{
+  "description": "Thread-count sweep for FP16 Tensor Core matmul. Output stores are suppressed so timed kernels do not intentionally touch L2/global memory.",
+  "defaults": {
+    "blocks": 0,
+    "blocks_per_sm": 8,
+    "warmup": 2,
+    "repeats": 1,
+    "unroll": 8,
+    "suppress_output_store": true
+  },
+  "conditions": [
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t032",
+      "args": {
+        "threads": 32
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t064",
+      "args": {
+        "threads": 64
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t128",
+      "args": {
+        "threads": 128
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t256",
+      "args": {
+        "threads": 256
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t512",
+      "args": {
+        "threads": 512
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t1024",
+      "args": {
+        "threads": 1024
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000
+      }
+    }
+  ]
+}

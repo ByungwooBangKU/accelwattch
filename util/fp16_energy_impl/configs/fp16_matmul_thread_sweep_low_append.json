@@ -1,0 +1,77 @@
+{
+  "description": "Low thread-count extension for FP16 Tensor Core m16n8k16 thread sweep. Intended to append 32/64/96/128 threads-per-block candidates to an existing fine sweep result directory.",
+  "defaults": {
+    "blocks": 0,
+    "blocks_per_sm": 8,
+    "warmup": 2,
+    "repeats": 2,
+    "unroll": 8,
+    "suppress_output_store": true
+  },
+  "conditions": [
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t032",
+      "args": {
+        "threads": 32
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 100
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 10
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t064",
+      "args": {
+        "threads": 64
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 50
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 5
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t096",
+      "args": {
+        "threads": 96
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 34
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 4
+      }
+    },
+    {
+      "name": "thread_sweep_tensor_mma_f16acc_t128",
+      "args": {
+        "threads": 128
+      },
+      "baseline": {
+        "kernel": "baseline_nop",
+        "iters": 1000000,
+        "repeats": 25
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "iters": 1000000,
+        "repeats": 3
+      }
+    }
+  ]
+}

@@ -129,6 +129,107 @@ class NvidiaSmiPowerLogger:
                 time.sleep(self.sample_s)
 
 
+class NvidiaSmiDmonUtilLogger:
+    """Capture dmon utilization counters, including the SM utilization column."""
+
+    def __init__(self, gpu: int, out_csv: Path, nvidia_smi: str = "nvidia-smi") -> None:
+        self.gpu = gpu
+        self.out_csv = out_csv
+        self.nvidia_smi = nvidia_smi
+        self._proc: Optional[subprocess.Popen[str]] = None
+        self._thread: Optional[threading.Thread] = None
+        self._errors: "queue.Queue[str]" = queue.Queue()
+
+    def start(self) -> None:
+        self.out_csv.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> List[str]:
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=3)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        errors: List[str] = []
+        while not self._errors.empty():
+            errors.append(self._errors.get())
+        return errors
+
+    def _run(self) -> None:
+        cmd = [
+            self.nvidia_smi,
+            "dmon",
+            "-i",
+            str(self.gpu),
+            "-s",
+            "u",
+            "-d",
+            "1",
+            "--format",
+            "csv,nounit",
+        ]
+        with self.out_csv.open("w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "sample_unix_ns",
+                    "gpu",
+                    "sm_util_pct",
+                    "mem_util_pct",
+                    "enc_util_pct",
+                    "dec_util_pct",
+                    "jpg_util_pct",
+                    "ofa_util_pct",
+                    "raw",
+                ],
+            )
+            writer.writeheader()
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=1,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._errors.put(str(exc))
+                return
+            assert self._proc.stdout is not None
+            for line in self._proc.stdout:
+                sample_ns = time.time_ns()
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                fields = [field.strip() for field in raw.split(",")]
+                if len(fields) < 7:
+                    self._errors.put(f"Unexpected nvidia-smi dmon output: {raw!r}")
+                    continue
+                writer.writerow(
+                    {
+                        "sample_unix_ns": sample_ns,
+                        "gpu": fields[0],
+                        "sm_util_pct": parse_float(fields[1]),
+                        "mem_util_pct": parse_float(fields[2]),
+                        "enc_util_pct": parse_float(fields[3]),
+                        "dec_util_pct": parse_float(fields[4]),
+                        "jpg_util_pct": parse_float(fields[5]),
+                        "ofa_util_pct": parse_float(fields[6]),
+                        "raw": raw,
+                    }
+                )
+                f.flush()
+            if self._proc.stderr is not None:
+                stderr = self._proc.stderr.read().strip()
+                if stderr:
+                    self._errors.put(stderr)
+
+
 def load_matrix(path: Path) -> Dict[str, Any]:
     with path.open() as f:
         return json.load(f)
@@ -180,6 +281,7 @@ def run_one_role(
     run_dir = outdir / "raw" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     power_csv = run_dir / "power.csv"
+    sm_util_csv = run_dir / "sm_util.csv"
     bench_json_path = run_dir / "bench.json"
 
     bench_args = dict(default_args)
@@ -187,12 +289,16 @@ def run_one_role(
     bench_args["device"] = gpu
 
     logger: Optional[NvidiaSmiPowerLogger] = None
+    sm_util_logger: Optional[NvidiaSmiDmonUtilLogger] = None
     power_errors: List[str] = []
+    sm_util_errors: List[str] = []
     if not no_power:
         logger = NvidiaSmiPowerLogger(gpu=gpu, sample_ms=sample_ms, out_csv=power_csv, nvidia_smi=nvidia_smi)
         logger.start()
+        sm_util_logger = NvidiaSmiDmonUtilLogger(gpu=gpu, out_csv=sm_util_csv, nvidia_smi=nvidia_smi)
+        sm_util_logger.start()
         # Let the logger capture a pre-kernel sample for plotting context.
-        time.sleep(max(sample_ms / 1000.0, 0.05))
+        time.sleep(max(sample_ms / 1000.0, 0.10))
 
     wall_start_ns = time.time_ns()
     try:
@@ -201,6 +307,8 @@ def run_one_role(
         wall_end_ns = time.time_ns()
         if logger is not None:
             power_errors = logger.stop()
+        if sm_util_logger is not None:
+            sm_util_errors = sm_util_logger.stop()
 
     result.update(
         {
@@ -211,8 +319,10 @@ def run_one_role(
             "runner_wall_start_unix_ns": wall_start_ns,
             "runner_wall_end_unix_ns": wall_end_ns,
             "power_csv": str(power_csv) if not no_power else "",
+            "sm_util_csv": str(sm_util_csv) if not no_power else "",
             "bench_json": str(bench_json_path),
             "power_logger_errors": power_errors,
+            "sm_util_logger_errors": sm_util_errors,
             "validity_note": "unchecked; run Nsight Compute validation separately",
         }
     )
@@ -264,6 +374,9 @@ def main() -> int:
                     roles.append(("single", cond["single"]))
                 if not roles:
                     raise RuntimeError(f"Condition {name} has no baseline/test/single role")
+                condition_args = cond.get("args", {})
+                default_args_for_condition = dict(defaults)
+                default_args_for_condition.update(condition_args)
                 for role, role_args in roles:
                     result = run_one_role(
                         binary=args.binary,
@@ -273,7 +386,7 @@ def main() -> int:
                         repeat_index=repeat_index,
                         role=role,
                         role_args=role_args,
-                        default_args=defaults,
+                        default_args=default_args_for_condition,
                         sample_ms=args.sample_ms,
                         nvidia_smi=args.nvidia_smi,
                         no_power=args.no_power,
