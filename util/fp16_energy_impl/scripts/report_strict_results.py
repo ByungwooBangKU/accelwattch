@@ -186,6 +186,12 @@ def requirement_rows(
     positive_pjbit = bool(audit_rows) and all(
         parse_float(row.get("matmul_input_pj_per_bit_mean")) > 0.0 for row in audit_rows
     )
+    denominator = bool(audit_rows) and all(
+        parse_bool(row.get("matmul_denominator_valid"))
+        and parse_float(row.get("matmul_input_bits_per_logical_mma")) == 8192.0
+        and parse_float(row.get("matmul_flops_per_logical_mma")) == 8192.0
+        for row in audit_rows
+    )
     model_util = bool(audit_rows) and all(
         parse_float(row.get("tensor_model_utilization_pct_mean")) > 0.0 for row in audit_rows
     )
@@ -206,6 +212,11 @@ def requirement_rows(
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
         row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),
         row("ptxas resource audit has no spills", no_spill, "test/baseline_resource_has_spills=false"),
+        row(
+            "logical m16n16k16 denominator",
+            denominator,
+            "matmul_input_bits_per_logical_mma=8192 and matmul_flops_per_logical_mma=8192",
+        ),
         row("positive logical FP16 pJ/bit", positive_pjbit, "matmul_input_pj_per_bit_mean > 0"),
         row("positive Tensor Core model utilization", model_util, "tensor_model_utilization_pct_mean > 0"),
     ]
@@ -223,6 +234,7 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "threads_per_sm": row.get("threads_per_sm", ""),
                 "threads": row.get("threads", ""),
                 "matmul_input_pj_per_bit": row.get("matmul_input_pj_per_bit_mean", ""),
+                "matmul_input_bits_per_logical_mma": row.get("matmul_input_bits_per_logical_mma", ""),
                 "tflops": row.get("tflops_mean", ""),
                 "avg_sm_util_pct": row.get("avg_sm_util_pct_mean", ""),
                 "tensor_model_util_pct": row.get("tensor_model_utilization_pct_mean", ""),

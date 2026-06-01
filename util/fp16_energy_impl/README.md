@@ -56,6 +56,8 @@ Tensor Core kernel은 Ampere/Hopper에서 지원되는 `mma.sync.aligned.m16n8k1
 N_FP16_ops = warps × repeats × iters × unroll × 8192
 ```
 
+benchmark JSON은 이 denominator를 `mma_logical_shape`, `mma_logical_count_estimate`, `mma_input_bits_per_logical_mma`, `mma_flops_per_logical_mma`로 직접 기록한다. 분석/quality gate는 이 값들이 logical `m16n16k16` 기준의 8192 input bits 및 8192 FLOP과 맞는지 확인한다.
+
 ## 3. Build
 
 ```bash
@@ -201,6 +203,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | counter-vs-trace cross-check | NVML counter energy와 `nvidia-smi` power trace 적분값의 ratio를 warning band로 확인. 기본은 warning-only |
 | reliable energy signal | 기본값으로 `incremental_energy_fraction >= 0.01`이고 `baseline_energy_fraction <= 0.99`. 0.05 미만은 warning |
 | measurement resolution | 기본값으로 test/baseline elapsed time >= 0.25 s, test energy >= 1 J, incremental energy >= 0.1 J |
+| matmul denominator | Tensor Core pJ/bit 분모가 logical `m16n16k16` 기준인지 확인. `matmul_input_bits_per_logical_mma=8192`, `matmul_flops_per_logical_mma=8192`가 아니면 최종 target에서 제외 |
 | structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
 | NCU validation | 최종 claim에는 `validate_ncu_reports.py`가 만든 `ncu_validation_summary.csv`를 `--require-ncu`로 연결 |
@@ -542,6 +545,10 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `baseline_energy_fraction` | `baseline_scaled_energy_j / test_energy_j`. 너무 크면 test energy 대부분이 baseline으로 설명됨 |
 | `pj_per_flop` | incremental energy / FP16 ops × 1e12 |
 | `matmul_input_pj_per_bit` | Tensor Core matmul의 A/B FP16 input bits 기준 incremental pJ/bit |
+| `matmul_input_bits_per_logical_mma` | logical `m16n16k16` 한 번당 A/B FP16 input bit 수. 정상값은 `(16*16 + 16*16) * 16 = 8192` |
+| `matmul_flops_per_logical_mma` | logical `m16n16k16` 한 번당 FLOP 수. 정상값은 `2 * 16 * 16 * 16 = 8192` |
+| `matmul_logical_mma_count` | `fp16_ops / matmul_flops_per_logical_mma`로 해석되는 logical MMA count. 새 benchmark JSON에서는 `mma_logical_count_estimate`로 직접 기록 |
+| `matmul_denominator_valid` | Tensor Core pJ/bit 분모 metadata가 logical `m16n16k16` input-bit denominator와 일치하는지 여부 |
 | `matmul_arithmetic_read_pj_per_bit` | A/B input bits + accumulator read bits 기준 incremental pJ/bit |
 | `matmul_register_read_write_pj_per_bit` | A/B input bits + accumulator read bits + output bits 기준 incremental pJ/bit |
 | `w_per_tflops` | incremental power / achieved TFLOPS |
@@ -578,6 +585,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `baseline_energy_counter_vs_trace_ratio_mean` | thread point별 평균 baseline NVML-counter/power-trace ratio |
 | `baseline_energy_fraction_mean` | thread point별 평균 baseline-scaled energy fraction |
 | `matmul_input_pj_per_bit_mean` | thread point별 logical input bit 기준 pJ/bit |
+| `matmul_input_bits_per_logical_mma_mean` | thread point별 logical MMA input-bit denominator. strict 결과는 8192여야 함 |
+| `matmul_denominator_valid_count` | 해당 thread point에서 pJ/bit denominator metadata가 통과한 반복 수 |
 | `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
 
 `stats_scope=all_runs_no_valid`는 해당 thread point에서 `valid_basic=True`인 반복이 없었다는 뜻이다. 이 경우 mean/std는 plot과 원인 분석을 위한 전체 run 통계일 뿐, 최종 pJ/bit 후보로 쓰면 안 된다. `valid_no_l2` 역시 “코드가 의도적으로 L2/global memory를 touch하지 않는다”는 조건이지, hardware counter 기반 증명은 아니므로 최종 보고 전에는 Nsight Compute로 `MemoryWorkloadAnalysis`를 확인한다.
@@ -646,7 +655,7 @@ matmul_arithmetic_read_bits  = matmul_input_bits + mma_count * 16*16 * accumulat
 matmul_register_rw_bits      = matmul_arithmetic_read_bits + mma_count * 16*16 * accumulator_bits
 ```
 
-`matmul_input_pJ_per_bit`는 DRAM bit energy가 아니라 logical `m16n16k16`의 A/B FP16 operand bit 기준 compute energy estimate다. 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. `accumulator_bits`는 `tensor_mma_f16acc`에서 16, `tensor_mma_f32acc`에서 32다.
+`matmul_input_pJ_per_bit`는 DRAM bit energy가 아니라 logical `m16n16k16`의 A/B FP16 operand bit 기준 compute energy estimate다. 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. `accumulator_bits`는 `tensor_mma_f16acc`에서 16, `tensor_mma_f32acc`에서 32다. 최종 target은 `matmul_denominator_valid=true`여야 하며, 이 gate가 실패하면 pJ/bit denominator가 잘못된 결과로 보고하지 않는다.
 
 P1 memory/cache-policy energy:
 

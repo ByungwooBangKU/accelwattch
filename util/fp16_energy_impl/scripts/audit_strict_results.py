@@ -175,6 +175,27 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     pjbit = parse_float(target.get("matmul_input_pj_per_bit_mean"))
     if not math.isfinite(pjbit) or pjbit <= 0.0:
         failed.append("matmul_input_pj_per_bit_mean is not positive/finite")
+    matmul_denominator_valid = parse_bool(target.get("matmul_denominator_valid"))
+    matmul_input_bits_per_mma = parse_float(target.get("matmul_input_bits_per_logical_mma"))
+    matmul_flops_per_mma = parse_float(target.get("matmul_flops_per_logical_mma"))
+    if not matmul_denominator_valid:
+        failed.append("matmul_denominator_valid is not true")
+    if (
+        not math.isfinite(matmul_input_bits_per_mma)
+        or abs(matmul_input_bits_per_mma - args.expected_matmul_input_bits_per_logical_mma) > 1e-6
+    ):
+        failed.append(
+            "matmul_input_bits_per_logical_mma "
+            f"{matmul_input_bits_per_mma:g} != {args.expected_matmul_input_bits_per_logical_mma:g}"
+        )
+    if (
+        not math.isfinite(matmul_flops_per_mma)
+        or abs(matmul_flops_per_mma - args.expected_mma_flops_per_logical_mma) > 1e-6
+    ):
+        failed.append(
+            f"matmul_flops_per_logical_mma {matmul_flops_per_mma:g} "
+            f"!= {args.expected_mma_flops_per_logical_mma:g}"
+        )
     sm_util = parse_float(target.get("avg_sm_util_pct_mean"))
     if not math.isfinite(sm_util):
         warnings.append("avg_sm_util_pct_mean is missing")
@@ -287,6 +308,11 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "tensor_peak_tflops_model_mean": target.get("tensor_peak_tflops_model_mean", ""),
         "achieved_flops_per_sm_cycle_mean": target.get("achieved_flops_per_sm_cycle_mean", ""),
         "tensor_model_utilization_pct_mean": target.get("tensor_model_utilization_pct_mean", ""),
+        "matmul_denominator_valid": target.get("matmul_denominator_valid", ""),
+        "matmul_denominator_note": target.get("matmul_denominator_note", ""),
+        "matmul_input_bits_per_logical_mma": target.get("matmul_input_bits_per_logical_mma", ""),
+        "matmul_flops_per_logical_mma": target.get("matmul_flops_per_logical_mma", ""),
+        "matmul_logical_mma_count_mean": target.get("matmul_logical_mma_count_mean", ""),
         "matmul_input_pj_per_bit_mean": target.get("matmul_input_pj_per_bit_mean", ""),
         "incremental_power_w_mean": target.get("incremental_power_w_mean", ""),
         "test_energy_j_mean": target.get("test_energy_j_mean", ""),
@@ -506,6 +532,10 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
         },
+        "matmul_denominator_thresholds": {
+            "expected_matmul_input_bits_per_logical_mma": args.expected_matmul_input_bits_per_logical_mma,
+            "expected_mma_flops_per_logical_mma": args.expected_mma_flops_per_logical_mma,
+        },
         "counter_trace_crosscheck_thresholds": {
             "warn_counter_trace_ratio_low": args.warn_counter_trace_ratio_low,
             "warn_counter_trace_ratio_high": args.warn_counter_trace_ratio_high,
@@ -544,6 +574,8 @@ def main() -> int:
     parser.add_argument("--warn-baseline-elapsed-s", type=float, default=1.0)
     parser.add_argument("--min-test-energy-j", type=float, default=1.0)
     parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
+    parser.add_argument("--expected-matmul-input-bits-per-logical-mma", type=float, default=8192.0)
+    parser.add_argument("--expected-mma-flops-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--require-baseline-elapsed", action="store_true")
     parser.add_argument("--warn-counter-trace-ratio-low", type=float, default=0.5)
     parser.add_argument("--warn-counter-trace-ratio-high", type=float, default=1.5)

@@ -287,6 +287,73 @@ def counter_trace_crosscheck(
     return (not failed and not warnings, failed, warnings, test_ratio, baseline_ratio)
 
 
+def row_value_or_mean(row: Dict[str, Any], key: str) -> Any:
+    if key in row and str(row.get(key, "")).strip():
+        return row.get(key)
+    mean_key = f"{key}_mean"
+    return row.get(mean_key, "")
+
+
+def matmul_denominator_quality(
+    row: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[bool, List[str], List[str], Dict[str, Any]]:
+    kernel = str(row.get("test_kernel", ""))
+    if kernel not in {"tensor_mma_f16acc", "tensor_mma_f32acc"}:
+        return (
+            True,
+            [],
+            [],
+            {
+                "valid": True,
+                "note": "not_tensor_matmul_kernel",
+                "input_bits_per_logical_mma": math.nan,
+                "flops_per_logical_mma": math.nan,
+                "logical_mma_count": math.nan,
+            },
+        )
+
+    valid_token = row.get("matmul_denominator_valid", "")
+    if not str(valid_token).strip():
+        valid_token = row.get("matmul_denominator_valid_all", "")
+    metadata_valid = parse_bool(valid_token)
+    input_bits = parse_float(row_value_or_mean(row, "matmul_input_bits_per_logical_mma"))
+    flops = parse_float(row_value_or_mean(row, "matmul_flops_per_logical_mma"))
+    mma_count = parse_float(row_value_or_mean(row, "matmul_logical_mma_count"))
+    note = str(row.get("matmul_denominator_note", "") or "")
+
+    failed: List[str] = []
+    warnings: List[str] = []
+    if not metadata_valid:
+        failed.append("matmul logical denominator metadata is missing or invalid")
+    if not math.isfinite(input_bits) or abs(input_bits - args.expected_matmul_input_bits_per_logical_mma) > 1e-6:
+        failed.append(
+            "matmul input-bit denominator "
+            f"{input_bits:g} != {args.expected_matmul_input_bits_per_logical_mma:g}"
+        )
+    if not math.isfinite(flops) or abs(flops - args.expected_mma_flops_per_logical_mma) > 1e-6:
+        failed.append(
+            f"mma FLOP denominator {flops:g} != {args.expected_mma_flops_per_logical_mma:g}"
+        )
+    if not math.isfinite(mma_count) or mma_count <= 0.0:
+        failed.append("logical MMA count is missing or nonpositive")
+    if note and metadata_valid and "m16n16k16" not in note:
+        warnings.append(note)
+
+    return (
+        not failed,
+        failed,
+        warnings,
+        {
+            "valid": not failed,
+            "note": note or ("logical_m16n16k16_input_bits_8192" if not failed else ""),
+            "input_bits_per_logical_mma": input_bits,
+            "flops_per_logical_mma": flops,
+            "logical_mma_count": mma_count,
+        },
+    )
+
+
 def pair_gate_rows(
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
@@ -339,6 +406,7 @@ def pair_gate_rows(
             row.get("baseline_energy_counter_vs_trace_ratio"),
             args,
         )
+        denom_ok, denom_failed, denom_warnings, denom_info = matmul_denominator_quality(row, args)
         test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
@@ -368,6 +436,9 @@ def pair_gate_rows(
             failed.append(source_note)
         if not baseline_ok:
             failed.append(baseline_note)
+        if not denom_ok:
+            failed.extend(denom_failed)
+        warnings.extend(denom_warnings)
         if not signal_ok:
             failed.extend(signal_failed)
         warnings.extend(signal_warnings)
@@ -424,6 +495,8 @@ def pair_gate_rows(
                 "energy_source_reliable": reliable_source,
                 "energy_trace_crosscheck_pass": trace_ok,
                 "baseline_structural_match": baseline_ok,
+                "matmul_denominator_valid": denom_ok,
+                "matmul_denominator_note": denom_info["note"],
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
@@ -456,6 +529,9 @@ def pair_gate_rows(
                 "achieved_flops_per_sm_cycle": row.get("achieved_flops_per_sm_cycle", ""),
                 "tensor_model_utilization_pct": row.get("tensor_model_utilization_pct", ""),
                 "avg_sm_util_pct": row.get("avg_sm_util_pct", ""),
+                "matmul_logical_mma_count": denom_info["logical_mma_count"],
+                "matmul_flops_per_logical_mma": denom_info["flops_per_logical_mma"],
+                "matmul_input_bits_per_logical_mma": denom_info["input_bits_per_logical_mma"],
                 "matmul_input_pj_per_bit": row.get("matmul_input_pj_per_bit", ""),
                 "incremental_power_w": row.get("incremental_power_w", ""),
                 "test_energy_j": test_energy_j,
@@ -601,6 +677,7 @@ def thread_gate_rows(
             row.get("baseline_energy_counter_vs_trace_ratio_mean"),
             args,
         )
+        denom_ok, denom_failed, denom_warnings, denom_info = matmul_denominator_quality(row, args)
 
         failed: List[str] = []
         warnings: List[str] = []
@@ -618,6 +695,9 @@ def thread_gate_rows(
             failed.append("energy source is unavailable or undersampled")
         if not baseline_ok:
             failed.append(baseline_note)
+        if not denom_ok:
+            failed.extend(denom_failed)
+        warnings.extend(denom_warnings)
         if not signal_ok:
             failed.extend(signal_failed)
         warnings.extend(signal_warnings)
@@ -675,6 +755,8 @@ def thread_gate_rows(
                 "energy_source_reliable": source_ok,
                 "energy_trace_crosscheck_pass": trace_ok,
                 "baseline_structural_match": baseline_ok,
+                "matmul_denominator_valid": denom_ok,
+                "matmul_denominator_note": denom_info["note"],
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
@@ -707,6 +789,9 @@ def thread_gate_rows(
                 "tensor_peak_tflops_model_mean": row.get("tensor_peak_tflops_model_mean", ""),
                 "achieved_flops_per_sm_cycle_mean": row.get("achieved_flops_per_sm_cycle_mean", ""),
                 "tensor_model_utilization_pct_mean": row.get("tensor_model_utilization_pct_mean", ""),
+                "matmul_logical_mma_count_mean": denom_info["logical_mma_count"],
+                "matmul_flops_per_logical_mma": denom_info["flops_per_logical_mma"],
+                "matmul_input_bits_per_logical_mma": denom_info["input_bits_per_logical_mma"],
                 "matmul_input_pj_per_bit_mean": row.get("matmul_input_pj_per_bit_mean", ""),
                 "matmul_input_pj_per_bit_ci95": row.get("matmul_input_pj_per_bit_ci95", ""),
                 "incremental_power_w_mean": row.get("incremental_power_w_mean", ""),
@@ -819,6 +904,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "min_baseline_elapsed_s": args.min_baseline_elapsed_s,
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
+            "expected_matmul_input_bits_per_logical_mma": args.expected_matmul_input_bits_per_logical_mma,
+            "expected_mma_flops_per_logical_mma": args.expected_mma_flops_per_logical_mma,
             "warn_counter_trace_ratio_low": args.warn_counter_trace_ratio_low,
             "warn_counter_trace_ratio_high": args.warn_counter_trace_ratio_high,
             "require_counter_trace_agreement": bool(args.require_counter_trace_agreement),
@@ -841,6 +928,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
             "energy_signal_reliable requires incremental energy to be a configurable minimum fraction of test energy.",
             "measurement_resolution_reliable requires enough elapsed time and energy magnitude for stable measurement.",
+            "matmul_denominator_valid requires the Tensor Core logical m16n16k16 denominator: "
+            "8192 FP16 input bits and 8192 FLOP per logical MMA.",
             "energy_trace_crosscheck_pass compares NVML total-energy delta with nvidia-smi power trace integration; "
             "it is a warning by default because power.draw may be averaged over a different window.",
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
@@ -866,6 +955,8 @@ def main() -> int:
     parser.add_argument("--warn-baseline-elapsed-s", type=float, default=1.0)
     parser.add_argument("--min-test-energy-j", type=float, default=1.0)
     parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
+    parser.add_argument("--expected-matmul-input-bits-per-logical-mma", type=float, default=8192.0)
+    parser.add_argument("--expected-mma-flops-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--require-baseline-elapsed", action="store_true")
     parser.add_argument("--warn-counter-trace-ratio-low", type=float, default=0.5)
     parser.add_argument("--warn-counter-trace-ratio-high", type=float, default=1.5)

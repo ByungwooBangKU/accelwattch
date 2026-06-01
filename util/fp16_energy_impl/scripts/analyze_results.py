@@ -318,7 +318,7 @@ def has_reliable_energy(run: Dict[str, Any]) -> bool:
     return int(run.get("power_sample_count", 0)) >= 3
 
 
-def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, float]:
+def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, Any]:
     """Return logical Tensor Core matmul bit counts, not memory traffic bits."""
     kernel = str(run.get("kernel", ""))
     if kernel not in {"tensor_mma_f16acc", "tensor_mma_f32acc"} or ops <= 0:
@@ -328,6 +328,15 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, float]:
             "matmul_output_bits": 0.0,
             "matmul_arithmetic_read_bits": 0.0,
             "matmul_register_read_write_bits": 0.0,
+            "matmul_logical_mma_count": 0.0,
+            "matmul_flops_per_logical_mma": math.nan,
+            "matmul_input_bits_per_logical_mma": math.nan,
+            "matmul_accumulator_bits_per_logical_mma": math.nan,
+            "matmul_output_bits_per_logical_mma": math.nan,
+            "matmul_arithmetic_read_bits_per_logical_mma": math.nan,
+            "matmul_register_read_write_bits_per_logical_mma": math.nan,
+            "matmul_denominator_valid": False,
+            "matmul_denominator_note": "not_tensor_matmul_kernel",
         }
 
     mma_m = finite_float(run.get("mma_m"), 16.0)
@@ -337,19 +346,77 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, float]:
     if not math.isfinite(flops_per_logical_mma) or flops_per_logical_mma <= 0:
         flops_per_logical_mma = 2.0 * 16.0 * 16.0 * 16.0
 
-    mma_count = ops / flops_per_logical_mma
-    input_bits = mma_count * (mma_m * mma_k + mma_k * mma_n) * 16
+    mma_count_from_ops = ops / flops_per_logical_mma
+    metadata_mma_count = finite_float(run.get("mma_logical_count_estimate"))
+    mma_count = metadata_mma_count if math.isfinite(metadata_mma_count) and metadata_mma_count > 0.0 else mma_count_from_ops
+    expected_input_bits_per_mma = (mma_m * mma_k + mma_k * mma_n) * 16.0
+    input_bits_per_mma = finite_float(run.get("mma_input_bits_per_logical_mma"), expected_input_bits_per_mma)
     acc_bits = 16 if kernel == "tensor_mma_f16acc" else 32
-    accumulator_read_bits = mma_count * mma_m * mma_n * acc_bits
-    output_bits = accumulator_read_bits
-    arithmetic_read_bits = input_bits + accumulator_read_bits
-    register_read_write_bits = arithmetic_read_bits + output_bits
+    expected_accumulator_bits_per_mma = mma_m * mma_n * acc_bits
+    accumulator_bits_per_mma = finite_float(
+        run.get("mma_accumulator_bits_per_logical_mma"),
+        expected_accumulator_bits_per_mma,
+    )
+    output_bits_per_mma = finite_float(run.get("mma_output_bits_per_logical_mma"), accumulator_bits_per_mma)
+    arithmetic_read_bits_per_mma = finite_float(
+        run.get("mma_arithmetic_read_bits_per_logical_mma"),
+        input_bits_per_mma + accumulator_bits_per_mma,
+    )
+    register_read_write_bits_per_mma = finite_float(
+        run.get("mma_register_read_write_bits_per_logical_mma"),
+        arithmetic_read_bits_per_mma + output_bits_per_mma,
+    )
+
+    input_bits = mma_count * input_bits_per_mma
+    accumulator_read_bits = mma_count * accumulator_bits_per_mma
+    output_bits = mma_count * output_bits_per_mma
+    arithmetic_read_bits = mma_count * arithmetic_read_bits_per_mma
+    register_read_write_bits = mma_count * register_read_write_bits_per_mma
+
+    def close(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-6) -> bool:
+        return math.isfinite(a) and math.isfinite(b) and abs(a - b) <= max(abs_tol, rel_tol * max(abs(a), abs(b)))
+
+    shape_valid = close(mma_m, 16.0) and close(mma_n, 16.0) and close(mma_k, 16.0)
+    count_valid = (
+        not math.isfinite(metadata_mma_count)
+        or close(metadata_mma_count, mma_count_from_ops, rel_tol=1e-9, abs_tol=1.0)
+    )
+    denominator_valid = bool(
+        shape_valid
+        and close(flops_per_logical_mma, 8192.0)
+        and close(input_bits_per_mma, 8192.0)
+        and close(input_bits_per_mma, expected_input_bits_per_mma)
+        and close(accumulator_bits_per_mma, expected_accumulator_bits_per_mma)
+        and close(output_bits_per_mma, accumulator_bits_per_mma)
+        and close(arithmetic_read_bits_per_mma, input_bits_per_mma + accumulator_bits_per_mma)
+        and close(register_read_write_bits_per_mma, arithmetic_read_bits_per_mma + output_bits_per_mma)
+        and count_valid
+    )
+    if denominator_valid:
+        denominator_note = "logical_m16n16k16_input_bits_8192"
+    else:
+        denominator_note = (
+            "invalid logical MMA denominator: "
+            f"shape=({mma_m:g},{mma_n:g},{mma_k:g}), "
+            f"flops_per_mma={flops_per_logical_mma:g}, "
+            f"input_bits_per_mma={input_bits_per_mma:g}, "
+            f"count_match={count_valid}"
+        )
     return {
         "matmul_input_bits": input_bits,
         "matmul_accumulator_read_bits": accumulator_read_bits,
         "matmul_output_bits": output_bits,
         "matmul_arithmetic_read_bits": arithmetic_read_bits,
         "matmul_register_read_write_bits": register_read_write_bits,
+        "matmul_logical_mma_count": mma_count,
+        "matmul_flops_per_logical_mma": flops_per_logical_mma,
+        "matmul_input_bits_per_logical_mma": input_bits_per_mma,
+        "matmul_accumulator_bits_per_logical_mma": accumulator_bits_per_mma,
+        "matmul_output_bits_per_logical_mma": output_bits_per_mma,
+        "matmul_arithmetic_read_bits_per_logical_mma": arithmetic_read_bits_per_mma,
+        "matmul_register_read_write_bits_per_logical_mma": register_read_write_bits_per_mma,
+        "matmul_denominator_valid": denominator_valid,
+        "matmul_denominator_note": denominator_note,
     }
 
 
@@ -703,6 +770,13 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "matmul_input_pj_per_bit",
         "matmul_arithmetic_read_pj_per_bit",
         "matmul_register_read_write_pj_per_bit",
+        "matmul_logical_mma_count",
+        "matmul_flops_per_logical_mma",
+        "matmul_input_bits_per_logical_mma",
+        "matmul_accumulator_bits_per_logical_mma",
+        "matmul_output_bits_per_logical_mma",
+        "matmul_arithmetic_read_bits_per_logical_mma",
+        "matmul_register_read_write_bits_per_logical_mma",
         "tflops",
         "memory_gbps",
         "incremental_power_w",
@@ -753,6 +827,8 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "valid_count": len(valid),
             "valid_no_l2_count": sum(1 for r in group if bool(r.get("valid_no_l2", False))),
             "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
+            "matmul_denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
+            "matmul_denominator_valid_all": all(bool(r.get("matmul_denominator_valid", False)) for r in group),
             "invalid_count": len(group) - len(valid),
             "stats_scope": "valid_basic" if valid else "all_runs_no_valid_basic",
         }
@@ -806,6 +882,13 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "max_sm_util_pct",
         "tflops",
         "matmul_input_pj_per_bit",
+        "matmul_logical_mma_count",
+        "matmul_flops_per_logical_mma",
+        "matmul_input_bits_per_logical_mma",
+        "matmul_accumulator_bits_per_logical_mma",
+        "matmul_output_bits_per_logical_mma",
+        "matmul_arithmetic_read_bits_per_logical_mma",
+        "matmul_register_read_write_bits_per_logical_mma",
         "pj_per_flop",
         "incremental_power_w",
         "test_energy_j",
@@ -857,6 +940,11 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "valid_count": len(valid),
             "valid_no_l2_count": len(valid_no_l2),
             "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
+            "matmul_denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
+            "matmul_denominator_valid_all": all(bool(r.get("matmul_denominator_valid", False)) for r in group),
+            "matmul_denominator_note": "; ".join(
+                sorted({str(r.get("matmul_denominator_note", "")) for r in group if str(r.get("matmul_denominator_note", ""))})
+            ),
             "stats_scope": "valid_no_l2" if valid_no_l2 else ("valid_basic" if valid else "all_runs_no_valid"),
             "expected_l2_touch": any(bool(r.get("expected_l2_touch", True)) for r in stats_source),
         }

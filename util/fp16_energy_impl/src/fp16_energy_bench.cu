@@ -407,8 +407,15 @@ __device__ __forceinline__ void consume_float(float x) {
 constexpr uint64_t kTensorLogicalM = 16;
 constexpr uint64_t kTensorLogicalN = 16;
 constexpr uint64_t kTensorLogicalK = 16;
+constexpr uint64_t kTensorMmaInstructionsPerLogicalMma = 2;
 constexpr uint64_t kTensorFlopsPerLogicalMma =
     2ull * kTensorLogicalM * kTensorLogicalN * kTensorLogicalK;
+constexpr uint64_t kTensorInputBitsPerLogicalMma =
+    (kTensorLogicalM * kTensorLogicalK + kTensorLogicalK * kTensorLogicalN) * 16ull;
+constexpr uint64_t kTensorF16AccumulatorBitsPerLogicalMma =
+    kTensorLogicalM * kTensorLogicalN * 16ull;
+constexpr uint64_t kTensorF32AccumulatorBitsPerLogicalMma =
+    kTensorLogicalM * kTensorLogicalN * 32ull;
 
 template <int UNROLL>
 __global__ void fp16_half2_kernel(const half2* __restrict__ in, half2* __restrict__ out,
@@ -758,6 +765,18 @@ bool supports_suppress_output_store(const std::string& k) {
   return k == "baseline_nop" || is_tensor_u32_kernel(k) || is_tensor_f32_kernel(k);
 }
 
+uint64_t tensor_logical_mma_count(const Args& args, int blocks, int threads) {
+  const uint64_t total_threads = static_cast<uint64_t>(blocks) * threads;
+  const uint64_t warps = total_threads / 32ull;
+  return warps * static_cast<uint64_t>(args.repeats) * static_cast<uint64_t>(args.iters) *
+         static_cast<uint64_t>(args.unroll);
+}
+
+uint64_t tensor_accumulator_bits_per_logical_mma(const std::string& kernel) {
+  return kernel == "tensor_mma_f16acc" ? kTensorF16AccumulatorBitsPerLogicalMma
+                                       : kTensorF32AccumulatorBitsPerLogicalMma;
+}
+
 template <int UNROLL>
 TimingResult launch_timed(const Args& args, int blocks, int threads, size_t total_threads, size_t mem_words) {
   float ms = 0.0f;
@@ -963,8 +982,7 @@ uint64_t fp16_ops_estimate(const Args& args, int blocks, int threads) {
   }
   if (args.kernel == "tensor_mma_f16acc" || args.kernel == "tensor_mma_f32acc") {
     // One logical m16n16k16 tile is implemented as two m16n8k16 warp-level MMA instructions.
-    const uint64_t warps = total_threads / 32ull;
-    return warps * repeats * iters * unroll * kTensorFlopsPerLogicalMma;
+    return tensor_logical_mma_count(args, blocks, threads) * kTensorFlopsPerLogicalMma;
   }
   return 0ull;
 }
@@ -1088,11 +1106,25 @@ int main(int argc, char** argv) {
   os << "  \"mem_stride\": " << args.mem_stride << ",\n";
   os << "  \"suppress_output_store\": " << (args.suppress_output_store ? "true" : "false") << ",\n";
   if (args.kernel == "tensor_mma_f16acc" || args.kernel == "tensor_mma_f32acc") {
+    const uint64_t mma_count = tensor_logical_mma_count(args, args.blocks, args.threads);
+    const uint64_t acc_bits_per_mma = tensor_accumulator_bits_per_logical_mma(args.kernel);
     os << "  \"mma_m\": " << kTensorLogicalM << ",\n";
     os << "  \"mma_n\": " << kTensorLogicalN << ",\n";
     os << "  \"mma_k\": " << kTensorLogicalK << ",\n";
-    os << "  \"mma_instructions_per_logical_mma\": 2,\n";
+    os << "  \"mma_logical_shape\": \"m16n16k16\",\n";
+    os << "  \"mma_instructions_per_logical_mma\": "
+       << kTensorMmaInstructionsPerLogicalMma << ",\n";
+    os << "  \"mma_logical_count_estimate\": " << mma_count << ",\n";
     os << "  \"mma_flops_per_logical_mma\": " << kTensorFlopsPerLogicalMma << ",\n";
+    os << "  \"mma_input_bits_per_logical_mma\": "
+       << kTensorInputBitsPerLogicalMma << ",\n";
+    os << "  \"mma_accumulator_bits_per_logical_mma\": "
+       << acc_bits_per_mma << ",\n";
+    os << "  \"mma_output_bits_per_logical_mma\": " << acc_bits_per_mma << ",\n";
+    os << "  \"mma_arithmetic_read_bits_per_logical_mma\": "
+       << (kTensorInputBitsPerLogicalMma + acc_bits_per_mma) << ",\n";
+    os << "  \"mma_register_read_write_bits_per_logical_mma\": "
+       << (kTensorInputBitsPerLogicalMma + 2ull * acc_bits_per_mma) << ",\n";
   }
   os << "  \"host_start_unix_ns\": " << host_start_ns << ",\n";
   os << "  \"host_end_unix_ns\": " << host_end_ns << ",\n";
