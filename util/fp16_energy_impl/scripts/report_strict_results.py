@@ -174,6 +174,7 @@ def artifact_links(
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_util_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_pjbit_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_model_util_*.png")))
+        candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_energy_fraction_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_resource_occupancy_*.png")))
     if architecture_model_dir:
         candidates.extend(

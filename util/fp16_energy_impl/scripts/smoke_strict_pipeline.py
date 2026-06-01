@@ -157,6 +157,7 @@ def resource_row(role: str, kernel: str, threads: int) -> Dict[str, Any]:
 
 def compare_thread_row(threads: int, threads_per_sm: int, sm_util: float, pjbit: float, *, target: bool) -> Dict[str, Any]:
     row = target_row("tensor_mma_f16acc", "tensor_baseline_u32", threads)
+    incremental_fraction = 0.03 if threads < 64 else (0.06 if target else 0.07)
     row.update(
         {
             "threads_per_sm": threads_per_sm,
@@ -164,6 +165,9 @@ def compare_thread_row(threads: int, threads_per_sm: int, sm_util: float, pjbit:
             "matmul_input_pj_per_bit_mean": pjbit,
             "tflops_mean": 600.0 + sm_util,
             "tensor_model_utilization_pct_mean": sm_util * 0.8,
+            "incremental_energy_fraction_mean": incremental_fraction,
+            "baseline_energy_fraction_mean": 1.0 - incremental_fraction,
+            "baseline_power_fraction_mean": 1.0 - incremental_fraction,
             "pure_fp16_candidate_count": 3,
             "valid_no_l2_count": 3,
             "valid_count": 3,
@@ -370,6 +374,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
         "architecture_best_fp16.csv",
         "architecture_thread_sweep_util_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
         "architecture_thread_sweep_pjbit_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
+        "architecture_thread_sweep_energy_fraction_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
     ):
         if not (compare_out / artifact).exists():
             raise AssertionError(f"Architecture compare smoke did not write {artifact}")

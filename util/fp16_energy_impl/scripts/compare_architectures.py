@@ -384,6 +384,28 @@ def selected_annotation(row: Dict[str, Any]) -> str:
     return label
 
 
+def selected_energy_fraction_annotation(row: Dict[str, Any]) -> str:
+    label = selected_annotation(row)
+    incremental = parse_float(row.get("incremental_energy_fraction_mean"))
+    baseline = parse_float(row.get("baseline_energy_fraction_mean"))
+    if math.isfinite(incremental):
+        label += f"\ninc {100.0 * incremental:.1f}%"
+    if math.isfinite(baseline):
+        label += f"\nbase {100.0 * baseline:.1f}%"
+    return label
+
+
+def add_energy_fraction_legend(ax: Any) -> None:
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D([0], [0], color="0.25", linestyle="-", label="incremental FP16 signal"),
+        Line2D([0], [0], color="0.25", linestyle="--", label="baseline-scaled energy"),
+    ]
+    legend = ax.legend(handles=handles, loc="upper left", fontsize=8, frameon=True, title="energy fraction")
+    ax.add_artist(legend)
+
+
 def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None:
     if not thread_rows:
         return
@@ -501,6 +523,83 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             add_quality_legend(ax)
             fig.tight_layout()
             safe = f"architecture_thread_sweep_model_util_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
+            fig.savefig(outdir / safe, dpi=160)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(8.8, 5.2))
+        plotted = False
+        arch_handles = []
+        for label in sorted({str(r.get("architecture_label", "")) for r in rows}):
+            group = [r for r in rows if str(r.get("architecture_label", "")) == label]
+            group = sorted(group, key=lambda r: parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))))
+            xs = [parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))) for r in group]
+            incremental = [parse_float(r.get("incremental_energy_fraction_mean")) for r in group]
+            baseline = [parse_float(r.get("baseline_energy_fraction_mean")) for r in group]
+            if any(math.isfinite(y) for y in incremental) or any(math.isfinite(y) for y in baseline):
+                line = ax.plot(xs, incremental, linewidth=1.3, alpha=0.85, label=label)[0]
+                ax.plot(xs, baseline, linewidth=1.1, alpha=0.65, linestyle="--", color=line.get_color())
+                arch_handles.append(line)
+                for r, x, y in zip(group, xs, incremental):
+                    scatter_quality_point(ax, x, y, r, line.get_color())
+                    if quality_class(r) == "target" and math.isfinite(x) and math.isfinite(y):
+                        ax.axvline(x, color="tab:green", linestyle="--", linewidth=0.9, alpha=0.55)
+                        ax.annotate(
+                            selected_energy_fraction_annotation(r),
+                            (x, y),
+                            textcoords="offset points",
+                            xytext=(8, 8),
+                            fontsize=8,
+                            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "none", "alpha": 0.78},
+                        )
+                plotted = True
+        if plotted:
+            ax.axhline(0.01, color="tab:red", linestyle=":", linewidth=0.9, alpha=0.6)
+            ax.axhline(0.05, color="tab:orange", linestyle=":", linewidth=0.9, alpha=0.6)
+            ax.axhline(0.99, color="tab:red", linestyle=":", linewidth=0.9, alpha=0.6)
+            threshold_label_box = {"fc": "white", "ec": "none", "alpha": 0.72, "pad": 0.1}
+            ax.text(
+                0.01,
+                0.01,
+                "min 1%",
+                transform=ax.get_yaxis_transform(),
+                ha="left",
+                va="bottom",
+                fontsize=8,
+                bbox=threshold_label_box,
+            )
+            ax.text(
+                0.01,
+                0.05,
+                "warn 5%",
+                transform=ax.get_yaxis_transform(),
+                ha="left",
+                va="bottom",
+                fontsize=8,
+                bbox=threshold_label_box,
+            )
+            ax.text(
+                0.48,
+                0.99,
+                "baseline max 99%",
+                transform=ax.get_yaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=8,
+                bbox=threshold_label_box,
+            )
+            ax.set_xlabel("Launched threads per SM")
+            ax.set_ylabel("Fraction of test energy")
+            ax.set_title(f"Architecture thread sweep energy separation: {test_kernel} vs {baseline_kernel}")
+            ax.set_ylim(-0.02, 1.05)
+            ax.get_xaxis().set_major_formatter(ScalarFormatter())
+            ax.grid(True, axis="y", alpha=0.25)
+            if arch_handles:
+                arch_legend = ax.legend(handles=arch_handles, loc="upper right", title="architecture")
+                ax.add_artist(arch_legend)
+            add_energy_fraction_legend(ax)
+            add_quality_legend(ax)
+            fig.tight_layout()
+            safe = f"architecture_thread_sweep_energy_fraction_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
             fig.savefig(outdir / safe, dpi=160)
         plt.close(fig)
 

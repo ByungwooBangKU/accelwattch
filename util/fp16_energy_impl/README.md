@@ -439,6 +439,7 @@ python3 scripts/smoke_strict_pipeline.py
 | `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교. marker는 `target_pass`, diagnostic `quality_pass`, fail, legacy/no-gate 상태를 구분하고 selected/target point에는 threads/block와 pJ/bit를 표시 |
 | `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교. marker는 quality gate 상태를 구분 |
 | `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교. `target_pass` point에는 threads/block와 pJ/bit 값을 직접 표시 |
+| `architecture_thread_sweep_energy_fraction_*.png` | x축 launched threads/SM, y축 test energy 대비 FP16 incremental fraction과 baseline-scaled fraction의 multi-GPU 비교. target에는 threads/block, pJ/bit, incremental/base 비율을 표시 |
 | `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
 | `fp16_strict_report.md` | strict audit와 architecture compare를 묶은 publishability 중심 Markdown report |
 | `fp16_strict_report_requirements.csv` | strict audit, suite preflight, denominator, NCU, resource, architecture model sanity requirement matrix |
