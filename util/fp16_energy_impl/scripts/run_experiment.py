@@ -31,11 +31,16 @@ class PowerSample:
     sample_unix_ns: int
     timestamp_text: str
     power_w: Optional[float]
+    power_draw_w: Optional[float]
+    power_draw_average_w: Optional[float]
+    power_draw_instant_w: Optional[float]
+    power_limit_w: Optional[float]
     sm_clock_mhz: Optional[float]
     mem_clock_mhz: Optional[float]
     temp_c: Optional[float]
     pstate: str
     util_gpu_pct: Optional[float]
+    query_mode: str
     raw: str
 
 
@@ -50,11 +55,55 @@ def parse_float(value: str) -> Optional[float]:
 
 
 class NvidiaSmiPowerLogger:
-    def __init__(self, gpu: int, sample_ms: int, out_csv: Path, nvidia_smi: str = "nvidia-smi") -> None:
-        self.gpu = gpu
+    QUERY_VARIANTS = [
+        (
+            "average_instant",
+            [
+                "timestamp",
+                "power.draw",
+                "power.draw.average",
+                "power.draw.instant",
+                "power.limit",
+                "clocks.sm",
+                "clocks.mem",
+                "temperature.gpu",
+                "pstate",
+                "utilization.gpu",
+            ],
+        ),
+        (
+            "legacy_with_limit",
+            [
+                "timestamp",
+                "power.draw",
+                "power.limit",
+                "clocks.sm",
+                "clocks.mem",
+                "temperature.gpu",
+                "pstate",
+                "utilization.gpu",
+            ],
+        ),
+        (
+            "legacy",
+            [
+                "timestamp",
+                "power.draw",
+                "clocks.sm",
+                "clocks.mem",
+                "temperature.gpu",
+                "pstate",
+                "utilization.gpu",
+            ],
+        ),
+    ]
+
+    def __init__(self, gpu_id: str, sample_ms: int, out_csv: Path, nvidia_smi: str = "nvidia-smi") -> None:
+        self.gpu_id = gpu_id
         self.sample_s = max(sample_ms, 20) / 1000.0
         self.out_csv = out_csv
         self.nvidia_smi = nvidia_smi
+        self._variant_index = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._errors: "queue.Queue[str]" = queue.Queue()
@@ -74,36 +123,56 @@ class NvidiaSmiPowerLogger:
         return errors
 
     def _query_once(self) -> Optional[PowerSample]:
-        query = (
-            "timestamp,power.draw,clocks.sm,clocks.mem,temperature.gpu,"
-            "pstate,utilization.gpu"
-        )
-        cmd = [
-            self.nvidia_smi,
-            f"--id={self.gpu}",
-            f"--query-gpu={query}",
-            "--format=csv,noheader,nounits",
-        ]
+        line = ""
+        mode = ""
+        field_names: List[str] = []
         sample_ns = time.time_ns()
-        try:
-            cp = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as exc:  # noqa: BLE001 - logger should not kill the run immediately
-            self._errors.put(str(exc))
+        while self._variant_index < len(self.QUERY_VARIANTS):
+            mode, field_names = self.QUERY_VARIANTS[self._variant_index]
+            cmd = [
+                self.nvidia_smi,
+                f"--id={self.gpu_id}",
+                f"--query-gpu={','.join(field_names)}",
+                "--format=csv,noheader,nounits",
+            ]
+            try:
+                cp = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as exc:  # noqa: BLE001 - logger should not kill the run immediately
+                self._errors.put(str(exc))
+                return None
+            if cp.returncode == 0:
+                line = cp.stdout.strip().splitlines()[0] if cp.stdout.strip() else ""
+                break
+            msg = cp.stderr.strip() or cp.stdout.strip() or f"nvidia-smi failed with code {cp.returncode}"
+            if self._variant_index + 1 < len(self.QUERY_VARIANTS):
+                self._errors.put(f"Power query mode {mode} unavailable ({msg}); falling back")
+                self._variant_index += 1
+                continue
+            self._errors.put(msg)
             return None
-        line = cp.stdout.strip().splitlines()[0] if cp.stdout.strip() else ""
+
         fields = [f.strip() for f in line.split(",")]
-        if len(fields) < 7:
-            self._errors.put(f"Unexpected nvidia-smi output: {line!r}")
+        if len(fields) < len(field_names):
+            self._errors.put(f"Unexpected nvidia-smi output for {mode}: {line!r}")
             return None
+        values = dict(zip(field_names, fields))
+        power_draw_w = parse_float(values.get("power.draw", ""))
+        power_average_w = parse_float(values.get("power.draw.average", ""))
+        power_instant_w = parse_float(values.get("power.draw.instant", ""))
         return PowerSample(
             sample_unix_ns=sample_ns,
-            timestamp_text=fields[0],
-            power_w=parse_float(fields[1]),
-            sm_clock_mhz=parse_float(fields[2]),
-            mem_clock_mhz=parse_float(fields[3]),
-            temp_c=parse_float(fields[4]),
-            pstate=fields[5],
-            util_gpu_pct=parse_float(fields[6]),
+            timestamp_text=values.get("timestamp", ""),
+            power_w=power_draw_w if power_draw_w is not None else (power_average_w or power_instant_w),
+            power_draw_w=power_draw_w,
+            power_draw_average_w=power_average_w,
+            power_draw_instant_w=power_instant_w,
+            power_limit_w=parse_float(values.get("power.limit", "")),
+            sm_clock_mhz=parse_float(values.get("clocks.sm", "")),
+            mem_clock_mhz=parse_float(values.get("clocks.mem", "")),
+            temp_c=parse_float(values.get("temperature.gpu", "")),
+            pstate=values.get("pstate", ""),
+            util_gpu_pct=parse_float(values.get("utilization.gpu", "")),
+            query_mode=mode,
             raw=line,
         )
 
@@ -115,11 +184,16 @@ class NvidiaSmiPowerLogger:
                     "sample_unix_ns",
                     "timestamp_text",
                     "power_w",
+                    "power_draw_w",
+                    "power_draw_average_w",
+                    "power_draw_instant_w",
+                    "power_limit_w",
                     "sm_clock_mhz",
                     "mem_clock_mhz",
                     "temp_c",
                     "pstate",
                     "util_gpu_pct",
+                    "query_mode",
                     "raw",
                 ],
             )
@@ -135,8 +209,8 @@ class NvidiaSmiPowerLogger:
 class NvidiaSmiDmonUtilLogger:
     """Capture dmon utilization counters, including the SM utilization column."""
 
-    def __init__(self, gpu: int, out_csv: Path, nvidia_smi: str = "nvidia-smi") -> None:
-        self.gpu = gpu
+    def __init__(self, gpu_id: str, out_csv: Path, nvidia_smi: str = "nvidia-smi") -> None:
+        self.gpu_id = gpu_id
         self.out_csv = out_csv
         self.nvidia_smi = nvidia_smi
         self._proc: Optional[subprocess.Popen[str]] = None
@@ -168,7 +242,7 @@ class NvidiaSmiDmonUtilLogger:
             self.nvidia_smi,
             "dmon",
             "-i",
-            str(self.gpu),
+            str(self.gpu_id),
             "-s",
             "u",
             "-d",
@@ -266,6 +340,46 @@ def run_benchmark(binary: Path, bench_args: Dict[str, Any], json_path: Path) -> 
         return json.load(f)
 
 
+def resolve_nvidia_smi_id(cuda_gpu: int, override: Optional[str]) -> str:
+    if override:
+        return override
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible.lower() not in {"nodevfiles", "void", "none"}:
+        parts = [part.strip() for part in visible.split(",")]
+        if 0 <= cuda_gpu < len(parts) and parts[cuda_gpu]:
+            return parts[cuda_gpu]
+    return str(cuda_gpu)
+
+
+def query_nvidia_smi_metadata(nvidia_smi: str, nvidia_smi_id: str) -> Dict[str, Any]:
+    fields = ["index", "uuid", "pci.bus_id", "name", "driver_version", "power.limit"]
+    cmd = [
+        nvidia_smi,
+        f"--id={nvidia_smi_id}",
+        f"--query-gpu={','.join(fields)}",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        cp = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as exc:  # noqa: BLE001
+        return {"nvidia_smi_metadata_error": str(exc)}
+    if cp.returncode != 0:
+        return {"nvidia_smi_metadata_error": cp.stderr.strip() or cp.stdout.strip()}
+    line = cp.stdout.strip().splitlines()[0] if cp.stdout.strip() else ""
+    values = [part.strip() for part in line.split(",")]
+    if len(values) < len(fields):
+        return {"nvidia_smi_metadata_error": f"unexpected nvidia-smi metadata output: {line!r}"}
+    data = dict(zip(fields, values))
+    return {
+        "nvidia_smi_index": data.get("index", ""),
+        "gpu_uuid": data.get("uuid", ""),
+        "pci_bus_id": data.get("pci.bus_id", ""),
+        "nvidia_smi_name": data.get("name", ""),
+        "driver_version": data.get("driver_version", ""),
+        "nvidia_smi_power_limit_w": parse_float(data.get("power.limit", "")),
+    }
+
+
 def run_one_role(
     *,
     binary: Path,
@@ -278,6 +392,8 @@ def run_one_role(
     default_args: Dict[str, Any],
     sample_ms: int,
     nvidia_smi: str,
+    nvidia_smi_id: str,
+    nvidia_smi_metadata: Dict[str, Any],
     no_power: bool,
 ) -> Dict[str, Any]:
     run_id = f"{condition_name}_rep{repeat_index:03d}_{role}_{uuid.uuid4().hex[:8]}"
@@ -295,10 +411,11 @@ def run_one_role(
     sm_util_logger: Optional[NvidiaSmiDmonUtilLogger] = None
     power_errors: List[str] = []
     sm_util_errors: List[str] = []
+    dmon_id = str(nvidia_smi_metadata.get("nvidia_smi_index") or nvidia_smi_id)
     if not no_power:
-        logger = NvidiaSmiPowerLogger(gpu=gpu, sample_ms=sample_ms, out_csv=power_csv, nvidia_smi=nvidia_smi)
+        logger = NvidiaSmiPowerLogger(gpu_id=nvidia_smi_id, sample_ms=sample_ms, out_csv=power_csv, nvidia_smi=nvidia_smi)
         logger.start()
-        sm_util_logger = NvidiaSmiDmonUtilLogger(gpu=gpu, out_csv=sm_util_csv, nvidia_smi=nvidia_smi)
+        sm_util_logger = NvidiaSmiDmonUtilLogger(gpu_id=dmon_id, out_csv=sm_util_csv, nvidia_smi=nvidia_smi)
         sm_util_logger.start()
         # Let the logger capture a pre-kernel sample for plotting context.
         time.sleep(max(sample_ms / 1000.0, 0.10))
@@ -319,6 +436,10 @@ def run_one_role(
             "condition": condition_name,
             "repeat_index": repeat_index,
             "role": role,
+            "cuda_device_index": gpu,
+            "nvidia_smi_id": nvidia_smi_id,
+            "nvidia_smi_dmon_id": dmon_id,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
             "runner_wall_start_unix_ns": wall_start_ns,
             "runner_wall_end_unix_ns": wall_end_ns,
             "power_csv": str(power_csv) if not no_power else "",
@@ -327,6 +448,7 @@ def run_one_role(
             "power_logger_errors": power_errors,
             "sm_util_logger_errors": sm_util_errors,
             "validity_note": "unchecked; run Nsight Compute validation separately",
+            **nvidia_smi_metadata,
         }
     )
     return result
@@ -342,6 +464,11 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=1, help="Repeat the full matrix N times")
     parser.add_argument("--append", action="store_true", help="Append to an existing runs.jsonl")
     parser.add_argument("--nvidia-smi", default="nvidia-smi")
+    parser.add_argument(
+        "--nvidia-smi-id",
+        default=None,
+        help="Physical nvidia-smi GPU id/UUID for telemetry. Defaults to CUDA_VISIBLE_DEVICES mapping or --gpu.",
+    )
     parser.add_argument("--no-power", action="store_true", help="Run benchmarks without nvidia-smi power logging")
     args = parser.parse_args()
     if args.repeat <= 0:
@@ -360,6 +487,10 @@ def main() -> int:
     args.outdir.mkdir(parents=True, exist_ok=True)
     with (args.outdir / "matrix_used.json").open("w") as f:
         json.dump(matrix, f, indent=2)
+
+    nvidia_smi_id = resolve_nvidia_smi_id(args.gpu, args.nvidia_smi_id)
+    nvidia_smi_metadata = query_nvidia_smi_metadata(args.nvidia_smi, nvidia_smi_id)
+    print(f"Telemetry nvidia-smi id: {nvidia_smi_id}", flush=True)
 
     with runs_jsonl.open("a") as log:
         for repeat_index in range(args.repeat):
@@ -392,6 +523,8 @@ def main() -> int:
                         default_args=default_args_for_condition,
                         sample_ms=args.sample_ms,
                         nvidia_smi=args.nvidia_smi,
+                        nvidia_smi_id=nvidia_smi_id,
+                        nvidia_smi_metadata=nvidia_smi_metadata,
                         no_power=args.no_power,
                     )
                     log.write(json.dumps(result, sort_keys=True) + "\n")

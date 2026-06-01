@@ -4,10 +4,14 @@ set -euo pipefail
 GPU_ID="${1:-0}"
 OUT="${2:-results/env.txt}"
 BINARY="${3:-build/fp16_energy_bench}"
+CUDA_DEVICE_INDEX="${4:-${GPU_ID}}"
 mkdir -p "$(dirname "${OUT}")"
 {
   echo "# date"
   date --iso-8601=seconds || date
+  echo
+  echo "# CUDA_VISIBLE_DEVICES"
+  echo "${CUDA_VISIBLE_DEVICES:-<unset>}"
   echo
   echo "# nvidia-smi -L"
   nvidia-smi -L || true
@@ -16,9 +20,13 @@ mkdir -p "$(dirname "${OUT}")"
   nvidia-smi -i "${GPU_ID}" -q || true
   echo
   echo "# nvidia-smi compact GPU query"
-  nvidia-smi -i "${GPU_ID}" \
-    --query-gpu=index,uuid,pci.bus_id,name,driver_version,power.limit,power.draw,pstate,clocks.sm,clocks.mem,temperature.gpu \
-    --format=csv || true
+  if ! nvidia-smi -i "${GPU_ID}" \
+    --query-gpu=index,uuid,pci.bus_id,name,driver_version,power.limit,power.draw,power.draw.average,power.draw.instant,pstate,clocks.sm,clocks.mem,temperature.gpu \
+    --format=csv; then
+    nvidia-smi -i "${GPU_ID}" \
+      --query-gpu=index,uuid,pci.bus_id,name,driver_version,power.limit,power.draw,pstate,clocks.sm,clocks.mem,temperature.gpu \
+      --format=csv || true
+  fi
   echo
   echo "# nvidia-smi compute apps"
   nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv || true
@@ -37,7 +45,7 @@ mkdir -p "$(dirname "${OUT}")"
   if [[ -x "${BINARY}" ]]; then
     PROBE_JSON="${OUT}.runtime_probe.json"
     "${BINARY}" \
-      --device "${GPU_ID}" \
+      --device "${CUDA_DEVICE_INDEX}" \
       --kernel baseline_nop \
       --blocks 1 \
       --threads 32 \

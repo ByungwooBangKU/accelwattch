@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 GPU_ID=0
+NVIDIA_SMI_ID=""
 CUDA_ARCH=""
 OUTDIR=""
 REPEAT=10
@@ -26,6 +27,7 @@ Runs the strict FP16 Tensor Core pJ/bit pipeline:
 
 Options:
   --gpu N              CUDA/NVML GPU index [0]
+  --nvidia-smi-id ID   Physical nvidia-smi id/UUID for telemetry [auto]
   --cuda-arch ARCH     CMake CUDA architecture, e.g. A100=80, RTX3090=86, H100=90
   --outdir DIR         Result directory [auto timestamp under results/strict_fp16_*]
   --repeat N           Matrix repeat count [10]
@@ -44,6 +46,7 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gpu) GPU_ID="$2"; shift 2 ;;
+    --nvidia-smi-id) NVIDIA_SMI_ID="$2"; shift 2 ;;
     --cuda-arch) CUDA_ARCH="$2"; shift 2 ;;
     --outdir) OUTDIR="$2"; shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
@@ -79,6 +82,15 @@ BINARY="${BUILD_PATH}/fp16_energy_bench"
 NCDIR="${OUTDIR}/ncu_no_l2_thread_sweep"
 ENV_OUT="${OUTDIR}/env_gpu${GPU_ID}.txt"
 
+if [[ -z "${NVIDIA_SMI_ID}" ]]; then
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -r -a CUDA_VISIBLE_LIST <<< "${CUDA_VISIBLE_DEVICES}"
+    NVIDIA_SMI_ID="${CUDA_VISIBLE_LIST[GPU_ID]:-${GPU_ID}}"
+  else
+    NVIDIA_SMI_ID="${GPU_ID}"
+  fi
+fi
+
 mkdir -p "${OUTDIR}"
 
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
@@ -88,12 +100,13 @@ if [[ "${SKIP_BUILD}" -eq 0 ]]; then
   "${CMAKE_BIN}" --build "${BUILD_PATH}" -j 2
 fi
 
-"${SCRIPT_DIR}/query_env.sh" "${GPU_ID}" "${ENV_OUT}" "${BINARY}"
+"${SCRIPT_DIR}/query_env.sh" "${NVIDIA_SMI_ID}" "${ENV_OUT}" "${BINARY}" "${GPU_ID}"
 
 "${PYTHON_BIN}" "${SCRIPT_DIR}/run_experiment.py" \
   --binary "${BINARY}" \
   --matrix "${ROOT}/configs/fp16_matmul_thread_sweep_fine.json" \
   --gpu "${GPU_ID}" \
+  --nvidia-smi-id "${NVIDIA_SMI_ID}" \
   --sample-ms "${SAMPLE_MS}" \
   --repeat "${REPEAT}" \
   --outdir "${OUTDIR}"

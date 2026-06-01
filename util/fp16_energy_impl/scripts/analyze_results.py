@@ -59,11 +59,16 @@ def read_power_csv(path: str) -> List[Dict[str, Any]]:
                     "sample_unix_ns": ns,
                     "t_s": ns / 1e9,
                     "power_w": parse_float(r.get("power_w")),
+                    "power_draw_w": parse_float(r.get("power_draw_w")),
+                    "power_draw_average_w": parse_float(r.get("power_draw_average_w")),
+                    "power_draw_instant_w": parse_float(r.get("power_draw_instant_w")),
+                    "power_limit_w": parse_float(r.get("power_limit_w")),
                     "sm_clock_mhz": parse_float(r.get("sm_clock_mhz")),
                     "mem_clock_mhz": parse_float(r.get("mem_clock_mhz")),
                     "temp_c": parse_float(r.get("temp_c")),
                     "pstate": r.get("pstate", ""),
                     "util_gpu_pct": parse_float(r.get("util_gpu_pct")),
+                    "query_mode": r.get("query_mode", ""),
                 }
             )
     return rows
@@ -154,6 +159,23 @@ def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
     clocks = [s["sm_clock_mhz"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["sm_clock_mhz"] is not None]
     temps = [s["temp_c"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["temp_c"] is not None]
     utils = [s["util_gpu_pct"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["util_gpu_pct"] is not None]
+    power_draws = [s["power_draw_w"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["power_draw_w"] is not None]
+    power_averages = [
+        s["power_draw_average_w"]
+        for s in samples
+        if start_ns <= s["sample_unix_ns"] <= end_ns and s["power_draw_average_w"] is not None
+    ]
+    power_instants = [
+        s["power_draw_instant_w"]
+        for s in samples
+        if start_ns <= s["sample_unix_ns"] <= end_ns and s["power_draw_instant_w"] is not None
+    ]
+    power_limits = [
+        s["power_limit_w"]
+        for s in samples
+        if start_ns <= s["sample_unix_ns"] <= end_ns and s["power_limit_w"] is not None
+    ]
+    query_modes = sorted({str(s.get("query_mode", "")) for s in samples if str(s.get("query_mode", ""))})
     sm_utils = [
         s["sm_util_pct"]
         for s in sm_util_samples
@@ -167,6 +189,11 @@ def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
         "energy_source": energy_source,
         "power_trace_energy_j": trace_energy_j,
         "power_trace_avg_power_w": trace_avg_power_w,
+        "power_trace_query_modes": ",".join(query_modes),
+        "avg_power_draw_w": sum(power_draws) / len(power_draws) if power_draws else math.nan,
+        "avg_power_draw_average_w": sum(power_averages) / len(power_averages) if power_averages else math.nan,
+        "avg_power_draw_instant_w": sum(power_instants) / len(power_instants) if power_instants else math.nan,
+        "avg_power_limit_w": sum(power_limits) / len(power_limits) if power_limits else math.nan,
         "nvml_energy_delta_j": nvml_energy_delta_j,
         "nvml_energy_counter_supported": bool(run.get("nvml_energy_supported", False)),
         "nvml_energy_note": run.get("nvml_energy_note", ""),
@@ -392,6 +419,16 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "baseline_energy_source": "",
                 "test_power_trace_energy_j": s.get("power_trace_energy_j", math.nan),
                 "baseline_power_trace_energy_j": math.nan,
+                "test_power_trace_avg_power_w": s.get("power_trace_avg_power_w", math.nan),
+                "baseline_power_trace_avg_power_w": math.nan,
+                "test_power_trace_query_modes": s.get("power_trace_query_modes", ""),
+                "baseline_power_trace_query_modes": "",
+                "test_avg_power_draw_average_w": s.get("avg_power_draw_average_w", math.nan),
+                "baseline_avg_power_draw_average_w": math.nan,
+                "test_avg_power_draw_instant_w": s.get("avg_power_draw_instant_w", math.nan),
+                "baseline_avg_power_draw_instant_w": math.nan,
+                "test_avg_power_limit_w": s.get("avg_power_limit_w", math.nan),
+                "baseline_avg_power_limit_w": math.nan,
                 "test_nvml_energy_delta_j": s.get("nvml_energy_delta_j", math.nan),
                 "baseline_nvml_energy_delta_j": math.nan,
                 "test_energy_counter_vs_trace_delta_j": s.get("energy_counter_vs_trace_delta_j", math.nan),
@@ -554,6 +591,16 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "baseline_energy_source": b.get("energy_source", ""),
         "test_power_trace_energy_j": t.get("power_trace_energy_j", math.nan),
         "baseline_power_trace_energy_j": b.get("power_trace_energy_j", math.nan),
+        "test_power_trace_avg_power_w": t.get("power_trace_avg_power_w", math.nan),
+        "baseline_power_trace_avg_power_w": b.get("power_trace_avg_power_w", math.nan),
+        "test_power_trace_query_modes": t.get("power_trace_query_modes", ""),
+        "baseline_power_trace_query_modes": b.get("power_trace_query_modes", ""),
+        "test_avg_power_draw_average_w": t.get("avg_power_draw_average_w", math.nan),
+        "baseline_avg_power_draw_average_w": b.get("avg_power_draw_average_w", math.nan),
+        "test_avg_power_draw_instant_w": t.get("avg_power_draw_instant_w", math.nan),
+        "baseline_avg_power_draw_instant_w": b.get("avg_power_draw_instant_w", math.nan),
+        "test_avg_power_limit_w": t.get("avg_power_limit_w", math.nan),
+        "baseline_avg_power_limit_w": b.get("avg_power_limit_w", math.nan),
         "test_nvml_energy_delta_j": t.get("nvml_energy_delta_j", math.nan),
         "baseline_nvml_energy_delta_j": b.get("nvml_energy_delta_j", math.nan),
         "test_energy_counter_vs_trace_delta_j": t.get("energy_counter_vs_trace_delta_j", math.nan),

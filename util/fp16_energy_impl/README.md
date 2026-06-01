@@ -16,6 +16,7 @@
 | `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
 | `scripts/analyze_results.py` | NVML energy counter 우선 분석, power trace fallback, baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
 | `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
+| `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
@@ -30,7 +31,7 @@
 | 우선순위 | Kernel | 목적 | Memory policy |
 |---|---|---|---|
 | P0 | `fp16_half2` | CUDA core 기반 `half2` FMA 반복 | timed loop 내부 global/shared memory 접근 없음 |
-| P0 | `baseline_nop` | loop/control baseline | 동일 launch/loop 구조, FP16 연산 없음 |
+| P0 | `baseline_nop` | loop/no-FP16 baseline | 동일 launch/loop 구조, FP16 연산 없음 |
 | P0 | `baseline_regmove` | register/integer movement baseline | FP16 연산 없음, integer/register overhead 참고 |
 | P0 | `tensor_mma_f16acc` | logical `m16n16k16` FP16 input + FP16 accumulate | timed loop 내부 register operand 기반 |
 | P0 | `tensor_mma_f32acc` | logical `m16n16k16` FP16 input + FP32 accumulate | timed loop 내부 register operand 기반 |
@@ -91,7 +92,7 @@ cmake --build build -j
 2. matrix에 정의된 baseline/test 조건을 순서대로 실행한다.
 3. `--repeat N`으로 전체 matrix를 N회 반복한다.
 4. benchmark timed loop 직전/직후 `nvmlDeviceGetTotalEnergyConsumption()` 누적 에너지 카운터를 읽는다. 이 기능은 `libnvidia-ml.so.1`을 동적으로 load하므로 NVML header/link dependency 없이 빌드된다.
-5. run별 `nvidia-smi` power/clock/temperature trace와 dmon SM utilization trace를 수집한다.
+5. run별 `nvidia-smi` power/clock/temperature trace와 dmon SM utilization trace를 수집한다. `CUDA_VISIBLE_DEVICES`가 설정된 경우 runner는 CUDA ordinal에 대응하는 physical index/UUID를 telemetry id로 자동 해석한다.
 6. `analyze_results.py`가 `summary.csv`, `condition_summary.csv`, thread sweep summary, figure를 생성한다.
 
 수동으로 맞춰야 하는 항목은 다음과 같다.
@@ -117,13 +118,24 @@ Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--c
 ./scripts/run_strict_fp16_pipeline.sh --gpu 0 --cuda-arch 90 --outdir results/strict_fp16_h100
 ```
 
+Scheduler, Docker, Slurm 등에서 `CUDA_VISIBLE_DEVICES`가 GPU 순서를 바꾸는 경우 `--gpu`는 CUDA device ordinal이고, telemetry용 `nvidia-smi` 대상은 UUID로 명시할 수 있다.
+
+```bash
+GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+./scripts/run_strict_fp16_pipeline.sh \
+  --gpu 0 \
+  --nvidia-smi-id "${GPU_UUID}" \
+  --cuda-arch 90 \
+  --outdir results/strict_fp16_h100
+```
+
 이 pipeline은 `fp16_matmul_thread_sweep_fine.json`의 structural baseline sweep을 실행하고, `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행한 뒤, `quality_gate.py --require-ncu`까지 실행한다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
 
 ### Energy source policy
 
 최종 energy 계산은 timed loop 내부의 NVML 누적 에너지 카운터 delta를 우선 사용한다. 즉 `bench.json`의 `nvml_energy_supported=true`이고 `nvml_energy_delta_j > 0`이면 `power_energy_j`와 `avg_power_w`는 `nvmlDeviceGetTotalEnergyConsumption()` 기반 값이다. 카운터가 지원되지 않는 GPU/driver 조합에서는 기존 방식대로 `nvidia-smi --query-gpu=power.draw` trace를 host timed interval에 적분한 값을 fallback으로 사용한다.
 
-`nvidia-smi` power trace는 제거하지 않는다. H100처럼 `power.draw`가 averaging/smoothing된 값을 줄 수 있는 환경에서는 NVML total energy counter가 더 직접적인 최종 에너지 값이고, power trace는 clock/temperature/throttling 및 counter-vs-trace sanity check 용도다. 분석 결과에는 `energy_source`, `power_trace_energy_j`, `nvml_energy_delta_j`, `energy_counter_vs_trace_delta_j`, `energy_counter_vs_trace_ratio`가 함께 기록된다.
+`nvidia-smi` power trace는 제거하지 않는다. H100처럼 `power.draw`가 averaging/smoothing된 값을 줄 수 있는 환경에서는 NVML total energy counter가 더 직접적인 최종 에너지 값이고, power trace는 clock/temperature/throttling 및 counter-vs-trace sanity check 용도다. runner는 지원되는 경우 `power.draw.average`와 `power.draw.instant`를 별도 컬럼으로 남긴다. 분석 결과에는 `energy_source`, `power_trace_energy_j`, `power_trace_query_modes`, `nvml_energy_delta_j`, `energy_counter_vs_trace_delta_j`, `energy_counter_vs_trace_ratio`가 함께 기록된다.
 
 ### Quality gate policy
 
@@ -176,6 +188,12 @@ benchmark JSON과 분석 CSV에는 `architecture_generation`, `architecture_chip
 ./scripts/query_env.sh 0 results/env_gpu0.txt build/fp16_energy_bench
 ```
 
+첫 번째 인자는 `nvidia-smi` telemetry id이며 UUID도 가능하다. telemetry id와 CUDA device ordinal이 다르면 네 번째 인자로 CUDA device index를 넘긴다.
+
+```bash
+./scripts/query_env.sh "${GPU_UUID}" results/env_gpu0.txt build/fp16_energy_bench 0
+```
+
 `cuobjdump`가 설치되어 있으면 `query_env.sh` 출력에 kernel별 resource usage가 포함된다. 설치되어 있지 않은 환경에서는 CMake가 이미 `-Xptxas=-v`로 build output에 register 수와 spill 정보를 출력하므로, 다음처럼 build log를 남겨 확인한다.
 
 ```bash
@@ -215,7 +233,7 @@ python3 scripts/run_experiment.py \
 python3 scripts/analyze_results.py --input results/p0_gpu0
 ```
 
-`run_experiment.py`는 기존 `runs.jsonl`이 있는 outdir에는 기본적으로 쓰지 않는다. 같은 outdir에 의도적으로 run을 누적할 때만 `--append`를 추가한다.
+`run_experiment.py`는 기존 `runs.jsonl`이 있는 outdir에는 기본적으로 쓰지 않는다. 같은 outdir에 의도적으로 run을 누적할 때만 `--append`를 추가한다. `--nvidia-smi-id`를 생략하면 `CUDA_VISIBLE_DEVICES` mapping을 먼저 보고, 없으면 `--gpu` 값을 telemetry id로 사용한다.
 
 For FP16 Tensor Core matmul logical pJ/bit estimates:
 
@@ -276,12 +294,20 @@ Fine + dmon legacy run에서는 `threads_per_sm=512`에서 평균 SM utilization
 여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 `analyze_results.py`를 먼저 실행하고, 다음처럼 묶는다.
 
 ```bash
+python3 scripts/audit_strict_results.py \
+  --input results/strict_fp16_a100 \
+          results/strict_fp16_h100 \
+          results/strict_fp16_rtx3090 \
+  --outdir results/strict_fp16_audit
+
 python3 scripts/compare_architectures.py \
-  --input results/fp16_matmul_thread_sweep_fine_a100 \
-          results/fp16_matmul_thread_sweep_fine_h100 \
-          results/fp16_matmul_thread_sweep_fine_rtx3090 \
+  --input results/strict_fp16_a100 \
+          results/strict_fp16_h100 \
+          results/strict_fp16_rtx3090 \
   --outdir results/architecture_compare_fp16
 ```
+
+`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
 
 주요 산출물은 다음과 같다.
 
@@ -323,6 +349,8 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/quality_gate_summary.json` | 선택된 target point와 gate threshold 요약 |
 | `results/ncu_*/ncu_validation_summary.csv` | Nsight Compute report별 HMMA/no-L2/local-spill 자동 검증 |
 | `results/ncu_*/figures/ncu_validation_summary.png` | NCU validation pass/fail 시각화 |
+| `results/strict_fp16_audit/strict_result_audit.csv` | 여러 strict 결과 디렉터리의 최종 채택 가능 여부 audit |
+| `results/strict_fp16_audit/figures/strict_result_audit.png` | architecture별 strict audit pass/fail 시각화 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |
@@ -437,6 +465,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
 
 `stats_scope=all_runs_no_valid`는 해당 thread point에서 `valid_basic=True`인 반복이 없었다는 뜻이다. 이 경우 mean/std는 plot과 원인 분석을 위한 전체 run 통계일 뿐, 최종 pJ/bit 후보로 쓰면 안 된다. `valid_no_l2` 역시 “코드가 의도적으로 L2/global memory를 touch하지 않는다”는 조건이지, hardware counter 기반 증명은 아니므로 최종 보고 전에는 Nsight Compute로 `MemoryWorkloadAnalysis`를 확인한다.
+
+코드와 표에서 baseline/control이라는 표현은 GPU의 control unit 에너지를 의미하지 않는다. 여기서는 같은 launch/loop/register 구조에서 FP16/HMMA instruction만 제거한 기준 루프 비용을 뜻한다. 최종 Tensor Core pJ/bit에는 `tensor_baseline_u32/f32` 같은 structural baseline을 사용하고, legacy `baseline_nop` 결과는 diagnostic으로만 본다.
 
 최종 보고서에는 `p0_cuda_core_half2_vs_nop`과 `p0_cuda_core_half2_vs_regmove`를 모두 제시하는 것이 좋다. 두 baseline 간 차이는 baseline sensitivity로 취급한다. Tensor Core는 `f16acc`와 `f32acc`를 분리 보고한다.
 

@@ -280,7 +280,7 @@ void usage(const char* argv0) {
       << "Usage: " << argv0 << " [options]\n\n"
       << "Kernels:\n"
       << "  fp16_half2                P0 CUDA-core half2 FMA test\n"
-      << "  baseline_nop             P0 control-flow/no-op baseline\n"
+      << "  baseline_nop             P0 loop/no-FP16 no-op baseline\n"
       << "  baseline_regmove         P0 integer/register-move baseline\n"
       << "  tensor_mma_f16acc        P0 Tensor Core MMA, FP16 input + FP16 accumulate\n"
       << "  tensor_mma_f32acc        P0 Tensor Core MMA, FP16 input + FP32 accumulate\n"
