@@ -140,7 +140,7 @@ Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--c
 
 GPU가 서로 다른 서버에 있으면 각 서버에서 `run_strict_fp16_pipeline.sh`를 실행해 결과 디렉터리를 한 곳으로 복사한 뒤 `postprocess_strict_architectures.sh`를 실행한다. 단일 GPU만 재실험할 때는 suite helper에 `--require-architectures gh100`처럼 현재 architecture만 지정하거나 `--no-postprocess`를 사용한다.
 
-Preflight에서 다른 compute process가 보이면 기본적으로 중단한다. 공유 장비에서 diagnostic만 하고 싶을 때는 `--allow-compute-apps`를 명시하고, `ncu`가 없는 local smoke는 `--diagnostic-no-ncu` 또는 `--skip-preflight`로만 수행한다. 최종 A100/H100/RTX3090 pJ/bit claim에는 이 예외 옵션을 쓰지 않는다.
+Preflight에서 다른 compute process가 보이면 기본적으로 중단한다. Suite helper가 만든 preflight JSON/CSV는 postprocess report까지 전달되어 completion evidence matrix의 필수 항목으로 표시된다. 공유 장비에서 diagnostic만 하고 싶을 때는 `--allow-compute-apps`를 명시하고, `ncu`가 없는 local smoke는 `--diagnostic-no-ncu` 또는 `--skip-preflight`로만 수행한다. 최종 A100/H100/RTX3090 pJ/bit claim에는 이 예외 옵션을 쓰지 않는다.
 
 Scheduler, Docker, Slurm 등에서 `CUDA_VISIBLE_DEVICES`가 GPU 순서를 바꾸는 경우 `--gpu`는 CUDA device ordinal이고, telemetry용 `nvidia-smi` 대상은 UUID로 명시할 수 있다.
 
@@ -391,10 +391,12 @@ python3 scripts/compare_architectures.py \
 python3 scripts/report_strict_results.py \
   --audit-dir results/strict_fp16_audit \
   --compare-dir results/architecture_compare_fp16 \
+  --suite-preflight-json results/strict_fp16_suite/strict_architecture_suite_preflight.json \
+  --suite-preflight-csv results/strict_fp16_suite/strict_architecture_suite_preflight.csv \
   --outdir results/strict_fp16_report
 ```
 
-`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `strict_pipeline_manifest.json`이 `fp16-strict-pipeline-manifest-v1`, `status=completed`이고 git head, binary SHA256, quality/NCU/resource 산출물 evidence를 담고 있는지도 확인한다. `resource_audit/thread_resource_occupancy.csv`에서는 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 측정 해상도도 gate에 포함되어 test/baseline duration과 Joule 단위 신호가 너무 작으면 fail된다. NVML counter와 power trace 적분값의 cross-check는 기본적으로 warning이며, trace agreement까지 필수 조건으로 보려면 `--require-counter-trace-agreement`를 사용한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
+`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `strict_pipeline_manifest.json`이 `fp16-strict-pipeline-manifest-v1`, `status=completed`이고 git head, binary SHA256, quality/NCU/resource 산출물 evidence를 담고 있는지도 확인한다. 최종 report는 여기에 suite preflight가 `overall_pass=true`이고 `dry_run=false`였는지도 추가로 요구한다. `resource_audit/thread_resource_occupancy.csv`에서는 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 측정 해상도도 gate에 포함되어 test/baseline duration과 Joule 단위 신호가 너무 작으면 fail된다. NVML counter와 power trace 적분값의 cross-check는 기본적으로 warning이며, trace agreement까지 필수 조건으로 보려면 `--require-counter-trace-agreement`를 사용한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
 
 `compare_architectures.py`도 quality gate 결과가 있는 디렉터리에서는 기본적으로 `target_pass=true`인 thread point만 `architecture_best_fp16.csv`와 best summary figure에 사용한다. `quality_pass=true`지만 utilization saturation target이 아닌 row는 diagnostic으로 남기되, 최종 best pJ/bit 그림에는 올리지 않는다. Diagnostic 후보까지 강제로 best table에 넣어야 할 때만 `--allow-diagnostic-best`를 사용한다.
 

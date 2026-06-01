@@ -95,9 +95,10 @@ def relative_link(target: Path, base: Path) -> str:
     return os.path.relpath(target.resolve(), base.resolve()).replace(os.sep, "/")
 
 
-def load_inputs(audit_dir: Path | None, compare_dir: Path | None) -> Dict[str, Any]:
+def load_inputs(audit_dir: Path | None, compare_dir: Path | None, suite_preflight_json: Path | None) -> Dict[str, Any]:
     audit_rows: List[Dict[str, Any]] = []
     audit_json: Dict[str, Any] = {}
+    preflight_json: Dict[str, Any] = {}
     best_rows: List[Dict[str, Any]] = []
     thread_rows: List[Dict[str, Any]] = []
     quality_rows: List[Dict[str, Any]] = []
@@ -106,6 +107,8 @@ def load_inputs(audit_dir: Path | None, compare_dir: Path | None) -> Dict[str, A
     if audit_dir:
         audit_rows = read_csv(audit_dir / "strict_result_audit.csv")
         audit_json = read_json(audit_dir / "strict_result_audit.json")
+    if suite_preflight_json:
+        preflight_json = read_json(suite_preflight_json)
     if compare_dir:
         best_rows = read_csv(compare_dir / "architecture_best_fp16.csv")
         thread_rows = read_csv(compare_dir / "architecture_thread_sweep_summary.csv")
@@ -115,6 +118,7 @@ def load_inputs(audit_dir: Path | None, compare_dir: Path | None) -> Dict[str, A
     return {
         "audit_rows": audit_rows,
         "audit_json": audit_json,
+        "preflight_json": preflight_json,
         "best_rows": best_rows,
         "thread_rows": thread_rows,
         "quality_rows": quality_rows,
@@ -164,6 +168,7 @@ def artifact_links(audit_dir: Path | None, compare_dir: Path | None, outdir: Pat
 def requirement_rows(
     audit_rows: List[Dict[str, Any]],
     audit_json: Dict[str, Any],
+    preflight_json: Dict[str, Any],
     required_architectures: Sequence[str],
 ) -> List[Dict[str, Any]]:
     passed = {str(row.get("architecture_chip", "")) for row in audit_rows if parse_bool(row.get("audit_pass"))}
@@ -207,6 +212,23 @@ def requirement_rows(
         parse_float(row.get("tensor_model_utilization_pct_mean")) > 0.0 for row in audit_rows
     )
     overall_json_pass = bool(audit_json.get("overall_pass", False))
+    preflight_schema = str(preflight_json.get("preflight_schema", "") or "")
+    preflight_supplied = bool(preflight_json)
+    preflight_ok = (
+        preflight_supplied
+        and preflight_schema == "fp16-strict-architecture-suite-preflight-v1"
+        and parse_bool(preflight_json.get("overall_pass"))
+        and not parse_bool(preflight_json.get("dry_run"))
+    )
+    preflight_evidence = "strict_architecture_suite_preflight.json"
+    if not preflight_supplied:
+        preflight_evidence = "suite preflight JSON not supplied to report"
+    elif parse_bool(preflight_json.get("dry_run")):
+        preflight_evidence = "suite preflight was dry_run=true"
+    else:
+        preflight_evidence = (
+            f"schema={preflight_schema or 'missing'}, overall_pass={preflight_json.get('overall_pass')}"
+        )
 
     def row(requirement: str, ok: bool, evidence: str) -> Dict[str, Any]:
         return {"requirement": requirement, "status": "pass" if ok else "missing_or_fail", "evidence": evidence}
@@ -217,6 +239,7 @@ def requirement_rows(
             bool(required_architectures) and not missing,
             "passed=" + ",".join(sorted(passed)) + ("; missing=" + ",".join(missing) if missing else ""),
         ),
+        row("suite preflight passed", preflight_ok, preflight_evidence),
         row("strict audit overall pass", overall_json_pass and all_audit_pass, "strict_result_audit.json overall_pass"),
         row("NVML total-energy counter source", strict_sources, "measurement_grade=strict_nvml_counter"),
         row("structural baseline separation", structural, "baseline_match_grade=structural_baseline"),
@@ -328,9 +351,12 @@ def write_markdown(
     rows: List[Dict[str, Any]],
     req_rows: List[Dict[str, Any]],
     audit_json: Dict[str, Any],
+    suite_preflight_json: Path | None,
+    suite_preflight_csv: Path | None,
     links: List[str],
 ) -> None:
-    overall = "pass" if audit_json.get("overall_pass", False) else "not publishable"
+    requirements_pass = bool(req_rows) and all(str(r.get("status", "")) == "pass" for r in req_rows)
+    overall = "pass" if audit_json.get("overall_pass", False) and requirements_pass else "not publishable"
     if not audit_json and rows:
         overall = "diagnostic only"
 
@@ -346,6 +372,10 @@ def write_markdown(
         report.append(f"- Audit directory: `{audit_dir}`")
     if compare_dir:
         report.append(f"- Architecture compare directory: `{compare_dir}`")
+    if suite_preflight_json:
+        report.append(f"- Suite preflight JSON: `{suite_preflight_json}`")
+    if suite_preflight_csv:
+        report.append(f"- Suite preflight CSV: `{suite_preflight_csv}`")
     report.append("")
 
     report.extend(
@@ -424,6 +454,7 @@ def write_markdown(
             "- Use only rows with `Publishable=yes` for final pJ/bit claims.",
             "- `pJ/bit` is logical FP16 matmul input-bit energy, not DRAM bit energy.",
             "- `strict_nvml_counter` plus structural baseline, NCU validation, resource audit, and measurement-resolution gates are required for A100/H100/RTX3090 comparison.",
+            "- Suite preflight must pass with `dry_run=false`; dry-run output is command validation only.",
             "- Missing A100 or H100 strict rows means the architecture comparison is incomplete, even if RTX 3090 diagnostics exist.",
             "",
         ]
@@ -436,6 +467,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a strict FP16 Markdown report")
     parser.add_argument("--audit-dir", type=Path, default=None, help="Directory from audit_strict_results.py")
     parser.add_argument("--compare-dir", type=Path, default=None, help="Directory from compare_architectures.py")
+    parser.add_argument("--suite-preflight-json", type=Path, default=None)
+    parser.add_argument("--suite-preflight-csv", type=Path, default=None)
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--title", default="Strict FP16 Energy Result Report")
     parser.add_argument("--require-architectures", default="ga100,gh100,ga102")
@@ -445,10 +478,10 @@ def main() -> int:
         raise SystemExit("Provide --audit-dir, --compare-dir, or both")
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    loaded = load_inputs(args.audit_dir, args.compare_dir)
+    loaded = load_inputs(args.audit_dir, args.compare_dir, args.suite_preflight_json)
     required = [item.strip() for item in args.require_architectures.split(",") if item.strip()]
     rows = summary_rows(loaded["audit_rows"], loaded["best_rows"])
-    req_rows = requirement_rows(loaded["audit_rows"], loaded["audit_json"], required)
+    req_rows = requirement_rows(loaded["audit_rows"], loaded["audit_json"], loaded["preflight_json"], required)
     links = artifact_links(args.audit_dir, args.compare_dir, args.outdir)
 
     write_csv(args.outdir / "fp16_strict_report_summary.csv", rows)
@@ -464,6 +497,8 @@ def main() -> int:
         rows,
         req_rows,
         loaded["audit_json"],
+        args.suite_preflight_json,
+        args.suite_preflight_csv,
         links,
     )
 

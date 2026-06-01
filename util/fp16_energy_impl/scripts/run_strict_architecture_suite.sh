@@ -260,6 +260,9 @@ if [[ "${NO_POSTPROCESS}" -eq 0 && "${#COMPLETED_DIRS[@]}" -gt 0 ]]; then
     --outdir "${POSTPROCESS_DIR}"
     --require-architectures "${REQUIRE_ARCHITECTURES}"
   )
+  if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
+    post_cmd+=(--suite-preflight-json "${PREFLIGHT_JSON}" --suite-preflight-csv "${PREFLIGHT_CSV}")
+  fi
   if [[ "${REQUIRE_COUNTER_TRACE}" -eq 1 ]]; then
     post_cmd+=(--require-counter-trace-agreement)
   fi

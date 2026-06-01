@@ -6,6 +6,8 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OUTDIR=""
+SUITE_PREFLIGHT_JSON=""
+SUITE_PREFLIGHT_CSV=""
 REQUIRE_ARCHITECTURES="ga100,gh100,ga102"
 NO_FAIL=0
 REQUIRE_COUNTER_TRACE=0
@@ -21,6 +23,10 @@ Runs the multi-GPU strict FP16 postprocess flow:
 
 Options:
   --outdir DIR          Output root [results/strict_fp16_postprocess_<timestamp>]
+  --suite-preflight-json FILE
+                        Suite-level strict_architecture_suite_preflight.json evidence
+  --suite-preflight-csv FILE
+                        Suite-level strict_architecture_suite_preflight.csv evidence
   --require-architectures CSV
                         Required architecture chips [ga100,gh100,ga102]
   --require-counter-trace-agreement
@@ -38,6 +44,8 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2 ;;
+    --suite-preflight-json) SUITE_PREFLIGHT_JSON="$2"; shift 2 ;;
+    --suite-preflight-csv) SUITE_PREFLIGHT_CSV="$2"; shift 2 ;;
     --require-architectures) REQUIRE_ARCHITECTURES="$2"; shift 2 ;;
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
@@ -103,12 +111,21 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   --input "${ABS_INPUTS[@]}" \
   --outdir "${COMPARE_DIR}"
 
-MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
-  "${PYTHON_BIN}" "${SCRIPT_DIR}/report_strict_results.py" \
+REPORT_ARGS=(
   --audit-dir "${AUDIT_DIR}" \
   --compare-dir "${COMPARE_DIR}" \
   --outdir "${REPORT_DIR}" \
   --require-architectures "${REQUIRE_ARCHITECTURES}"
+)
+if [[ -n "${SUITE_PREFLIGHT_JSON}" ]]; then
+  REPORT_ARGS+=(--suite-preflight-json "${SUITE_PREFLIGHT_JSON}")
+fi
+if [[ -n "${SUITE_PREFLIGHT_CSV}" ]]; then
+  REPORT_ARGS+=(--suite-preflight-csv "${SUITE_PREFLIGHT_CSV}")
+fi
+
+MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/report_strict_results.py" "${REPORT_ARGS[@]}"
 
 OVERALL_PASS="$("${PYTHON_BIN}" - "${AUDIT_DIR}/strict_result_audit.json" <<'PY'
 import json
