@@ -179,6 +179,8 @@ def artifact_links(
         candidates.extend(
             [
                 architecture_model_dir / "architecture_model_dense_peak.png",
+                architecture_model_dir / "architecture_model_per_sm_capacity.png",
+                architecture_model_dir / "architecture_model_resource_limits.png",
             ]
         )
 
@@ -259,9 +261,23 @@ def requirement_rows(
         if math.isfinite(parse_float(row.get("reference_error_pct")))
     ]
     model_max_error = max(model_error_values) if model_error_values else math.nan
+    required_model_rows = [
+        row for row in architecture_model_rows if str(row.get("architecture_chip", "")) in required_architectures
+    ]
+    model_metadata = bool(required_model_rows) and all(
+        str(row.get("reference_source_url", "")).strip()
+        and str(row.get("reference_note", "")).strip()
+        and str(row.get("dense_reference_formula", "")).strip()
+        and str(row.get("common_tensor_instruction_path", "")).strip()
+        and str(row.get("normalization_scope", "")).strip()
+        and str(row.get("normalization_note", "")).strip()
+        and str(row.get("sparsity_mode", "")).strip()
+        and not parse_bool(row.get("uses_wgmma_model"))
+        for row in required_model_rows
+    )
     model_sanity = bool(architecture_model_rows) and not missing_model_chips and (
         math.isfinite(model_max_error) and model_max_error <= 1.0
-    )
+    ) and model_metadata
     overall_json_pass = bool(audit_json.get("overall_pass", False))
     preflight_schema = str(preflight_json.get("preflight_schema", "") or "")
     preflight_supplied = bool(preflight_json)
@@ -327,6 +343,11 @@ def requirement_rows(
             + ",".join(sorted(model_chips))
             + (f"; max_reference_error_pct={model_max_error:.3g}" if math.isfinite(model_max_error) else "")
             + ("; missing=" + ",".join(missing_model_chips) if missing_model_chips else ""),
+        ),
+        row(
+            "architecture model metadata",
+            model_metadata,
+            "source URL, formula, common HMMA scope, dense/no-WGMMA metadata present",
         ),
     ]
 

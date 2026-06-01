@@ -114,7 +114,10 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
 
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/architecture_models.py" \
-  --outdir "${ARCH_MODEL_DIR}"
+  --outdir "${ARCH_MODEL_DIR}" \
+  --require-architectures "${REQUIRE_ARCHITECTURES}" \
+  --fail-on-model-error-pct 1.0 \
+  --fail-on-missing-metadata
 
 REPORT_ARGS=(
   --audit-dir "${AUDIT_DIR}" \

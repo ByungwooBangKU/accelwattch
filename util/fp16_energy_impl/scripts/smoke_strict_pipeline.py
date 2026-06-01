@@ -210,6 +210,24 @@ def write_model_dir(path: Path) -> None:
                 "reference_dense_tensor_fp16_tflops": 989,
                 "derived_dense_tensor_fp16_tflops": 989,
                 "reference_error_pct": 0.0,
+                "reference_sparse_tensor_fp16_tflops": 1978,
+                "sparse_to_dense_ratio": 2.0,
+                "sparsity_mode": "dense_no_sparsity",
+                "uses_wgmma_model": "false",
+                "reference_source_url": "https://www.nvidia.com/en-us/data-center/h100/",
+                "reference_note": "Synthetic GH100 dense FP16 Tensor Core peak, no sparsity",
+                "dense_reference_formula": (
+                    "dense_tensor_fp16_flop_per_sm_cycle * reference_sm_count * "
+                    "reference_boost_clock_mhz * 1e6 / 1e12"
+                ),
+                "common_tensor_instruction_path": (
+                    "warp-level HMMA mma.sync.aligned.m16n8k16 pair -> logical m16n16k16"
+                ),
+                "normalization_scope": "dense FP16 Tensor Core HMMA normalization only; no sparsity, no WGMMA",
+                "normalization_note": (
+                    "Dense Tensor Core peak is used only to normalize measured FP16 HMMA throughput; "
+                    "it is not an energy source and does not imply H100 WGMMA was benchmarked."
+                ),
             }
         ],
     )
@@ -255,6 +273,29 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     write_result_dir(no_required, include_required_target=False)
     write_model_dir(model_dir)
     write_preflight(preflight)
+
+    architecture_model_smoke = base / "architecture_model_smoke"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "architecture_models.py"),
+            "--outdir",
+            str(architecture_model_smoke),
+            "--fail-on-model-error-pct",
+            "1.0",
+            "--fail-on-missing-metadata",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    for artifact in (
+        "architecture_model_summary.csv",
+        "architecture_model_dense_peak.png",
+        "architecture_model_per_sm_capacity.png",
+        "architecture_model_resource_limits.png",
+    ):
+        if not (architecture_model_smoke / artifact).exists():
+            raise AssertionError(f"Architecture model smoke did not write {artifact}")
 
     audit_good = base / "audit_good"
     run(
@@ -328,6 +369,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     )
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "required kernel target selected")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "suite preflight passed")
+    assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "architecture model metadata")
     report_row = read_single_csv_row(report_dir / "fp16_strict_report_summary.csv")
     if report_row.get("target_selection_source") != "selected_targets_required_kernel_baseline":
         raise AssertionError(f"Report did not carry target selection source: {report_row}")
