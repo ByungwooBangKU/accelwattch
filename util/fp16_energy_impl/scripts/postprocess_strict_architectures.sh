@@ -127,20 +127,37 @@ fi
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/report_strict_results.py" "${REPORT_ARGS[@]}"
 
-OVERALL_PASS="$("${PYTHON_BIN}" - "${AUDIT_DIR}/strict_result_audit.json" <<'PY'
+read -r AUDIT_PASS REPORT_REQUIREMENTS_PASS OVERALL_PASS < <("${PYTHON_BIN}" - \
+  "${AUDIT_DIR}/strict_result_audit.json" \
+  "${REPORT_DIR}/fp16_strict_report_requirements.csv" <<'PY'
+import csv
 import json
 import sys
 from pathlib import Path
 
-path = Path(sys.argv[1])
-if not path.exists():
-    print("false")
-    raise SystemExit(0)
-with path.open() as f:
-    payload = json.load(f)
-print("true" if payload.get("overall_pass") else "false")
+audit_path = Path(sys.argv[1])
+requirements_path = Path(sys.argv[2])
+
+audit_pass = False
+if audit_path.exists():
+    with audit_path.open() as f:
+        payload = json.load(f)
+    audit_pass = bool(payload.get("overall_pass"))
+
+requirements_pass = False
+if requirements_path.exists():
+    with requirements_path.open() as f:
+        rows = list(csv.DictReader(f))
+    requirements_pass = bool(rows) and all(str(row.get("status", "")) == "pass" for row in rows)
+
+overall_pass = audit_pass and requirements_pass
+print(
+    ("true" if audit_pass else "false"),
+    ("true" if requirements_pass else "false"),
+    ("true" if overall_pass else "false"),
+)
 PY
-)"
+)
 
 cat <<EOF
 Strict FP16 postprocess complete:
@@ -148,6 +165,8 @@ Strict FP16 postprocess complete:
   audit: ${AUDIT_DIR}/strict_result_audit.csv
   compare: ${COMPARE_DIR}/architecture_best_fp16.csv
   report: ${REPORT_DIR}/fp16_strict_report.md
+  audit_pass: ${AUDIT_PASS}
+  report_requirements_pass: ${REPORT_REQUIREMENTS_PASS}
   overall_pass: ${OVERALL_PASS}
 EOF
 
