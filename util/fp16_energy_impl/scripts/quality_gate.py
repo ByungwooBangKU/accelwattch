@@ -43,6 +43,31 @@ def read_csv(path: Path) -> List[Dict[str, Any]]:
         return list(csv.DictReader(f))
 
 
+def load_ncu_validation(path: Path | None) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    if path is None:
+        return {}
+    rows = read_csv(path)
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        out[(str(row.get("kernel", "")), str(row.get("threads", "")))] = row
+    return out
+
+
+def ncu_status(kernel: str, threads: Any, ncu_rows: Dict[Tuple[str, str], Dict[str, Any]]) -> Tuple[bool, str]:
+    thread_text = str(threads)
+    if "." in thread_text:
+        value = parse_float(thread_text)
+        if math.isfinite(value):
+            thread_text = str(int(value))
+    row = ncu_rows.get((kernel, thread_text)) or ncu_rows.get((kernel, ""))
+    if not row:
+        return (False, "missing NCU validation row")
+    if parse_bool(row.get("validation_pass")):
+        return (True, "NCU validation passed")
+    reason = str(row.get("fail_reasons", "") or "NCU validation failed")
+    return (False, reason)
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -103,7 +128,11 @@ def baseline_match_grade(test_kernel: str, baseline_kernel: str) -> Tuple[str, b
     return ("baseline_mismatch", False, f"expected {expected}")
 
 
-def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
+def pair_gate_rows(
+    summary_rows: Iterable[Dict[str, Any]],
+    args: argparse.Namespace,
+    ncu_rows: Dict[Tuple[str, str], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in summary_rows:
         test_samples = int(parse_float(row.get("test_power_samples"), 0.0))
@@ -128,6 +157,11 @@ def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namesp
         common_hmma = not parse_bool(row.get("benchmark_uses_wgmma"))
         sm_util_samples = int(parse_float(row.get("test_sm_util_samples"), 0.0))
         sm_util_available = sm_util_samples >= args.min_sm_util_samples
+        test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
+        baseline_ncu_ok, baseline_ncu_note = ncu_status(
+            str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
+        )
+        ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
 
         failed: List[str] = []
         warnings: List[str] = []
@@ -151,6 +185,10 @@ def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namesp
             failed.append("benchmark used WGMMA; cross-GPU HMMA comparison is not apples-to-apples")
         if not sm_util_available:
             warnings.append("SM utilization samples missing or sparse")
+        if args.require_ncu and not ncu_ok:
+            failed.append(f"NCU validation failed or missing: test={test_ncu_note}; baseline={baseline_ncu_note}")
+        elif args.ncu_summary and not ncu_ok:
+            warnings.append(f"NCU validation not passing: test={test_ncu_note}; baseline={baseline_ncu_note}")
 
         out.append(
             {
@@ -173,6 +211,10 @@ def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namesp
                 "pure_fp16_candidate": pure,
                 "energy_source_reliable": reliable_source,
                 "baseline_structural_match": baseline_ok,
+                "ncu_validation_pass": ncu_ok,
+                "ncu_required": bool(args.require_ncu),
+                "test_ncu_note": test_ncu_note,
+                "baseline_ncu_note": baseline_ncu_note,
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_available,
                 "common_hmma_path": common_hmma,
@@ -223,8 +265,12 @@ def util_value(row: Dict[str, Any]) -> float:
     return util
 
 
-def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[Dict[str, Any]],
-                     args: argparse.Namespace) -> List[Dict[str, Any]]:
+def thread_gate_rows(
+    thread_rows: List[Dict[str, Any]],
+    summary_rows: Iterable[Dict[str, Any]],
+    args: argparse.Namespace,
+    ncu_rows: Dict[Tuple[str, str], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     source_by_thread = source_counts_by_thread(summary_rows)
     max_util_by_kernel: Dict[Tuple[str, str, str], float] = {}
     for row in thread_rows:
@@ -258,6 +304,11 @@ def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[D
             str(row.get("test_kernel", "")),
             str(row.get("baseline_kernel", "")),
         )
+        test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
+        baseline_ncu_ok, baseline_ncu_note = ncu_status(
+            str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
+        )
+        ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
         if source_info.get("all_nvml"):
             grade = "strict_nvml_counter"
             source_ok = True
@@ -287,8 +338,12 @@ def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[D
             failed.append("energy source is unavailable or undersampled")
         if not baseline_ok:
             failed.append(baseline_note)
+        if args.require_ncu and not ncu_ok:
+            failed.append(f"NCU validation failed or missing: test={test_ncu_note}; baseline={baseline_ncu_note}")
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
+        if args.ncu_summary and not args.require_ncu and not ncu_ok:
+            warnings.append(f"NCU validation not passing: test={test_ncu_note}; baseline={baseline_ncu_note}")
 
         quality_pass = not failed
         target_pass = quality_pass and selected and util_saturated
@@ -318,6 +373,10 @@ def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[D
                 "pure_fp16_candidate": enough_pure,
                 "energy_source_reliable": source_ok,
                 "baseline_structural_match": baseline_ok,
+                "ncu_validation_pass": ncu_ok,
+                "ncu_required": bool(args.require_ncu),
+                "test_ncu_note": test_ncu_note,
+                "baseline_ncu_note": baseline_ncu_note,
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_observed,
                 "avg_sm_util_pct_mean": row.get("avg_sm_util_pct_mean", ""),
@@ -416,6 +475,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "min_power_samples": args.min_power_samples,
             "min_sm_util_samples": args.min_sm_util_samples,
             "util_tolerance_pct": args.util_tolerance_pct,
+            "require_ncu": bool(args.require_ncu),
+            "ncu_summary": str(args.ncu_summary) if args.ncu_summary else "",
         },
         "counts": {
             "rows": len(rows),
@@ -431,6 +492,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "It is not a physical proof of zero L2 traffic; Nsight Compute memory counters are still required.",
             "strict_nvml_counter is preferred for H100/A100/RTX3090 comparison; power_trace_fallback is diagnostic.",
             "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
+            "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
         ],
     }
     with (input_dir / "quality_gate_summary.json").open("w") as f:
@@ -444,15 +506,18 @@ def main() -> int:
     parser.add_argument("--min-power-samples", type=int, default=3)
     parser.add_argument("--min-sm-util-samples", type=int, default=1)
     parser.add_argument("--util-tolerance-pct", type=float, default=0.1)
+    parser.add_argument("--ncu-summary", type=Path, default=None, help="ncu_validation_summary.csv from validate_ncu_reports.py")
+    parser.add_argument("--require-ncu", action="store_true", help="Require passing NCU validation for quality_pass")
     args = parser.parse_args()
 
     summary_rows = read_csv(args.input / "summary.csv")
     if not summary_rows:
         raise SystemExit(f"{args.input / 'summary.csv'} not found or empty; run analyze_results.py first")
     thread_rows = read_csv(args.input / "thread_sweep_summary.csv")
+    ncu_rows = load_ncu_validation(args.ncu_summary)
 
-    rows = pair_gate_rows(summary_rows, args)
-    rows.extend(thread_gate_rows(thread_rows, summary_rows, args))
+    rows = pair_gate_rows(summary_rows, args, ncu_rows)
+    rows.extend(thread_gate_rows(thread_rows, summary_rows, args, ncu_rows))
     write_csv(args.input / "quality_gates.csv", rows)
     write_summary(args.input, rows, args)
     plot_thread_quality(rows, args.input / "figures")

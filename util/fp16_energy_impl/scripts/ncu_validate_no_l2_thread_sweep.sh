@@ -45,5 +45,8 @@ for threads in "${THREADS_LIST[@]}"; do
     --iters 20000
 done
 
+python3 "$(dirname "$0")/validate_ncu_reports.py" --input "${OUTDIR}" --outdir "${OUTDIR}"
+
 echo "Nsight Compute no-L2 thread-sweep reports written to ${OUTDIR}"
 echo "Acceptance check: timed tensor/baseline kernels should show no material L1/L2/DRAM global memory workload beyond profiler noise."
+echo "Validation summary: ${OUTDIR}/ncu_validation_summary.csv"

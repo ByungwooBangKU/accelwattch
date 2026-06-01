@@ -19,6 +19,7 @@
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
 | `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
+| `scripts/validate_ncu_reports.py` | Nsight Compute text report에서 HMMA/no-L2/local-spill evidence를 자동 판정 |
 | `scripts/lock_clocks.sh` | GPU clock lock helper |
 | `scripts/reset_clocks.sh` | GPU clock reset helper |
 | `scripts/query_env.sh` | 실험 환경 metadata 수집 |
@@ -127,9 +128,19 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | reliable energy source | `nvml_total_energy_counter` 우선. 미지원 시 power trace fallback은 최소 sample 수를 만족할 때만 diagnostic grade로 통과 |
 | structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
+| NCU validation | 최종 claim에는 `validate_ncu_reports.py`가 만든 `ncu_validation_summary.csv`를 `--require-ncu`로 연결 |
 | utilization target | SM utilization 최대값에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
 
 출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이며 `quality_gate_summary.json`의 `selected_targets`에 들어간다. 기존 sweep logic이 고른 point라도 strict gate를 통과하지 못하면 `selected_diagnostics`로만 남긴다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다. `baseline_match_grade=generic_nop_baseline`인 결과는 utilization diagnostic으로만 보고, 최종 FP16 pJ/bit에는 쓰지 않는다.
+
+최종 보고용 gate는 Nsight Compute 검증 결과까지 묶어서 실행한다.
+
+```bash
+python3 scripts/quality_gate.py \
+  --input results/fp16_matmul_thread_sweep_fine_gpu0 \
+  --ncu-summary results/ncu_no_l2_thread_sweep_gpu0/ncu_validation_summary.csv \
+  --require-ncu
+```
 
 ### Architecture comparison policy
 
@@ -294,6 +305,8 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/thread_sweep_summary.csv` | thread-count sweep일 때 thread별 utilization/TFLOPS 집계와 `selected_optimal` 표시 |
 | `results/p0_gpu0/quality_gates.csv` | pair/thread point별 quality gate 통과 여부와 실패 이유 |
 | `results/p0_gpu0/quality_gate_summary.json` | 선택된 target point와 gate threshold 요약 |
+| `results/ncu_*/ncu_validation_summary.csv` | Nsight Compute report별 HMMA/no-L2/local-spill 자동 검증 |
+| `results/ncu_*/figures/ncu_validation_summary.png` | NCU validation pass/fail 시각화 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |
@@ -341,6 +354,16 @@ Thread sweep에서 선택된 후보가 L2/global memory를 의도적으로 touch
 ```
 
 이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 `tensor_baseline_u32`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
+
+두 validation helper는 실행 후 `validate_ncu_reports.py`를 호출해 다음 산출물을 만든다.
+
+```text
+results/ncu_*/ncu_validation_summary.csv
+results/ncu_*/ncu_validation_summary.json
+results/ncu_*/figures/ncu_validation_summary.png
+```
+
+strict mode에서는 explicit L2/DRAM/local counter metric이 없으면 fail로 처리한다. Nsight Compute 버전별 metric 이름 차이 때문에 counter가 빠진 경우, `ncu_validation_summary.csv`의 `fail_reasons`를 확인해 metric set을 조정한 뒤 다시 실행한다. `--allow-missing-counters`는 SASS token fallback을 쓰는 diagnostic 모드일 뿐, 최종 pJ/bit claim에는 사용하지 않는다.
 
 P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 

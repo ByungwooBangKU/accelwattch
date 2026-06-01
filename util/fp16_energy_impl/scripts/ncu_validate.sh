@@ -33,5 +33,8 @@ run_ncu tensor_baseline_f32 --kernel tensor_baseline_f32 --iters 20000
 run_ncu tensor_mma_f16acc --kernel tensor_mma_f16acc --iters 20000
 run_ncu tensor_mma_f32acc --kernel tensor_mma_f32acc --iters 20000
 
+python3 "$(dirname "$0")/validate_ncu_reports.py" --input "${OUTDIR}" --outdir "${OUTDIR}"
+
 echo "Nsight Compute reports written to ${OUTDIR}"
 echo "Acceptance checks: no local spill, low L1/L2/DRAM traffic in P0 timed kernels, expected FP16/HMMA instruction path."
+echo "Validation summary: ${OUTDIR}/ncu_validation_summary.csv"

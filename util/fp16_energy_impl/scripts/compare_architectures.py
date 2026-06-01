@@ -166,6 +166,10 @@ def load_result_dir(
                         "target_pass",
                         "baseline_structural_match",
                         "energy_source_reliable",
+                        "ncu_validation_pass",
+                        "ncu_required",
+                        "test_ncu_note",
+                        "baseline_ncu_note",
                         "fail_reasons",
                         "warnings",
                     ):
