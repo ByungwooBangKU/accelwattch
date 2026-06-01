@@ -19,6 +19,7 @@
 | `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
 | `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
 | `scripts/report_strict_results.py` | strict audit/architecture compare 산출물을 최종 검토용 Markdown report와 dashboard figure로 요약 |
+| `scripts/postprocess_strict_architectures.sh` | A100/H100/RTX3090 결과 디렉터리를 받아 audit/compare/report/visualization을 한 번에 생성 |
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
@@ -325,7 +326,17 @@ python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gp
 
 Fine + dmon legacy run에서는 `threads_per_sm=512`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 후보 thread count는 512 threads/SM, 즉 64 threads/block이다. pJ/bit 자체는 224 threads/block 후보에서 `0.0819 +/- 0.0121 pJ/bit`로 더 낮게 관찰되었지만, valid no-L2 count가 5/10이고 incremental power가 3.23 W 수준이라 target saturation point로 채택하지 않았다. 256 threads/block 이상 후보는 baseline subtraction 후 incremental power가 음수로 나와 `all_runs_no_valid`로 집계되었다. 이 값들은 board-level `nvidia-smi` power trace와 `baseline_nop` subtraction 기반 estimate이므로, 최종 수치 채택 전에는 현재 matrix로 재실행하고 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
 
-여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 `analyze_results.py`를 먼저 실행하고, 다음처럼 묶는다.
+여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 strict pipeline을 완료한 다음 아래 wrapper를 실행한다. 이 wrapper는 strict audit이 실패해도 compare/report 산출물을 먼저 남기고, 기본적으로 마지막에 nonzero로 종료한다. 실패 상태까지 report로 남기고 싶을 때는 `--no-fail`을 추가한다.
+
+```bash
+./scripts/postprocess_strict_architectures.sh \
+  --outdir results/strict_fp16_postprocess \
+  results/strict_fp16_a100 \
+  results/strict_fp16_h100 \
+  results/strict_fp16_rtx3090
+```
+
+수동으로 단계를 분리해서 실행할 수도 있다.
 
 ```bash
 python3 scripts/audit_strict_results.py \

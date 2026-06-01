@@ -132,6 +132,7 @@ def artifact_links(audit_dir: Path | None, compare_dir: Path | None, outdir: Pat
                 audit_dir / "figures" / "strict_result_tflops.png",
                 audit_dir / "figures" / "strict_result_sm_utilization.png",
                 audit_dir / "figures" / "strict_result_tensor_model_utilization.png",
+                audit_dir / "figures" / "strict_result_ncu_tensor_activity.png",
                 audit_dir / "figures" / "strict_result_incremental_energy_fraction.png",
                 audit_dir / "figures" / "strict_result_counter_trace_ratio.png",
             ]
