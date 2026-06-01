@@ -17,6 +17,7 @@
 | `scripts/analyze_results.py` | NVML energy counter 우선 분석, power trace fallback, baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
 | `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
 | `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
+| `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
@@ -129,7 +130,7 @@ GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   --outdir results/strict_fp16_h100
 ```
 
-이 pipeline은 `fp16_matmul_thread_sweep_fine.json`의 structural baseline sweep을 실행하고, `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행한 뒤, `quality_gate.py --require-ncu`까지 실행한다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
+이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, `fp16_matmul_thread_sweep_fine.json`의 structural baseline sweep을 실행한 뒤, `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu`까지 실행한다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
 
 ### Energy source policy
 
@@ -157,6 +158,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
 | NCU validation | 최종 claim에는 `validate_ncu_reports.py`가 만든 `ncu_validation_summary.csv`를 `--require-ncu`로 연결 |
+| ptxas resource audit | selected test/baseline kernel의 register/thread와 stack/spill bytes를 build log에서 추출 |
 | utilization target | SM utilization 최대값에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
 
 출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이며 `quality_gate_summary.json`의 `selected_targets`에 들어간다. 기존 sweep logic이 고른 point라도 strict gate를 통과하지 못하면 `selected_diagnostics`로만 남긴다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다. `baseline_match_grade=generic_nop_baseline`인 결과는 utilization diagnostic으로만 보고, 최종 FP16 pJ/bit에는 쓰지 않는다.
@@ -307,7 +309,7 @@ python3 scripts/compare_architectures.py \
   --outdir results/architecture_compare_fp16
 ```
 
-`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
+`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `resource_audit/thread_resource_occupancy.csv`에서 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
 
 주요 산출물은 다음과 같다.
 
@@ -319,6 +321,7 @@ python3 scripts/compare_architectures.py \
 | `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |
 | `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교 |
 | `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교 |
+| `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
 
 For memory/cache-policy calibration and DRAM pJ/bit estimates:
 
@@ -349,6 +352,9 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/quality_gate_summary.json` | 선택된 target point와 gate threshold 요약 |
 | `results/ncu_*/ncu_validation_summary.csv` | Nsight Compute report별 HMMA/no-L2/local-spill 자동 검증 |
 | `results/ncu_*/figures/ncu_validation_summary.png` | NCU validation pass/fail 시각화 |
+| `results/p0_gpu0/resource_audit/kernel_resource_summary.csv` | ptxas kernel별 registers/thread, stack/spill bytes |
+| `results/p0_gpu0/resource_audit/thread_resource_occupancy.csv` | thread sweep 후보별 static resource occupancy model |
+| `results/p0_gpu0/resource_audit/figures/thread_sweep_resource_occupancy.png` | launched threads/SM 대비 static occupancy와 measured SM utilization 비교 |
 | `results/strict_fp16_audit/strict_result_audit.csv` | 여러 strict 결과 디렉터리의 최종 채택 가능 여부 audit |
 | `results/strict_fp16_audit/figures/strict_result_audit.png` | architecture별 strict audit pass/fail 시각화 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
@@ -467,6 +473,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 `stats_scope=all_runs_no_valid`는 해당 thread point에서 `valid_basic=True`인 반복이 없었다는 뜻이다. 이 경우 mean/std는 plot과 원인 분석을 위한 전체 run 통계일 뿐, 최종 pJ/bit 후보로 쓰면 안 된다. `valid_no_l2` 역시 “코드가 의도적으로 L2/global memory를 touch하지 않는다”는 조건이지, hardware counter 기반 증명은 아니므로 최종 보고 전에는 Nsight Compute로 `MemoryWorkloadAnalysis`를 확인한다.
 
 코드와 표에서 baseline/control이라는 표현은 GPU의 control unit 에너지를 의미하지 않는다. 여기서는 같은 launch/loop/register 구조에서 FP16/HMMA instruction만 제거한 기준 루프 비용을 뜻한다. 최종 Tensor Core pJ/bit에는 `tensor_baseline_u32/f32` 같은 structural baseline을 사용하고, legacy `baseline_nop` 결과는 diagnostic으로만 본다.
+
+`resource_audit/thread_resource_occupancy.csv`의 occupancy 값은 ptxas register count와 architecture별 thread/block/register limit을 사용한 static model이다. 이것은 measured SM utilization을 대체하지 않는다. 목적은 selected FP16 후보가 local spill 없이 실행 가능한지, 그리고 thread sweep에서 occupancy/resource limit이 utilization 포화점과 어떻게 맞물리는지 확인하는 것이다.
 
 최종 보고서에는 `p0_cuda_core_half2_vs_nop`과 `p0_cuda_core_half2_vs_regmove`를 모두 제시하는 것이 좋다. 두 baseline 간 차이는 baseline sensitivity로 취급한다. Tensor Core는 `f16acc`와 `f32acc`를 분리 보고한다.
 

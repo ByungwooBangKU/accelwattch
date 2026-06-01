@@ -81,6 +81,8 @@ BUILD_PATH="${ROOT}/${BUILD_DIR}"
 BINARY="${BUILD_PATH}/fp16_energy_bench"
 NCDIR="${OUTDIR}/ncu_no_l2_thread_sweep"
 ENV_OUT="${OUTDIR}/env_gpu${GPU_ID}.txt"
+BUILD_LOG="${OUTDIR}/build_ptxas.log"
+RESOURCE_DIR="${OUTDIR}/resource_audit"
 
 if [[ -z "${NVIDIA_SMI_ID}" ]]; then
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -97,7 +99,7 @@ if [[ "${SKIP_BUILD}" -eq 0 ]]; then
   "${CMAKE_BIN}" -S "${ROOT}" -B "${BUILD_PATH}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"
-  "${CMAKE_BIN}" --build "${BUILD_PATH}" -j 2
+  "${CMAKE_BIN}" --build "${BUILD_PATH}" --clean-first -j 2 2>&1 | tee "${BUILD_LOG}"
 fi
 
 "${SCRIPT_DIR}/query_env.sh" "${NVIDIA_SMI_ID}" "${ENV_OUT}" "${BINARY}" "${GPU_ID}"
@@ -113,6 +115,15 @@ fi
 
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/analyze_results.py" --input "${OUTDIR}"
+
+RESOURCE_ARGS=(--result-dir "${OUTDIR}" --outdir "${RESOURCE_DIR}" --cuda-arch "${CUDA_ARCH}")
+if [[ -f "${BUILD_LOG}" ]]; then
+  RESOURCE_ARGS+=(--ptxas-log "${BUILD_LOG}")
+else
+  RESOURCE_ARGS+=(--allow-missing)
+fi
+MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/summarize_kernel_resources.py" "${RESOURCE_ARGS[@]}"
 
 "${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \
   "${BINARY}" \
@@ -131,6 +142,7 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
 cat <<EOF
 Strict FP16 pipeline complete:
   results: ${OUTDIR}
+  resource audit: ${RESOURCE_DIR}/kernel_resource_summary.csv
   NCU validation: ${NCDIR}/ncu_validation_summary.csv
   quality gate: ${OUTDIR}/quality_gates.csv
   selected target summary: ${OUTDIR}/quality_gate_summary.json

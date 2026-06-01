@@ -180,6 +180,24 @@ def load_result_dir(
     return enrich(condition_rows), enrich(summary_rows), enrich(thread_rows), enrich(quality_rows)
 
 
+def load_resource_rows(path: Path) -> List[Dict[str, Any]]:
+    rows = read_csv(path / "resource_audit" / "thread_resource_occupancy.csv")
+    if not rows:
+        return []
+    seed = rows[0]
+    arch = classify_from_row(seed)
+    label = result_label(path, arch)
+    return [
+        {
+            **row,
+            **classify_from_row({**arch, **row}),
+            "input_dir": str(path),
+            "architecture_label": label,
+        }
+        for row in rows
+    ]
+
+
 def is_fp16_candidate(row: Dict[str, Any]) -> bool:
     test_kernel = str(row.get("test_kernel", ""))
     if test_kernel not in {"tensor_mma_f16acc", "tensor_mma_f32acc", "fp16_half2"}:
@@ -325,6 +343,37 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
         plt.close(fig)
 
 
+def plot_resource_compare(resource_rows: List[Dict[str, Any]], outdir: Path) -> None:
+    rows = [r for r in resource_rows if str(r.get("role", "")) == "test"]
+    if not rows:
+        return
+    by_kernel: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_kernel.setdefault(str(row.get("kernel", "")), []).append(row)
+    for kernel, group_rows in by_kernel.items():
+        fig, ax = plt.subplots(figsize=(8.8, 5.2))
+        plotted = False
+        for label in sorted({str(r.get("architecture_label", "")) for r in group_rows}):
+            group = [r for r in group_rows if str(r.get("architecture_label", "")) == label]
+            group = sorted(group, key=lambda r: parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))))
+            xs = [parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))) for r in group]
+            ys = [parse_float(r.get("thread_occupancy_pct_model")) for r in group]
+            if any(math.isfinite(y) for y in ys):
+                ax.plot(xs, ys, marker="o", label=label)
+                plotted = True
+        if plotted:
+            ax.set_xlabel("Launched threads per SM")
+            ax.set_ylabel("Resource occupancy model (%)")
+            ax.set_title(f"Architecture resource occupancy model: {kernel}")
+            ax.get_xaxis().set_major_formatter(ScalarFormatter())
+            ax.grid(True, axis="y", alpha=0.25)
+            ax.legend(loc="best")
+            fig.tight_layout()
+            safe = f"architecture_resource_occupancy_{kernel}.png".replace("/", "_")
+            fig.savefig(outdir / safe, dpi=160)
+        plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare analyzed FP16 energy result directories")
     parser.add_argument("--input", type=Path, nargs="+", required=True, help="One or more analyzed result dirs")
@@ -335,6 +384,7 @@ def main() -> int:
     all_summary: List[Dict[str, Any]] = []
     all_threads: List[Dict[str, Any]] = []
     all_quality: List[Dict[str, Any]] = []
+    all_resources: List[Dict[str, Any]] = []
     for path in args.input:
         conditions, summary, threads, quality = load_result_dir(path)
         if not conditions and not summary:
@@ -343,6 +393,7 @@ def main() -> int:
         all_summary.extend(summary)
         all_threads.extend(threads)
         all_quality.extend(quality)
+        all_resources.extend(load_resource_rows(path))
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     best_source = all_threads if all_threads else all_conditions
@@ -351,6 +402,7 @@ def main() -> int:
     write_csv(args.outdir / "architecture_summary_rows.csv", all_summary)
     write_csv(args.outdir / "architecture_thread_sweep_summary.csv", all_threads)
     write_csv(args.outdir / "architecture_quality_gates.csv", all_quality)
+    write_csv(args.outdir / "architecture_resource_occupancy.csv", all_resources)
     write_csv(args.outdir / "architecture_best_fp16.csv", best)
 
     plot_bar(
@@ -375,6 +427,7 @@ def main() -> int:
         args.outdir / "architecture_best_incremental_power.png",
     )
     plot_thread_compare(all_threads, args.outdir)
+    plot_resource_compare(all_resources, args.outdir)
 
     print(f"Wrote: {args.outdir / 'architecture_condition_summary.csv'}")
     print(f"Wrote: {args.outdir / 'architecture_best_fp16.csv'}")

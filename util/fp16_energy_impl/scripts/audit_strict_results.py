@@ -89,10 +89,30 @@ def find_ncu_row(rows: List[Dict[str, Any]], kernel: str, threads: str) -> Dict[
     return {}
 
 
+def find_resource_row(rows: List[Dict[str, Any]], role: str, kernel: str, threads: str, unroll: str) -> Dict[str, Any]:
+    for row in rows:
+        if (
+            str(row.get("role", "")) == role
+            and str(row.get("kernel", "")) == kernel
+            and normalize_thread(row.get("threads", "")) == threads
+            and (not unroll or normalize_thread(row.get("unroll", "")) == normalize_thread(unroll))
+        ):
+            return row
+    for row in rows:
+        if (
+            str(row.get("role", "")) == role
+            and str(row.get("kernel", "")) == kernel
+            and normalize_thread(row.get("threads", "")) == threads
+        ):
+            return row
+    return {}
+
+
 def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     summary = read_json(path / "quality_gate_summary.json")
     quality_rows = read_csv(path / "quality_gates.csv")
     ncu_rows = read_csv(path / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
+    resource_rows = read_csv(path / "resource_audit" / "thread_resource_occupancy.csv")
     targets = summary.get("selected_targets") or []
     target = dict(targets[0]) if targets else {}
 
@@ -107,8 +127,11 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     test_kernel = str(target.get("test_kernel", "") or "")
     baseline_kernel = str(target.get("baseline_kernel", "") or "")
     threads = normalize_thread(target.get("threads", ""))
+    unroll = normalize_thread(target.get("unroll", ""))
     test_ncu = find_ncu_row(ncu_rows, test_kernel, threads)
     baseline_ncu = find_ncu_row(ncu_rows, baseline_kernel, threads)
+    test_resource = find_resource_row(resource_rows, "test", test_kernel, threads, unroll)
+    baseline_resource = find_resource_row(resource_rows, "baseline", baseline_kernel, threads, unroll)
 
     failed: List[str] = []
     warnings: List[str] = []
@@ -155,6 +178,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("selected test NCU validation did not pass")
     if baseline_ncu and not parse_bool(baseline_ncu.get("validation_pass")):
         failed.append("selected baseline NCU validation did not pass")
+    if not resource_rows:
+        failed.append("resource_audit/thread_resource_occupancy.csv is missing or empty")
+    if resource_rows and not test_resource:
+        failed.append("missing resource audit row for selected test kernel/thread")
+    if resource_rows and not baseline_resource:
+        failed.append("missing resource audit row for selected baseline kernel/thread")
+    if test_resource and parse_bool(test_resource.get("has_spills")):
+        failed.append("selected test kernel has ptxas stack/spill usage")
+    if baseline_resource and parse_bool(baseline_resource.get("has_spills")):
+        failed.append("selected baseline kernel has ptxas stack/spill usage")
 
     return {
         "input_dir": str(path),
@@ -165,6 +198,7 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "test_kernel": test_kernel,
         "baseline_kernel": baseline_kernel,
         "threads": threads,
+        "unroll": unroll,
         "threads_per_sm": target.get("threads_per_sm", ""),
         "measurement_grade": target.get("measurement_grade", ""),
         "baseline_match_grade": target.get("baseline_match_grade", ""),
@@ -180,6 +214,12 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "incremental_power_w_mean": target.get("incremental_power_w_mean", ""),
         "test_ncu_pass": test_ncu.get("validation_pass", "") if test_ncu else "",
         "baseline_ncu_pass": baseline_ncu.get("validation_pass", "") if baseline_ncu else "",
+        "test_registers_per_thread": test_resource.get("registers_per_thread", "") if test_resource else "",
+        "baseline_registers_per_thread": baseline_resource.get("registers_per_thread", "") if baseline_resource else "",
+        "test_thread_occupancy_pct_model": test_resource.get("thread_occupancy_pct_model", "") if test_resource else "",
+        "baseline_thread_occupancy_pct_model": baseline_resource.get("thread_occupancy_pct_model", "") if baseline_resource else "",
+        "test_resource_has_spills": test_resource.get("has_spills", "") if test_resource else "",
+        "baseline_resource_has_spills": baseline_resource.get("has_spills", "") if baseline_resource else "",
         "fail_reasons": "; ".join(failed),
         "warnings": "; ".join(warnings),
     }
