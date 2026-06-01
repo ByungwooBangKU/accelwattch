@@ -668,6 +668,14 @@ def util_value(row: Dict[str, Any]) -> float:
     return util
 
 
+def util_metric_source(row: Dict[str, Any]) -> str:
+    if math.isfinite(parse_float(row.get("avg_sm_util_pct_mean"))):
+        return "avg_sm_util_pct_mean"
+    if math.isfinite(parse_float(row.get("avg_gpu_util_pct_mean"))):
+        return "avg_gpu_util_pct_mean"
+    return ""
+
+
 def thread_gate_rows(
     thread_rows: List[Dict[str, Any]],
     summary_rows: Iterable[Dict[str, Any]],
@@ -675,13 +683,6 @@ def thread_gate_rows(
     ncu_rows: Dict[Tuple[str, str], Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     source_by_thread = source_counts_by_thread(summary_rows)
-    max_util_by_kernel: Dict[Tuple[str, str, str], float] = {}
-    for row in thread_rows:
-        key = (str(row.get("fp16_path", "")), str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")))
-        util = util_value(row)
-        if math.isfinite(util):
-            max_util_by_kernel[key] = max(util, max_util_by_kernel.get(key, -math.inf))
-
     out: List[Dict[str, Any]] = []
     for row in thread_rows:
         run_count = int(parse_float(row.get("run_count"), 0.0))
@@ -709,10 +710,8 @@ def thread_gate_rows(
         clock_span = parse_float(row.get("clock_span_mhz_mean"))
         clock_stable = math.isfinite(clock_span) and clock_span <= args.max_clock_span_mhz
         util = util_value(row)
+        util_source = util_metric_source(row)
         sm_util_observed = math.isfinite(util)
-        key = (str(row.get("fp16_path", "")), str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")))
-        max_util = max_util_by_kernel.get(key, math.nan)
-        util_saturated = sm_util_observed and math.isfinite(max_util) and util >= max_util - args.util_tolerance_pct
         selected = parse_bool(row.get("selected_optimal"))
 
         source_key = (str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")), str(row.get("threads", "")))
@@ -810,7 +809,6 @@ def thread_gate_rows(
             )
 
         quality_pass = not failed
-        target_pass = quality_pass and selected and util_saturated
 
         out.append(
             {
@@ -820,6 +818,7 @@ def thread_gate_rows(
                 "architecture_generation": row.get("architecture_generation", ""),
                 "architecture_chip": row.get("architecture_chip", ""),
                 "sm_count": row.get("sm_count", ""),
+                "fp16_path": row.get("fp16_path", ""),
                 "test_kernel": row.get("test_kernel", ""),
                 "baseline_kernel": row.get("baseline_kernel", ""),
                 "threads": row.get("threads", ""),
@@ -833,9 +832,14 @@ def thread_gate_rows(
                 "measurement_grade": grade,
                 "baseline_match_grade": baseline_grade,
                 "quality_pass": quality_pass,
-                "target_pass": target_pass,
+                "target_pass": False,
                 "selected_optimal": selected,
-                "util_saturated": util_saturated,
+                "quality_gate_selected_target": False,
+                "util_saturated": False,
+                "util_reference_scope": "pending_quality_pass_selection",
+                "util_reference_max_pct": math.nan,
+                "util_metric_source": util_source,
+                "target_selection_note": "",
                 "no_intended_l2": enough_no_l2,
                 "pure_fp16_candidate": enough_pure,
                 "energy_source_reliable": source_ok,
@@ -906,6 +910,67 @@ def thread_gate_rows(
                 "warnings": "; ".join(warnings),
             }
         )
+    by_target_key: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in out:
+        key = (
+            str(row.get("fp16_path", "")),
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+        )
+        by_target_key[key].append(row)
+
+    for group in by_target_key.values():
+        quality_rows = [
+            row
+            for row in group
+            if parse_bool(row.get("quality_pass")) and math.isfinite(util_value(row))
+        ]
+        if not quality_rows:
+            for row in group:
+                row["util_reference_scope"] = "no_quality_pass"
+                row["target_selection_note"] = (
+                    "no_quality_pass_candidates"
+                    if parse_bool(row.get("quality_pass"))
+                    else "not_quality_pass"
+                )
+            continue
+
+        max_quality_util = max(util_value(row) for row in quality_rows)
+        saturated = [
+            row
+            for row in quality_rows
+            if util_value(row) >= max_quality_util - args.util_tolerance_pct
+        ]
+
+        def target_score(row: Dict[str, Any]) -> Tuple[float, float, float]:
+            threads_per_sm = parse_float(row.get("threads_per_sm"), math.inf)
+            if not math.isfinite(threads_per_sm):
+                threads_per_sm = parse_float(row.get("threads"), math.inf)
+            tflops = parse_float(row.get("tflops_mean"), -math.inf)
+            if not math.isfinite(tflops):
+                tflops = -math.inf
+            clock_span = parse_float(row.get("clock_span_mhz_mean"), math.inf)
+            if not math.isfinite(clock_span):
+                clock_span = math.inf
+            return (threads_per_sm, -tflops, clock_span)
+
+        target = min(saturated, key=target_score) if saturated else None
+        saturated_ids = {id(row) for row in saturated}
+        target_id = id(target) if target is not None else None
+        for row in group:
+            row["util_reference_scope"] = "quality_pass"
+            row["util_reference_max_pct"] = max_quality_util
+            row["util_saturated"] = id(row) in saturated_ids
+            row["quality_gate_selected_target"] = id(row) == target_id
+            row["target_pass"] = id(row) == target_id
+            if id(row) == target_id:
+                row["target_selection_note"] = "quality_gate_first_saturation_point"
+            elif not parse_bool(row.get("quality_pass")):
+                row["target_selection_note"] = "not_quality_pass"
+            elif id(row) in saturated_ids:
+                row["target_selection_note"] = "quality_pass_saturated_tie_loser"
+            else:
+                row["target_selection_note"] = "quality_pass_below_saturation_band"
     return out
 
 
@@ -956,11 +1021,23 @@ def plot_thread_quality(rows: List[Dict[str, Any]], figdir: Path) -> None:
                 va="top" if near_top else "bottom",
                 fontsize=8,
             )
-        selected = [r for r in group if parse_bool(r.get("selected_optimal"))]
-        if selected:
-            sx = parse_float(selected[0].get("threads_per_sm"), parse_float(selected[0].get("threads")))
+        targets = [r for r in group if parse_bool(r.get("target_pass"))]
+        if targets:
+            sx = parse_float(targets[0].get("threads_per_sm"), parse_float(targets[0].get("threads")))
             if math.isfinite(sx):
-                ax.axvline(sx, color="tab:green", linestyle="--", linewidth=1.2, label="selected")
+                ax.axvline(sx, color="tab:green", linestyle="--", linewidth=1.2, label="target_pass")
+        else:
+            selected = [r for r in group if parse_bool(r.get("selected_optimal"))]
+            if selected:
+                sx = parse_float(selected[0].get("threads_per_sm"), parse_float(selected[0].get("threads")))
+                if math.isfinite(sx):
+                    ax.axvline(
+                        sx,
+                        color="0.35",
+                        linestyle=":",
+                        linewidth=1.0,
+                        label="analyzer selected diagnostic",
+                    )
         ax.set_xlabel("Launched threads per SM")
         ax.set_ylabel("Avg SM utilization (%)")
         ax.set_xticks(xs)

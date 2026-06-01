@@ -230,9 +230,9 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | NCU validation context | NCU 검증 run의 `blocks_per_sm`, `unroll`, `suppress_output_store`가 측정 row와 같은지 확인 |
 | NCU tensor activity | explicit metric 또는 `ComputeWorkloadAnalysis` section에서 Tensor activity percentage를 추출해 selected Tensor Core point의 profiler-side utilization evidence로 기록 |
 | ptxas resource audit | selected test/baseline kernel의 register/thread와 stack/spill bytes를 build log에서 추출 |
-| utilization target | SM utilization 최대값에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
+| utilization target | strict quality gate를 통과한 후보군 안에서 SM utilization 최대값 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
 
-출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이며 `quality_gate_summary.json`의 `selected_targets`에 들어간다. 기존 sweep logic이 고른 point라도 strict gate를 통과하지 못하면 `selected_diagnostics`로만 남긴다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다. `baseline_match_grade=generic_nop_baseline`인 결과는 utilization diagnostic으로만 보고, 최종 FP16 pJ/bit에는 쓰지 않는다.
+출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이며 `quality_gate_summary.json`의 `selected_targets`에 들어간다. Target 판정은 `quality_pass=true`인 row만 utilization reference pool로 사용하므로, L2/global traffic, NCU, energy source, denominator, 측정 해상도 gate를 통과하지 못한 high-utilization row가 최종 target을 밀어내지 못한다. `quality_gates.csv`에는 `quality_gate_selected_target`, `util_reference_scope`, `util_reference_max_pct`, `util_metric_source`, `target_selection_note`를 기록한다. 기존 sweep logic이 고른 point라도 strict gate를 통과하지 못하면 `selected_diagnostics`로만 남긴다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다. `baseline_match_grade=generic_nop_baseline`인 결과는 utilization diagnostic으로만 보고, 최종 FP16 pJ/bit에는 쓰지 않는다.
 
 최종 보고용 gate는 Nsight Compute 검증 결과까지 묶어서 실행한다.
 
@@ -362,7 +362,7 @@ python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_fine
 python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gpu0
 ```
 
-여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 선택 기준은 max SM utilization에서 0.1 percentage point 이내로 포화된 후보 중 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다.
+여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 최종 `target_pass` 선택 기준은 strict `quality_pass=true` 후보 중 max SM utilization에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다.
 
 2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 logical `m16n16k16`이며, 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*16) * 16 = 8192 bit/logical MMA`다. 이 run은 이전 matrix의 `baseline_nop` 기반 legacy diagnostic 결과이며, Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다. 현재 strict matrix는 `tensor_baseline_u32`를 사용하므로 최종 pJ/bit는 재실행 후 `quality_gate.py`의 `target_pass=true` 결과를 사용한다.
 

@@ -164,6 +164,7 @@ def load_result_dir(
                         "baseline_match_grade",
                         "quality_pass",
                         "target_pass",
+                        "quality_gate_selected_target",
                         "baseline_structural_match",
                         "energy_source_reliable",
                         "energy_trace_crosscheck_pass",
@@ -196,6 +197,11 @@ def load_result_dir(
                         "baseline_ncu_sm_activity_pct",
                         "test_ncu_tensor_activity_observed",
                         "baseline_ncu_tensor_activity_observed",
+                        "util_saturated",
+                        "util_reference_scope",
+                        "util_reference_max_pct",
+                        "util_metric_source",
+                        "target_selection_note",
                         "incremental_energy_fraction_mean",
                         "elapsed_s_mean",
                         "test_energy_j_mean",
@@ -398,9 +404,12 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
                     scatter_quality_point(ax, x, y, r, line.get_color())
                 plotted = True
             for r, x, y in zip(group, xs, ys):
-                if bool(str(r.get("selected_optimal", "")).lower() == "true") and math.isfinite(x):
-                    color = "tab:green" if quality_class(r) == "target" else "0.35"
-                    ax.axvline(x, color=color, linestyle="--", linewidth=0.9, alpha=0.55)
+                is_target = parse_bool(r.get("target_pass"))
+                is_analyzer_selected = parse_bool(r.get("selected_optimal"))
+                if (is_target or is_analyzer_selected) and math.isfinite(x):
+                    color = "tab:green" if is_target else "0.35"
+                    linestyle = "--" if is_target else ":"
+                    ax.axvline(x, color=color, linestyle=linestyle, linewidth=0.9, alpha=0.55)
                     if math.isfinite(y):
                         ax.annotate(
                             selected_annotation(r),
