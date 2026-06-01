@@ -186,6 +186,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("target_pass is not true")
     if not parse_bool(target.get("quality_pass")):
         failed.append("quality_pass is not true")
+    if not parse_bool(target.get("quality_gate_selected_target")):
+        failed.append("quality_gate_selected_target is not true; rerun quality_gate.py with current target selection")
+    if not parse_bool(target.get("util_saturated")):
+        failed.append("util_saturated is not true for the quality-gated target")
+    if str(target.get("util_reference_scope", "") or "") != "quality_pass":
+        failed.append("util_reference_scope is not quality_pass")
+    if not math.isfinite(parse_float(target.get("util_reference_max_pct"))):
+        failed.append("util_reference_max_pct is missing")
+    if str(target.get("target_selection_note", "") or "") != "quality_gate_first_saturation_point":
+        failed.append("target_selection_note does not identify the quality-gated first saturation point")
     if str(target.get("measurement_grade", "")) != "strict_nvml_counter":
         failed.append("measurement_grade is not strict_nvml_counter")
     if str(target.get("measurement_grade", "")) == "strict_nvml_counter" and not parse_bool(
@@ -369,6 +379,12 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "energy_trace_crosscheck_pass": target.get("energy_trace_crosscheck_pass", ""),
         "target_pass": target.get("target_pass", ""),
         "quality_pass": target.get("quality_pass", ""),
+        "quality_gate_selected_target": target.get("quality_gate_selected_target", ""),
+        "util_saturated": target.get("util_saturated", ""),
+        "util_reference_scope": target.get("util_reference_scope", ""),
+        "util_reference_max_pct": target.get("util_reference_max_pct", ""),
+        "util_metric_source": target.get("util_metric_source", ""),
+        "target_selection_note": target.get("target_selection_note", ""),
         "ncu_required": target.get("ncu_required", ""),
         "ncu_validation_pass": target.get("ncu_validation_pass", ""),
         "ncu_validation_context_match": target.get("ncu_validation_context_match", ""),

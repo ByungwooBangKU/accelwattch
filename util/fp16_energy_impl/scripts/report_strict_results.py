@@ -204,6 +204,13 @@ def requirement_rows(
         str(row.get("baseline_match_grade", "")) == "structural_baseline" for row in audit_rows
     )
     schema_current = bool(audit_rows) and all(parse_bool(row.get("benchmark_schema_current")) for row in audit_rows)
+    quality_selection = bool(audit_rows) and all(
+        parse_bool(row.get("quality_gate_selected_target"))
+        and parse_bool(row.get("util_saturated"))
+        and str(row.get("util_reference_scope", "")) == "quality_pass"
+        and str(row.get("target_selection_note", "")) == "quality_gate_first_saturation_point"
+        for row in audit_rows
+    )
     pipeline_manifest = bool(audit_rows) and all(
         parse_bool(row.get("pipeline_manifest_present"))
         and str(row.get("pipeline_manifest_schema", "")) == "fp16-strict-pipeline-manifest-v1"
@@ -279,6 +286,11 @@ def requirement_rows(
         row("structural baseline separation", structural, "baseline_match_grade=structural_baseline"),
         row("current benchmark schema", schema_current, "benchmark_schema_current=true"),
         row(
+            "quality-gated utilization target",
+            quality_selection,
+            "quality_gate_selected_target=true and util_reference_scope=quality_pass",
+        ),
+        row(
             "strict pipeline provenance manifest",
             pipeline_manifest,
             "strict_pipeline_manifest.json schema/status/git/binary hash",
@@ -320,6 +332,9 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "matmul_denominator_source": row.get("matmul_denominator_source", ""),
                 "tflops": row.get("tflops_mean", ""),
                 "avg_sm_util_pct": row.get("avg_sm_util_pct_mean", ""),
+                "util_reference_max_pct": row.get("util_reference_max_pct", ""),
+                "util_reference_scope": row.get("util_reference_scope", ""),
+                "target_selection_note": row.get("target_selection_note", ""),
                 "tensor_model_util_pct": row.get("tensor_model_utilization_pct_mean", ""),
                 "measurement_grade": row.get("measurement_grade", ""),
                 "baseline_match_grade": row.get("baseline_match_grade", ""),
@@ -345,6 +360,9 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
             "matmul_input_pj_per_bit": row.get("matmul_input_pj_per_bit_mean", ""),
             "tflops": row.get("tflops_mean", ""),
             "avg_sm_util_pct": row.get("avg_sm_util_pct_mean", ""),
+            "util_reference_max_pct": row.get("util_reference_max_pct", ""),
+            "util_reference_scope": row.get("util_reference_scope", ""),
+            "target_selection_note": row.get("target_selection_note", ""),
             "tensor_model_util_pct": row.get("tensor_model_utilization_pct_mean", ""),
             "measurement_grade": row.get("measurement_grade", ""),
             "baseline_match_grade": row.get("baseline_match_grade", ""),
@@ -445,6 +463,8 @@ def write_markdown(
                     "pJ/bit",
                     "TFLOPS",
                     "SM util %",
+                    "Util ref %",
+                    "Target note",
                     "Tensor model %",
                     "Energy source",
                     "Baseline",
@@ -461,6 +481,8 @@ def write_markdown(
                         fmt_value(r.get("matmul_input_pj_per_bit")),
                         fmt_value(r.get("tflops")),
                         fmt_value(r.get("avg_sm_util_pct")),
+                        fmt_value(r.get("util_reference_max_pct")),
+                        r.get("target_selection_note", ""),
                         fmt_value(r.get("tensor_model_util_pct")),
                         r.get("measurement_grade", ""),
                         r.get("baseline_match_grade", ""),
@@ -533,6 +555,7 @@ def write_markdown(
             "",
             "- Use only rows with `Publishable=yes` for final pJ/bit claims.",
             "- `pJ/bit` is logical FP16 matmul input-bit energy, not DRAM bit energy.",
+            "- `target_pass` is selected only after all quality gates pass; invalid high-utilization rows cannot define the utilization reference point.",
             "- `strict_nvml_counter` plus structural baseline, NCU validation, resource audit, and measurement-resolution gates are required for A100/H100/RTX3090 comparison.",
             "- Suite preflight must pass with `dry_run=false`; dry-run output is command validation only.",
             "- Missing A100 or H100 strict rows means the architecture comparison is incomplete, even if RTX 3090 diagnostics exist.",
