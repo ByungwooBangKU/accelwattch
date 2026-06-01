@@ -157,6 +157,8 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("energy_source_reliable is not true")
     if not parse_bool(target.get("baseline_structural_match")):
         failed.append("baseline_structural_match is not true")
+    if not parse_bool(target.get("benchmark_schema_current")):
+        failed.append("benchmark_schema_current is not true")
     if not parse_bool(target.get("ncu_required")):
         failed.append("ncu_required is not true")
     if not parse_bool(target.get("ncu_validation_pass")):
@@ -301,6 +303,15 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "threads_per_sm": target.get("threads_per_sm", ""),
         "measurement_grade": target.get("measurement_grade", ""),
         "baseline_match_grade": target.get("baseline_match_grade", ""),
+        "benchmark_schema_current": target.get("benchmark_schema_current", ""),
+        "test_benchmark_schema_versions": target.get(
+            "test_benchmark_schema_versions",
+            target.get("test_benchmark_schema_version", ""),
+        ),
+        "baseline_benchmark_schema_versions": target.get(
+            "baseline_benchmark_schema_versions",
+            target.get("baseline_benchmark_schema_version", ""),
+        ),
         "energy_trace_crosscheck_pass": target.get("energy_trace_crosscheck_pass", ""),
         "target_pass": target.get("target_pass", ""),
         "quality_pass": target.get("quality_pass", ""),
@@ -541,6 +552,9 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
             "warn_baseline_elapsed_s": args.warn_baseline_elapsed_s,
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
+        },
+        "benchmark_schema_thresholds": {
+            "expected_benchmark_schema_version": "fp16-energy-bench-v2",
         },
         "matmul_denominator_thresholds": {
             "expected_matmul_input_bits_per_logical_mma": args.expected_matmul_input_bits_per_logical_mma,

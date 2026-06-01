@@ -19,6 +19,14 @@
 
 namespace {
 
+#ifndef FP16_ENERGY_BENCH_SCHEMA_VERSION
+#define FP16_ENERGY_BENCH_SCHEMA_VERSION "fp16-energy-bench-v2"
+#endif
+
+#ifndef FP16_ENERGY_BENCH_GIT_COMMIT
+#define FP16_ENERGY_BENCH_GIT_COMMIT "unknown"
+#endif
+
 struct Args {
   std::string kernel = "fp16_half2";
   int device = 0;
@@ -1074,7 +1082,15 @@ int main(int argc, char** argv) {
   std::ostringstream os;
   os << std::setprecision(12);
   os << "{\n";
-  os << "  \"schema_version\": \"fp16-energy-bench-v1\",\n";
+  os << "  \"schema_version\": \"" << json_escape(FP16_ENERGY_BENCH_SCHEMA_VERSION)
+     << "\",\n";
+  os << "  \"schema_features\": ["
+     << "\"nvml_timed_energy_counter\", "
+     << "\"explicit_m16n16k16_denominator\", "
+     << "\"strict_denominator_provenance\""
+     << "],\n";
+  os << "  \"bench_build_git_commit\": \"" << json_escape(FP16_ENERGY_BENCH_GIT_COMMIT)
+     << "\",\n";
   os << "  \"kernel\": \"" << json_escape(args.kernel) << "\",\n";
   os << "  \"fp16_path\": \"" << fp16_path_label(args.kernel) << "\",\n";
   os << "  \"cache_policy\": \"" << cache_policy_label(args.kernel) << "\",\n";

@@ -175,6 +175,7 @@ def requirement_rows(
     structural = bool(audit_rows) and all(
         str(row.get("baseline_match_grade", "")) == "structural_baseline" for row in audit_rows
     )
+    schema_current = bool(audit_rows) and all(parse_bool(row.get("benchmark_schema_current")) for row in audit_rows)
     ncu = bool(audit_rows) and all(parse_bool(row.get("ncu_validation_pass")) for row in audit_rows)
     ncu_context = bool(audit_rows) and all(
         parse_bool(row.get("ncu_validation_context_match")) for row in audit_rows
@@ -211,6 +212,7 @@ def requirement_rows(
         row("strict audit overall pass", overall_json_pass and all_audit_pass, "strict_result_audit.json overall_pass"),
         row("NVML total-energy counter source", strict_sources, "measurement_grade=strict_nvml_counter"),
         row("structural baseline separation", structural, "baseline_match_grade=structural_baseline"),
+        row("current benchmark schema", schema_current, "benchmark_schema_current=true"),
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
         row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),
         row("ptxas resource audit has no spills", no_spill, "test/baseline_resource_has_spills=false"),
@@ -243,6 +245,7 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "tensor_model_util_pct": row.get("tensor_model_utilization_pct_mean", ""),
                 "measurement_grade": row.get("measurement_grade", ""),
                 "baseline_match_grade": row.get("baseline_match_grade", ""),
+                "benchmark_schema_current": row.get("benchmark_schema_current", ""),
                 "ncu_validation_pass": row.get("ncu_validation_pass", ""),
                 "ncu_validation_context_match": row.get("ncu_validation_context_match", ""),
                 "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),

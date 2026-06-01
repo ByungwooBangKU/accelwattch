@@ -294,6 +294,66 @@ def row_value_or_mean(row: Dict[str, Any], key: str) -> Any:
     return row.get(mean_key, "")
 
 
+def feature_set(text: Any) -> set[str]:
+    return {item.strip() for item in str(text or "").replace(";", ",").split(",") if item.strip()}
+
+
+def benchmark_schema_quality(
+    row: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[bool, List[str], List[str], Dict[str, Any]]:
+    expected = str(args.expected_benchmark_schema_version)
+    failed: List[str] = []
+    warnings: List[str] = []
+
+    if "test_benchmark_schema_versions" in row or "baseline_benchmark_schema_versions" in row:
+        test_versions = feature_set(row.get("test_benchmark_schema_versions"))
+        baseline_versions = feature_set(row.get("baseline_benchmark_schema_versions"))
+        current_schema = parse_bool(row.get("benchmark_schema_v2_all"))
+        features_required_all = parse_bool(row.get("benchmark_schema_features_required_all"))
+    else:
+        test_versions = feature_set(row.get("test_benchmark_schema_version"))
+        baseline_versions = feature_set(row.get("baseline_benchmark_schema_version"))
+        current_schema = test_versions == {expected} and baseline_versions == {expected}
+        features_required_all = True
+
+    test_features = feature_set(row.get("test_benchmark_schema_features"))
+    baseline_features = feature_set(row.get("baseline_benchmark_schema_features"))
+    required_features = {
+        "nvml_timed_energy_counter",
+        "explicit_m16n16k16_denominator",
+        "strict_denominator_provenance",
+    }
+
+    if not current_schema:
+        failed.append(
+            f"benchmark schema is not uniformly {expected}: "
+            f"test={','.join(sorted(test_versions)) or 'missing'}, "
+            f"baseline={','.join(sorted(baseline_versions)) or 'missing'}"
+        )
+    if not features_required_all:
+        failed.append("not all thread-group rows include required benchmark schema features")
+    missing_test = sorted(required_features - test_features)
+    missing_baseline = sorted(required_features - baseline_features)
+    if missing_test:
+        failed.append("test benchmark schema features missing: " + ",".join(missing_test))
+    if missing_baseline:
+        failed.append("baseline benchmark schema features missing: " + ",".join(missing_baseline))
+
+    return (
+        not failed,
+        failed,
+        warnings,
+        {
+            "current_schema": current_schema,
+            "test_versions": ",".join(sorted(test_versions)),
+            "baseline_versions": ",".join(sorted(baseline_versions)),
+            "test_features": ",".join(sorted(test_features)),
+            "baseline_features": ",".join(sorted(baseline_features)),
+        },
+    )
+
+
 def matmul_denominator_quality(
     row: Dict[str, Any],
     args: argparse.Namespace,
@@ -419,6 +479,7 @@ def pair_gate_rows(
             row.get("baseline_energy_counter_vs_trace_ratio"),
             args,
         )
+        schema_ok, schema_failed, schema_warnings, schema_info = benchmark_schema_quality(row, args)
         denom_ok, denom_failed, denom_warnings, denom_info = matmul_denominator_quality(row, args)
         test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
@@ -449,6 +510,9 @@ def pair_gate_rows(
             failed.append(source_note)
         if not baseline_ok:
             failed.append(baseline_note)
+        if not schema_ok:
+            failed.extend(schema_failed)
+        warnings.extend(schema_warnings)
         if not denom_ok:
             failed.extend(denom_failed)
         warnings.extend(denom_warnings)
@@ -508,6 +572,9 @@ def pair_gate_rows(
                 "energy_source_reliable": reliable_source,
                 "energy_trace_crosscheck_pass": trace_ok,
                 "baseline_structural_match": baseline_ok,
+                "benchmark_schema_current": schema_ok,
+                "test_benchmark_schema_version": schema_info["test_versions"],
+                "baseline_benchmark_schema_version": schema_info["baseline_versions"],
                 "matmul_denominator_valid": denom_ok,
                 "matmul_denominator_note": denom_info["note"],
                 "matmul_denominator_metadata_complete": denom_info["metadata_complete"],
@@ -692,6 +759,7 @@ def thread_gate_rows(
             row.get("baseline_energy_counter_vs_trace_ratio_mean"),
             args,
         )
+        schema_ok, schema_failed, schema_warnings, schema_info = benchmark_schema_quality(row, args)
         denom_ok, denom_failed, denom_warnings, denom_info = matmul_denominator_quality(row, args)
 
         failed: List[str] = []
@@ -710,6 +778,9 @@ def thread_gate_rows(
             failed.append("energy source is unavailable or undersampled")
         if not baseline_ok:
             failed.append(baseline_note)
+        if not schema_ok:
+            failed.extend(schema_failed)
+        warnings.extend(schema_warnings)
         if not denom_ok:
             failed.extend(denom_failed)
         warnings.extend(denom_warnings)
@@ -770,6 +841,9 @@ def thread_gate_rows(
                 "energy_source_reliable": source_ok,
                 "energy_trace_crosscheck_pass": trace_ok,
                 "baseline_structural_match": baseline_ok,
+                "benchmark_schema_current": schema_ok,
+                "test_benchmark_schema_versions": schema_info["test_versions"],
+                "baseline_benchmark_schema_versions": schema_info["baseline_versions"],
                 "matmul_denominator_valid": denom_ok,
                 "matmul_denominator_note": denom_info["note"],
                 "matmul_denominator_metadata_complete": denom_info["metadata_complete"],
@@ -921,6 +995,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "min_baseline_elapsed_s": args.min_baseline_elapsed_s,
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
+            "expected_benchmark_schema_version": args.expected_benchmark_schema_version,
             "expected_matmul_input_bits_per_logical_mma": args.expected_matmul_input_bits_per_logical_mma,
             "expected_mma_flops_per_logical_mma": args.expected_mma_flops_per_logical_mma,
             "warn_counter_trace_ratio_low": args.warn_counter_trace_ratio_low,
@@ -945,6 +1020,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
             "energy_signal_reliable requires incremental energy to be a configurable minimum fraction of test energy.",
             "measurement_resolution_reliable requires enough elapsed time and energy magnitude for stable measurement.",
+            "benchmark_schema_current requires test and baseline JSON from the current explicit-denominator "
+            "schema before a strict target can pass.",
             "matmul_denominator_valid requires the Tensor Core logical m16n16k16 denominator: "
             "8192 FP16 input bits and 8192 FLOP per logical MMA.",
             "strict denominator gates require these values to come from complete benchmark JSON metadata, "
@@ -974,6 +1051,7 @@ def main() -> int:
     parser.add_argument("--warn-baseline-elapsed-s", type=float, default=1.0)
     parser.add_argument("--min-test-energy-j", type=float, default=1.0)
     parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
+    parser.add_argument("--expected-benchmark-schema-version", default="fp16-energy-bench-v2")
     parser.add_argument("--expected-matmul-input-bits-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--expected-mma-flops-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--require-baseline-elapsed", action="store_true")

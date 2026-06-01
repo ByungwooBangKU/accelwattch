@@ -18,6 +18,25 @@ add_executable(fp16_energy_bench
 target_include_directories(fp16_energy_bench PRIVATE include)
 target_link_libraries(fp16_energy_bench PRIVATE ${CMAKE_DL_LIBS})
 
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE FP16_ENERGY_BENCH_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+endif()
+if(NOT FP16_ENERGY_BENCH_GIT_COMMIT)
+  set(FP16_ENERGY_BENCH_GIT_COMMIT "unknown")
+endif()
+
+target_compile_definitions(fp16_energy_bench PRIVATE
+  FP16_ENERGY_BENCH_SCHEMA_VERSION="fp16-energy-bench-v2"
+  FP16_ENERGY_BENCH_GIT_COMMIT="${FP16_ENERGY_BENCH_GIT_COMMIT}"
+)
+
 target_compile_options(fp16_energy_bench PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
   $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>

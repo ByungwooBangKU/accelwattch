@@ -101,6 +101,16 @@ def read_sm_util_csv(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def schema_features_text(value: Any) -> str:
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    return str(value or "")
+
+
+def schema_feature_set(value: Any) -> set[str]:
+    return {item.strip() for item in schema_features_text(value).replace(";", ",").split(",") if item.strip()}
+
+
 def integrate_power(samples: List[Dict[str, Any]], start_ns: int, end_ns: int) -> Tuple[float, float, int]:
     """Return (energy_j, avg_power_w, sample_count) inside [start_ns, end_ns].
 
@@ -186,6 +196,9 @@ def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
     return {
         **run,
         **arch,
+        "benchmark_schema_version": str(run.get("schema_version", "") or ""),
+        "benchmark_schema_features": schema_features_text(run.get("schema_features")),
+        "bench_build_git_commit": str(run.get("bench_build_git_commit", "") or ""),
         "power_energy_j": energy_j,
         "avg_power_w": avg_power_w,
         "energy_source": energy_source,
@@ -486,6 +499,12 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "wgmma_supported": bool(s.get("wgmma_supported", False)),
                 "benchmark_uses_wgmma": bool(s.get("benchmark_uses_wgmma", False)),
                 "fp16_path": s.get("fp16_path", ""),
+                "test_benchmark_schema_version": s.get("benchmark_schema_version", ""),
+                "baseline_benchmark_schema_version": "",
+                "test_benchmark_schema_features": s.get("benchmark_schema_features", ""),
+                "baseline_benchmark_schema_features": "",
+                "test_bench_build_git_commit": s.get("bench_build_git_commit", ""),
+                "baseline_bench_build_git_commit": "",
                 "test_kernel": s.get("kernel", ""),
                 "baseline_kernel": "",
                 "blocks": s.get("blocks", ""),
@@ -662,6 +681,12 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "wgmma_supported": bool(t.get("wgmma_supported", False)),
         "benchmark_uses_wgmma": bool(t.get("benchmark_uses_wgmma", False)),
         "fp16_path": t.get("fp16_path", ""),
+        "test_benchmark_schema_version": t.get("benchmark_schema_version", ""),
+        "baseline_benchmark_schema_version": b.get("benchmark_schema_version", ""),
+        "test_benchmark_schema_features": t.get("benchmark_schema_features", ""),
+        "baseline_benchmark_schema_features": b.get("benchmark_schema_features", ""),
+        "test_bench_build_git_commit": t.get("bench_build_git_commit", ""),
+        "baseline_bench_build_git_commit": b.get("bench_build_git_commit", ""),
         "test_kernel": t.get("kernel", ""),
         "baseline_kernel": b.get("kernel", ""),
         "blocks": t.get("blocks", ""),
@@ -841,6 +866,12 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "tensor_model_reference_dense_tflops": first.get("tensor_model_reference_dense_tflops", ""),
             "tensor_model_reference_sparse_tflops": first.get("tensor_model_reference_sparse_tflops", ""),
             "fp16_path": first.get("fp16_path", ""),
+            "test_benchmark_schema_version": first.get("test_benchmark_schema_version", ""),
+            "baseline_benchmark_schema_version": first.get("baseline_benchmark_schema_version", ""),
+            "test_benchmark_schema_features": first.get("test_benchmark_schema_features", ""),
+            "baseline_benchmark_schema_features": first.get("baseline_benchmark_schema_features", ""),
+            "test_bench_build_git_commit": first.get("test_bench_build_git_commit", ""),
+            "baseline_bench_build_git_commit": first.get("baseline_bench_build_git_commit", ""),
             "test_kernel": first.get("test_kernel", ""),
             "baseline_kernel": first.get("baseline_kernel", ""),
             "run_count": len(group),
@@ -958,6 +989,46 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "tensor_model_reference_dense_tflops": group[0].get("tensor_model_reference_dense_tflops", ""),
             "tensor_model_reference_sparse_tflops": group[0].get("tensor_model_reference_sparse_tflops", ""),
             "fp16_path": fp16_path,
+            "test_benchmark_schema_versions": "; ".join(
+                sorted({str(r.get("test_benchmark_schema_version", "")) for r in group if str(r.get("test_benchmark_schema_version", ""))})
+            ),
+            "baseline_benchmark_schema_versions": "; ".join(
+                sorted({str(r.get("baseline_benchmark_schema_version", "")) for r in group if str(r.get("baseline_benchmark_schema_version", ""))})
+            ),
+            "test_benchmark_schema_features": group[0].get("test_benchmark_schema_features", ""),
+            "baseline_benchmark_schema_features": group[0].get("baseline_benchmark_schema_features", ""),
+            "test_bench_build_git_commits": "; ".join(
+                sorted({str(r.get("test_bench_build_git_commit", "")) for r in group if str(r.get("test_bench_build_git_commit", ""))})
+            ),
+            "baseline_bench_build_git_commits": "; ".join(
+                sorted({str(r.get("baseline_bench_build_git_commit", "")) for r in group if str(r.get("baseline_bench_build_git_commit", ""))})
+            ),
+            "benchmark_schema_v2_count": sum(
+                1
+                for r in group
+                if str(r.get("test_benchmark_schema_version", "")) == "fp16-energy-bench-v2"
+                and str(r.get("baseline_benchmark_schema_version", "")) == "fp16-energy-bench-v2"
+            ),
+            "benchmark_schema_v2_all": all(
+                str(r.get("test_benchmark_schema_version", "")) == "fp16-energy-bench-v2"
+                and str(r.get("baseline_benchmark_schema_version", "")) == "fp16-energy-bench-v2"
+                for r in group
+            ),
+            "benchmark_schema_features_required_all": all(
+                {
+                    "nvml_timed_energy_counter",
+                    "explicit_m16n16k16_denominator",
+                    "strict_denominator_provenance",
+                }
+                <= schema_feature_set(r.get("test_benchmark_schema_features"))
+                and {
+                    "nvml_timed_energy_counter",
+                    "explicit_m16n16k16_denominator",
+                    "strict_denominator_provenance",
+                }
+                <= schema_feature_set(r.get("baseline_benchmark_schema_features"))
+                for r in group
+            ),
             "test_kernel": test_kernel,
             "baseline_kernel": baseline_kernel,
             "threads": threads,
