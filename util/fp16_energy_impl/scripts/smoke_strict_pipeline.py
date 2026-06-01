@@ -155,6 +155,60 @@ def resource_row(role: str, kernel: str, threads: int) -> Dict[str, Any]:
     }
 
 
+def compare_thread_row(threads: int, threads_per_sm: int, sm_util: float, pjbit: float, *, target: bool) -> Dict[str, Any]:
+    row = target_row("tensor_mma_f16acc", "tensor_baseline_u32", threads)
+    row.update(
+        {
+            "threads_per_sm": threads_per_sm,
+            "avg_sm_util_pct_mean": sm_util,
+            "matmul_input_pj_per_bit_mean": pjbit,
+            "tflops_mean": 600.0 + sm_util,
+            "tensor_model_utilization_pct_mean": sm_util * 0.8,
+            "pure_fp16_candidate_count": 3,
+            "valid_no_l2_count": 3,
+            "valid_count": 3,
+            "selected_optimal": "true" if target else "false",
+            "target_pass": "true" if target else "false",
+            "quality_gate_selected_target": "true" if target else "false",
+            "util_saturated": "true" if target else "false",
+            "target_selection_note": (
+                "quality_gate_first_saturation_point" if target else "quality_pass_below_saturation_band"
+            ),
+        }
+    )
+    return row
+
+
+def write_compare_dir(path: Path) -> None:
+    rows = [
+        compare_thread_row(32, 256, 60.0, 0.22, target=False),
+        compare_thread_row(64, 512, 96.0, 0.18, target=True),
+        compare_thread_row(96, 768, 96.05, 0.17, target=False),
+    ]
+    seed = {
+        "gpu": "Synthetic H100",
+        "device_name": "Synthetic H100",
+        "compute_capability": "9.0",
+        "architecture_generation": "hopper",
+        "architecture_chip": "gh100",
+        "gpu_product_class": "datacenter",
+        "recommended_cuda_arch": "90",
+    }
+    condition = {**seed, **rows[1]}
+    write_csv(path / "condition_summary.csv", [condition])
+    write_csv(path / "summary.csv", [condition])
+    write_csv(path / "thread_sweep_summary.csv", rows)
+    write_csv(path / "quality_gates.csv", rows)
+    write_csv(
+        path / "resource_audit" / "thread_resource_occupancy.csv",
+        [
+            {**seed, **resource_row("test", "tensor_mma_f16acc", 32), "threads_per_sm": 256},
+            {**seed, **resource_row("test", "tensor_mma_f16acc", 64), "threads_per_sm": 512},
+            {**seed, **resource_row("test", "tensor_mma_f16acc", 96), "threads_per_sm": 768},
+        ],
+    )
+
+
 def write_result_dir(path: Path, *, include_required_target: bool) -> None:
     wrong = target_row("fp16_half2", "baseline_regmove", 64)
     required = target_row("tensor_mma_f16acc", "tensor_baseline_u32", 128)
@@ -296,6 +350,29 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     ):
         if not (architecture_model_smoke / artifact).exists():
             raise AssertionError(f"Architecture model smoke did not write {artifact}")
+
+    compare_input = base / "compare_input"
+    compare_out = base / "compare_out"
+    write_compare_dir(compare_input)
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "compare_architectures.py"),
+            "--input",
+            str(compare_input),
+            "--outdir",
+            str(compare_out),
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    for artifact in (
+        "architecture_best_fp16.csv",
+        "architecture_thread_sweep_util_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
+        "architecture_thread_sweep_pjbit_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
+    ):
+        if not (compare_out / artifact).exists():
+            raise AssertionError(f"Architecture compare smoke did not write {artifact}")
 
     audit_good = base / "audit_good"
     run(

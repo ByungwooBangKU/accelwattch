@@ -374,10 +374,14 @@ def add_quality_legend(ax: Any) -> None:
 
 
 def selected_annotation(row: Dict[str, Any]) -> str:
+    label = "target" if quality_class(row) == "target" else "selected\nnot target"
     threads = str(row.get("threads", ""))
-    if quality_class(row) == "target":
-        return f"target\n{threads}"
-    return f"selected\nnot target\n{threads}"
+    if threads:
+        label += f"\n{threads} th/block"
+    pjbit = parse_float(row.get("matmul_input_pj_per_bit_mean"))
+    if math.isfinite(pjbit):
+        label += f"\n{pjbit:.3g} pJ/b"
+    return label
 
 
 def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None:
@@ -403,6 +407,8 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
                 for r, x, y in zip(group, xs, ys):
                     scatter_quality_point(ax, x, y, r, line.get_color())
                 plotted = True
+            finite_group_y = [y for y in ys if math.isfinite(y)]
+            top_y = max(finite_group_y) if finite_group_y else math.nan
             for r, x, y in zip(group, xs, ys):
                 is_target = parse_bool(r.get("target_pass"))
                 is_analyzer_selected = parse_bool(r.get("selected_optimal"))
@@ -411,12 +417,15 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
                     linestyle = "--" if is_target else ":"
                     ax.axvline(x, color=color, linestyle=linestyle, linewidth=0.9, alpha=0.55)
                     if math.isfinite(y):
+                        near_top = (math.isfinite(top_y) and y >= top_y - 0.1) or y >= 95.0
                         ax.annotate(
                             selected_annotation(r),
                             (x, y),
                             textcoords="offset points",
-                            xytext=(4, 5),
+                            xytext=(6, -18 if near_top else 6),
+                            va="top" if near_top else "bottom",
                             fontsize=8,
+                            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "none", "alpha": 0.75},
                         )
 
         if plotted:

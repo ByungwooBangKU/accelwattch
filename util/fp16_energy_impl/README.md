@@ -436,7 +436,7 @@ python3 scripts/smoke_strict_pipeline.py
 | `architecture_models/architecture_model_dense_peak.png` | architecture별 reference dense peak와 derived dense peak 비교 |
 | `architecture_models/architecture_model_per_sm_capacity.png` | architecture별 dense FP16 Tensor Core FLOP/SM/cycle 비교 |
 | `architecture_models/architecture_model_resource_limits.png` | architecture별 max thread/warp/block/register resource limit 비교 |
-| `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교. marker는 `target_pass`, diagnostic `quality_pass`, fail, legacy/no-gate 상태를 구분 |
+| `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교. marker는 `target_pass`, diagnostic `quality_pass`, fail, legacy/no-gate 상태를 구분하고 selected/target point에는 threads/block와 pJ/bit를 표시 |
 | `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교. marker는 quality gate 상태를 구분 |
 | `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교. `target_pass` point에는 threads/block와 pJ/bit 값을 직접 표시 |
 | `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
