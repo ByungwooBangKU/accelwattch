@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
@@ -81,6 +82,10 @@ def fmt_value(value: Any, digits: int = 4, missing: str = "") -> str:
 
 def yes_no(value: Any) -> str:
     return "yes" if parse_bool(value) else "no"
+
+
+def requirements_pass(req_rows: List[Dict[str, Any]]) -> bool:
+    return bool(req_rows) and all(str(row.get("status", "")) == "pass" for row in req_rows)
 
 
 def markdown_table(headers: Sequence[str], rows: Iterable[Sequence[Any]]) -> str:
@@ -429,8 +434,8 @@ def write_markdown(
     suite_preflight_csv: Path | None,
     links: List[str],
 ) -> None:
-    requirements_pass = bool(req_rows) and all(str(r.get("status", "")) == "pass" for r in req_rows)
-    overall = "pass" if audit_json.get("overall_pass", False) and requirements_pass else "not publishable"
+    requirement_status = requirements_pass(req_rows)
+    overall = "pass" if audit_json.get("overall_pass", False) and requirement_status else "not publishable"
     if not audit_json and rows:
         overall = "diagnostic only"
 
@@ -590,6 +595,11 @@ def main() -> int:
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--title", default="Strict FP16 Energy Result Report")
     parser.add_argument("--require-architectures", default="ga100,gh100,ga102")
+    parser.add_argument(
+        "--fail-on-missing-requirements",
+        action="store_true",
+        help="Return nonzero after writing artifacts if any report requirement is missing_or_fail",
+    )
     args = parser.parse_args()
 
     if not args.audit_dir and not args.compare_dir:
@@ -633,6 +643,12 @@ def main() -> int:
     print(f"Wrote: {args.outdir / 'fp16_strict_report_requirements.csv'}")
     if (args.outdir / "fp16_strict_report_dashboard.png").exists():
         print(f"Wrote: {args.outdir / 'fp16_strict_report_dashboard.png'}")
+    if args.fail_on_missing_requirements and not requirements_pass(req_rows):
+        failed = [row for row in req_rows if str(row.get("status", "")) != "pass"]
+        print("Strict FP16 report requirements failed:", file=sys.stderr)
+        for row in failed:
+            print(f"  - {row.get('requirement')}: {row.get('evidence')}", file=sys.stderr)
+        return 1
     return 0
 
 

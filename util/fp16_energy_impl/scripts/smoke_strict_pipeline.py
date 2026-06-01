@@ -236,6 +236,16 @@ def assert_requirement_pass(path: Path, requirement: str) -> None:
     raise AssertionError(f"Requirement {requirement!r} not found in {path}")
 
 
+def assert_requirement_fail(path: Path, requirement: str) -> None:
+    rows = read_csv_rows(path)
+    for row in rows:
+        if row.get("requirement") == requirement:
+            if row.get("status") == "pass":
+                raise AssertionError(f"Requirement {requirement!r} unexpectedly passed: {row}")
+            return
+    raise AssertionError(f"Requirement {requirement!r} not found in {path}")
+
+
 def smoke(base: Path, env: Dict[str, str]) -> None:
     good = base / "good"
     no_required = base / "no_required"
@@ -311,6 +321,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
             str(report_dir),
             "--require-architectures",
             "gh100",
+            "--fail-on-missing-requirements",
         ],
         cwd=ROOT,
         env=env,
@@ -320,6 +331,30 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     report_row = read_single_csv_row(report_dir / "fp16_strict_report_summary.csv")
     if report_row.get("target_selection_source") != "selected_targets_required_kernel_baseline":
         raise AssertionError(f"Report did not carry target selection source: {report_row}")
+
+    report_bad = base / "report_no_required"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "report_strict_results.py"),
+            "--audit-dir",
+            str(audit_bad),
+            "--architecture-model-dir",
+            str(model_dir),
+            "--suite-preflight-json",
+            str(preflight),
+            "--outdir",
+            str(report_bad),
+            "--require-architectures",
+            "gh100",
+            "--fail-on-missing-requirements",
+        ],
+        cwd=ROOT,
+        env=env,
+        expect_success=False,
+    )
+    assert_requirement_fail(report_bad / "fp16_strict_report_requirements.csv", "strict audit overall pass")
+    assert_requirement_fail(report_bad / "fp16_strict_report_requirements.csv", "required kernel target selected")
 
 
 def main() -> int:
