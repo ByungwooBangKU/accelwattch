@@ -21,7 +21,7 @@ ARCH_LIMITS: Dict[str, Dict[str, Any]] = {
 
 KERNEL_RE = re.compile(
     r"(fp16_half2|baseline_nop|baseline_regmove|tensor_mma_f16acc|tensor_mma_f32acc|"
-    r"tensor_baseline_u32|tensor_baseline_f32|memory_policy)_kernelILi(\d+)E(?:Li(\d+)E)?"
+    r"tensor_baseline_mov|tensor_baseline_u32|tensor_baseline_f32|memory_policy)_kernelILi(\d+)E(?:Li(\d+)E)?"
 )
 ENTRY_RE = re.compile(r"Compiling entry function '([^']+)' for 'sm_(\d+)'")
 SPILL_RE = re.compile(r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads")

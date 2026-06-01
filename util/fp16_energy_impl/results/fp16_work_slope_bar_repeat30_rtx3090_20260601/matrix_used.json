@@ -1,0 +1,153 @@
+{
+  "description": "Work-amount slope sweep for FP16 Tensor Core logical m16n16k16. Uses tensor_baseline_mov no-memory warp-sync structural baseline. Run without matrix calibration so unroll changes remain distinct work points; baseline repeats are longer to stabilize NVML counter power.",
+  "defaults": {
+    "blocks": 0,
+    "blocks_per_sm": 8,
+    "warmup": 2,
+    "repeats": 2,
+    "iters": 2000000,
+    "suppress_output_store": true
+  },
+  "conditions": [
+    {
+      "name": "work_slope_tensor_mma_f16acc_t064_u01",
+      "args": {
+        "threads": 64,
+        "unroll": 1
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t064_u02",
+      "args": {
+        "threads": 64,
+        "unroll": 2
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t064_u04",
+      "args": {
+        "threads": 64,
+        "unroll": 4
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t064_u08",
+      "args": {
+        "threads": 64,
+        "unroll": 8
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t064_u16",
+      "args": {
+        "threads": 64,
+        "unroll": 16
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t128_u01",
+      "args": {
+        "threads": 128,
+        "unroll": 1
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t128_u02",
+      "args": {
+        "threads": 128,
+        "unroll": 2
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t128_u04",
+      "args": {
+        "threads": 128,
+        "unroll": 4
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t128_u08",
+      "args": {
+        "threads": 128,
+        "unroll": 8
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    },
+    {
+      "name": "work_slope_tensor_mma_f16acc_t128_u16",
+      "args": {
+        "threads": 128,
+        "unroll": 16
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc"
+      }
+    }
+  ]
+}

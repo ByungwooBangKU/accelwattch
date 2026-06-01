@@ -171,7 +171,7 @@ def source_grade(test_source: str, baseline_source: str, test_samples: int, base
 
 def baseline_match_grade(test_kernel: str, baseline_kernel: str) -> Tuple[str, bool, str]:
     expected = {
-        "tensor_mma_f16acc": "tensor_baseline_u32",
+        "tensor_mma_f16acc": "tensor_baseline_mov",
         "tensor_mma_f32acc": "tensor_baseline_f32",
         "fp16_half2": "baseline_regmove",
     }.get(test_kernel)
@@ -190,6 +190,12 @@ def baseline_match_grade(test_kernel: str, baseline_kernel: str) -> Tuple[str, b
             "generic_nop_baseline",
             False,
             "rerun/use baseline_regmove for the stricter CUDA-core FP16 separation",
+        )
+    if test_kernel == "tensor_mma_f16acc" and baseline_kernel == "tensor_baseline_u32":
+        return (
+            "structural_alu_baseline",
+            False,
+            "tensor_baseline_u32 is an ALU-heavy diagnostic baseline; rerun with tensor_baseline_mov",
         )
     return ("baseline_mismatch", False, f"expected {expected}")
 
@@ -1131,7 +1137,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "valid_no_l2 means valid_basic=True and the benchmark metadata does not expect global/L2 traffic.",
             "It is not a physical proof of zero L2 traffic; Nsight Compute memory counters are still required.",
             "strict_nvml_counter is preferred for H100/A100/RTX3090 comparison; power_trace_fallback is diagnostic.",
-            "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
+            "Tensor Core final candidates must use tensor_baseline_mov/f32, not the legacy baseline_nop.",
             "energy_signal_reliable requires incremental energy to be a configurable minimum fraction of test energy.",
             "measurement_resolution_reliable requires enough elapsed time and energy magnitude for stable measurement.",
             "benchmark_schema_current requires test and baseline JSON from the current explicit-denominator "

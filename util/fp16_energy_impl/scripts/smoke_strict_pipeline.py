@@ -158,7 +158,7 @@ def resource_row(role: str, kernel: str, threads: int) -> Dict[str, Any]:
 
 
 def compare_thread_row(threads: int, threads_per_sm: int, sm_util: float, pjbit: float, *, target: bool) -> Dict[str, Any]:
-    row = target_row("tensor_mma_f16acc", "tensor_baseline_u32", threads)
+    row = target_row("tensor_mma_f16acc", "tensor_baseline_mov", threads)
     incremental_fraction = 0.03 if threads < 64 else (0.06 if target else 0.07)
     row.update(
         {
@@ -217,12 +217,12 @@ def write_compare_dir(path: Path) -> None:
 
 def quality_gate_summary_row() -> Dict[str, Any]:
     features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
-    row = target_row("tensor_mma_f16acc", "tensor_baseline_u32", 128)
+    row = target_row("tensor_mma_f16acc", "tensor_baseline_mov", 128)
     row.update(
         {
             "condition": "synthetic_quality_gate",
             "repeat_index": 0,
-            "fp16_path": "tensor_mma_f16acc_vs_tensor_baseline_u32",
+            "fp16_path": "tensor_mma_f16acc_vs_tensor_baseline_mov",
             "blocks_per_sm_requested": 8,
             "suppress_output_store": "true",
             "test_energy_source": "nvml_total_energy_counter",
@@ -282,14 +282,14 @@ def write_quality_gate_input(path: Path, *, tensor_activity_observed: bool) -> N
         path / "ncu_validation_summary.csv",
         [
             ncu_row("tensor_mma_f16acc", 128, tensor_activity_observed=tensor_activity_observed),
-            ncu_row("tensor_baseline_u32", 128),
+            ncu_row("tensor_baseline_mov", 128),
         ],
     )
 
 
 def write_result_dir(path: Path, *, include_required_target: bool, required_tensor_activity: bool = True) -> None:
     wrong = target_row("fp16_half2", "baseline_regmove", 64)
-    required = target_row("tensor_mma_f16acc", "tensor_baseline_u32", 128)
+    required = target_row("tensor_mma_f16acc", "tensor_baseline_mov", 128)
     selected_targets = [wrong, required] if include_required_target else [wrong]
     write_preflight(path / "strict_pipeline_preflight.json")
     write_csv(
@@ -315,7 +315,7 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
             ncu_row("fp16_half2", 64),
             ncu_row("baseline_regmove", 64),
             ncu_row("tensor_mma_f16acc", 128, tensor_activity_observed=required_tensor_activity),
-            ncu_row("tensor_baseline_u32", 128),
+            ncu_row("tensor_baseline_mov", 128),
         ],
     )
     write_csv(
@@ -324,7 +324,7 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
             resource_row("test", "fp16_half2", 64),
             resource_row("baseline", "baseline_regmove", 64),
             resource_row("test", "tensor_mma_f16acc", 128),
-            resource_row("baseline", "tensor_baseline_u32", 128),
+            resource_row("baseline", "tensor_baseline_mov", 128),
         ],
     )
     write_json(
@@ -530,9 +530,9 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     )
     for artifact in (
         "architecture_best_fp16.csv",
-        "architecture_thread_sweep_util_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
-        "architecture_thread_sweep_pjbit_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
-        "architecture_thread_sweep_energy_fraction_tensor_mma_f16acc_vs_tensor_baseline_u32.png",
+        "architecture_thread_sweep_util_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
+        "architecture_thread_sweep_pjbit_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
+        "architecture_thread_sweep_energy_fraction_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
     ):
         if not (compare_out / artifact).exists():
             raise AssertionError(f"Architecture compare smoke did not write {artifact}")
@@ -596,7 +596,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
         raise AssertionError(f"Positive strict audit did not pass: {good_row}")
     if good_row.get("test_kernel") != "tensor_mma_f16acc":
         raise AssertionError(f"Strict audit selected the wrong test kernel: {good_row}")
-    if good_row.get("baseline_kernel") != "tensor_baseline_u32":
+    if good_row.get("baseline_kernel") != "tensor_baseline_mov":
         raise AssertionError(f"Strict audit selected the wrong baseline kernel: {good_row}")
     if good_row.get("target_selection_source") != "selected_targets_required_kernel_baseline":
         raise AssertionError(f"Strict audit did not record required target selection: {good_row}")
@@ -626,7 +626,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     bad_row = read_single_csv_row(audit_bad / "strict_result_audit.csv")
     if bad_row.get("audit_pass") != "False":
         raise AssertionError(f"Negative strict audit unexpectedly passed: {bad_row}")
-    expected_reason = "quality_gate_summary has no selected target matching tensor_mma_f16acc/tensor_baseline_u32"
+    expected_reason = "quality_gate_summary has no selected target matching tensor_mma_f16acc/tensor_baseline_mov"
     if expected_reason not in bad_row.get("fail_reasons", ""):
         raise AssertionError(f"Negative strict audit missed required-target failure: {bad_row}")
 

@@ -822,7 +822,7 @@ def main() -> int:
     parser.add_argument("--outdir", type=Path, required=True, help="Audit output directory")
     parser.add_argument("--require-architectures", default="ga100,gh100,ga102")
     parser.add_argument("--require-kernel", default="tensor_mma_f16acc")
-    parser.add_argument("--require-baseline", default="tensor_baseline_u32")
+    parser.add_argument("--require-baseline", default="tensor_baseline_mov")
     parser.add_argument("--max-tensor-model-util-pct", type=float, default=105.0)
     parser.add_argument("--warn-tensor-model-util-pct", type=float, default=50.0)
     parser.add_argument("--min-incremental-energy-fraction", type=float, default=0.01)

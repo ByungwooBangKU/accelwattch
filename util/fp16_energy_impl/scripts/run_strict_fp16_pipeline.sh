@@ -13,6 +13,7 @@ OUTDIR=""
 REPEAT=10
 SAMPLE_MS=100
 THREADS_CSV="32,64,96,128,160,192,224,256,288,320,384"
+MATRIX_OVERRIDE=""
 BUILD_DIR="build"
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
 CMAKE_CUDA_FLAGS="${CMAKE_CUDA_FLAGS:-}"
@@ -46,6 +47,7 @@ Options:
   --repeat N           Matrix repeat count [10]
   --sample-ms N        nvidia-smi power sample interval [100]
   --threads CSV        Threads/block list for NCU validation [32,64,96,128,160,192,224,256,288,320,384]
+  --matrix FILE        Experiment matrix [configs/fp16_matmul_thread_sweep_fine.json]
   --build-dir DIR      Build directory relative to fp16_energy_impl [build]
   --skip-build         Reuse existing binary
   --skip-preflight     Skip tool/GPU/process checks before build
@@ -74,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --repeat) REPEAT="$2"; shift 2 ;;
     --sample-ms) SAMPLE_MS="$2"; shift 2 ;;
     --threads) THREADS_CSV="$2"; shift 2 ;;
+    --matrix) MATRIX_OVERRIDE="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
@@ -112,6 +115,13 @@ ENV_OUT="${OUTDIR}/env_gpu${GPU_ID}.txt"
 BUILD_LOG="${OUTDIR}/build_ptxas.log"
 RESOURCE_DIR="${OUTDIR}/resource_audit"
 BASE_MATRIX="${ROOT}/configs/fp16_matmul_thread_sweep_fine.json"
+if [[ -n "${MATRIX_OVERRIDE}" ]]; then
+  if [[ "${MATRIX_OVERRIDE}" == /* ]]; then
+    BASE_MATRIX="${MATRIX_OVERRIDE}"
+  else
+    BASE_MATRIX="${ROOT}/${MATRIX_OVERRIDE}"
+  fi
+fi
 MATRIX_PATH="${BASE_MATRIX}"
 START_MANIFEST="${OUTDIR}/strict_pipeline_manifest_start.json"
 FINAL_MANIFEST="${OUTDIR}/strict_pipeline_manifest.json"

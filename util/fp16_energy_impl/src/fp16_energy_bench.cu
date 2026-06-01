@@ -292,6 +292,7 @@ void usage(const char* argv0) {
       << "  baseline_regmove         P0 integer/register-move baseline\n"
       << "  tensor_mma_f16acc        P0 Tensor Core MMA, FP16 input + FP16 accumulate\n"
       << "  tensor_mma_f32acc        P0 Tensor Core MMA, FP16 input + FP32 accumulate\n"
+      << "  tensor_baseline_mov      P0 no-memory warp-sync baseline for f16acc output shape\n"
       << "  tensor_baseline_u32      P0 Tensor baseline for f16acc output shape\n"
       << "  tensor_baseline_f32      P0 Tensor baseline for f32acc output shape\n"
       << "  memory_default           P1 memory baseline, default load/store policy\n"
@@ -667,6 +668,39 @@ __global__ void tensor_baseline_u32_kernel(uint32_t* __restrict__ out, int iters
 }
 
 template <int UNROLL>
+__global__ void tensor_baseline_mov_kernel(uint32_t* __restrict__ out, int iters,
+                                           bool suppress_output_store) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t c0 = 0x00010001u ^ static_cast<uint32_t>(tid);
+  uint32_t c1 = 0x00020002u ^ static_cast<uint32_t>(tid << 1);
+  uint32_t c2 = 0x00030003u ^ static_cast<uint32_t>(tid << 2);
+  uint32_t c3 = 0x00040004u ^ static_cast<uint32_t>(tid << 3);
+#pragma unroll 1
+  for (int i = 0; i < iters; ++i) {
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u) {
+      // Keep a side-effectful, no-memory Tensor baseline step. Pure register
+      // move cycles are optimized away for some unroll factors, while the
+      // warp barrier keeps the timed loop materialized without integer ALU or
+      // L2/global memory traffic.
+      asm volatile("bar.warp.sync 0xffffffff;\n");
+    }
+  }
+  if (suppress_output_store) {
+    consume_u32(c0);
+    consume_u32(c1);
+    consume_u32(c2);
+    consume_u32(c3);
+  } else {
+    const size_t base = static_cast<size_t>(tid) * 4;
+    out[base + 0] = c0;
+    out[base + 1] = c1;
+    out[base + 2] = c2;
+    out[base + 3] = c3;
+  }
+}
+
+template <int UNROLL>
 __global__ void tensor_baseline_f32_kernel(float* __restrict__ out, int iters,
                                            bool suppress_output_store) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -758,7 +792,8 @@ bool is_half2_kernel(const std::string& k) {
 }
 
 bool is_tensor_u32_kernel(const std::string& k) {
-  return k == "tensor_mma_f16acc" || k == "tensor_baseline_u32";
+  return k == "tensor_mma_f16acc" || k == "tensor_baseline_mov" ||
+         k == "tensor_baseline_u32";
 }
 
 bool is_tensor_f32_kernel(const std::string& k) {
@@ -847,6 +882,9 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
       if (args.kernel == "tensor_mma_f16acc") {
         tensor_mma_f16acc_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters,
                                                              args.suppress_output_store);
+      } else if (args.kernel == "tensor_baseline_mov") {
+        tensor_baseline_mov_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters,
+                                                                args.suppress_output_store);
       } else {
         tensor_baseline_u32_kernel<UNROLL><<<blocks, threads>>>(d_out, args.iters,
                                                                 args.suppress_output_store);
@@ -1087,7 +1125,8 @@ int main(int argc, char** argv) {
   os << "  \"schema_features\": ["
      << "\"nvml_timed_energy_counter\", "
      << "\"explicit_m16n16k16_denominator\", "
-     << "\"strict_denominator_provenance\""
+     << "\"strict_denominator_provenance\", "
+     << "\"tensor_no_memory_warpsync_baseline\""
      << "],\n";
   os << "  \"bench_build_git_commit\": \"" << json_escape(FP16_ENERGY_BENCH_GIT_COMMIT)
      << "\",\n";

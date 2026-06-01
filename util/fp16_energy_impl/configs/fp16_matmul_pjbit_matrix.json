@@ -13,7 +13,7 @@
     {
       "name": "matmul_tensor_mma_f16acc_vs_tensor_baseline",
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 3
       },

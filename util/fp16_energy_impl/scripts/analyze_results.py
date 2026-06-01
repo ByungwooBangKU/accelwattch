@@ -801,6 +801,25 @@ def metric_stats(values: List[float]) -> Dict[str, Any]:
     return {"n": n, "mean": mean, "std": std, "min": min(clean), "max": max(clean), "ci95": ci95}
 
 
+def linear_fit(xs: List[float], ys: List[float]) -> Dict[str, float]:
+    clean = [(x, y) for x, y in zip(xs, ys) if math.isfinite(x) and math.isfinite(y)]
+    n = len(clean)
+    if n < 2:
+        return {"n": n, "slope": math.nan, "intercept": math.nan, "r2": math.nan}
+    mx = sum(x for x, _ in clean) / n
+    my = sum(y for _, y in clean) / n
+    sxx = sum((x - mx) ** 2 for x, _ in clean)
+    if sxx <= 0.0:
+        return {"n": n, "slope": math.nan, "intercept": math.nan, "r2": math.nan}
+    sxy = sum((x - mx) * (y - my) for x, y in clean)
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    ss_tot = sum((y - my) ** 2 for _, y in clean)
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in clean)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
+    return {"n": n, "slope": slope, "intercept": intercept, "r2": r2}
+
+
 def formatted_counts(values: Iterable[Any]) -> str:
     counts = Counter(str(value) for value in values if str(value))
     return "; ".join(f"{key}:{counts[key]}" for key in sorted(counts))
@@ -1172,6 +1191,124 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda r: (str(r["test_kernel"]), int(r["threads"])))
 
 
+def aggregate_work_slope(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_variant: Dict[Tuple[str, str, str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if str(row.get("test_kernel", "")) not in {"tensor_mma_f16acc", "tensor_mma_f32acc"}:
+            continue
+        key = (
+            str(row.get("gpu", "")),
+            str(row.get("fp16_path", "")),
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+            str(row.get("threads", "")),
+            str(row.get("blocks_per_sm_requested", "")),
+        )
+        by_variant[key].append(row)
+
+    out: List[Dict[str, Any]] = []
+    for (gpu, fp16_path, test_kernel, baseline_kernel, threads, blocks_per_sm), group in by_variant.items():
+        valid_no_l2_rows = [r for r in group if bool(r.get("valid_no_l2", False))]
+        valid_rows = [r for r in group if bool(r.get("valid_basic", False))]
+
+        def distinct_work_points(candidates: List[Dict[str, Any]]) -> int:
+            return len(
+                {
+                    finite_float(r.get("matmul_input_bits"))
+                    for r in candidates
+                    if math.isfinite(finite_float(r.get("matmul_input_bits")))
+                    and finite_float(r.get("matmul_input_bits")) > 0.0
+                    and math.isfinite(finite_float(r.get("incremental_energy_j")))
+                }
+            )
+
+        if distinct_work_points(valid_no_l2_rows) >= 3:
+            fit_rows = valid_no_l2_rows
+            fit_scope = "valid_no_l2"
+        elif distinct_work_points(valid_rows) >= 3:
+            fit_rows = valid_rows
+            fit_scope = "valid_basic"
+        else:
+            fit_rows = group
+            fit_scope = "all_runs_diagnostic"
+
+        by_bits: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
+        for row in fit_rows:
+            bits = finite_float(row.get("matmul_input_bits"))
+            inc = finite_float(row.get("incremental_energy_j"))
+            if math.isfinite(bits) and bits > 0.0 and math.isfinite(inc):
+                by_bits[bits].append(row)
+        if len(by_bits) < 3:
+            continue
+
+        points: List[Dict[str, Any]] = []
+        for bits, bucket in sorted(by_bits.items()):
+            points.append(
+                {
+                    "matmul_input_bits": bits,
+                    "incremental_energy_j_mean": metric_stats(
+                        [finite_float(r.get("incremental_energy_j")) for r in bucket]
+                    )["mean"],
+                    "test_energy_j_mean": metric_stats([finite_float(r.get("test_energy_j")) for r in bucket])["mean"],
+                    "baseline_scaled_energy_j_mean": metric_stats(
+                        [finite_float(r.get("baseline_scaled_energy_j")) for r in bucket]
+                    )["mean"],
+                    "run_count": len(bucket),
+                    "valid_no_l2_count": sum(1 for r in bucket if bool(r.get("valid_no_l2", False))),
+                    "denominator_valid_count": sum(1 for r in bucket if bool(r.get("matmul_denominator_valid", False))),
+                    "unroll_values": ";".join(sorted({str(r.get("unroll", "")) for r in bucket})),
+                    "iters_values": ";".join(sorted({str(r.get("iters", "")) for r in bucket})),
+                }
+            )
+
+        xs = [finite_float(p["matmul_input_bits"]) for p in points]
+        ys = [finite_float(p["incremental_energy_j_mean"]) for p in points]
+        fit = linear_fit(xs, ys)
+        slope_pj_per_bit = fit["slope"] * 1.0e12 if math.isfinite(fit["slope"]) else math.nan
+        slope_valid = bool(
+            len(points) >= 3
+            and fit_scope == "valid_no_l2"
+            and math.isfinite(slope_pj_per_bit)
+            and slope_pj_per_bit > 0.0
+            and math.isfinite(fit["r2"])
+            and fit["r2"] >= 0.80
+        )
+        first = group[0]
+        out.append(
+            {
+                "gpu": gpu,
+                "architecture_generation": first.get("architecture_generation", ""),
+                "architecture_chip": first.get("architecture_chip", ""),
+                "recommended_cuda_arch": first.get("recommended_cuda_arch", ""),
+                "fp16_path": fp16_path,
+                "test_kernel": test_kernel,
+                "baseline_kernel": baseline_kernel,
+                "threads": threads,
+                "threads_per_sm": first.get("threads_per_sm", ""),
+                "blocks_per_sm_requested": blocks_per_sm,
+                "fit_scope": fit_scope,
+                "point_count": len(points),
+                "run_count": len(group),
+                "distinct_matmul_input_bits": ";".join(f"{p['matmul_input_bits']:.12g}" for p in points),
+                "unroll_values": ";".join(sorted({str(r.get("unroll", "")) for r in group})),
+                "iters_values": ";".join(sorted({str(r.get("iters", "")) for r in group})),
+                "valid_no_l2_count": sum(1 for r in group if bool(r.get("valid_no_l2", False))),
+                "denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
+                "slope_incremental_j_per_input_bit": fit["slope"],
+                "slope_matmul_input_pj_per_bit": slope_pj_per_bit,
+                "slope_intercept_energy_j": fit["intercept"],
+                "slope_r2": fit["r2"],
+                "slope_valid": slope_valid,
+                "slope_note": (
+                    "positive incremental-energy slope across work sweep"
+                    if slope_valid
+                    else "diagnostic only; need >=3 valid no-L2 work points, positive slope, and r2>=0.80"
+                ),
+            }
+        )
+    return sorted(out, key=lambda r: (str(r["test_kernel"]), str(r["baseline_kernel"]), finite_float(r["threads"])))
+
+
 def plot_power_trace(summary: Dict[str, Any], figdir: Path) -> None:
     paths = []
     if summary.get("baseline_power_csv"):
@@ -1404,6 +1541,72 @@ def plot_scatter(summary_rows: List[Dict[str, Any]], figdir: Path) -> None:
     plt.close()
 
 
+def plot_work_slope(work_slope_rows: List[Dict[str, Any]], summary_rows: List[Dict[str, Any]], figdir: Path) -> None:
+    if not work_slope_rows:
+        return
+    by_key: Dict[Tuple[str, str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in summary_rows:
+        key = (
+            str(row.get("gpu", "")),
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+            str(row.get("threads", "")),
+            str(row.get("blocks_per_sm_requested", "")),
+        )
+        by_key[key].append(row)
+
+    for slope_row in work_slope_rows:
+        key = (
+            str(slope_row.get("gpu", "")),
+            str(slope_row.get("test_kernel", "")),
+            str(slope_row.get("baseline_kernel", "")),
+            str(slope_row.get("threads", "")),
+            str(slope_row.get("blocks_per_sm_requested", "")),
+        )
+        points_by_bits: Dict[float, List[float]] = defaultdict(list)
+        for row in by_key.get(key, []):
+            fit_scope = str(slope_row.get("fit_scope", ""))
+            if fit_scope == "valid_no_l2" and not bool(row.get("valid_no_l2", False)):
+                continue
+            if fit_scope == "valid_basic" and not bool(row.get("valid_basic", False)):
+                continue
+            bits = finite_float(row.get("matmul_input_bits"))
+            inc = finite_float(row.get("incremental_energy_j"))
+            if math.isfinite(bits) and bits > 0.0 and math.isfinite(inc):
+                points_by_bits[bits].append(inc)
+        if len(points_by_bits) < 3:
+            continue
+        xs = sorted(points_by_bits)
+        ys = [sum(points_by_bits[x]) / len(points_by_bits[x]) for x in xs]
+        slope = finite_float(slope_row.get("slope_incremental_j_per_input_bit"))
+        intercept = finite_float(slope_row.get("slope_intercept_energy_j"))
+
+        fig, ax = plt.subplots(figsize=(8, 4.8))
+        x_plot = [x / 1.0e12 for x in xs]
+        ax.scatter(x_plot, ys, label="mean measured points")
+        if math.isfinite(slope) and math.isfinite(intercept):
+            y_fit = [slope * x + intercept for x in xs]
+            label = f"fit: {finite_float(slope_row.get('slope_matmul_input_pj_per_bit')):.4g} pJ/bit"
+            ax.plot(x_plot, y_fit, color="tab:orange", label=label)
+        ax.axhline(0.0, color="0.3", linewidth=0.8, alpha=0.6)
+        ax.set_xlabel("Logical matmul input bits (1e12 bits)")
+        ax.set_ylabel("Incremental energy (J)")
+        ax.set_title(
+            "Work slope: "
+            f"{slope_row.get('test_kernel')} vs {slope_row.get('baseline_kernel')} "
+            f"t{slope_row.get('threads')}"
+        )
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        safe = (
+            "work_slope_"
+            f"{slope_row.get('test_kernel')}_vs_{slope_row.get('baseline_kernel')}_t{slope_row.get('threads')}.png"
+        ).replace("/", "_")
+        fig.savefig(figdir / safe, dpi=160)
+        plt.close(fig)
+
+
 def plot_clock_temp(rows: List[Dict[str, Any]], figdir: Path) -> None:
     # Basic per-run clock/temperature timeline from power CSV files.
     for r in rows:
@@ -1448,12 +1651,15 @@ def main() -> int:
     summary = group_pairs(enriched)
     condition_summary = aggregate_conditions(summary)
     thread_sweep_summary = aggregate_thread_sweep(summary)
+    work_slope_summary = aggregate_work_slope(summary)
 
     write_csv(args.input / "run_level_summary.csv", enriched)
     write_csv(args.input / "summary.csv", summary)
     write_csv(args.input / "condition_summary.csv", condition_summary)
     if thread_sweep_summary:
         write_csv(args.input / "thread_sweep_summary.csv", thread_sweep_summary)
+    if work_slope_summary:
+        write_csv(args.input / "work_slope_summary.csv", work_slope_summary)
 
     figdir = args.input / "figures"
     figdir.mkdir(exist_ok=True)
@@ -1463,6 +1669,7 @@ def main() -> int:
     plot_energy_separation(summary, figdir)
     plot_thread_sweep(thread_sweep_summary, figdir)
     plot_scatter(summary, figdir)
+    plot_work_slope(work_slope_summary, summary, figdir)
     for s in summary:
         plot_power_trace(s, figdir)
     plot_clock_temp(enriched, figdir)
@@ -1471,6 +1678,8 @@ def main() -> int:
     print(f"Wrote: {args.input / 'condition_summary.csv'}")
     if thread_sweep_summary:
         print(f"Wrote: {args.input / 'thread_sweep_summary.csv'}")
+    if work_slope_summary:
+        print(f"Wrote: {args.input / 'work_slope_summary.csv'}")
     print(f"Wrote figures under: {figdir}")
     return 0
 

@@ -1,5 +1,5 @@
 {
-  "description": "Fine thread-count sweep around the valid FP16 Tensor Core logical m16n16k16 matmul point. Uses tensor_baseline_u32 structural baseline. Output stores are suppressed so timed kernels do not intentionally touch L2/global memory.",
+  "description": "Fine thread-count sweep around the valid FP16 Tensor Core logical m16n16k16 matmul point. Uses tensor_baseline_mov no-memory warp-sync structural baseline. Output stores are suppressed so timed kernels do not intentionally touch L2/global memory.",
   "defaults": {
     "blocks": 0,
     "blocks_per_sm": 8,
@@ -15,7 +15,7 @@
         "threads": 32
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 100
       },
@@ -31,7 +31,7 @@
         "threads": 64
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 50
       },
@@ -47,7 +47,7 @@
         "threads": 96
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 34
       },
@@ -63,7 +63,7 @@
         "threads": 128
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 25
       },
@@ -79,7 +79,7 @@
         "threads": 160
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 20
       },
@@ -94,7 +94,7 @@
         "threads": 192
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 20
       },
@@ -109,7 +109,7 @@
         "threads": 224
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 20
       },
@@ -124,7 +124,7 @@
         "threads": 256
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 20
       },
@@ -139,7 +139,7 @@
         "threads": 288
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 20
       },
@@ -154,7 +154,7 @@
         "threads": 320
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 20
       },
@@ -169,7 +169,7 @@
         "threads": 384
       },
       "baseline": {
-        "kernel": "tensor_baseline_u32",
+        "kernel": "tensor_baseline_mov",
         "iters": 1000000,
         "repeats": 20
       },

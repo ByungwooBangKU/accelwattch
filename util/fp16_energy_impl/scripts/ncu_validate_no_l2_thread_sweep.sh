@@ -20,6 +20,7 @@ NCU_ITERS="${NCU_ITERS:-20000}"
 NCU_SUPPRESS_OUTPUT_STORE="${NCU_SUPPRESS_OUTPUT_STORE:-1}"
 NCU_REQUIRE_TENSOR_ACTIVITY="${NCU_REQUIRE_TENSOR_ACTIVITY:-1}"
 NCU_MIN_TENSOR_ACTIVITY_PCT="${NCU_MIN_TENSOR_ACTIVITY_PCT:-0.0}"
+NCU_BASELINE_KERNEL="${NCU_BASELINE_KERNEL:-tensor_baseline_mov}"
 NCU_SUPPRESS_OUTPUT_STORE_BOOL="false"
 NCU_FAILURES_CSV="${OUTDIR}/ncu_run_failures.csv"
 
@@ -84,8 +85,8 @@ for threads in "${THREADS_LIST[@]}"; do
     --kernel tensor_mma_f16acc \
     --threads "${threads}" \
     --iters "${NCU_ITERS}"
-  run_ncu "tensor_baseline_u32_t${threads}" "tensor_baseline_u32" \
-    --kernel tensor_baseline_u32 \
+  run_ncu "${NCU_BASELINE_KERNEL}_t${threads}" "${NCU_BASELINE_KERNEL}" \
+    --kernel "${NCU_BASELINE_KERNEL}" \
     --threads "${threads}" \
     --iters "${NCU_ITERS}"
 done
