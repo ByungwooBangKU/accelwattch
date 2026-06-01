@@ -360,6 +360,12 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "report": str(path),
         "kernel": kernel,
         "threads": threads,
+        "validation_blocks_per_sm": args.benchmark_blocks_per_sm,
+        "validation_unroll": args.benchmark_unroll,
+        "validation_suppress_output_store": args.benchmark_suppress_output_store,
+        "validation_warmup": args.benchmark_warmup,
+        "validation_repeats": args.benchmark_repeats,
+        "validation_iters": args.benchmark_iters,
         "expected_hmma": expected_hmma,
         "baseline_tensor": baseline_tensor,
         "validation_pass": validation_pass,
@@ -404,6 +410,12 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "report",
         "kernel",
         "threads",
+        "validation_blocks_per_sm",
+        "validation_unroll",
+        "validation_suppress_output_store",
+        "validation_warmup",
+        "validation_repeats",
+        "validation_iters",
         "expected_hmma",
         "baseline_tensor",
         "validation_pass",
@@ -556,6 +568,14 @@ def summarize(rows: List[Dict[str, Any]], input_dir: Path, args: argparse.Namesp
             "min_tensor_activity_pct": args.min_tensor_activity_pct,
             "require_tensor_activity": args.require_tensor_activity,
         },
+        "validation_context": {
+            "blocks_per_sm": args.benchmark_blocks_per_sm,
+            "unroll": args.benchmark_unroll,
+            "suppress_output_store": args.benchmark_suppress_output_store,
+            "warmup": args.benchmark_warmup,
+            "repeats": args.benchmark_repeats,
+            "iters": args.benchmark_iters,
+        },
         "counts": {
             "reports": len(rows),
             "pass": counts.get("pass", 0),
@@ -583,6 +603,12 @@ def main() -> int:
     parser.add_argument("--dram-sector-bytes", type=float, default=32.0)
     parser.add_argument("--local-sector-bytes", type=float, default=32.0)
     parser.add_argument("--min-tensor-activity-pct", type=float, default=0.0)
+    parser.add_argument("--benchmark-blocks-per-sm", default="")
+    parser.add_argument("--benchmark-unroll", default="")
+    parser.add_argument("--benchmark-suppress-output-store", default="")
+    parser.add_argument("--benchmark-warmup", default="")
+    parser.add_argument("--benchmark-repeats", default="")
+    parser.add_argument("--benchmark-iters", default="")
     parser.add_argument(
         "--require-tensor-activity",
         action="store_true",

@@ -204,6 +204,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
 | NCU validation | 최종 claim에는 `validate_ncu_reports.py`가 만든 `ncu_validation_summary.csv`를 `--require-ncu`로 연결 |
+| NCU validation context | NCU 검증 run의 `blocks_per_sm`, `unroll`, `suppress_output_store`가 측정 row와 같은지 확인 |
 | NCU tensor activity | explicit metric 또는 `ComputeWorkloadAnalysis` section에서 Tensor activity percentage를 추출해 selected Tensor Core point의 profiler-side utilization evidence로 기록 |
 | ptxas resource audit | selected test/baseline kernel의 register/thread와 stack/spill bytes를 build log에서 추출 |
 | utilization target | SM utilization 최대값에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
@@ -492,7 +493,7 @@ Thread sweep에서 선택된 후보가 L2/global memory를 의도적으로 touch
   32,64,128,256,512,1024
 ```
 
-이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 `tensor_baseline_u32`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
+이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 `tensor_baseline_u32`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. Helper는 기본적으로 strict matrix와 같은 `blocks_per_sm=8`, `unroll=8`, `suppress_output_store=true` context를 `ncu_validation_summary.csv`에 기록하고, `quality_gate.py --require-ncu`는 이 context가 측정 row와 맞는지도 확인한다. 필요한 경우 `NCU_BLOCKS_PER_SM`, `NCU_UNROLL`, `NCU_SUPPRESS_OUTPUT_STORE`, `NCU_ITERS`, `NCU_REPEATS`, `NCU_WARMUP` 환경변수로 profiler validation run의 launch context를 override한다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
 
 두 validation helper는 실행 후 `validate_ncu_reports.py`를 호출해 다음 산출물을 만든다.
 
@@ -502,7 +503,7 @@ results/ncu_*/ncu_validation_summary.json
 results/ncu_*/figures/ncu_validation_summary.png
 ```
 
-strict mode에서는 explicit DRAM/L2/local counter class가 모두 있어야 pass된다. Nsight Compute 버전별 metric 이름 차이 때문에 counter가 빠진 경우, `ncu_validation_summary.csv`의 `fail_reasons`와 `*_counter_sources`를 확인해 metric set을 조정한 뒤 다시 실행한다. `--allow-missing-counters`는 SASS token fallback을 쓰는 diagnostic 모드일 뿐, 최종 pJ/bit claim에는 사용하지 않는다. metric 이름에 `sectors`가 들어간 counter는 기본 32 bytes/sector로 normalized bytes로 변환한 뒤 threshold와 비교한다. 필요한 경우 `validate_ncu_reports.py --l2-sector-bytes`, `--dram-sector-bytes`, `--local-sector-bytes`로 조정한다.
+strict mode에서는 explicit DRAM/L2/local counter class가 모두 있어야 pass된다. Nsight Compute 버전별 metric 이름 차이 때문에 counter가 빠진 경우, `ncu_validation_summary.csv`의 `fail_reasons`, `validation_*`, `*_counter_sources`를 확인해 metric set과 validation context를 조정한 뒤 다시 실행한다. `--allow-missing-counters`는 SASS token fallback을 쓰는 diagnostic 모드일 뿐, 최종 pJ/bit claim에는 사용하지 않는다. metric 이름에 `sectors`가 들어간 counter는 기본 32 bytes/sector로 normalized bytes로 변환한 뒤 threshold와 비교한다. 필요한 경우 `validate_ncu_reports.py --l2-sector-bytes`, `--dram-sector-bytes`, `--local-sector-bytes`로 조정한다.
 
 NCU helper는 memory counter 외에 `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed`와 `sm__throughput.avg.pct_of_peak_sustained_elapsed`도 기본 metric set에 포함한다. `validate_ncu_reports.py`는 이 explicit metric이 없으면 `ComputeWorkloadAnalysis` section label에서 Tensor/SM activity percentage를 best-effort로 추출한다. 이 값은 `nvidia-smi dmon` SM utilization을 대체하지 않고, HMMA 경로가 실제 Tensor pipe를 사용했다는 profiler-side 보조 evidence로 사용한다. 최종 audit에서 이 evidence를 hard gate로 만들려면 `audit_strict_results.py --require-ncu-tensor-activity`를 사용한다.
 
@@ -547,6 +548,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `avg_gpu_util_pct`, `max_gpu_util_pct` | test interval 안의 `nvidia-smi utilization.gpu` 평균/최대값 |
 | `avg_sm_util_pct`, `max_sm_util_pct` | test interval 안의 `nvidia-smi dmon -s u` `sm` 컬럼 평균/최대값 |
 | `test_ncu_tensor_activity_pct`, `baseline_ncu_tensor_activity_pct` | NCU validation report에서 추출한 Tensor pipe activity percentage |
+| `ncu_validation_context_match` | NCU validation run의 launch context가 측정 row의 `blocks_per_sm`, `unroll`, `suppress_output_store`와 일치하는지 여부 |
 | `tensor_peak_tflops_model` | run의 SM count와 평균 SM clock으로 계산한 dense FP16 Tensor Core peak model |
 | `achieved_flops_per_sm_cycle` | measured TFLOPS를 SM count와 평균 SM clock으로 나눈 FLOP/SM/cycle |
 | `tensor_model_utilization_pct` | measured TFLOPS / `tensor_peak_tflops_model` × 100 |

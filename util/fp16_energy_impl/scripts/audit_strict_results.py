@@ -161,6 +161,8 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("ncu_required is not true")
     if not parse_bool(target.get("ncu_validation_pass")):
         failed.append("ncu_validation_pass is not true")
+    if not parse_bool(target.get("ncu_validation_context_match")):
+        failed.append("ncu_validation_context_match is not true")
     if args.require_kernel and test_kernel != args.require_kernel:
         failed.append(f"test_kernel is not {args.require_kernel}")
     if args.require_baseline and baseline_kernel != args.require_baseline:
@@ -275,6 +277,7 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "quality_pass": target.get("quality_pass", ""),
         "ncu_required": target.get("ncu_required", ""),
         "ncu_validation_pass": target.get("ncu_validation_pass", ""),
+        "ncu_validation_context_match": target.get("ncu_validation_context_match", ""),
         "valid_no_l2_count": target.get("valid_no_l2_count", ""),
         "required_valid_count": target.get("required_valid_count", ""),
         "avg_sm_util_pct_mean": target.get("avg_sm_util_pct_mean", ""),
@@ -308,6 +311,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_ncu_pass": baseline_ncu.get("validation_pass", "") if baseline_ncu else "",
         "test_ncu_memory_counter_classes_complete": test_ncu.get("memory_counter_classes_complete", "") if test_ncu else "",
         "baseline_ncu_memory_counter_classes_complete": baseline_ncu.get("memory_counter_classes_complete", "") if baseline_ncu else "",
+        "test_ncu_validation_blocks_per_sm": test_ncu.get("validation_blocks_per_sm", "") if test_ncu else "",
+        "baseline_ncu_validation_blocks_per_sm": baseline_ncu.get("validation_blocks_per_sm", "") if baseline_ncu else "",
+        "test_ncu_validation_unroll": test_ncu.get("validation_unroll", "") if test_ncu else "",
+        "baseline_ncu_validation_unroll": baseline_ncu.get("validation_unroll", "") if baseline_ncu else "",
+        "test_ncu_validation_suppress_output_store": (
+            test_ncu.get("validation_suppress_output_store", "") if test_ncu else ""
+        ),
+        "baseline_ncu_validation_suppress_output_store": (
+            baseline_ncu.get("validation_suppress_output_store", "") if baseline_ncu else ""
+        ),
         "test_ncu_l2_counter_total": test_ncu.get("l2_counter_total", "") if test_ncu else "",
         "baseline_ncu_l2_counter_total": baseline_ncu.get("l2_counter_total", "") if baseline_ncu else "",
         "test_ncu_dram_counter_total": test_ncu.get("dram_counter_total", "") if test_ncu else "",

@@ -72,6 +72,52 @@ def ncu_row(kernel: str, threads: Any, ncu_rows: Dict[Tuple[str, str], Dict[str,
     return ncu_rows.get((kernel, thread_text)) or ncu_rows.get((kernel, "")) or {}
 
 
+def ncu_context_status(
+    result_row: Dict[str, Any],
+    ncu: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[bool, List[str], List[str]]:
+    if not ncu:
+        return (False, ["missing NCU validation row"], [])
+
+    failed: List[str] = []
+    warnings: List[str] = []
+
+    comparisons = [
+        ("blocks_per_sm_requested", "validation_blocks_per_sm", "blocks_per_sm"),
+        ("unroll", "validation_unroll", "unroll"),
+    ]
+    for result_key, ncu_key, label in comparisons:
+        expected = parse_float(result_row.get(result_key))
+        observed = parse_float(ncu.get(ncu_key))
+        if not math.isfinite(observed):
+            msg = f"NCU validation {label} context is missing"
+            if args.require_ncu:
+                failed.append(msg)
+            else:
+                warnings.append(msg)
+            continue
+        if math.isfinite(expected) and int(round(expected)) != int(round(observed)):
+            failed.append(
+                f"NCU validation {label} {int(round(observed))} != measurement {int(round(expected))}"
+            )
+
+    if "validation_suppress_output_store" in ncu and str(ncu.get("validation_suppress_output_store", "")).strip():
+        expected_store = parse_bool(result_row.get("suppress_output_store"))
+        observed_store = parse_bool(ncu.get("validation_suppress_output_store"))
+        if expected_store != observed_store:
+            failed.append(
+                "NCU validation suppress_output_store "
+                f"{observed_store} != measurement {expected_store}"
+            )
+    elif args.require_ncu:
+        failed.append("NCU validation suppress_output_store context is missing")
+    else:
+        warnings.append("NCU validation suppress_output_store context is missing")
+
+    return (not failed, failed, warnings)
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -300,6 +346,13 @@ def pair_gate_rows(
         )
         baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows)
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
+        test_context_ok, test_context_failed, test_context_warnings = ncu_context_status(row, test_ncu, args)
+        baseline_context_ok, baseline_context_failed, baseline_context_warnings = ncu_context_status(
+            row,
+            baseline_ncu,
+            args,
+        )
+        ncu_context_ok = bool(test_context_ok and baseline_context_ok)
 
         failed: List[str] = []
         warnings: List[str] = []
@@ -336,6 +389,15 @@ def pair_gate_rows(
             failed.append(f"NCU validation failed or missing: test={test_ncu_note}; baseline={baseline_ncu_note}")
         elif args.ncu_summary and not ncu_ok:
             warnings.append(f"NCU validation not passing: test={test_ncu_note}; baseline={baseline_ncu_note}")
+        if args.require_ncu and not ncu_context_ok:
+            failed.extend([f"test NCU context: {msg}" for msg in test_context_failed])
+            failed.extend([f"baseline NCU context: {msg}" for msg in baseline_context_failed])
+        elif args.ncu_summary and not ncu_context_ok:
+            warnings.extend([f"test NCU context: {msg}" for msg in test_context_failed + test_context_warnings])
+            warnings.extend(
+                f"baseline NCU context: {msg}"
+                for msg in baseline_context_failed + baseline_context_warnings
+            )
 
         out.append(
             {
@@ -365,9 +427,19 @@ def pair_gate_rows(
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
+                "ncu_validation_context_match": ncu_context_ok,
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
                 "baseline_ncu_note": baseline_ncu_note,
+                "test_ncu_validation_blocks_per_sm": test_ncu.get("validation_blocks_per_sm", ""),
+                "baseline_ncu_validation_blocks_per_sm": baseline_ncu.get("validation_blocks_per_sm", ""),
+                "test_ncu_validation_unroll": test_ncu.get("validation_unroll", ""),
+                "baseline_ncu_validation_unroll": baseline_ncu.get("validation_unroll", ""),
+                "test_ncu_validation_suppress_output_store": test_ncu.get("validation_suppress_output_store", ""),
+                "baseline_ncu_validation_suppress_output_store": baseline_ncu.get(
+                    "validation_suppress_output_store",
+                    "",
+                ),
                 "test_ncu_tensor_activity_pct": test_ncu.get("tensor_activity_pct", ""),
                 "baseline_ncu_tensor_activity_pct": baseline_ncu.get("tensor_activity_pct", ""),
                 "test_ncu_sm_activity_pct": test_ncu.get("sm_activity_pct", ""),
@@ -498,6 +570,13 @@ def thread_gate_rows(
         )
         baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows)
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
+        test_context_ok, test_context_failed, test_context_warnings = ncu_context_status(row, test_ncu, args)
+        baseline_context_ok, baseline_context_failed, baseline_context_warnings = ncu_context_status(
+            row,
+            baseline_ncu,
+            args,
+        )
+        ncu_context_ok = bool(test_context_ok and baseline_context_ok)
         if source_info.get("all_nvml"):
             grade = "strict_nvml_counter"
             source_ok = True
@@ -550,10 +629,19 @@ def thread_gate_rows(
         warnings.extend(trace_warnings)
         if args.require_ncu and not ncu_ok:
             failed.append(f"NCU validation failed or missing: test={test_ncu_note}; baseline={baseline_ncu_note}")
+        if args.require_ncu and not ncu_context_ok:
+            failed.extend([f"test NCU context: {msg}" for msg in test_context_failed])
+            failed.extend([f"baseline NCU context: {msg}" for msg in baseline_context_failed])
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
         if args.ncu_summary and not args.require_ncu and not ncu_ok:
             warnings.append(f"NCU validation not passing: test={test_ncu_note}; baseline={baseline_ncu_note}")
+        if args.ncu_summary and not args.require_ncu and not ncu_context_ok:
+            warnings.extend([f"test NCU context: {msg}" for msg in test_context_failed + test_context_warnings])
+            warnings.extend(
+                f"baseline NCU context: {msg}"
+                for msg in baseline_context_failed + baseline_context_warnings
+            )
 
         quality_pass = not failed
         target_pass = quality_pass and selected and util_saturated
@@ -590,9 +678,19 @@ def thread_gate_rows(
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
+                "ncu_validation_context_match": ncu_context_ok,
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
                 "baseline_ncu_note": baseline_ncu_note,
+                "test_ncu_validation_blocks_per_sm": test_ncu.get("validation_blocks_per_sm", ""),
+                "baseline_ncu_validation_blocks_per_sm": baseline_ncu.get("validation_blocks_per_sm", ""),
+                "test_ncu_validation_unroll": test_ncu.get("validation_unroll", ""),
+                "baseline_ncu_validation_unroll": baseline_ncu.get("validation_unroll", ""),
+                "test_ncu_validation_suppress_output_store": test_ncu.get("validation_suppress_output_store", ""),
+                "baseline_ncu_validation_suppress_output_store": baseline_ncu.get(
+                    "validation_suppress_output_store",
+                    "",
+                ),
                 "test_ncu_tensor_activity_pct": test_ncu.get("tensor_activity_pct", ""),
                 "baseline_ncu_tensor_activity_pct": baseline_ncu.get("tensor_activity_pct", ""),
                 "test_ncu_sm_activity_pct": test_ncu.get("sm_activity_pct", ""),

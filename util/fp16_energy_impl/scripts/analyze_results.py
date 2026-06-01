@@ -852,6 +852,7 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "threads_per_sm": finite_float(group[0].get("threads_per_sm")),
             "blocks_per_sm_requested": group[0].get("blocks_per_sm_requested", ""),
             "unroll": group[0].get("unroll", ""),
+            "suppress_output_store": all(bool(r.get("suppress_output_store", False)) for r in group),
             "run_count": len(group),
             "valid_count": len(valid),
             "valid_no_l2_count": len(valid_no_l2),

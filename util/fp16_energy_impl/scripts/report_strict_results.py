@@ -176,6 +176,9 @@ def requirement_rows(
         str(row.get("baseline_match_grade", "")) == "structural_baseline" for row in audit_rows
     )
     ncu = bool(audit_rows) and all(parse_bool(row.get("ncu_validation_pass")) for row in audit_rows)
+    ncu_context = bool(audit_rows) and all(
+        parse_bool(row.get("ncu_validation_context_match")) for row in audit_rows
+    )
     no_spill = bool(audit_rows) and all(
         not parse_bool(row.get("test_resource_has_spills")) and not parse_bool(row.get("baseline_resource_has_spills"))
         for row in audit_rows
@@ -201,6 +204,7 @@ def requirement_rows(
         row("NVML total-energy counter source", strict_sources, "measurement_grade=strict_nvml_counter"),
         row("structural baseline separation", structural, "baseline_match_grade=structural_baseline"),
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
+        row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),
         row("ptxas resource audit has no spills", no_spill, "test/baseline_resource_has_spills=false"),
         row("positive logical FP16 pJ/bit", positive_pjbit, "matmul_input_pj_per_bit_mean > 0"),
         row("positive Tensor Core model utilization", model_util, "tensor_model_utilization_pct_mean > 0"),
@@ -225,6 +229,7 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "measurement_grade": row.get("measurement_grade", ""),
                 "baseline_match_grade": row.get("baseline_match_grade", ""),
                 "ncu_validation_pass": row.get("ncu_validation_pass", ""),
+                "ncu_validation_context_match": row.get("ncu_validation_context_match", ""),
                 "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),
                 "fail_reasons": row.get("fail_reasons", ""),
             }
