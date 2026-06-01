@@ -168,6 +168,28 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     sm_util = parse_float(target.get("avg_sm_util_pct_mean"))
     if not math.isfinite(sm_util):
         warnings.append("avg_sm_util_pct_mean is missing")
+    elapsed_s = parse_float(target.get("elapsed_s_mean"))
+    baseline_elapsed_s = parse_float(target.get("baseline_elapsed_s_mean"))
+    test_energy_j = parse_float(target.get("test_energy_j_mean"))
+    incremental_energy_j = parse_float(target.get("incremental_energy_j_mean"))
+    if not math.isfinite(elapsed_s) or elapsed_s < args.min_test_elapsed_s:
+        failed.append(f"elapsed_s_mean is below {args.min_test_elapsed_s:g}s or missing")
+    elif elapsed_s < args.warn_test_elapsed_s:
+        warnings.append(f"elapsed_s_mean {elapsed_s:.4g}s < warning threshold {args.warn_test_elapsed_s:g}s")
+    if math.isfinite(baseline_elapsed_s) and baseline_elapsed_s > 0.0:
+        if baseline_elapsed_s < args.min_baseline_elapsed_s:
+            failed.append(f"baseline_elapsed_s_mean is below {args.min_baseline_elapsed_s:g}s")
+        elif baseline_elapsed_s < args.warn_baseline_elapsed_s:
+            warnings.append(
+                f"baseline_elapsed_s_mean {baseline_elapsed_s:.4g}s < warning threshold "
+                f"{args.warn_baseline_elapsed_s:g}s"
+            )
+    elif args.require_baseline_elapsed:
+        failed.append("baseline_elapsed_s_mean is missing")
+    if not math.isfinite(test_energy_j) or test_energy_j < args.min_test_energy_j:
+        failed.append(f"test_energy_j_mean is below {args.min_test_energy_j:g} J or missing")
+    if not math.isfinite(incremental_energy_j) or incremental_energy_j < args.min_incremental_energy_j:
+        failed.append(f"incremental_energy_j_mean is below {args.min_incremental_energy_j:g} J or missing")
     inc_fraction = parse_float(target.get("incremental_energy_fraction_mean"))
     base_fraction = parse_float(target.get("baseline_energy_fraction_mean"))
     if not math.isfinite(inc_fraction) or inc_fraction <= 0.0:
@@ -242,11 +264,15 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "required_valid_count": target.get("required_valid_count", ""),
         "avg_sm_util_pct_mean": target.get("avg_sm_util_pct_mean", ""),
         "tflops_mean": target.get("tflops_mean", ""),
+        "elapsed_s_mean": target.get("elapsed_s_mean", ""),
+        "baseline_elapsed_s_mean": target.get("baseline_elapsed_s_mean", ""),
         "tensor_peak_tflops_model_mean": target.get("tensor_peak_tflops_model_mean", ""),
         "achieved_flops_per_sm_cycle_mean": target.get("achieved_flops_per_sm_cycle_mean", ""),
         "tensor_model_utilization_pct_mean": target.get("tensor_model_utilization_pct_mean", ""),
         "matmul_input_pj_per_bit_mean": target.get("matmul_input_pj_per_bit_mean", ""),
         "incremental_power_w_mean": target.get("incremental_power_w_mean", ""),
+        "test_energy_j_mean": target.get("test_energy_j_mean", ""),
+        "incremental_energy_j_mean": target.get("incremental_energy_j_mean", ""),
         "incremental_energy_fraction_mean": target.get("incremental_energy_fraction_mean", ""),
         "baseline_energy_fraction_mean": target.get("baseline_energy_fraction_mean", ""),
         "baseline_power_fraction_mean": target.get("baseline_power_fraction_mean", ""),
@@ -342,6 +368,14 @@ def plot_audit_metrics(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plot_metric(
         rows,
         outdir,
+        "elapsed_s_mean",
+        "CUDA event elapsed time (s)",
+        "Strict FP16 selected test duration",
+        "strict_result_elapsed_s.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
         "avg_sm_util_pct_mean",
         "Avg SM utilization (%)",
         "Strict FP16 selected SM utilization",
@@ -362,6 +396,14 @@ def plot_audit_metrics(rows: List[Dict[str, Any]], outdir: Path) -> None:
         "Incremental energy / test energy",
         "Strict FP16 selected incremental energy signal",
         "strict_result_incremental_energy_fraction.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
+        "incremental_energy_j_mean",
+        "Incremental energy (J)",
+        "Strict FP16 selected incremental energy magnitude",
+        "strict_result_incremental_energy_j.png",
     )
     plot_metric(
         rows,
@@ -391,6 +433,14 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
             "warn_incremental_energy_fraction": args.warn_incremental_energy_fraction,
             "max_baseline_energy_fraction": args.max_baseline_energy_fraction,
         },
+        "measurement_resolution_thresholds": {
+            "min_test_elapsed_s": args.min_test_elapsed_s,
+            "warn_test_elapsed_s": args.warn_test_elapsed_s,
+            "min_baseline_elapsed_s": args.min_baseline_elapsed_s,
+            "warn_baseline_elapsed_s": args.warn_baseline_elapsed_s,
+            "min_test_energy_j": args.min_test_energy_j,
+            "min_incremental_energy_j": args.min_incremental_energy_j,
+        },
         "counts": {
             "rows": len(rows),
             "audit_pass": sum(1 for r in rows if parse_bool(r.get("audit_pass"))),
@@ -415,6 +465,13 @@ def main() -> int:
     parser.add_argument("--min-incremental-energy-fraction", type=float, default=0.01)
     parser.add_argument("--warn-incremental-energy-fraction", type=float, default=0.05)
     parser.add_argument("--max-baseline-energy-fraction", type=float, default=0.99)
+    parser.add_argument("--min-test-elapsed-s", type=float, default=0.25)
+    parser.add_argument("--warn-test-elapsed-s", type=float, default=1.0)
+    parser.add_argument("--min-baseline-elapsed-s", type=float, default=0.25)
+    parser.add_argument("--warn-baseline-elapsed-s", type=float, default=1.0)
+    parser.add_argument("--min-test-energy-j", type=float, default=1.0)
+    parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
+    parser.add_argument("--require-baseline-elapsed", action="store_true")
     parser.add_argument("--no-fail", action="store_true", help="Write audit files but return success even if audit fails")
     args = parser.parse_args()
 

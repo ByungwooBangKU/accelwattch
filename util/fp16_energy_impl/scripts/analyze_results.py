@@ -695,6 +695,8 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         by_cond[row["condition"]].append(row)
 
     metrics = [
+        "elapsed_s",
+        "baseline_elapsed_s",
         "pj_per_flop",
         "incremental_pj_per_bit",
         "total_pj_per_bit",
@@ -704,6 +706,8 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "tflops",
         "memory_gbps",
         "incremental_power_w",
+        "test_energy_j",
+        "baseline_scaled_energy_j",
         "incremental_energy_j",
         "baseline_energy_fraction",
         "incremental_energy_fraction",
@@ -790,6 +794,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         by_variant[key].append(row)
 
     metrics = [
+        "elapsed_s",
+        "baseline_elapsed_s",
         "avg_gpu_util_pct",
         "max_gpu_util_pct",
         "avg_sm_util_pct",
@@ -798,6 +804,9 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "matmul_input_pj_per_bit",
         "pj_per_flop",
         "incremental_power_w",
+        "test_energy_j",
+        "baseline_scaled_energy_j",
+        "incremental_energy_j",
         "baseline_energy_fraction",
         "incremental_energy_fraction",
         "baseline_power_fraction",

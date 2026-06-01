@@ -156,6 +156,39 @@ def signal_quality(
     return (not failed, failed, warnings, inc, base)
 
 
+def resolution_quality(
+    elapsed_s: Any,
+    baseline_elapsed_s: Any,
+    test_energy_j: Any,
+    incremental_energy_j: Any,
+    args: argparse.Namespace,
+) -> Tuple[bool, List[str], List[str], float, float, float, float]:
+    elapsed = parse_float(elapsed_s)
+    baseline_elapsed = parse_float(baseline_elapsed_s)
+    test_energy = parse_float(test_energy_j)
+    incremental_energy = parse_float(incremental_energy_j)
+    failed: List[str] = []
+    warnings: List[str] = []
+    if not math.isfinite(elapsed) or elapsed < args.min_test_elapsed_s:
+        failed.append(f"test elapsed_s is below {args.min_test_elapsed_s:g}s or missing")
+    elif elapsed < args.warn_test_elapsed_s:
+        warnings.append(f"test elapsed_s {elapsed:.4g}s < warning threshold {args.warn_test_elapsed_s:g}s")
+    if math.isfinite(baseline_elapsed) and baseline_elapsed > 0.0:
+        if baseline_elapsed < args.min_baseline_elapsed_s:
+            failed.append(f"baseline elapsed_s is below {args.min_baseline_elapsed_s:g}s")
+        elif baseline_elapsed < args.warn_baseline_elapsed_s:
+            warnings.append(
+                f"baseline elapsed_s {baseline_elapsed:.4g}s < warning threshold {args.warn_baseline_elapsed_s:g}s"
+            )
+    elif args.require_baseline_elapsed:
+        failed.append("baseline elapsed_s is missing")
+    if not math.isfinite(test_energy) or test_energy < args.min_test_energy_j:
+        failed.append(f"test energy is below {args.min_test_energy_j:g} J or missing")
+    if not math.isfinite(incremental_energy) or incremental_energy < args.min_incremental_energy_j:
+        failed.append(f"incremental energy is below {args.min_incremental_energy_j:g} J or missing")
+    return (not failed, failed, warnings, elapsed, baseline_elapsed, test_energy, incremental_energy)
+
+
 def pair_gate_rows(
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
@@ -190,6 +223,15 @@ def pair_gate_rows(
             row.get("baseline_energy_fraction"),
             args,
         )
+        resolution_ok, resolution_failed, resolution_warnings, elapsed_s, baseline_elapsed_s, test_energy_j, inc_energy_j = (
+            resolution_quality(
+                row.get("elapsed_s"),
+                row.get("baseline_elapsed_s"),
+                row.get("test_energy_j"),
+                row.get("incremental_energy_j"),
+                args,
+            )
+        )
         test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
             str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
@@ -213,6 +255,9 @@ def pair_gate_rows(
         if not signal_ok:
             failed.extend(signal_failed)
         warnings.extend(signal_warnings)
+        if not resolution_ok:
+            failed.extend(resolution_failed)
+        warnings.extend(resolution_warnings)
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
         if not clock_stable:
@@ -251,6 +296,7 @@ def pair_gate_rows(
                 "energy_source_reliable": reliable_source,
                 "baseline_structural_match": baseline_ok,
                 "energy_signal_reliable": signal_ok,
+                "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
@@ -259,12 +305,16 @@ def pair_gate_rows(
                 "sm_util_available": sm_util_available,
                 "common_hmma_path": common_hmma,
                 "tflops": row.get("tflops", ""),
+                "elapsed_s": elapsed_s,
+                "baseline_elapsed_s": baseline_elapsed_s,
                 "tensor_peak_tflops_model": row.get("tensor_peak_tflops_model", ""),
                 "achieved_flops_per_sm_cycle": row.get("achieved_flops_per_sm_cycle", ""),
                 "tensor_model_utilization_pct": row.get("tensor_model_utilization_pct", ""),
                 "avg_sm_util_pct": row.get("avg_sm_util_pct", ""),
                 "matmul_input_pj_per_bit": row.get("matmul_input_pj_per_bit", ""),
                 "incremental_power_w": row.get("incremental_power_w", ""),
+                "test_energy_j": test_energy_j,
+                "incremental_energy_j": inc_energy_j,
                 "incremental_energy_fraction": inc_fraction,
                 "baseline_energy_fraction": base_fraction,
                 "baseline_power_fraction": row.get("baseline_power_fraction", ""),
@@ -340,6 +390,15 @@ def thread_gate_rows(
             row.get("baseline_energy_fraction_mean"),
             args,
         )
+        resolution_ok, resolution_failed, resolution_warnings, elapsed_s, baseline_elapsed_s, test_energy_j, inc_energy_j = (
+            resolution_quality(
+                row.get("elapsed_s_mean"),
+                row.get("baseline_elapsed_s_mean"),
+                row.get("test_energy_j_mean"),
+                row.get("incremental_energy_j_mean"),
+                args,
+            )
+        )
         clock_span = parse_float(row.get("clock_span_mhz_mean"))
         clock_stable = math.isfinite(clock_span) and clock_span <= args.max_clock_span_mhz
         util = util_value(row)
@@ -392,6 +451,9 @@ def thread_gate_rows(
         if not signal_ok:
             failed.extend(signal_failed)
         warnings.extend(signal_warnings)
+        if not resolution_ok:
+            failed.extend(resolution_failed)
+        warnings.extend(resolution_warnings)
         if args.require_ncu and not ncu_ok:
             failed.append(f"NCU validation failed or missing: test={test_ncu_note}; baseline={baseline_ncu_note}")
         if grade == "power_trace_fallback":
@@ -431,6 +493,7 @@ def thread_gate_rows(
                 "energy_source_reliable": source_ok,
                 "baseline_structural_match": baseline_ok,
                 "energy_signal_reliable": signal_ok,
+                "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
@@ -440,12 +503,16 @@ def thread_gate_rows(
                 "avg_sm_util_pct_mean": row.get("avg_sm_util_pct_mean", ""),
                 "avg_gpu_util_pct_mean": row.get("avg_gpu_util_pct_mean", ""),
                 "tflops_mean": row.get("tflops_mean", ""),
+                "elapsed_s_mean": elapsed_s,
+                "baseline_elapsed_s_mean": baseline_elapsed_s,
                 "tensor_peak_tflops_model_mean": row.get("tensor_peak_tflops_model_mean", ""),
                 "achieved_flops_per_sm_cycle_mean": row.get("achieved_flops_per_sm_cycle_mean", ""),
                 "tensor_model_utilization_pct_mean": row.get("tensor_model_utilization_pct_mean", ""),
                 "matmul_input_pj_per_bit_mean": row.get("matmul_input_pj_per_bit_mean", ""),
                 "matmul_input_pj_per_bit_ci95": row.get("matmul_input_pj_per_bit_ci95", ""),
                 "incremental_power_w_mean": row.get("incremental_power_w_mean", ""),
+                "test_energy_j_mean": test_energy_j,
+                "incremental_energy_j_mean": inc_energy_j,
                 "incremental_energy_fraction_mean": inc_fraction,
                 "baseline_energy_fraction_mean": base_fraction,
                 "baseline_power_fraction_mean": row.get("baseline_power_fraction_mean", ""),
@@ -542,6 +609,10 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "min_incremental_energy_fraction": args.min_incremental_energy_fraction,
             "warn_incremental_energy_fraction": args.warn_incremental_energy_fraction,
             "max_baseline_energy_fraction": args.max_baseline_energy_fraction,
+            "min_test_elapsed_s": args.min_test_elapsed_s,
+            "min_baseline_elapsed_s": args.min_baseline_elapsed_s,
+            "min_test_energy_j": args.min_test_energy_j,
+            "min_incremental_energy_j": args.min_incremental_energy_j,
             "require_ncu": bool(args.require_ncu),
             "ncu_summary": str(args.ncu_summary) if args.ncu_summary else "",
         },
@@ -560,6 +631,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "strict_nvml_counter is preferred for H100/A100/RTX3090 comparison; power_trace_fallback is diagnostic.",
             "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
             "energy_signal_reliable requires incremental energy to be a configurable minimum fraction of test energy.",
+            "measurement_resolution_reliable requires enough elapsed time and energy magnitude for stable measurement.",
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
         ],
     }
@@ -577,6 +649,13 @@ def main() -> int:
     parser.add_argument("--min-incremental-energy-fraction", type=float, default=0.01)
     parser.add_argument("--warn-incremental-energy-fraction", type=float, default=0.05)
     parser.add_argument("--max-baseline-energy-fraction", type=float, default=0.99)
+    parser.add_argument("--min-test-elapsed-s", type=float, default=0.25)
+    parser.add_argument("--warn-test-elapsed-s", type=float, default=1.0)
+    parser.add_argument("--min-baseline-elapsed-s", type=float, default=0.25)
+    parser.add_argument("--warn-baseline-elapsed-s", type=float, default=1.0)
+    parser.add_argument("--min-test-energy-j", type=float, default=1.0)
+    parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
+    parser.add_argument("--require-baseline-elapsed", action="store_true")
     parser.add_argument("--ncu-summary", type=Path, default=None, help="ncu_validation_summary.csv from validate_ncu_reports.py")
     parser.add_argument("--require-ncu", action="store_true", help="Require passing NCU validation for quality_pass")
     args = parser.parse_args()
