@@ -166,6 +166,21 @@ benchmark binary는 warmup 완료 후 CUDA event interval을 열기 직전에 en
 
 `quality_gate.py`는 NVML counter 기반 energy와 power trace 적분값의 ratio도 확인한다. 기본값은 warning-only이며, H100/Ampere 이후 `power.draw`가 다른 시간 window의 평균값일 수 있기 때문이다. 이 sanity check까지 hard gate로 쓰려면 `--require-counter-trace-agreement`를 추가한다.
 
+#### A100/H100 power API policy
+
+`power.txt`에서 정리한 대로 최종 pJ/FLOP 또는 pJ/bit 산출용 API와 trace/debug용 API를 분리한다. 이 repo의 최종 energy path는 benchmark binary 내부의 `nvmlDeviceGetTotalEnergyConsumption()` delta이고, `nvidia-smi` trace는 fallback 또는 sanity check 용도다.
+
+| API / field | A100/GA100 | H100/GH100 | 시간 의미와 제약 | 이 repo의 사용 |
+|---|---|---|---|---|
+| `nvmlDeviceGetTotalEnergyConsumption()` | 사용 | 사용 | driver reload 이후 device-level total energy 누적값, mJ. sampling API가 아니라 시작/끝 counter delta로 Joule을 계산한다. MIG/shared GPU에서는 같은 물리 GPU의 다른 workload energy가 섞일 수 있다. | 최종 `power_energy_j`, `avg_power_w`의 1순위 source |
+| `nvidia-smi power.draw` | 사용 가능 | 사용 가능 | 장비/driver별 power telemetry 의미가 다를 수 있고, H100 계열에서는 smoothing/averaging window 영향이 커질 수 있다. | NVML counter 미지원 시 fallback 적분값과 counter-vs-trace sanity check |
+| `power.draw.instant` | 사용 가능 | 사용 가능 | last measured power draw 계열 trace. polling interval을 낮춰도 실제 센서 갱신률이 그만큼 올라간다는 뜻은 아니다. | `power.csv`에 별도 컬럼으로 저장 |
+| `power.draw.average` | A100/GA100에서는 `N/A`일 수 있음 | 사용 가능 | last-second average 계열 trace. 100 ms로 polling해도 독립적인 100 ms energy sample로 해석하면 안 된다. | H100 debug trace 컬럼 |
+| `nvmlDeviceGetPowerUsage()` | instantaneous 계열로 해석 | 1초 평균 계열로 해석 | 같은 API라도 A100과 H100의 시간 의미가 다르므로 architecture 비교의 최종 energy source로 쓰지 않는다. | 직접 사용하지 않음 |
+| `module.power.draw.*` | 일반적으로 해당 없음 | GH/Hopper module telemetry에서 보일 수 있음 | module scope는 GPU-only가 아니라 CPU/기타 module component를 포함할 수 있다. | FP16 pJ/bit 계산에 사용하지 않음 |
+
+따라서 A100/H100/RTX 3090 비교에서 보고할 최종 값은 `energy_source=nvml_total_energy_counter`이고 `measurement_grade=strict_nvml_counter`인 selected target만 사용한다. `power_trace_integral` 결과는 legacy/diagnostic grade로 유지하되, strict 비교 표와 figure에는 섞지 않는다.
+
 ### Quality gate policy
 
 `analyze_results.py`가 만든 수치는 바로 최종값으로 채택하지 않고, `quality_gate.py`로 다음 조건을 확인한다.
