@@ -86,6 +86,7 @@ done
 
 AUDIT_DIR="${OUTDIR}/strict_fp16_audit"
 COMPARE_DIR="${OUTDIR}/architecture_compare_fp16"
+ARCH_MODEL_DIR="${OUTDIR}/architecture_models"
 REPORT_DIR="${OUTDIR}/strict_fp16_report"
 
 mkdir -p "${OUTDIR}"
@@ -110,6 +111,10 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/compare_architectures.py" \
   --input "${ABS_INPUTS[@]}" \
   --outdir "${COMPARE_DIR}"
+
+MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/architecture_models.py" \
+  --outdir "${ARCH_MODEL_DIR}"
 
 REPORT_ARGS=(
   --audit-dir "${AUDIT_DIR}" \
@@ -164,6 +169,7 @@ Strict FP16 postprocess complete:
   output root: ${OUTDIR}
   audit: ${AUDIT_DIR}/strict_result_audit.csv
   compare: ${COMPARE_DIR}/architecture_best_fp16.csv
+  architecture models: ${ARCH_MODEL_DIR}/architecture_model_summary.csv
   report: ${REPORT_DIR}/fp16_strict_report.md
   audit_pass: ${AUDIT_PASS}
   report_requirements_pass: ${REPORT_REQUIREMENTS_PASS}

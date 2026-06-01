@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
+import csv
 import math
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, List
 
 
 ARCH_MODELS: Dict[str, Dict[str, Any]] = {
@@ -98,6 +101,98 @@ def architecture_model_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def reference_dense_tflops(model: Dict[str, Any]) -> float:
+    flops_per_sm_cycle = parse_float(model.get("dense_tensor_fp16_flop_per_sm_cycle"))
+    sm_count = parse_float(model.get("reference_sm_count"))
+    clock_mhz = parse_float(model.get("reference_boost_clock_mhz"))
+    if (
+        math.isfinite(flops_per_sm_cycle)
+        and math.isfinite(sm_count)
+        and sm_count > 0.0
+        and math.isfinite(clock_mhz)
+        and clock_mhz > 0.0
+    ):
+        return flops_per_sm_cycle * sm_count * clock_mhz * 1.0e6 / 1.0e12
+    return math.nan
+
+
+def model_summary_rows() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for model in ARCH_MODELS.values():
+        derived = reference_dense_tflops(model)
+        reference = parse_float(model.get("reference_dense_tensor_fp16_tflops"))
+        error_pct = (
+            (derived - reference) / reference * 100.0
+            if math.isfinite(derived) and math.isfinite(reference) and reference > 0.0
+            else math.nan
+        )
+        rows.append(
+            {
+                "architecture_generation": model.get("architecture_generation", ""),
+                "architecture_chip": model.get("architecture_chip", ""),
+                "recommended_cuda_arch": model.get("recommended_cuda_arch", ""),
+                "registers_per_sm": model.get("registers_per_sm", ""),
+                "max_threads_per_sm": model.get("max_threads_per_sm", ""),
+                "max_blocks_per_sm": model.get("max_blocks_per_sm", ""),
+                "max_warps_per_sm": model.get("max_warps_per_sm", ""),
+                "dense_tensor_fp16_flop_per_sm_cycle": model.get(
+                    "dense_tensor_fp16_flop_per_sm_cycle",
+                    math.nan,
+                ),
+                "reference_sm_count": model.get("reference_sm_count", ""),
+                "reference_boost_clock_mhz": model.get("reference_boost_clock_mhz", ""),
+                "reference_dense_tensor_fp16_tflops": reference,
+                "derived_dense_tensor_fp16_tflops": derived,
+                "reference_error_pct": error_pct,
+                "reference_sparse_tensor_fp16_tflops": model.get(
+                    "reference_sparse_tensor_fp16_tflops",
+                    math.nan,
+                ),
+                "reference_source_url": model.get("reference_source_url", ""),
+                "reference_note": model.get("reference_note", ""),
+                "normalization_note": (
+                    "Dense Tensor Core peak is used only to normalize measured FP16 HMMA throughput; "
+                    "it is not an energy source and does not imply H100 WGMMA was benchmarked."
+                ),
+            }
+        )
+    return rows
+
+
+def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_model_summary(rows: List[Dict[str, Any]], outdir: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    labels = [str(row.get("architecture_chip", "")) for row in rows]
+    reference = [parse_float(row.get("reference_dense_tensor_fp16_tflops")) for row in rows]
+    derived = [parse_float(row.get("derived_dense_tensor_fp16_tflops")) for row in rows]
+    x = list(range(len(rows)))
+    width = 0.36
+
+    fig, ax = plt.subplots(figsize=(8.4, 4.8))
+    ax.bar([i - width / 2 for i in x], reference, width=width, label="reference dense TFLOPS")
+    ax.bar([i + width / 2 for i in x], derived, width=width, label="derived from SM*clock*FLOP/cycle")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Dense FP16 Tensor Core TFLOPS")
+    ax.set_title("A100/H100/RTX3090 FP16 Tensor Core peak model sanity")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(outdir / "architecture_model_dense_peak.png", dpi=160)
+    plt.close(fig)
+
+
 def tensor_peak_metrics(row: Dict[str, Any], achieved_tflops: Any) -> Dict[str, Any]:
     """Return dense Tensor Core peak-normalized metrics for the common HMMA path."""
     model = architecture_model_from_row(row)
@@ -140,3 +235,25 @@ def tensor_peak_metrics(row: Dict[str, Any], achieved_tflops: Any) -> Dict[str, 
         "achieved_flops_per_sm_cycle": achieved_flops_per_sm_cycle,
         "tensor_model_utilization_pct": utilization_pct,
     }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Write FP16 architecture model summary and sanity figures")
+    parser.add_argument("--outdir", type=Path, required=True)
+    parser.add_argument("--no-figures", action="store_true")
+    args = parser.parse_args()
+
+    rows = model_summary_rows()
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    csv_path = args.outdir / "architecture_model_summary.csv"
+    write_csv(csv_path, rows)
+    if not args.no_figures:
+        plot_model_summary(rows, args.outdir)
+    print(f"Wrote: {csv_path}")
+    if not args.no_figures:
+        print(f"Wrote: {args.outdir / 'architecture_model_dense_peak.png'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
