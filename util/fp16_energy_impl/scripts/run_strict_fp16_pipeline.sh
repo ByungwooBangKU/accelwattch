@@ -122,6 +122,7 @@ fi
 "${SCRIPT_DIR}/query_env.sh" "${NVIDIA_SMI_ID}" "${ENV_OUT}" "${BINARY}" "${GPU_ID}"
 
 RUNTIME_PREFLIGHT_JSON="${OUTDIR}/runtime_preflight.json"
+ARCH_PREFLIGHT_JSON="${OUTDIR}/architecture_preflight.json"
 "${BINARY}" \
   --device "${GPU_ID}" \
   --kernel baseline_nop \
@@ -132,6 +133,13 @@ RUNTIME_PREFLIGHT_JSON="${OUTDIR}/runtime_preflight.json"
   --repeats 1 \
   --suppress-output-store \
   --json-out "${RUNTIME_PREFLIGHT_JSON}"
+
+"${PYTHON_BIN}" "${SCRIPT_DIR}/verify_architecture.py" \
+  --input "${RUNTIME_PREFLIGHT_JSON}" \
+  --cuda-arch "${CUDA_ARCH}" \
+  --strict-chip \
+  --require-common-hmma \
+  --out "${ARCH_PREFLIGHT_JSON}"
 
 if [[ "${CALIBRATE_MATRIX}" -eq 1 ]]; then
   MATRIX_PATH="${OUTDIR}/calibrated_matrix.json"
