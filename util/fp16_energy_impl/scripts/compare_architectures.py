@@ -368,7 +368,9 @@ def plot_bar(rows: List[Dict[str, Any]], metric: str, ylabel: str, title: str, p
 def quality_class(row: Dict[str, Any]) -> str:
     has_quality = str(row.get("quality_pass", "")).strip() != ""
     if parse_bool(row.get("target_pass")):
-        return "target"
+        if str(row.get("measurement_grade", "")) == "strict_nvml_counter":
+            return "target"
+        return "diagnostic_target"
     if parse_bool(row.get("quality_pass")):
         return "quality"
     if has_quality:
@@ -382,6 +384,8 @@ def scatter_quality_point(ax: Any, x: float, y: float, row: Dict[str, Any], colo
     cls = quality_class(row)
     if cls == "target":
         ax.scatter([x], [y], marker="*", s=135, c=[color], edgecolors="black", linewidths=0.8, zorder=5)
+    elif cls == "diagnostic_target":
+        ax.scatter([x], [y], marker="D", s=70, facecolors="tab:orange", edgecolors="black", linewidths=0.8, zorder=5)
     elif cls == "quality":
         ax.scatter([x], [y], marker="o", s=52, facecolors="white", edgecolors=color, linewidths=1.5, zorder=4)
     elif cls == "failed":
@@ -395,7 +399,9 @@ def add_quality_legend(ax: Any) -> None:
 
     handles = [
         Line2D([0], [0], marker="*", color="none", markerfacecolor="0.55", markeredgecolor="black",
-               label="target_pass", markersize=10),
+               label="strict target", markersize=10),
+        Line2D([0], [0], marker="D", color="none", markerfacecolor="tab:orange", markeredgecolor="black",
+               label="diagnostic target", markersize=7),
         Line2D([0], [0], marker="o", color="none", markerfacecolor="white", markeredgecolor="0.35",
                label="quality_pass diagnostic", markersize=7),
         Line2D([0], [0], marker="x", color="tab:red", label="quality fail", markersize=7),
@@ -406,7 +412,13 @@ def add_quality_legend(ax: Any) -> None:
 
 
 def selected_annotation(row: Dict[str, Any]) -> str:
-    label = "target" if quality_class(row) == "target" else "selected\nnot target"
+    cls = quality_class(row)
+    if cls == "target":
+        label = "strict target"
+    elif cls == "diagnostic_target":
+        label = "diagnostic\ntarget"
+    else:
+        label = "selected\nnot target"
     threads = str(row.get("threads", ""))
     if threads:
         label += f"\n{threads} th/block"
@@ -464,11 +476,20 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             finite_group_y = [y for y in ys if math.isfinite(y)]
             top_y = max(finite_group_y) if finite_group_y else math.nan
             for r, x, y in zip(group, xs, ys):
-                is_target = parse_bool(r.get("target_pass"))
+                cls = quality_class(r)
+                is_target = cls == "target"
+                is_diagnostic_target = cls == "diagnostic_target"
                 is_analyzer_selected = parse_bool(r.get("selected_optimal"))
-                if (is_target or is_analyzer_selected) and math.isfinite(x):
-                    color = "tab:green" if is_target else "0.35"
-                    linestyle = "--" if is_target else ":"
+                if (is_target or is_diagnostic_target or is_analyzer_selected) and math.isfinite(x):
+                    if is_target:
+                        color = "tab:green"
+                        linestyle = "--"
+                    elif is_diagnostic_target:
+                        color = "tab:orange"
+                        linestyle = "-."
+                    else:
+                        color = "0.35"
+                        linestyle = ":"
                     ax.axvline(x, color=color, linestyle=linestyle, linewidth=0.9, alpha=0.55)
                     if math.isfinite(y):
                         near_top = (math.isfinite(top_y) and y >= top_y - 0.1) or y >= 95.0

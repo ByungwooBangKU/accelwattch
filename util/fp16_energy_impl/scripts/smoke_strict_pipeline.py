@@ -386,6 +386,9 @@ def write_model_dir(path: Path) -> None:
                 "sparsity_mode": "dense_no_sparsity",
                 "uses_wgmma_model": "false",
                 "reference_source_url": "https://www.nvidia.com/en-us/data-center/h100/",
+                "tensor_core_architecture_source_url": (
+                    "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/"
+                ),
                 "reference_note": "Synthetic GH100 dense FP16 Tensor Core peak, no sparsity",
                 "dense_reference_formula": (
                     "dense_tensor_fp16_flop_per_sm_cycle * reference_sm_count * "

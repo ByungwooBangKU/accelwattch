@@ -283,6 +283,7 @@ def requirement_rows(
     ]
     model_metadata = bool(required_model_rows) and all(
         str(row.get("reference_source_url", "")).strip()
+        and str(row.get("tensor_core_architecture_source_url", "")).strip()
         and str(row.get("reference_note", "")).strip()
         and str(row.get("dense_reference_formula", "")).strip()
         and str(row.get("common_tensor_instruction_path", "")).strip()

@@ -33,6 +33,10 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "reference_dense_tensor_fp16_tflops": 312.0,
         "reference_sparse_tensor_fp16_tflops": 624.0,
         "reference_source_url": "https://www.nvidia.com/en-us/data-center/a100/",
+        "tensor_core_architecture_source_url": (
+            "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/"
+            "nvidia-ampere-architecture-whitepaper.pdf"
+        ),
         "reference_note": "A100 SXM dense FP16 Tensor Core peak, no sparsity",
         "sparsity_mode": "dense_no_sparsity",
         "uses_wgmma_model": False,
@@ -54,6 +58,10 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
             "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/"
             "NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf"
         ),
+        "tensor_core_architecture_source_url": (
+            "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/"
+            "NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf"
+        ),
         "reference_note": "RTX 3090 FE dense FP16 Tensor Core peak, no sparsity",
         "sparsity_mode": "dense_no_sparsity",
         "uses_wgmma_model": False,
@@ -72,9 +80,13 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "reference_dense_tensor_fp16_tflops": 989.5,
         "reference_sparse_tensor_fp16_tflops": 1979.0,
         "reference_source_url": "https://www.nvidia.com/en-us/data-center/h100/",
+        "tensor_core_architecture_source_url": (
+            "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/"
+        ),
         "reference_note": (
-            "H100 SXM dense FP16 Tensor Core peak model, no sparsity; NVIDIA's public H100 "
-            "product table marks FP16 Tensor Core values with sparsity, so dense is half"
+            "H100 SXM dense FP16 Tensor Core peak model, no sparsity; public H100 product "
+            "tables mark FP16 Tensor Core values with sparsity, while the Hopper architecture "
+            "table separates dense and sparse throughput"
         ),
         "sparsity_mode": "dense_no_sparsity",
         "uses_wgmma_model": False,
@@ -179,6 +191,7 @@ def model_summary_rows() -> List[Dict[str, Any]]:
                 "sparsity_mode": model.get("sparsity_mode", ""),
                 "uses_wgmma_model": model.get("uses_wgmma_model", ""),
                 "reference_source_url": model.get("reference_source_url", ""),
+                "tensor_core_architecture_source_url": model.get("tensor_core_architecture_source_url", ""),
                 "reference_note": model.get("reference_note", ""),
                 "dense_reference_formula": DERIVED_DENSE_FORMULA,
                 "common_tensor_instruction_path": COMMON_TENSOR_INSTRUCTION_PATH,
