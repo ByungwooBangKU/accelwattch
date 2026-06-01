@@ -310,6 +310,8 @@ def matmul_denominator_quality(
                 "input_bits_per_logical_mma": math.nan,
                 "flops_per_logical_mma": math.nan,
                 "logical_mma_count": math.nan,
+                "metadata_complete": False,
+                "source": "not_applicable",
             },
         )
 
@@ -317,6 +319,11 @@ def matmul_denominator_quality(
     if not str(valid_token).strip():
         valid_token = row.get("matmul_denominator_valid_all", "")
     metadata_valid = parse_bool(valid_token)
+    complete_token = row.get("matmul_denominator_metadata_complete", "")
+    if not str(complete_token).strip():
+        complete_token = row.get("matmul_denominator_metadata_complete_all", "")
+    metadata_complete = parse_bool(complete_token)
+    source = str(row.get("matmul_denominator_source", "") or "")
     input_bits = parse_float(row_value_or_mean(row, "matmul_input_bits_per_logical_mma"))
     flops = parse_float(row_value_or_mean(row, "matmul_flops_per_logical_mma"))
     mma_count = parse_float(row_value_or_mean(row, "matmul_logical_mma_count"))
@@ -324,6 +331,10 @@ def matmul_denominator_quality(
 
     failed: List[str] = []
     warnings: List[str] = []
+    if not metadata_complete:
+        failed.append("matmul denominator metadata is not complete in benchmark JSON")
+    if source != "bench_json_metadata":
+        failed.append(f"matmul denominator source is {source or 'missing'}, not bench_json_metadata")
     if not metadata_valid:
         failed.append("matmul logical denominator metadata is missing or invalid")
     if not math.isfinite(input_bits) or abs(input_bits - args.expected_matmul_input_bits_per_logical_mma) > 1e-6:
@@ -350,6 +361,8 @@ def matmul_denominator_quality(
             "input_bits_per_logical_mma": input_bits,
             "flops_per_logical_mma": flops,
             "logical_mma_count": mma_count,
+            "metadata_complete": metadata_complete,
+            "source": source,
         },
     )
 
@@ -497,6 +510,8 @@ def pair_gate_rows(
                 "baseline_structural_match": baseline_ok,
                 "matmul_denominator_valid": denom_ok,
                 "matmul_denominator_note": denom_info["note"],
+                "matmul_denominator_metadata_complete": denom_info["metadata_complete"],
+                "matmul_denominator_source": denom_info["source"],
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
@@ -757,6 +772,8 @@ def thread_gate_rows(
                 "baseline_structural_match": baseline_ok,
                 "matmul_denominator_valid": denom_ok,
                 "matmul_denominator_note": denom_info["note"],
+                "matmul_denominator_metadata_complete": denom_info["metadata_complete"],
+                "matmul_denominator_source": denom_info["source"],
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
                 "ncu_validation_pass": ncu_ok,
@@ -930,6 +947,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "measurement_resolution_reliable requires enough elapsed time and energy magnitude for stable measurement.",
             "matmul_denominator_valid requires the Tensor Core logical m16n16k16 denominator: "
             "8192 FP16 input bits and 8192 FLOP per logical MMA.",
+            "strict denominator gates require these values to come from complete benchmark JSON metadata, "
+            "not analyzer-only legacy fallback formulas.",
             "energy_trace_crosscheck_pass compares NVML total-energy delta with nvidia-smi power trace integration; "
             "it is a warning by default because power.draw may be averaged over a different window.",
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",

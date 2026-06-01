@@ -335,9 +335,24 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, Any]:
             "matmul_output_bits_per_logical_mma": math.nan,
             "matmul_arithmetic_read_bits_per_logical_mma": math.nan,
             "matmul_register_read_write_bits_per_logical_mma": math.nan,
+            "matmul_denominator_metadata_complete": False,
+            "matmul_denominator_source": "not_applicable",
             "matmul_denominator_valid": False,
             "matmul_denominator_note": "not_tensor_matmul_kernel",
         }
+
+    required_metadata_keys = [
+        "mma_logical_shape",
+        "mma_logical_count_estimate",
+        "mma_flops_per_logical_mma",
+        "mma_input_bits_per_logical_mma",
+        "mma_accumulator_bits_per_logical_mma",
+        "mma_output_bits_per_logical_mma",
+        "mma_arithmetic_read_bits_per_logical_mma",
+        "mma_register_read_write_bits_per_logical_mma",
+    ]
+    metadata_complete = all(key in run and str(run.get(key, "")).strip() for key in required_metadata_keys)
+    denominator_source = "bench_json_metadata" if metadata_complete else "derived_legacy_formula"
 
     mma_m = finite_float(run.get("mma_m"), 16.0)
     mma_n = finite_float(run.get("mma_n"), 16.0)
@@ -382,7 +397,8 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, Any]:
         or close(metadata_mma_count, mma_count_from_ops, rel_tol=1e-9, abs_tol=1.0)
     )
     denominator_valid = bool(
-        shape_valid
+        metadata_complete
+        and shape_valid
         and close(flops_per_logical_mma, 8192.0)
         and close(input_bits_per_mma, 8192.0)
         and close(input_bits_per_mma, expected_input_bits_per_mma)
@@ -394,6 +410,8 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, Any]:
     )
     if denominator_valid:
         denominator_note = "logical_m16n16k16_input_bits_8192"
+    elif not metadata_complete:
+        denominator_note = "missing explicit benchmark JSON logical MMA denominator metadata"
     else:
         denominator_note = (
             "invalid logical MMA denominator: "
@@ -415,6 +433,8 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, Any]:
         "matmul_output_bits_per_logical_mma": output_bits_per_mma,
         "matmul_arithmetic_read_bits_per_logical_mma": arithmetic_read_bits_per_mma,
         "matmul_register_read_write_bits_per_logical_mma": register_read_write_bits_per_mma,
+        "matmul_denominator_metadata_complete": metadata_complete,
+        "matmul_denominator_source": denominator_source,
         "matmul_denominator_valid": denominator_valid,
         "matmul_denominator_note": denominator_note,
     }
@@ -829,6 +849,15 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
             "matmul_denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
             "matmul_denominator_valid_all": all(bool(r.get("matmul_denominator_valid", False)) for r in group),
+            "matmul_denominator_metadata_complete_count": sum(
+                1 for r in group if bool(r.get("matmul_denominator_metadata_complete", False))
+            ),
+            "matmul_denominator_metadata_complete_all": all(
+                bool(r.get("matmul_denominator_metadata_complete", False)) for r in group
+            ),
+            "matmul_denominator_source": "; ".join(
+                sorted({str(r.get("matmul_denominator_source", "")) for r in group if str(r.get("matmul_denominator_source", ""))})
+            ),
             "invalid_count": len(group) - len(valid),
             "stats_scope": "valid_basic" if valid else "all_runs_no_valid_basic",
         }
@@ -942,6 +971,15 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
             "matmul_denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
             "matmul_denominator_valid_all": all(bool(r.get("matmul_denominator_valid", False)) for r in group),
+            "matmul_denominator_metadata_complete_count": sum(
+                1 for r in group if bool(r.get("matmul_denominator_metadata_complete", False))
+            ),
+            "matmul_denominator_metadata_complete_all": all(
+                bool(r.get("matmul_denominator_metadata_complete", False)) for r in group
+            ),
+            "matmul_denominator_source": "; ".join(
+                sorted({str(r.get("matmul_denominator_source", "")) for r in group if str(r.get("matmul_denominator_source", ""))})
+            ),
             "matmul_denominator_note": "; ".join(
                 sorted({str(r.get("matmul_denominator_note", "")) for r in group if str(r.get("matmul_denominator_note", ""))})
             ),

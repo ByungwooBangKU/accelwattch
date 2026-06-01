@@ -171,6 +171,8 @@ def load_result_dir(
                         "measurement_resolution_reliable",
                         "matmul_denominator_valid",
                         "matmul_denominator_note",
+                        "matmul_denominator_metadata_complete",
+                        "matmul_denominator_source",
                         "matmul_logical_mma_count_mean",
                         "matmul_flops_per_logical_mma",
                         "matmul_input_bits_per_logical_mma",

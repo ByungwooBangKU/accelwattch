@@ -176,10 +176,18 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     if not math.isfinite(pjbit) or pjbit <= 0.0:
         failed.append("matmul_input_pj_per_bit_mean is not positive/finite")
     matmul_denominator_valid = parse_bool(target.get("matmul_denominator_valid"))
+    matmul_denominator_metadata_complete = parse_bool(target.get("matmul_denominator_metadata_complete"))
+    matmul_denominator_source = str(target.get("matmul_denominator_source", "") or "")
     matmul_input_bits_per_mma = parse_float(target.get("matmul_input_bits_per_logical_mma"))
     matmul_flops_per_mma = parse_float(target.get("matmul_flops_per_logical_mma"))
     if not matmul_denominator_valid:
         failed.append("matmul_denominator_valid is not true")
+    if not matmul_denominator_metadata_complete:
+        failed.append("matmul_denominator_metadata_complete is not true")
+    if matmul_denominator_source != "bench_json_metadata":
+        failed.append(
+            f"matmul_denominator_source is {matmul_denominator_source or 'missing'}, not bench_json_metadata"
+        )
     if (
         not math.isfinite(matmul_input_bits_per_mma)
         or abs(matmul_input_bits_per_mma - args.expected_matmul_input_bits_per_logical_mma) > 1e-6
@@ -310,6 +318,8 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "tensor_model_utilization_pct_mean": target.get("tensor_model_utilization_pct_mean", ""),
         "matmul_denominator_valid": target.get("matmul_denominator_valid", ""),
         "matmul_denominator_note": target.get("matmul_denominator_note", ""),
+        "matmul_denominator_metadata_complete": target.get("matmul_denominator_metadata_complete", ""),
+        "matmul_denominator_source": target.get("matmul_denominator_source", ""),
         "matmul_input_bits_per_logical_mma": target.get("matmul_input_bits_per_logical_mma", ""),
         "matmul_flops_per_logical_mma": target.get("matmul_flops_per_logical_mma", ""),
         "matmul_logical_mma_count_mean": target.get("matmul_logical_mma_count_mean", ""),

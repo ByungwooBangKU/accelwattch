@@ -188,6 +188,8 @@ def requirement_rows(
     )
     denominator = bool(audit_rows) and all(
         parse_bool(row.get("matmul_denominator_valid"))
+        and parse_bool(row.get("matmul_denominator_metadata_complete"))
+        and str(row.get("matmul_denominator_source", "")) == "bench_json_metadata"
         and parse_float(row.get("matmul_input_bits_per_logical_mma")) == 8192.0
         and parse_float(row.get("matmul_flops_per_logical_mma")) == 8192.0
         for row in audit_rows
@@ -215,7 +217,7 @@ def requirement_rows(
         row(
             "logical m16n16k16 denominator",
             denominator,
-            "matmul_input_bits_per_logical_mma=8192 and matmul_flops_per_logical_mma=8192",
+            "bench_json_metadata with input_bits=8192 and flops=8192",
         ),
         row("positive logical FP16 pJ/bit", positive_pjbit, "matmul_input_pj_per_bit_mean > 0"),
         row("positive Tensor Core model utilization", model_util, "tensor_model_utilization_pct_mean > 0"),
@@ -235,6 +237,7 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "threads": row.get("threads", ""),
                 "matmul_input_pj_per_bit": row.get("matmul_input_pj_per_bit_mean", ""),
                 "matmul_input_bits_per_logical_mma": row.get("matmul_input_bits_per_logical_mma", ""),
+                "matmul_denominator_source": row.get("matmul_denominator_source", ""),
                 "tflops": row.get("tflops_mean", ""),
                 "avg_sm_util_pct": row.get("avg_sm_util_pct_mean", ""),
                 "tensor_model_util_pct": row.get("tensor_model_utilization_pct_mean", ""),
