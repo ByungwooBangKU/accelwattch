@@ -168,6 +168,25 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     sm_util = parse_float(target.get("avg_sm_util_pct_mean"))
     if not math.isfinite(sm_util):
         warnings.append("avg_sm_util_pct_mean is missing")
+    inc_fraction = parse_float(target.get("incremental_energy_fraction_mean"))
+    base_fraction = parse_float(target.get("baseline_energy_fraction_mean"))
+    if not math.isfinite(inc_fraction) or inc_fraction <= 0.0:
+        failed.append("incremental_energy_fraction_mean is missing or nonpositive")
+    elif inc_fraction < args.min_incremental_energy_fraction:
+        failed.append(
+            f"incremental_energy_fraction_mean {inc_fraction:.4g} < {args.min_incremental_energy_fraction:.4g}"
+        )
+    elif inc_fraction < args.warn_incremental_energy_fraction:
+        warnings.append(
+            f"incremental_energy_fraction_mean {inc_fraction:.4g} < warning threshold "
+            f"{args.warn_incremental_energy_fraction:.4g}"
+        )
+    if not math.isfinite(base_fraction) or base_fraction < 0.0:
+        failed.append("baseline_energy_fraction_mean is missing or invalid")
+    elif base_fraction > args.max_baseline_energy_fraction:
+        failed.append(
+            f"baseline_energy_fraction_mean {base_fraction:.4g} > {args.max_baseline_energy_fraction:.4g}"
+        )
     model_util = parse_float(target.get("tensor_model_utilization_pct_mean"))
     if not math.isfinite(model_util) or model_util <= 0.0:
         failed.append("tensor_model_utilization_pct_mean is not positive/finite")
@@ -228,6 +247,9 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "tensor_model_utilization_pct_mean": target.get("tensor_model_utilization_pct_mean", ""),
         "matmul_input_pj_per_bit_mean": target.get("matmul_input_pj_per_bit_mean", ""),
         "incremental_power_w_mean": target.get("incremental_power_w_mean", ""),
+        "incremental_energy_fraction_mean": target.get("incremental_energy_fraction_mean", ""),
+        "baseline_energy_fraction_mean": target.get("baseline_energy_fraction_mean", ""),
+        "baseline_power_fraction_mean": target.get("baseline_power_fraction_mean", ""),
         "test_ncu_pass": test_ncu.get("validation_pass", "") if test_ncu else "",
         "baseline_ncu_pass": baseline_ncu.get("validation_pass", "") if baseline_ncu else "",
         "test_registers_per_thread": test_resource.get("registers_per_thread", "") if test_resource else "",
@@ -325,6 +347,22 @@ def plot_audit_metrics(rows: List[Dict[str, Any]], outdir: Path) -> None:
         "Strict FP16 selected Tensor Core model utilization",
         "strict_result_tensor_model_utilization.png",
     )
+    plot_metric(
+        rows,
+        outdir,
+        "incremental_energy_fraction_mean",
+        "Incremental energy / test energy",
+        "Strict FP16 selected incremental energy signal",
+        "strict_result_incremental_energy_fraction.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
+        "baseline_energy_fraction_mean",
+        "Baseline-scaled energy / test energy",
+        "Strict FP16 selected baseline energy fraction",
+        "strict_result_baseline_energy_fraction.png",
+    )
 
 
 def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
@@ -339,6 +377,11 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
         "tensor_model_thresholds": {
             "max_tensor_model_util_pct": args.max_tensor_model_util_pct,
             "warn_tensor_model_util_pct": args.warn_tensor_model_util_pct,
+        },
+        "energy_signal_thresholds": {
+            "min_incremental_energy_fraction": args.min_incremental_energy_fraction,
+            "warn_incremental_energy_fraction": args.warn_incremental_energy_fraction,
+            "max_baseline_energy_fraction": args.max_baseline_energy_fraction,
         },
         "counts": {
             "rows": len(rows),
@@ -361,6 +404,9 @@ def main() -> int:
     parser.add_argument("--require-baseline", default="tensor_baseline_u32")
     parser.add_argument("--max-tensor-model-util-pct", type=float, default=105.0)
     parser.add_argument("--warn-tensor-model-util-pct", type=float, default=50.0)
+    parser.add_argument("--min-incremental-energy-fraction", type=float, default=0.01)
+    parser.add_argument("--warn-incremental-energy-fraction", type=float, default=0.05)
+    parser.add_argument("--max-baseline-energy-fraction", type=float, default=0.99)
     parser.add_argument("--no-fail", action="store_true", help="Write audit files but return success even if audit fails")
     args = parser.parse_args()
 

@@ -158,6 +158,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | enough valid repeats | thread point별 `valid_no_l2_count >= max(3, ceil(run_count/2))` |
 | stable clock | 기본값으로 `clock_span_mhz <= 60` |
 | reliable energy source | `nvml_total_energy_counter` 우선. 미지원 시 power trace fallback은 최소 sample 수를 만족할 때만 diagnostic grade로 통과 |
+| reliable energy signal | 기본값으로 `incremental_energy_fraction >= 0.01`이고 `baseline_energy_fraction <= 0.99`. 0.05 미만은 warning |
 | structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
 | NCU validation | 최종 claim에는 `validate_ncu_reports.py`가 만든 `ncu_validation_summary.csv`를 `--require-ncu`로 연결 |
@@ -314,7 +315,7 @@ python3 scripts/compare_architectures.py \
   --outdir results/architecture_compare_fp16
 ```
 
-`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `resource_audit/thread_resource_occupancy.csv`에서 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
+`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `resource_audit/thread_resource_occupancy.csv`에서 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
 
 주요 산출물은 다음과 같다.
 
@@ -325,6 +326,7 @@ python3 scripts/compare_architectures.py \
 | `architecture_best_matmul_input_pj_per_bit.png` | GPU architecture별 best logical matmul input pJ/bit 비교 |
 | `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |
 | `architecture_best_tensor_model_utilization.png` | GPU architecture별 best 후보의 dense Tensor Core model utilization 비교 |
+| `architecture_best_incremental_energy_fraction.png` | GPU architecture별 best 후보의 incremental energy signal fraction 비교 |
 | `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교 |
 | `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교 |
 | `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교 |
@@ -368,6 +370,8 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/strict_fp16_audit/figures/strict_result_tflops.png` | strict selected target의 TFLOPS 비교 |
 | `results/strict_fp16_audit/figures/strict_result_sm_utilization.png` | strict selected target의 SM utilization 비교 |
 | `results/strict_fp16_audit/figures/strict_result_tensor_model_utilization.png` | strict selected target의 dense Tensor Core model utilization 비교 |
+| `results/strict_fp16_audit/figures/strict_result_incremental_energy_fraction.png` | strict selected target의 incremental energy signal fraction 비교 |
+| `results/strict_fp16_audit/figures/strict_result_baseline_energy_fraction.png` | strict selected target의 baseline-scaled energy fraction 비교 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |
@@ -454,6 +458,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `baseline_scaled_energy_j` | baseline 평균 power × test elapsed time |
 | `incremental_power_w` | test 평균 power - baseline 평균 power |
 | `incremental_energy_j` | test_energy_j - baseline_scaled_energy_j |
+| `incremental_energy_fraction` | `incremental_energy_j / test_energy_j`. 너무 작으면 baseline subtraction noise에 민감 |
+| `baseline_energy_fraction` | `baseline_scaled_energy_j / test_energy_j`. 너무 크면 test energy 대부분이 baseline으로 설명됨 |
 | `pj_per_flop` | incremental energy / FP16 ops × 1e12 |
 | `matmul_input_pj_per_bit` | Tensor Core matmul의 A/B FP16 input bits 기준 incremental pJ/bit |
 | `matmul_arithmetic_read_pj_per_bit` | A/B input bits + accumulator read bits 기준 incremental pJ/bit |
@@ -483,6 +489,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `avg_gpu_util_pct_mean` | dmon SM utilization이 없을 때 fallback으로 쓰는 평균 GPU utilization |
 | `tflops_mean` | thread point별 평균 Tensor Core throughput |
 | `tensor_model_utilization_pct_mean` | thread point별 dense Tensor Core peak model 대비 평균 utilization |
+| `incremental_energy_fraction_mean` | thread point별 평균 incremental energy signal fraction |
+| `baseline_energy_fraction_mean` | thread point별 평균 baseline-scaled energy fraction |
 | `matmul_input_pj_per_bit_mean` | thread point별 logical input bit 기준 pJ/bit |
 | `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
 

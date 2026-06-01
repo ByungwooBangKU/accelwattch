@@ -128,6 +128,34 @@ def baseline_match_grade(test_kernel: str, baseline_kernel: str) -> Tuple[str, b
     return ("baseline_mismatch", False, f"expected {expected}")
 
 
+def signal_quality(
+    incremental_fraction: Any,
+    baseline_fraction: Any,
+    args: argparse.Namespace,
+) -> Tuple[bool, List[str], List[str], float, float]:
+    inc = parse_float(incremental_fraction)
+    base = parse_float(baseline_fraction)
+    failed: List[str] = []
+    warnings: List[str] = []
+    if not math.isfinite(inc) or inc <= 0.0:
+        failed.append("incremental energy fraction is missing or nonpositive")
+    elif inc < args.min_incremental_energy_fraction:
+        failed.append(
+            f"incremental energy fraction {inc:.4g} < {args.min_incremental_energy_fraction:.4g}"
+        )
+    elif inc < args.warn_incremental_energy_fraction:
+        warnings.append(
+            f"incremental energy fraction {inc:.4g} < warning threshold {args.warn_incremental_energy_fraction:.4g}"
+        )
+    if not math.isfinite(base) or base < 0.0:
+        failed.append("baseline energy fraction is missing or invalid")
+    elif base > args.max_baseline_energy_fraction:
+        failed.append(
+            f"baseline energy fraction {base:.4g} > {args.max_baseline_energy_fraction:.4g}"
+        )
+    return (not failed, failed, warnings, inc, base)
+
+
 def pair_gate_rows(
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
@@ -157,6 +185,11 @@ def pair_gate_rows(
         common_hmma = not parse_bool(row.get("benchmark_uses_wgmma"))
         sm_util_samples = int(parse_float(row.get("test_sm_util_samples"), 0.0))
         sm_util_available = sm_util_samples >= args.min_sm_util_samples
+        signal_ok, signal_failed, signal_warnings, inc_fraction, base_fraction = signal_quality(
+            row.get("incremental_energy_fraction"),
+            row.get("baseline_energy_fraction"),
+            args,
+        )
         test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
             str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
@@ -177,6 +210,9 @@ def pair_gate_rows(
             failed.append(source_note)
         if not baseline_ok:
             failed.append(baseline_note)
+        if not signal_ok:
+            failed.extend(signal_failed)
+        warnings.extend(signal_warnings)
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
         if not clock_stable:
@@ -214,6 +250,7 @@ def pair_gate_rows(
                 "pure_fp16_candidate": pure,
                 "energy_source_reliable": reliable_source,
                 "baseline_structural_match": baseline_ok,
+                "energy_signal_reliable": signal_ok,
                 "ncu_validation_pass": ncu_ok,
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
@@ -228,6 +265,9 @@ def pair_gate_rows(
                 "avg_sm_util_pct": row.get("avg_sm_util_pct", ""),
                 "matmul_input_pj_per_bit": row.get("matmul_input_pj_per_bit", ""),
                 "incremental_power_w": row.get("incremental_power_w", ""),
+                "incremental_energy_fraction": inc_fraction,
+                "baseline_energy_fraction": base_fraction,
+                "baseline_power_fraction": row.get("baseline_power_fraction", ""),
                 "clock_span_mhz": row.get("clock_span_mhz", ""),
                 "test_energy_source": row.get("test_energy_source", ""),
                 "baseline_energy_source": row.get("baseline_energy_source", ""),
@@ -295,6 +335,11 @@ def thread_gate_rows(
         enough_pure = pure_count >= required
         pjbit = parse_float(row.get("matmul_input_pj_per_bit_mean"))
         pjbit_positive = math.isfinite(pjbit) and pjbit > 0.0
+        signal_ok, signal_failed, signal_warnings, inc_fraction, base_fraction = signal_quality(
+            row.get("incremental_energy_fraction_mean"),
+            row.get("baseline_energy_fraction_mean"),
+            args,
+        )
         clock_span = parse_float(row.get("clock_span_mhz_mean"))
         clock_stable = math.isfinite(clock_span) and clock_span <= args.max_clock_span_mhz
         util = util_value(row)
@@ -344,6 +389,9 @@ def thread_gate_rows(
             failed.append("energy source is unavailable or undersampled")
         if not baseline_ok:
             failed.append(baseline_note)
+        if not signal_ok:
+            failed.extend(signal_failed)
+        warnings.extend(signal_warnings)
         if args.require_ncu and not ncu_ok:
             failed.append(f"NCU validation failed or missing: test={test_ncu_note}; baseline={baseline_ncu_note}")
         if grade == "power_trace_fallback":
@@ -382,6 +430,7 @@ def thread_gate_rows(
                 "pure_fp16_candidate": enough_pure,
                 "energy_source_reliable": source_ok,
                 "baseline_structural_match": baseline_ok,
+                "energy_signal_reliable": signal_ok,
                 "ncu_validation_pass": ncu_ok,
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
@@ -397,6 +446,9 @@ def thread_gate_rows(
                 "matmul_input_pj_per_bit_mean": row.get("matmul_input_pj_per_bit_mean", ""),
                 "matmul_input_pj_per_bit_ci95": row.get("matmul_input_pj_per_bit_ci95", ""),
                 "incremental_power_w_mean": row.get("incremental_power_w_mean", ""),
+                "incremental_energy_fraction_mean": inc_fraction,
+                "baseline_energy_fraction_mean": base_fraction,
+                "baseline_power_fraction_mean": row.get("baseline_power_fraction_mean", ""),
                 "clock_span_mhz_mean": row.get("clock_span_mhz_mean", ""),
                 "stats_scope": row.get("stats_scope", ""),
                 "test_energy_source_counts": source_info.get("test_energy_source_counts", ""),
@@ -487,6 +539,9 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "min_power_samples": args.min_power_samples,
             "min_sm_util_samples": args.min_sm_util_samples,
             "util_tolerance_pct": args.util_tolerance_pct,
+            "min_incremental_energy_fraction": args.min_incremental_energy_fraction,
+            "warn_incremental_energy_fraction": args.warn_incremental_energy_fraction,
+            "max_baseline_energy_fraction": args.max_baseline_energy_fraction,
             "require_ncu": bool(args.require_ncu),
             "ncu_summary": str(args.ncu_summary) if args.ncu_summary else "",
         },
@@ -504,6 +559,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "It is not a physical proof of zero L2 traffic; Nsight Compute memory counters are still required.",
             "strict_nvml_counter is preferred for H100/A100/RTX3090 comparison; power_trace_fallback is diagnostic.",
             "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
+            "energy_signal_reliable requires incremental energy to be a configurable minimum fraction of test energy.",
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
         ],
     }
@@ -518,6 +574,9 @@ def main() -> int:
     parser.add_argument("--min-power-samples", type=int, default=3)
     parser.add_argument("--min-sm-util-samples", type=int, default=1)
     parser.add_argument("--util-tolerance-pct", type=float, default=0.1)
+    parser.add_argument("--min-incremental-energy-fraction", type=float, default=0.01)
+    parser.add_argument("--warn-incremental-energy-fraction", type=float, default=0.05)
+    parser.add_argument("--max-baseline-energy-fraction", type=float, default=0.99)
     parser.add_argument("--ncu-summary", type=Path, default=None, help="ncu_validation_summary.csv from validate_ncu_reports.py")
     parser.add_argument("--require-ncu", action="store_true", help="Require passing NCU validation for quality_pass")
     args = parser.parse_args()

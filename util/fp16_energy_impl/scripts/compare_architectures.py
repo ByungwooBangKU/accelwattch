@@ -166,10 +166,14 @@ def load_result_dir(
                         "target_pass",
                         "baseline_structural_match",
                         "energy_source_reliable",
+                        "energy_signal_reliable",
                         "ncu_validation_pass",
                         "ncu_required",
                         "test_ncu_note",
                         "baseline_ncu_note",
+                        "incremental_energy_fraction_mean",
+                        "baseline_energy_fraction_mean",
+                        "baseline_power_fraction_mean",
                         "tensor_peak_tflops_model_mean",
                         "achieved_flops_per_sm_cycle_mean",
                         "tensor_model_utilization_pct_mean",
@@ -458,6 +462,13 @@ def main() -> int:
         "Incremental power (W)",
         "Best pure-FP16 incremental power by architecture",
         args.outdir / "architecture_best_incremental_power.png",
+    )
+    plot_bar(
+        best,
+        "incremental_energy_fraction_mean",
+        "Incremental energy / test energy",
+        "Best pure-FP16 energy signal fraction by architecture",
+        args.outdir / "architecture_best_incremental_energy_fraction.png",
     )
     plot_thread_compare(all_threads, args.outdir)
     plot_resource_compare(all_resources, args.outdir)
