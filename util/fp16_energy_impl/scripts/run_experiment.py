@@ -3,6 +3,9 @@
 
 This runner intentionally keeps the primary experiment matrix small. Cache-policy
 experiments are supported as P1 memory baselines, not as the default P0 compute sweep.
+The benchmark binary also emits an optional timed-loop NVML total-energy counter
+delta. The nvidia-smi trace remains useful for fallback energy integration and
+clock/temperature/utilization diagnostics.
 """
 
 from __future__ import annotations

@@ -2,12 +2,15 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -37,11 +40,179 @@ struct TimingResult {
   float elapsed_ms = 0.0f;
   uint64_t host_start_ns = 0;
   uint64_t host_end_ns = 0;
+  bool nvml_energy_supported = false;
+  uint64_t nvml_energy_start_mj = 0;
+  uint64_t nvml_energy_end_mj = 0;
+  double nvml_energy_delta_j = std::numeric_limits<double>::quiet_NaN();
+  std::string nvml_energy_note;
 };
 
 uint64_t now_unix_ns() {
   using namespace std::chrono;
   return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+using NvmlReturn = int;
+using NvmlDevice = void*;
+constexpr NvmlReturn kNvmlSuccess = 0;
+
+using NvmlInitFn = NvmlReturn (*)();
+using NvmlShutdownFn = NvmlReturn (*)();
+using NvmlDeviceGetHandleByIndexFn = NvmlReturn (*)(unsigned int, NvmlDevice*);
+using NvmlDeviceGetHandleByPciBusIdFn = NvmlReturn (*)(const char*, NvmlDevice*);
+using NvmlDeviceGetTotalEnergyConsumptionFn = NvmlReturn (*)(NvmlDevice, unsigned long long*);
+using NvmlErrorStringFn = const char* (*)(NvmlReturn);
+
+struct EnergyReading {
+  bool ok = false;
+  uint64_t mj = 0;
+  std::string note;
+};
+
+class NvmlEnergyCounter {
+ public:
+  explicit NvmlEnergyCounter(int cuda_device_index) {
+    lib_ = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib_) {
+      const char* err = dlerror();
+      note_ = std::string("NVML unavailable: ") + (err ? err : "dlopen failed");
+      return;
+    }
+
+    init_ = reinterpret_cast<NvmlInitFn>(dlsym(lib_, "nvmlInit_v2"));
+    shutdown_ = reinterpret_cast<NvmlShutdownFn>(dlsym(lib_, "nvmlShutdown"));
+    get_handle_by_index_ =
+        reinterpret_cast<NvmlDeviceGetHandleByIndexFn>(dlsym(lib_, "nvmlDeviceGetHandleByIndex_v2"));
+    get_handle_by_pci_bus_id_ = reinterpret_cast<NvmlDeviceGetHandleByPciBusIdFn>(
+        dlsym(lib_, "nvmlDeviceGetHandleByPciBusId_v2"));
+    get_total_energy_ = reinterpret_cast<NvmlDeviceGetTotalEnergyConsumptionFn>(
+        dlsym(lib_, "nvmlDeviceGetTotalEnergyConsumption"));
+    error_string_ = reinterpret_cast<NvmlErrorStringFn>(dlsym(lib_, "nvmlErrorString"));
+
+    if (!init_ || !shutdown_ || !get_handle_by_index_ || !get_total_energy_) {
+      note_ = "NVML unavailable: required symbols are missing";
+      return;
+    }
+
+    NvmlReturn ret = init_();
+    if (ret != kNvmlSuccess) {
+      note_ = std::string("nvmlInit_v2 failed: ") + error_string(ret);
+      return;
+    }
+    initialized_ = true;
+
+    std::string lookup_note;
+    char pci_bus_id[32] = {};
+    const cudaError_t pci_status = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_device_index);
+    if (pci_status == cudaSuccess && get_handle_by_pci_bus_id_) {
+      ret = get_handle_by_pci_bus_id_(pci_bus_id, &device_);
+      if (ret == kNvmlSuccess) {
+        lookup_note = std::string("CUDA PCI bus id ") + pci_bus_id;
+      } else {
+        lookup_note = std::string("PCI lookup failed: ") + error_string(ret);
+        device_ = nullptr;
+      }
+    } else if (pci_status != cudaSuccess) {
+      lookup_note = std::string("CUDA PCI bus id unavailable: ") + cudaGetErrorString(pci_status);
+      (void)cudaGetLastError();
+    }
+
+    if (!device_) {
+      ret = get_handle_by_index_(static_cast<unsigned int>(cuda_device_index), &device_);
+      if (ret != kNvmlSuccess) {
+        note_ = std::string("nvmlDeviceGetHandle failed: ") + error_string(ret);
+        if (!lookup_note.empty()) note_ += "; " + lookup_note;
+        return;
+      }
+      if (!lookup_note.empty()) {
+        lookup_note += "; fell back to CUDA device index";
+      } else {
+        lookup_note = "CUDA device index";
+      }
+    }
+
+    unsigned long long probe_mj = 0;
+    ret = get_total_energy_(device_, &probe_mj);
+    if (ret != kNvmlSuccess) {
+      note_ = std::string("nvmlDeviceGetTotalEnergyConsumption unsupported: ") + error_string(ret);
+      if (!lookup_note.empty()) note_ += "; " + lookup_note;
+      return;
+    }
+
+    available_ = true;
+    note_ = std::string("nvmlDeviceGetTotalEnergyConsumption available via ") + lookup_note;
+  }
+
+  ~NvmlEnergyCounter() {
+    if (initialized_ && shutdown_) {
+      (void)shutdown_();
+    }
+    if (lib_) {
+      dlclose(lib_);
+    }
+  }
+
+  EnergyReading read_mj() const {
+    if (!available_) {
+      return EnergyReading{false, 0, note_};
+    }
+    unsigned long long mj = 0;
+    NvmlReturn ret = get_total_energy_(device_, &mj);
+    if (ret != kNvmlSuccess) {
+      return EnergyReading{false, 0,
+                           std::string("nvmlDeviceGetTotalEnergyConsumption failed: ") +
+                               error_string(ret)};
+    }
+    return EnergyReading{true, static_cast<uint64_t>(mj), note_};
+  }
+
+ private:
+  std::string error_string(NvmlReturn ret) const {
+    if (error_string_) {
+      const char* s = error_string_(ret);
+      if (s) return s;
+    }
+    return std::string("NVML error ") + std::to_string(ret);
+  }
+
+  void* lib_ = nullptr;
+  NvmlDevice device_ = nullptr;
+  NvmlInitFn init_ = nullptr;
+  NvmlShutdownFn shutdown_ = nullptr;
+  NvmlDeviceGetHandleByIndexFn get_handle_by_index_ = nullptr;
+  NvmlDeviceGetHandleByPciBusIdFn get_handle_by_pci_bus_id_ = nullptr;
+  NvmlDeviceGetTotalEnergyConsumptionFn get_total_energy_ = nullptr;
+  NvmlErrorStringFn error_string_ = nullptr;
+  bool initialized_ = false;
+  bool available_ = false;
+  std::string note_;
+};
+
+TimingResult make_timing_result(float elapsed_ms, uint64_t host_start_ns, uint64_t host_end_ns,
+                                const EnergyReading& energy_start,
+                                const EnergyReading& energy_end) {
+  TimingResult result;
+  result.elapsed_ms = elapsed_ms;
+  result.host_start_ns = host_start_ns;
+  result.host_end_ns = host_end_ns;
+  result.nvml_energy_start_mj = energy_start.mj;
+  result.nvml_energy_end_mj = energy_end.mj;
+
+  if (energy_start.ok && energy_end.ok && energy_end.mj >= energy_start.mj) {
+    result.nvml_energy_supported = true;
+    result.nvml_energy_delta_j = static_cast<double>(energy_end.mj - energy_start.mj) / 1000.0;
+    result.nvml_energy_note = energy_start.note;
+  } else {
+    result.nvml_energy_supported = false;
+    if (!energy_start.ok) {
+      result.nvml_energy_note = energy_start.note;
+    } else if (!energy_end.ok) {
+      result.nvml_energy_note = energy_end.note;
+    } else {
+      result.nvml_energy_note = "NVML energy counter ended below start value";
+    }
+  }
+  return result;
 }
 
 void usage(const char* argv0) {
@@ -532,6 +703,9 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
   float ms = 0.0f;
   uint64_t timed_host_start_ns = 0;
   uint64_t timed_host_end_ns = 0;
+  NvmlEnergyCounter energy_counter(args.device);
+  EnergyReading energy_start;
+  EnergyReading energy_end;
 
   if (is_half2_kernel(args.kernel)) {
     half2* d_in = nullptr;
@@ -562,12 +736,14 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    energy_start = energy_counter.read_mj();
     timed_host_start_ns = now_unix_ns();
     CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < args.repeats; ++r) run();
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     timed_host_end_ns = now_unix_ns();
+    energy_end = energy_counter.read_mj();
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -599,12 +775,14 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    energy_start = energy_counter.read_mj();
     timed_host_start_ns = now_unix_ns();
     CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < args.repeats; ++r) run();
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     timed_host_end_ns = now_unix_ns();
+    energy_end = energy_counter.read_mj();
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -635,12 +813,14 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    energy_start = energy_counter.read_mj();
     timed_host_start_ns = now_unix_ns();
     CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < args.repeats; ++r) run();
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     timed_host_end_ns = now_unix_ns();
+    energy_end = energy_counter.read_mj();
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -677,12 +857,14 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    energy_start = energy_counter.read_mj();
     timed_host_start_ns = now_unix_ns();
     CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < args.repeats; ++r) run();
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     timed_host_end_ns = now_unix_ns();
+    energy_end = energy_counter.read_mj();
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -692,7 +874,7 @@ TimingResult launch_timed(const Args& args, int blocks, int threads, size_t tota
     std::cerr << "Unsupported kernel: " << args.kernel << "\n";
     std::exit(EXIT_FAILURE);
   }
-  return TimingResult{ms, timed_host_start_ns, timed_host_end_ns};
+  return make_timing_result(ms, timed_host_start_ns, timed_host_end_ns, energy_start, energy_end);
 }
 
 TimingResult launch_by_unroll(const Args& args, int blocks, int threads, size_t total_threads, size_t mem_words) {
@@ -844,6 +1026,17 @@ int main(int argc, char** argv) {
   os << "  \"host_start_unix_ns\": " << host_start_ns << ",\n";
   os << "  \"host_end_unix_ns\": " << host_end_ns << ",\n";
   os << "  \"cuda_elapsed_ms\": " << elapsed_ms << ",\n";
+  os << "  \"nvml_energy_supported\": " << (timing.nvml_energy_supported ? "true" : "false") << ",\n";
+  os << "  \"nvml_energy_start_mj\": " << timing.nvml_energy_start_mj << ",\n";
+  os << "  \"nvml_energy_end_mj\": " << timing.nvml_energy_end_mj << ",\n";
+  os << "  \"nvml_energy_delta_j\": ";
+  if (timing.nvml_energy_supported && std::isfinite(timing.nvml_energy_delta_j)) {
+    os << timing.nvml_energy_delta_j;
+  } else {
+    os << "null";
+  }
+  os << ",\n";
+  os << "  \"nvml_energy_note\": \"" << json_escape(timing.nvml_energy_note) << "\",\n";
   os << "  \"fp16_ops_estimate\": " << ops << ",\n";
   os << "  \"memory_bytes_estimate\": " << mem_bytes << ",\n";
   os << "  \"estimated_tflops\": " << tflops << ",\n";

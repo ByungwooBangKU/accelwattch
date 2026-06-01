@@ -123,7 +123,33 @@ def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
     sm_util_samples = read_sm_util_csv(run.get("sm_util_csv", ""))
     start_ns = int(run["host_start_unix_ns"])
     end_ns = int(run["host_end_unix_ns"])
-    energy_j, avg_power_w, sample_count = integrate_power(samples, start_ns, end_ns)
+    duration_s = max((end_ns - start_ns) / 1e9, 0.0)
+    trace_energy_j, trace_avg_power_w, sample_count = integrate_power(samples, start_ns, end_ns)
+    nvml_energy_delta_j = finite_float(run.get("nvml_energy_delta_j"))
+    use_nvml_counter = (
+        bool(run.get("nvml_energy_supported", False))
+        and math.isfinite(nvml_energy_delta_j)
+        and nvml_energy_delta_j > 0.0
+    )
+    if use_nvml_counter:
+        energy_j = nvml_energy_delta_j
+        avg_power_w = nvml_energy_delta_j / duration_s if duration_s > 0.0 else math.nan
+        energy_source = "nvml_total_energy_counter"
+    else:
+        energy_j = trace_energy_j
+        avg_power_w = trace_avg_power_w
+        energy_source = "power_trace_integral" if math.isfinite(trace_energy_j) else "unavailable"
+
+    energy_counter_vs_trace_delta_j = (
+        nvml_energy_delta_j - trace_energy_j
+        if math.isfinite(nvml_energy_delta_j) and math.isfinite(trace_energy_j)
+        else math.nan
+    )
+    energy_counter_vs_trace_ratio = (
+        nvml_energy_delta_j / trace_energy_j
+        if math.isfinite(nvml_energy_delta_j) and math.isfinite(trace_energy_j) and trace_energy_j > 0.0
+        else math.nan
+    )
     clocks = [s["sm_clock_mhz"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["sm_clock_mhz"] is not None]
     temps = [s["temp_c"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["temp_c"] is not None]
     utils = [s["util_gpu_pct"] for s in samples if start_ns <= s["sample_unix_ns"] <= end_ns and s["util_gpu_pct"] is not None]
@@ -136,6 +162,14 @@ def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
         **run,
         "power_energy_j": energy_j,
         "avg_power_w": avg_power_w,
+        "energy_source": energy_source,
+        "power_trace_energy_j": trace_energy_j,
+        "power_trace_avg_power_w": trace_avg_power_w,
+        "nvml_energy_delta_j": nvml_energy_delta_j,
+        "nvml_energy_counter_supported": bool(run.get("nvml_energy_supported", False)),
+        "nvml_energy_note": run.get("nvml_energy_note", ""),
+        "energy_counter_vs_trace_delta_j": energy_counter_vs_trace_delta_j,
+        "energy_counter_vs_trace_ratio": energy_counter_vs_trace_ratio,
         "power_sample_count": sample_count,
         "sm_util_sample_count": len(sm_utils),
         "avg_sm_clock_mhz": sum(clocks) / len(clocks) if clocks else math.nan,
@@ -168,6 +202,15 @@ def sort_key(run: Dict[str, Any]) -> Tuple[int, str]:
     return (int(run.get("runner_wall_start_unix_ns", run.get("host_start_unix_ns", 0))), run.get("run_id", ""))
 
 
+def has_reliable_energy(run: Dict[str, Any]) -> bool:
+    energy = finite_float(run.get("power_energy_j"))
+    if not math.isfinite(energy) or energy <= 0.0:
+        return False
+    if run.get("energy_source") == "nvml_total_energy_counter":
+        return True
+    return int(run.get("power_sample_count", 0)) >= 3
+
+
 def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, float]:
     """Return logical Tensor Core matmul bit counts, not memory traffic bits."""
     kernel = str(run.get("kernel", ""))
@@ -181,11 +224,11 @@ def matmul_bit_estimates(run: Dict[str, Any], ops: float) -> Dict[str, float]:
         }
 
     mma_m = finite_float(run.get("mma_m"), 16.0)
-    mma_n = finite_float(run.get("mma_n"), 8.0)
+    mma_n = finite_float(run.get("mma_n"), 16.0)
     mma_k = finite_float(run.get("mma_k"), 16.0)
     flops_per_logical_mma = finite_float(run.get("mma_flops_per_logical_mma"), 2.0 * mma_m * mma_n * mma_k)
     if not math.isfinite(flops_per_logical_mma) or flops_per_logical_mma <= 0:
-        flops_per_logical_mma = 2.0 * 16.0 * 8.0 * 16.0
+        flops_per_logical_mma = 2.0 * 16.0 * 16.0 * 16.0
 
     mma_count = ops / flops_per_logical_mma
     input_bits = mma_count * (mma_m * mma_k + mma_k * mma_n) * 16
@@ -260,6 +303,16 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "baseline_avg_power_w": math.nan,
                 "test_energy_j": total_energy,
                 "baseline_energy_j": math.nan,
+                "test_energy_source": s.get("energy_source", ""),
+                "baseline_energy_source": "",
+                "test_power_trace_energy_j": s.get("power_trace_energy_j", math.nan),
+                "baseline_power_trace_energy_j": math.nan,
+                "test_nvml_energy_delta_j": s.get("nvml_energy_delta_j", math.nan),
+                "baseline_nvml_energy_delta_j": math.nan,
+                "test_energy_counter_vs_trace_delta_j": s.get("energy_counter_vs_trace_delta_j", math.nan),
+                "baseline_energy_counter_vs_trace_delta_j": math.nan,
+                "test_energy_counter_vs_trace_ratio": s.get("energy_counter_vs_trace_ratio", math.nan),
+                "baseline_energy_counter_vs_trace_ratio": math.nan,
                 "baseline_scaled_energy_j": math.nan,
                 "incremental_power_w": math.nan,
                 "incremental_energy_j": math.nan,
@@ -333,10 +386,10 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         else math.nan
     )
     has_work = ops > 0 or mem_bytes > 0
-    enough_samples = int(t.get("power_sample_count", 0)) >= 3 and int(b.get("power_sample_count", 0)) >= 3
+    reliable_energy = has_reliable_energy(t) and has_reliable_energy(b)
     valid_basic = bool(
         has_work
-        and enough_samples
+        and reliable_energy
         and math.isfinite(inc_power)
         and inc_power > 0
         and math.isfinite(inc_energy)
@@ -369,6 +422,16 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "baseline_avg_power_w": base_avg_power,
         "test_energy_j": test_energy,
         "baseline_energy_j": baseline_energy,
+        "test_energy_source": t.get("energy_source", ""),
+        "baseline_energy_source": b.get("energy_source", ""),
+        "test_power_trace_energy_j": t.get("power_trace_energy_j", math.nan),
+        "baseline_power_trace_energy_j": b.get("power_trace_energy_j", math.nan),
+        "test_nvml_energy_delta_j": t.get("nvml_energy_delta_j", math.nan),
+        "baseline_nvml_energy_delta_j": b.get("nvml_energy_delta_j", math.nan),
+        "test_energy_counter_vs_trace_delta_j": t.get("energy_counter_vs_trace_delta_j", math.nan),
+        "baseline_energy_counter_vs_trace_delta_j": b.get("energy_counter_vs_trace_delta_j", math.nan),
+        "test_energy_counter_vs_trace_ratio": t.get("energy_counter_vs_trace_ratio", math.nan),
+        "baseline_energy_counter_vs_trace_ratio": b.get("energy_counter_vs_trace_ratio", math.nan),
         "baseline_scaled_energy_j": baseline_scaled_energy,
         "incremental_power_w": inc_power,
         "incremental_energy_j": inc_energy,

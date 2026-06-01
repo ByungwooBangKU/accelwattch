@@ -16,6 +16,7 @@ add_executable(fp16_energy_bench
 )
 
 target_include_directories(fp16_energy_bench PRIVATE include)
+target_link_libraries(fp16_energy_bench PRIVATE ${CMAKE_DL_LIBS})
 
 target_compile_options(fp16_energy_bench PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>

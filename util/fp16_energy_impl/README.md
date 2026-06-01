@@ -14,7 +14,7 @@
 | `configs/fp16_matmul_thread_sweep_low_append.json` | 기존 fine sweep 결과 디렉터리에 32/64/96/128 후보를 append하는 matrix |
 | `configs/p1_memory_policy_matrix.json` | P1 memory/cache policy 보정용 matrix |
 | `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
-| `scripts/analyze_results.py` | baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
+| `scripts/analyze_results.py` | NVML energy counter 우선 분석, power trace fallback, baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
 | `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
 | `scripts/lock_clocks.sh` | GPU clock lock helper |
@@ -86,8 +86,9 @@ cmake --build build -j
 1. `--blocks 0`일 때 GPU SM 개수를 감지해 `blocks = SM_count * blocks_per_sm`로 설정한다.
 2. matrix에 정의된 baseline/test 조건을 순서대로 실행한다.
 3. `--repeat N`으로 전체 matrix를 N회 반복한다.
-4. run별 `nvidia-smi` power/clock/temperature trace와 dmon SM utilization trace를 수집한다.
-5. `analyze_results.py`가 `summary.csv`, `condition_summary.csv`, thread sweep summary, figure를 생성한다.
+4. benchmark timed loop 직전/직후 `nvmlDeviceGetTotalEnergyConsumption()` 누적 에너지 카운터를 읽는다. 이 기능은 `libnvidia-ml.so.1`을 동적으로 load하므로 NVML header/link dependency 없이 빌드된다.
+5. run별 `nvidia-smi` power/clock/temperature trace와 dmon SM utilization trace를 수집한다.
+6. `analyze_results.py`가 `summary.csv`, `condition_summary.csv`, thread sweep summary, figure를 생성한다.
 
 수동으로 맞춰야 하는 항목은 다음과 같다.
 
@@ -98,6 +99,12 @@ cmake --build build -j
 5. GPU별 `iters`/`repeats` 조정으로 power sample 수 확보.
 
 H100에서도 현재 Tensor Core kernel은 `mma.sync.m16n8k16` 두 개로 logical `m16n16k16`을 만드는 warp-level 경로를 사용한다. 따라서 A100/H100/RTX 3090 간 같은 HMMA 계열 FP16 matmul path 비교에는 사용할 수 있지만, H100 고유 WGMMA/TMA 경로의 최대 matmul energy를 측정하는 실험은 아니다. H100 WGMMA 경로까지 측정하려면 별도 kernel과 validation matrix를 추가해야 한다.
+
+### Energy source policy
+
+최종 energy 계산은 timed loop 내부의 NVML 누적 에너지 카운터 delta를 우선 사용한다. 즉 `bench.json`의 `nvml_energy_supported=true`이고 `nvml_energy_delta_j > 0`이면 `power_energy_j`와 `avg_power_w`는 `nvmlDeviceGetTotalEnergyConsumption()` 기반 값이다. 카운터가 지원되지 않는 GPU/driver 조합에서는 기존 방식대로 `nvidia-smi --query-gpu=power.draw` trace를 host timed interval에 적분한 값을 fallback으로 사용한다.
+
+`nvidia-smi` power trace는 제거하지 않는다. H100처럼 `power.draw`가 averaging/smoothing된 값을 줄 수 있는 환경에서는 NVML total energy counter가 더 직접적인 최종 에너지 값이고, power trace는 clock/temperature/throttling 및 counter-vs-trace sanity check 용도다. 분석 결과에는 `energy_source`, `power_trace_energy_j`, `nvml_energy_delta_j`, `energy_counter_vs_trace_delta_j`, `energy_counter_vs_trace_ratio`가 함께 기록된다.
 
 ## 5. 실험 전 환경 수집
 
@@ -214,10 +221,11 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/runs.jsonl` | run별 benchmark metadata |
 | `results/p0_gpu0/raw/*/power.csv` | run별 power/clock/temp trace |
 | `results/p0_gpu0/raw/*/sm_util.csv` | run별 dmon SM utilization trace |
+| `results/p0_gpu0/raw/*/bench.json` | timed loop의 CUDA event timing과 optional NVML total-energy counter delta |
 | `results/p0_gpu0/summary.csv` | baseline/test pair별 baseline subtraction 결과 |
 | `results/p0_gpu0/condition_summary.csv` | condition별 반복 측정 통계(mean/std/min/max/95% CI) |
 | `results/p0_gpu0/thread_sweep_summary.csv` | thread-count sweep일 때 thread별 utilization/TFLOPS 집계와 `selected_optimal` 표시 |
-| `results/p0_gpu0/run_level_summary.csv` | run 단위 power integration 결과 |
+| `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |
 | `results/p0_gpu0/figures/thread_sweep_*.png` | launched threads/SM별 SM utilization/TFLOPS plot |
