@@ -108,6 +108,7 @@ PROFILER_ERROR_PATTERNS = [
 GLOBAL_MEMORY_TOKENS = re.compile(r"\b(LDG|STG|LD\.GLOBAL|ST\.GLOBAL|ATOM\.GLOBAL)\b", re.IGNORECASE)
 LOCAL_MEMORY_TOKENS = re.compile(r"\b(LDL|STL|LOCAL)\b", re.IGNORECASE)
 HMMA_TOKENS = re.compile(r"\b(HMMA|MMA\.SYNC)\b", re.IGNORECASE)
+WGMMA_TOKENS = re.compile(r"\b(WGMMA|WARP(?:GROUP)?\.MMA|MMA\.SPARSE\.WGMMA)\b", re.IGNORECASE)
 PERCENT_LINE = re.compile(r"(?:%|pct|percent)", re.IGNORECASE)
 
 
@@ -266,14 +267,25 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
 
     expected_hmma = kernel.startswith("tensor_mma_")
     baseline_tensor = kernel.startswith("tensor_baseline_")
-    hmma_value = metrics.get("hmma_inst", metrics.get("tensor_inst", math.nan))
-    hmma_metric_present = "hmma_inst" in metrics or "tensor_inst" in metrics
+    hmma_value = metrics.get("hmma_inst", math.nan)
+    tensor_inst_value = metrics.get("tensor_inst", math.nan)
+    hmma_metric_present = "hmma_inst" in metrics
+    tensor_inst_metric_present = "tensor_inst" in metrics
     hmma_token_seen = bool(HMMA_TOKENS.search(text))
-    hmma_seen = (
-        (math.isfinite(hmma_value) and hmma_value > 0.0)
-        or (not hmma_metric_present and hmma_token_seen)
+    wgmma_token_seen = bool(WGMMA_TOKENS.search(text))
+    hmma_metric_seen = math.isfinite(hmma_value) and hmma_value > 0.0
+    tensor_inst_seen = math.isfinite(tensor_inst_value) and tensor_inst_value > 0.0
+    common_hmma_seen = hmma_metric_seen or (
+        not hmma_metric_present
+        and hmma_token_seen
+        and not wgmma_token_seen
     )
-    hmma_ok = (hmma_seen if expected_hmma else (not hmma_seen if baseline_tensor else True))
+    if expected_hmma:
+        hmma_ok = common_hmma_seen and not wgmma_token_seen
+    elif baseline_tensor:
+        hmma_ok = not common_hmma_seen and not tensor_inst_seen and not wgmma_token_seen
+    else:
+        hmma_ok = not wgmma_token_seen
     tensor_activity_pct = metrics.get("tensor_activity_pct", math.nan)
     sm_activity_pct = metrics.get("sm_activity_pct", math.nan)
     tensor_activity_present = math.isfinite(tensor_activity_pct)
@@ -327,8 +339,12 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     warnings: List[str] = []
     if errors:
         fail_reasons.append("profiler errors: " + ",".join(errors))
-    if expected_hmma and not hmma_ok:
-        fail_reasons.append("missing HMMA/Tensor Core instruction evidence")
+    if expected_hmma and not common_hmma_seen:
+        fail_reasons.append("missing common HMMA instruction evidence")
+    if expected_hmma and tensor_inst_seen and not common_hmma_seen:
+        warnings.append("generic tensor instruction evidence was present without common HMMA evidence")
+    if wgmma_token_seen:
+        fail_reasons.append("WGMMA evidence found; strict cross-GPU comparison requires common HMMA")
     if expected_hmma and args.require_tensor_activity and not tensor_activity_observed:
         fail_reasons.append(
             f"tensor activity is missing or below {args.min_tensor_activity_pct:g}%"
@@ -336,7 +352,7 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     elif expected_hmma and not tensor_activity_present:
         warnings.append("tensor activity percentage was not found in NCU report")
     if baseline_tensor and not hmma_ok:
-        fail_reasons.append("baseline shows unexpected HMMA/Tensor Core evidence")
+        fail_reasons.append("baseline shows unexpected Tensor Core/HMMA/WGMMA evidence")
     if not memory_complete and not args.allow_missing_counters:
         missing = [
             name
@@ -370,9 +386,14 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_tensor": baseline_tensor,
         "validation_pass": validation_pass,
         "hmma_ok": hmma_ok,
-        "hmma_seen": hmma_seen,
+        "hmma_seen": common_hmma_seen,
+        "common_hmma_seen": common_hmma_seen,
+        "hmma_metric_seen": hmma_metric_seen,
         "hmma_metric_present": hmma_metric_present,
         "hmma_token_seen": hmma_token_seen,
+        "tensor_inst_metric_present": tensor_inst_metric_present,
+        "tensor_inst_seen": tensor_inst_seen,
+        "wgmma_token_seen": wgmma_token_seen,
         "memory_counters_present": memory_present,
         "dram_counters_present": dram_present,
         "l2_counters_present": l2_present,
@@ -421,8 +442,13 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "validation_pass",
         "hmma_ok",
         "hmma_seen",
+        "common_hmma_seen",
+        "hmma_metric_seen",
         "hmma_metric_present",
         "hmma_token_seen",
+        "tensor_inst_metric_present",
+        "tensor_inst_seen",
+        "wgmma_token_seen",
         "memory_counters_present",
         "dram_counters_present",
         "l2_counters_present",
@@ -583,6 +609,10 @@ def summarize(rows: List[Dict[str, Any]], input_dir: Path, args: argparse.Namesp
         },
         "notes": [
             "Strict mode requires explicit L2/DRAM/local counter metrics.",
+            "Strict cross-GPU FP16 comparison requires common HMMA evidence; generic tensor "
+            "instruction metrics alone do not prove the m16n8k16 HMMA path.",
+            "Any WGMMA token evidence fails validation because this benchmark compares the "
+            "common A100/H100/RTX3090 warp-level HMMA path, not Hopper WGMMA.",
             "Counters with 'sectors' in the metric ID are normalized to bytes before thresholding.",
             "Token fallback is diagnostic only; use explicit counters for final pJ/bit claims.",
             "Rows with validation_pass=false must not be used as final pure-FP16 evidence.",

@@ -549,6 +549,8 @@ strict mode에서는 explicit DRAM/L2/local counter class가 모두 있어야 pa
 
 NCU helper는 memory counter 외에 `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed`와 `sm__throughput.avg.pct_of_peak_sustained_elapsed`도 기본 metric set에 포함한다. `validate_ncu_reports.py`는 이 explicit metric이 없으면 `ComputeWorkloadAnalysis` section label에서 Tensor/SM activity percentage를 best-effort로 추출한다. 이 값은 `nvidia-smi dmon` SM utilization을 대체하지 않고, HMMA 경로가 실제 Tensor pipe를 사용했다는 profiler-side 보조 evidence로 사용한다. 최종 audit에서 이 evidence를 hard gate로 만들려면 `audit_strict_results.py --require-ncu-tensor-activity`를 사용한다.
 
+Tensor instruction evidence는 strict 비교에서 더 좁게 본다. `tensor_mma_*` kernel은 공통 warp-level HMMA `mma.sync.m16n8k16` path 증거가 필요하고, `smsp__inst_executed_pipe_tensor.sum` 같은 generic tensor instruction counter만으로는 pass하지 않는다. H100에서 WGMMA token이 보이면 strict A100/H100/RTX3090 비교용 결과에서는 실패 처리한다. 이 benchmark의 목적은 Hopper WGMMA 최대 성능이 아니라 세 GPU가 공통으로 실행할 수 있는 HMMA path의 pJ/bit 비교이기 때문이다. `ncu_validation_summary.csv`에는 이를 확인할 수 있도록 `common_hmma_seen`, `hmma_metric_seen`, `tensor_inst_seen`, `wgmma_token_seen` 필드가 함께 기록된다.
+
 NCU helper는 parser가 요구하는 counter를 `--metrics`로 명시 수집한다. 기본 metric set은 `NCU_METRICS` 환경 변수로 override할 수 있다.
 
 P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
