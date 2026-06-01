@@ -235,6 +235,12 @@ for spec in "${SPECS[@]}"; do
   if [[ "${DIAGNOSTIC_NO_NCU}" -eq 1 ]]; then
     cmd+=(--diagnostic-no-ncu)
   fi
+  if [[ "${SKIP_PREFLIGHT}" -eq 1 ]]; then
+    cmd+=(--skip-preflight)
+  fi
+  if [[ "${ALLOW_COMPUTE_APPS}" -eq 1 ]]; then
+    cmd+=(--allow-compute-apps)
+  fi
 
   echo "Strict FP16 suite target: ${label} (gpu=${gpu}, cuda_arch=${cuda_arch}, out=${run_dir})"
   if [[ "${DRY_RUN}" -eq 1 ]]; then

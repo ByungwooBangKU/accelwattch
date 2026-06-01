@@ -21,6 +21,8 @@ NCU_BIN="${NCU_BIN:-ncu}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 SKIP_BUILD=0
+SKIP_PREFLIGHT=0
+ALLOW_COMPUTE_APPS=0
 DIAGNOSTIC_NO_NCU=0
 CALIBRATE_MATRIX=1
 TARGET_TEST_S=1.0
@@ -46,6 +48,8 @@ Options:
   --threads CSV        Threads/block list for NCU validation [32,64,96,128,160,192,224,256,288,320,384]
   --build-dir DIR      Build directory relative to fp16_energy_impl [build]
   --skip-build         Reuse existing binary
+  --skip-preflight     Skip tool/GPU/process checks before build
+  --allow-compute-apps Allow active compute processes on the target GPU during preflight
   --no-calibrate-matrix
                         Use configs/fp16_matmul_thread_sweep_fine.json without GPU-specific repeat calibration
   --target-test-s S     Target test CUDA-event duration for calibrated matrix [1.0]
@@ -72,6 +76,8 @@ while [[ $# -gt 0 ]]; do
     --threads) THREADS_CSV="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
+    --allow-compute-apps) ALLOW_COMPUTE_APPS=1; shift ;;
     --no-calibrate-matrix) CALIBRATE_MATRIX=0; shift ;;
     --target-test-s) TARGET_TEST_S="$2"; shift 2 ;;
     --target-baseline-s) TARGET_BASELINE_S="$2"; shift 2 ;;
@@ -109,6 +115,8 @@ BASE_MATRIX="${ROOT}/configs/fp16_matmul_thread_sweep_fine.json"
 MATRIX_PATH="${BASE_MATRIX}"
 START_MANIFEST="${OUTDIR}/strict_pipeline_manifest_start.json"
 FINAL_MANIFEST="${OUTDIR}/strict_pipeline_manifest.json"
+PIPELINE_PREFLIGHT_JSON="${OUTDIR}/strict_pipeline_preflight.json"
+PIPELINE_PREFLIGHT_CSV="${OUTDIR}/strict_pipeline_preflight.csv"
 
 if [[ -z "${NVIDIA_SMI_ID}" ]]; then
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -132,6 +140,8 @@ write_manifest() {
     --binary "${BINARY}" \
     --build-dir "${BUILD_DIR}" \
     --build-log "${BUILD_LOG}" \
+    --pipeline-preflight-json "${PIPELINE_PREFLIGHT_JSON}" \
+    --pipeline-preflight-csv "${PIPELINE_PREFLIGHT_CSV}" \
     --resource-dir "${RESOURCE_DIR}" \
     --ncu-dir "${NCDIR}" \
     --base-matrix "${BASE_MATRIX}" \
@@ -143,6 +153,8 @@ write_manifest() {
     --sample-ms "${SAMPLE_MS}" \
     --threads "${THREADS_CSV}" \
     --skip-build "${SKIP_BUILD}" \
+    --skip-preflight "${SKIP_PREFLIGHT}" \
+    --allow-compute-apps "${ALLOW_COMPUTE_APPS}" \
     --diagnostic-no-ncu "${DIAGNOSTIC_NO_NCU}" \
     --calibrate-matrix "${CALIBRATE_MATRIX}" \
     --target-test-s "${TARGET_TEST_S}" \
@@ -170,6 +182,27 @@ on_pipeline_exit() {
 trap on_pipeline_exit EXIT
 
 write_manifest started "${START_MANIFEST}"
+
+if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
+  PREFLIGHT_ARGS=(
+    --spec "pipeline:${GPU_ID}:${CUDA_ARCH}:${NVIDIA_SMI_ID}"
+    --out-json "${PIPELINE_PREFLIGHT_JSON}"
+    --out-csv "${PIPELINE_PREFLIGHT_CSV}"
+    --cmake-bin "${CMAKE_BIN}"
+    --nvcc-bin "${NVCC_BIN}"
+    --ncu-bin "${NCU_BIN}"
+    --python-bin "${PYTHON_BIN}"
+    --nvidia-smi-bin "${NVIDIA_SMI_BIN}"
+  )
+  if [[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]]; then
+    PREFLIGHT_ARGS+=(--require-ncu)
+  fi
+  if [[ "${ALLOW_COMPUTE_APPS}" -eq 1 ]]; then
+    PREFLIGHT_ARGS+=(--allow-compute-apps)
+  fi
+
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/preflight_strict_architecture_suite.py" "${PREFLIGHT_ARGS[@]}"
+fi
 
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
   CMAKE_CONFIGURE_ARGS=(

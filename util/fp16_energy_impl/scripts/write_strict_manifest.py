@@ -64,6 +64,8 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--build-dir", required=True)
     parser.add_argument("--build-log", type=Path, required=True)
+    parser.add_argument("--pipeline-preflight-json", type=Path, required=True)
+    parser.add_argument("--pipeline-preflight-csv", type=Path, required=True)
     parser.add_argument("--resource-dir", type=Path, required=True)
     parser.add_argument("--ncu-dir", type=Path, required=True)
     parser.add_argument("--base-matrix", type=Path, required=True)
@@ -75,6 +77,8 @@ def main() -> int:
     parser.add_argument("--sample-ms", required=True)
     parser.add_argument("--threads", required=True)
     parser.add_argument("--skip-build", required=True)
+    parser.add_argument("--skip-preflight", required=True)
+    parser.add_argument("--allow-compute-apps", required=True)
     parser.add_argument("--diagnostic-no-ncu", required=True)
     parser.add_argument("--calibrate-matrix", required=True)
     parser.add_argument("--target-test-s", required=True)
@@ -105,6 +109,8 @@ def main() -> int:
             "threads": args.threads,
             "build_dir": args.build_dir,
             "skip_build": args.skip_build,
+            "skip_preflight": args.skip_preflight,
+            "allow_compute_apps": args.allow_compute_apps,
             "diagnostic_no_ncu": args.diagnostic_no_ncu,
             "calibrate_matrix": args.calibrate_matrix,
             "target_test_s": args.target_test_s,
@@ -142,6 +148,8 @@ def main() -> int:
             "outdir": str(outdir),
             "binary": path_info(args.binary.resolve()),
             "build_log": path_info(args.build_log.resolve()),
+            "pipeline_preflight_json": path_info(args.pipeline_preflight_json.resolve()),
+            "pipeline_preflight_csv": path_info(args.pipeline_preflight_csv.resolve()),
             "base_matrix": path_info(args.base_matrix.resolve()),
             "matrix": path_info(args.matrix.resolve()),
             "quality_gates": path_info((outdir / "quality_gates.csv").resolve()),
