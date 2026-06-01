@@ -18,6 +18,7 @@
 | `scripts/architecture_models.py` | A100/H100/RTX3090 Tensor Core peak/occupancy normalization에 쓰는 architecture constants |
 | `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
 | `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
+| `scripts/report_strict_results.py` | strict audit/architecture compare 산출물을 최종 검토용 Markdown report와 dashboard figure로 요약 |
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
@@ -131,7 +132,7 @@ GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   --outdir results/strict_fp16_h100
 ```
 
-이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, `fp16_matmul_thread_sweep_fine.json`의 structural baseline sweep을 실행한 뒤, `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu`까지 실행한다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
+이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, 환경 수집 뒤 짧은 CUDA runtime preflight를 먼저 실행한다. 이 단계가 실패하면 driver/runtime mismatch 또는 오래된 binary 문제이므로 긴 sweep을 시작하지 않는다. 이후 `fp16_matmul_thread_sweep_fine.json`의 structural baseline sweep을 실행한 뒤, `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu`까지 실행한다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
 
 ### Energy source policy
 
@@ -317,6 +318,11 @@ python3 scripts/compare_architectures.py \
           results/strict_fp16_h100 \
           results/strict_fp16_rtx3090 \
   --outdir results/architecture_compare_fp16
+
+python3 scripts/report_strict_results.py \
+  --audit-dir results/strict_fp16_audit \
+  --compare-dir results/architecture_compare_fp16 \
+  --outdir results/strict_fp16_report
 ```
 
 `audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `resource_audit/thread_resource_occupancy.csv`에서 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 측정 해상도도 gate에 포함되어 test/baseline duration과 Joule 단위 신호가 너무 작으면 fail된다. NVML counter와 power trace 적분값의 cross-check는 기본적으로 warning이며, trace agreement까지 필수 조건으로 보려면 `--require-counter-trace-agreement`를 사용한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
@@ -335,6 +341,8 @@ python3 scripts/compare_architectures.py \
 | `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교 |
 | `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교 |
 | `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
+| `fp16_strict_report.md` | strict audit와 architecture compare를 묶은 publishability 중심 Markdown report |
+| `fp16_strict_report_dashboard.png` | selected TFLOPS 대비 logical pJ/bit dashboard |
 
 For memory/cache-policy calibration and DRAM pJ/bit estimates:
 
@@ -380,6 +388,8 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/strict_fp16_audit/figures/strict_result_incremental_energy_j.png` | strict selected target의 incremental energy magnitude 비교 |
 | `results/strict_fp16_audit/figures/strict_result_counter_trace_ratio.png` | strict selected target의 NVML energy counter / power trace energy sanity ratio |
 | `results/strict_fp16_audit/figures/strict_result_baseline_energy_fraction.png` | strict selected target의 baseline-scaled energy fraction 비교 |
+| `results/strict_fp16_report/fp16_strict_report.md` | strict audit/compare 결과를 사람이 검토하기 위한 최종 Markdown report |
+| `results/strict_fp16_report/fp16_strict_report_dashboard.png` | selected TFLOPS와 logical pJ/bit를 pass/fail 색상으로 표시 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |

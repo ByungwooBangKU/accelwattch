@@ -104,6 +104,18 @@ fi
 
 "${SCRIPT_DIR}/query_env.sh" "${NVIDIA_SMI_ID}" "${ENV_OUT}" "${BINARY}" "${GPU_ID}"
 
+RUNTIME_PREFLIGHT_JSON="${OUTDIR}/runtime_preflight.json"
+"${BINARY}" \
+  --device "${GPU_ID}" \
+  --kernel baseline_nop \
+  --blocks 1 \
+  --threads 32 \
+  --iters 1 \
+  --warmup 0 \
+  --repeats 1 \
+  --suppress-output-store \
+  --json-out "${RUNTIME_PREFLIGHT_JSON}"
+
 "${PYTHON_BIN}" "${SCRIPT_DIR}/run_experiment.py" \
   --binary "${BINARY}" \
   --matrix "${ROOT}/configs/fp16_matmul_thread_sweep_fine.json" \
