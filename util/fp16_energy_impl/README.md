@@ -15,6 +15,7 @@
 | `configs/p1_memory_policy_matrix.json` | P1 memory/cache policy 보정용 matrix |
 | `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
 | `scripts/analyze_results.py` | NVML energy counter 우선 분석, power trace fallback, baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
+| `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
 | `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
 | `scripts/lock_clocks.sh` | GPU clock lock helper |
@@ -105,6 +106,12 @@ H100에서도 현재 Tensor Core kernel은 `mma.sync.m16n8k16` 두 개로 logica
 최종 energy 계산은 timed loop 내부의 NVML 누적 에너지 카운터 delta를 우선 사용한다. 즉 `bench.json`의 `nvml_energy_supported=true`이고 `nvml_energy_delta_j > 0`이면 `power_energy_j`와 `avg_power_w`는 `nvmlDeviceGetTotalEnergyConsumption()` 기반 값이다. 카운터가 지원되지 않는 GPU/driver 조합에서는 기존 방식대로 `nvidia-smi --query-gpu=power.draw` trace를 host timed interval에 적분한 값을 fallback으로 사용한다.
 
 `nvidia-smi` power trace는 제거하지 않는다. H100처럼 `power.draw`가 averaging/smoothing된 값을 줄 수 있는 환경에서는 NVML total energy counter가 더 직접적인 최종 에너지 값이고, power trace는 clock/temperature/throttling 및 counter-vs-trace sanity check 용도다. 분석 결과에는 `energy_source`, `power_trace_energy_j`, `nvml_energy_delta_j`, `energy_counter_vs_trace_delta_j`, `energy_counter_vs_trace_ratio`가 함께 기록된다.
+
+### Architecture comparison policy
+
+A100, H100, RTX 3090 비교는 같은 logical workload와 같은 instruction family를 비교하는 방식으로 해석한다. 현재 Tensor Core kernel은 세 GPU 모두에서 warp-level `mma.sync.m16n8k16` 두 개를 묶어 logical `m16n16k16`을 만들며, H100에서 지원되는 WGMMA 경로를 사용하지 않는다. 따라서 이 결과는 "H100의 최대 WGMMA matmul efficiency"가 아니라 "A100/H100/RTX3090에서 공통 HMMA FP16 path를 같은 baseline subtraction으로 측정한 값"이다.
+
+benchmark JSON과 분석 CSV에는 `architecture_generation`, `architecture_chip`, `recommended_cuda_arch`, `fp16_tensor_instruction_path`, `wgmma_supported`, `benchmark_uses_wgmma`가 기록된다. 오래된 결과 JSON도 `analyze_results.py`가 `device_name`과 `compute_capability`로 fallback 분류한다. Summary에는 `baseline_energy_fraction`, `incremental_energy_fraction`, `baseline_power_fraction`, `valid_no_l2`, `pure_fp16_candidate`, `separation_quality`가 추가되어, baseline이 너무 크거나 L2/global traffic이 예상되는 run을 pJ/bit 최종 후보에서 분리할 수 있다.
 
 ## 5. 실험 전 환경 수집
 
@@ -200,6 +207,26 @@ python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_fine
 
 Fine + dmon run에서는 `threads_per_sm=512`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 target thread count는 512 threads/SM, 즉 64 threads/block로 지정한다. pJ/bit 자체는 224 threads/block 후보에서 `0.0819 +/- 0.0121 pJ/bit`로 더 낮게 관찰되었지만, valid no-L2 count가 5/10이고 incremental power가 3.23 W 수준이라 target saturation point로 채택하지 않았다. 256 threads/block 이상 후보는 baseline subtraction 후 incremental power가 음수로 나와 `all_runs_no_valid`로 집계되었다. 이 값들은 board-level `nvidia-smi` power trace와 baseline subtraction 기반 estimate이므로, 최종 수치 채택 전에는 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
 
+여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 `analyze_results.py`를 먼저 실행하고, 다음처럼 묶는다.
+
+```bash
+python3 scripts/compare_architectures.py \
+  --input results/fp16_matmul_thread_sweep_fine_a100 \
+          results/fp16_matmul_thread_sweep_fine_h100 \
+          results/fp16_matmul_thread_sweep_fine_rtx3090 \
+  --outdir results/architecture_compare_fp16
+```
+
+주요 산출물은 다음과 같다.
+
+| 파일 | 내용 |
+|---|---|
+| `architecture_best_fp16.csv` | 결과 디렉터리별 pure FP16 후보 중 utilization/valid count 기준 best row |
+| `architecture_best_matmul_input_pj_per_bit.png` | GPU architecture별 best logical matmul input pJ/bit 비교 |
+| `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |
+| `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교 |
+| `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교 |
+
 For memory/cache-policy calibration and DRAM pJ/bit estimates:
 
 ```bash
@@ -228,6 +255,7 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |
+| `results/p0_gpu0/figures/fp16_energy_separation_stack.png` | test interval energy를 baseline-scaled energy와 FP16 incremental energy로 분리한 stack plot |
 | `results/p0_gpu0/figures/thread_sweep_*.png` | launched threads/SM별 SM utilization/TFLOPS plot |
 | `results/p0_gpu0/figures/thread_sweep_pjbit_*.png` | launched threads/SM별 matmul logical pJ/bit plot. label은 threads/block와 pJ/bit 값 |
 | `results/p0_gpu0/figures/power_trace_*.png` | baseline/test power trace 비교 |

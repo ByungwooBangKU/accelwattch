@@ -119,6 +119,7 @@ def integrate_power(samples: List[Dict[str, Any]], start_ns: int, end_ns: int) -
 
 
 def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
+    arch = classify_architecture(run)
     samples = read_power_csv(run.get("power_csv", ""))
     sm_util_samples = read_sm_util_csv(run.get("sm_util_csv", ""))
     start_ns = int(run["host_start_unix_ns"])
@@ -160,6 +161,7 @@ def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
     ]
     return {
         **run,
+        **arch,
         "power_energy_j": energy_j,
         "avg_power_w": avg_power_w,
         "energy_source": energy_source,
@@ -187,6 +189,82 @@ def summarize_run(run: Dict[str, Any]) -> Dict[str, Any]:
 def finite_float(x: Any, default: float = math.nan) -> float:
     value = parse_float(x)
     return value if value is not None else default
+
+
+def classify_architecture(run: Dict[str, Any]) -> Dict[str, Any]:
+    """Return normalized architecture tags for new and legacy benchmark JSON."""
+    generation = str(run.get("architecture_generation", "") or "")
+    chip = str(run.get("architecture_chip", "") or "")
+    product_class = str(run.get("gpu_product_class", "") or "")
+    cuda_arch = str(run.get("recommended_cuda_arch", "") or "")
+    path = str(
+        run.get(
+            "fp16_tensor_instruction_path",
+            "benchmark uses warp-level HMMA mma.sync m16n8k16 pairs",
+        )
+        or ""
+    )
+    note = str(run.get("architecture_measurement_note", "") or "")
+    wgmma_supported = bool(run.get("wgmma_supported", False))
+    benchmark_uses_wgmma = bool(run.get("benchmark_uses_wgmma", False))
+
+    if generation and chip and cuda_arch:
+        return {
+            "architecture_generation": generation,
+            "architecture_chip": chip,
+            "gpu_product_class": product_class or "unknown",
+            "recommended_cuda_arch": cuda_arch,
+            "fp16_tensor_instruction_path": path,
+            "wgmma_supported": wgmma_supported,
+            "benchmark_uses_wgmma": benchmark_uses_wgmma,
+            "architecture_measurement_note": note,
+        }
+
+    name = str(run.get("device_name", "") or "")
+    cc = str(run.get("compute_capability", "") or "")
+    generation = "unknown"
+    chip = "unknown"
+    product_class = "unknown"
+    cuda_arch = cc.replace(".", "") if cc else ""
+    note = "unknown GPU architecture; inspect compute capability and validation counters before comparison"
+
+    if cc.startswith("9."):
+        generation = "hopper"
+        chip = "gh100" if "H100" in name else "hopper_sm90"
+        product_class = "datacenter"
+        cuda_arch = "90"
+        wgmma_supported = True
+        note = (
+            "H100/Hopper supports WGMMA, but this benchmark uses the same warp-level HMMA "
+            "m16n8k16 pair path as Ampere for cross-GPU comparison"
+        )
+    elif cc == "8.0":
+        generation = "ampere"
+        chip = "ga100" if "A100" in name else "ampere_sm80"
+        product_class = "datacenter"
+        cuda_arch = "80"
+        note = "A100/GA100-class HMMA path; compare with the same workload, clocks, and baseline subtraction"
+    elif cc == "8.6":
+        generation = "ampere"
+        chip = "ga102" if "3090" in name else "ampere_sm86"
+        product_class = "consumer" if "RTX" in name else "workstation_or_consumer"
+        cuda_arch = "86"
+        note = "RTX/GA10x-class HMMA path; validate clock stability and no-L2 behavior before using pJ/bit"
+    elif cc.startswith("8."):
+        generation = "ampere"
+        chip = "ampere_sm8x"
+        product_class = "unknown"
+
+    return {
+        "architecture_generation": generation,
+        "architecture_chip": chip,
+        "gpu_product_class": product_class,
+        "recommended_cuda_arch": cuda_arch,
+        "fp16_tensor_instruction_path": path,
+        "wgmma_supported": wgmma_supported,
+        "benchmark_uses_wgmma": benchmark_uses_wgmma,
+        "architecture_measurement_note": note,
+    }
 
 
 def estimate_threads_per_sm(run: Dict[str, Any]) -> float:
@@ -281,6 +359,13 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "pair_index": pair_index,
                 "repeat_index": s.get("repeat_index", pair_index),
                 "gpu": s.get("device_name", ""),
+                "architecture_generation": s.get("architecture_generation", ""),
+                "architecture_chip": s.get("architecture_chip", ""),
+                "gpu_product_class": s.get("gpu_product_class", ""),
+                "recommended_cuda_arch": s.get("recommended_cuda_arch", ""),
+                "fp16_tensor_instruction_path": s.get("fp16_tensor_instruction_path", ""),
+                "wgmma_supported": bool(s.get("wgmma_supported", False)),
+                "benchmark_uses_wgmma": bool(s.get("benchmark_uses_wgmma", False)),
                 "fp16_path": s.get("fp16_path", ""),
                 "test_kernel": s.get("kernel", ""),
                 "baseline_kernel": "",
@@ -314,6 +399,10 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "test_energy_counter_vs_trace_ratio": s.get("energy_counter_vs_trace_ratio", math.nan),
                 "baseline_energy_counter_vs_trace_ratio": math.nan,
                 "baseline_scaled_energy_j": math.nan,
+                "baseline_energy_fraction": math.nan,
+                "incremental_energy_fraction": math.nan,
+                "baseline_power_fraction": math.nan,
+                "energy_sources_match": False,
                 "incremental_power_w": math.nan,
                 "incremental_energy_j": math.nan,
                 "pj_per_flop": math.nan,
@@ -335,6 +424,9 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "avg_sm_util_pct": s.get("avg_sm_util_pct", math.nan),
                 "max_sm_util_pct": s.get("max_sm_util_pct", math.nan),
                 "valid_basic": False,
+                "valid_no_l2": False,
+                "pure_fp16_candidate": False,
+                "separation_quality": "single_run_no_baseline",
                 "test_run_id": s.get("run_id", ""),
                 "baseline_run_id": "",
                 "test_power_csv": s.get("power_csv", ""),
@@ -362,6 +454,21 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
     inc_energy = (
         test_energy - baseline_scaled_energy
         if math.isfinite(test_energy) and math.isfinite(baseline_scaled_energy)
+        else math.nan
+    )
+    baseline_energy_fraction = (
+        baseline_scaled_energy / test_energy
+        if math.isfinite(baseline_scaled_energy) and math.isfinite(test_energy) and test_energy > 0.0
+        else math.nan
+    )
+    incremental_energy_fraction = (
+        inc_energy / test_energy
+        if math.isfinite(inc_energy) and math.isfinite(test_energy) and test_energy > 0.0
+        else math.nan
+    )
+    baseline_power_fraction = (
+        base_avg_power / test_avg_power
+        if math.isfinite(base_avg_power) and math.isfinite(test_avg_power) and test_avg_power > 0.0
         else math.nan
     )
     tflops = ops / elapsed_s / 1e12 if ops > 0 and elapsed_s > 0 else math.nan
@@ -395,11 +502,32 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         and math.isfinite(inc_energy)
         and inc_energy > 0
     )
+    expected_l2_touch = bool(mem_bytes > 0 or not t.get("suppress_output_store", False))
+    valid_no_l2 = bool(valid_basic and not expected_l2_touch)
+    pure_fp16_candidate = bool(
+        valid_no_l2
+        and str(t.get("kernel", "")) in {"tensor_mma_f16acc", "tensor_mma_f32acc", "fp16_half2"}
+    )
+    if pure_fp16_candidate:
+        separation_quality = "pure_fp16_candidate_no_l2"
+    elif valid_basic and expected_l2_touch:
+        separation_quality = "valid_but_expected_l2_touch"
+    elif valid_basic:
+        separation_quality = "valid_non_fp16_or_memory"
+    else:
+        separation_quality = "invalid_or_nonpositive_increment"
     return {
         "condition": cond,
         "pair_index": pair_index,
         "repeat_index": t.get("repeat_index", pair_index),
         "gpu": t.get("device_name", ""),
+        "architecture_generation": t.get("architecture_generation", ""),
+        "architecture_chip": t.get("architecture_chip", ""),
+        "gpu_product_class": t.get("gpu_product_class", ""),
+        "recommended_cuda_arch": t.get("recommended_cuda_arch", ""),
+        "fp16_tensor_instruction_path": t.get("fp16_tensor_instruction_path", ""),
+        "wgmma_supported": bool(t.get("wgmma_supported", False)),
+        "benchmark_uses_wgmma": bool(t.get("benchmark_uses_wgmma", False)),
         "fp16_path": t.get("fp16_path", ""),
         "test_kernel": t.get("kernel", ""),
         "baseline_kernel": b.get("kernel", ""),
@@ -415,7 +543,7 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "memory_bits": mem_bits,
         **matmul_bits,
         "suppress_output_store": bool(t.get("suppress_output_store", False)),
-        "expected_l2_touch": bool(mem_bytes > 0 or not t.get("suppress_output_store", False)),
+        "expected_l2_touch": expected_l2_touch,
         "tflops": tflops,
         "memory_gbps": gbps,
         "test_avg_power_w": test_avg_power,
@@ -433,6 +561,10 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "test_energy_counter_vs_trace_ratio": t.get("energy_counter_vs_trace_ratio", math.nan),
         "baseline_energy_counter_vs_trace_ratio": b.get("energy_counter_vs_trace_ratio", math.nan),
         "baseline_scaled_energy_j": baseline_scaled_energy,
+        "baseline_energy_fraction": baseline_energy_fraction,
+        "incremental_energy_fraction": incremental_energy_fraction,
+        "baseline_power_fraction": baseline_power_fraction,
+        "energy_sources_match": t.get("energy_source", "") == b.get("energy_source", ""),
         "incremental_power_w": inc_power,
         "incremental_energy_j": inc_energy,
         "pj_per_flop": pj_per_flop,
@@ -454,6 +586,9 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "avg_sm_util_pct": t.get("avg_sm_util_pct", math.nan),
         "max_sm_util_pct": t.get("max_sm_util_pct", math.nan),
         "valid_basic": valid_basic,
+        "valid_no_l2": valid_no_l2,
+        "pure_fp16_candidate": pure_fp16_candidate,
+        "separation_quality": separation_quality,
         "test_run_id": t.get("run_id", ""),
         "baseline_run_id": b.get("run_id", ""),
         "test_power_csv": t.get("power_csv", ""),
@@ -512,6 +647,9 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "memory_gbps",
         "incremental_power_w",
         "incremental_energy_j",
+        "baseline_energy_fraction",
+        "incremental_energy_fraction",
+        "baseline_power_fraction",
         "w_per_tflops",
         "avg_sm_clock_mhz",
         "clock_span_mhz",
@@ -529,11 +667,17 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         row: Dict[str, Any] = {
             "condition": cond,
             "gpu": first.get("gpu", ""),
+            "architecture_generation": first.get("architecture_generation", ""),
+            "architecture_chip": first.get("architecture_chip", ""),
+            "gpu_product_class": first.get("gpu_product_class", ""),
+            "recommended_cuda_arch": first.get("recommended_cuda_arch", ""),
             "fp16_path": first.get("fp16_path", ""),
             "test_kernel": first.get("test_kernel", ""),
             "baseline_kernel": first.get("baseline_kernel", ""),
             "run_count": len(group),
             "valid_count": len(valid),
+            "valid_no_l2_count": sum(1 for r in group if bool(r.get("valid_no_l2", False))),
+            "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
             "invalid_count": len(group) - len(valid),
             "stats_scope": "valid_basic" if valid else "all_runs_no_valid_basic",
         }
@@ -600,6 +744,11 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         valid = [r for r in group if bool(r.get("valid_basic", False))]
         stats_source = valid_no_l2 or valid or group
         row: Dict[str, Any] = {
+            "gpu": group[0].get("gpu", ""),
+            "architecture_generation": group[0].get("architecture_generation", ""),
+            "architecture_chip": group[0].get("architecture_chip", ""),
+            "gpu_product_class": group[0].get("gpu_product_class", ""),
+            "recommended_cuda_arch": group[0].get("recommended_cuda_arch", ""),
             "fp16_path": fp16_path,
             "test_kernel": test_kernel,
             "baseline_kernel": baseline_kernel,
@@ -608,6 +757,7 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "run_count": len(group),
             "valid_count": len(valid),
             "valid_no_l2_count": len(valid_no_l2),
+            "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
             "stats_scope": "valid_no_l2" if valid_no_l2 else ("valid_basic" if valid else "all_runs_no_valid"),
             "expected_l2_touch": any(bool(r.get("expected_l2_touch", True)) for r in stats_source),
         }
@@ -751,6 +901,34 @@ def plot_matmul_pj_per_bit_bar(summary_rows: List[Dict[str, Any]], figdir: Path)
     plt.tight_layout()
     plt.savefig(figdir / "matmul_input_pj_per_bit_bar.png", dpi=160)
     plt.close()
+
+
+def plot_energy_separation(summary_rows: List[Dict[str, Any]], figdir: Path) -> None:
+    rows = [
+        r for r in summary_rows
+        if math.isfinite(finite_float(r.get("baseline_scaled_energy_j")))
+        and math.isfinite(finite_float(r.get("incremental_energy_j")))
+    ]
+    if not rows:
+        return
+    rows = sorted(rows, key=lambda r: (str(r.get("condition", "")), int(r.get("pair_index", 0))))[:40]
+    labels = [f"{r['condition']}#{int(r.get('pair_index', 0))}" for r in rows]
+    baseline = [finite_float(r.get("baseline_scaled_energy_j"), 0.0) for r in rows]
+    incremental = [finite_float(r.get("incremental_energy_j"), 0.0) for r in rows]
+
+    fig, ax = plt.subplots(figsize=(max(10, 0.32 * len(rows)), 5.2))
+    xs = list(range(len(rows)))
+    ax.bar(xs, baseline, label="baseline-scaled energy")
+    ax.bar(xs, incremental, bottom=baseline, label="FP16 incremental energy")
+    ax.axhline(0.0, color="0.25", linewidth=0.8)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("Energy in test interval (J)")
+    ax.set_title("Baseline separation for FP16 incremental estimate")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(figdir / "fp16_energy_separation_stack.png", dpi=160)
+    plt.close(fig)
 
 
 def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
@@ -923,6 +1101,7 @@ def main() -> int:
     plot_bar(summary, figdir)
     plot_pj_per_bit_bar(summary, figdir)
     plot_matmul_pj_per_bit_bar(summary, figdir)
+    plot_energy_separation(summary, figdir)
     plot_thread_sweep(thread_sweep_summary, figdir)
     plot_scatter(summary, figdir)
     for s in summary:

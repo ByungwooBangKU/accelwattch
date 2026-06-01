@@ -69,6 +69,17 @@ struct EnergyReading {
   std::string note;
 };
 
+struct ArchitectureProfile {
+  std::string generation;
+  std::string chip;
+  std::string product_class;
+  std::string recommended_cuda_arch;
+  std::string fp16_tensor_instruction_path;
+  std::string measurement_note;
+  bool wgmma_supported = false;
+  bool benchmark_uses_wgmma = false;
+};
+
 class NvmlEnergyCounter {
  public:
   explicit NvmlEnergyCounter(int cuda_device_index) {
@@ -213,6 +224,55 @@ TimingResult make_timing_result(float elapsed_ms, uint64_t host_start_ns, uint64
     }
   }
   return result;
+}
+
+ArchitectureProfile classify_architecture(const cudaDeviceProp& prop) {
+  const std::string name(prop.name);
+  ArchitectureProfile p;
+  p.generation = "unknown";
+  p.chip = "unknown";
+  p.product_class = "unknown";
+  p.recommended_cuda_arch = std::to_string(prop.major) + std::to_string(prop.minor);
+  p.fp16_tensor_instruction_path = "benchmark uses warp-level HMMA mma.sync m16n8k16 pairs";
+  p.measurement_note = "unknown GPU architecture; rely on recorded compute capability and validation counters";
+
+  if (prop.major == 9) {
+    p.generation = "hopper";
+    p.chip = name.find("H100") != std::string::npos ? "gh100" : "hopper_sm90";
+    p.product_class = "datacenter";
+    p.recommended_cuda_arch = "90";
+    p.wgmma_supported = true;
+    p.measurement_note =
+        "H100/Hopper supports WGMMA, but this benchmark intentionally uses the same warp-level "
+        "HMMA m16n8k16 pair path as Ampere for cross-GPU FP16 Tensor Core comparison; use NVML "
+        "total energy counter as the primary energy source when available";
+  } else if (prop.major == 8 && prop.minor == 0) {
+    p.generation = "ampere";
+    p.chip = name.find("A100") != std::string::npos ? "ga100" : "ampere_sm80";
+    p.product_class = "datacenter";
+    p.recommended_cuda_arch = "80";
+    p.measurement_note =
+        "A100/GA100 path uses warp-level HMMA m16n8k16 pairs; compare against H100/RTX3090 only "
+        "with the same logical m16n16k16 workload, clock policy, and baseline subtraction";
+  } else if (prop.major == 8 && prop.minor == 6) {
+    p.generation = "ampere";
+    p.chip = name.find("3090") != std::string::npos ? "ga102" : "ampere_sm86";
+    p.product_class = name.find("RTX") != std::string::npos ? "consumer" : "workstation_or_consumer";
+    p.recommended_cuda_arch = "86";
+    p.measurement_note =
+        "RTX 3090/GA102 path uses warp-level HMMA m16n8k16 pairs; board-level power and boost "
+        "behavior are more variable than datacenter GPUs, so clock stability and no-L2 validation "
+        "must be checked before using the pJ/bit estimate";
+  } else if (prop.major == 8) {
+    p.generation = "ampere";
+    p.chip = "ampere_sm8x";
+    p.recommended_cuda_arch = std::string("8") + std::to_string(prop.minor);
+    p.measurement_note =
+        "Ampere-class GPU; benchmark uses warp-level HMMA m16n8k16 pairs and requires validation "
+        "before comparing against A100/H100/RTX3090 reference runs";
+  }
+
+  return p;
 }
 
 void usage(const char* argv0) {
@@ -944,6 +1004,7 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaSetDevice(args.device));
   cudaDeviceProp prop{};
   CUDA_CHECK(cudaGetDeviceProperties(&prop, args.device));
+  const ArchitectureProfile arch = classify_architecture(prop);
 
   if (args.blocks_per_sm <= 0 || args.threads <= 0 || args.iters <= 0 || args.repeats <= 0 ||
       args.warmup < 0 || args.mem_mib <= 0 || args.mem_stride <= 0) {
@@ -1002,6 +1063,16 @@ int main(int argc, char** argv) {
   os << "  \"device_index\": " << args.device << ",\n";
   os << "  \"device_name\": \"" << json_escape(prop.name) << "\",\n";
   os << "  \"compute_capability\": \"" << prop.major << "." << prop.minor << "\",\n";
+  os << "  \"architecture_generation\": \"" << json_escape(arch.generation) << "\",\n";
+  os << "  \"architecture_chip\": \"" << json_escape(arch.chip) << "\",\n";
+  os << "  \"gpu_product_class\": \"" << json_escape(arch.product_class) << "\",\n";
+  os << "  \"recommended_cuda_arch\": \"" << json_escape(arch.recommended_cuda_arch) << "\",\n";
+  os << "  \"fp16_tensor_instruction_path\": \"" << json_escape(arch.fp16_tensor_instruction_path)
+     << "\",\n";
+  os << "  \"wgmma_supported\": " << (arch.wgmma_supported ? "true" : "false") << ",\n";
+  os << "  \"benchmark_uses_wgmma\": " << (arch.benchmark_uses_wgmma ? "true" : "false")
+     << ",\n";
+  os << "  \"architecture_measurement_note\": \"" << json_escape(arch.measurement_note) << "\",\n";
   os << "  \"sm_count\": " << prop.multiProcessorCount << ",\n";
   os << "  \"l2_cache_bytes\": " << prop.l2CacheSize << ",\n";
   os << "  \"shared_mem_per_block\": " << prop.sharedMemPerBlock << ",\n";
