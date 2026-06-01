@@ -189,6 +189,54 @@ def resolution_quality(
     return (not failed, failed, warnings, elapsed, baseline_elapsed, test_energy, incremental_energy)
 
 
+def counter_trace_crosscheck(
+    test_source: str,
+    baseline_source: str,
+    test_ratio_value: Any,
+    baseline_ratio_value: Any,
+    args: argparse.Namespace,
+) -> Tuple[bool, List[str], List[str], float, float]:
+    """Check NVML total-energy counter against nvidia-smi power trace integration.
+
+    The NVML counter remains the primary energy source. This check is a telemetry
+    sanity warning by default because H100/Ampere power.draw values may be averaged
+    over a different window than the timed kernel interval.
+    """
+    test_ratio = parse_float(test_ratio_value)
+    baseline_ratio = parse_float(baseline_ratio_value)
+    failed: List[str] = []
+    warnings: List[str] = []
+
+    ratios: List[Tuple[str, float]] = []
+    for role, source, ratio in (
+        ("test", test_source, test_ratio),
+        ("baseline", baseline_source, baseline_ratio),
+    ):
+        if source != "nvml_total_energy_counter":
+            continue
+        if math.isfinite(ratio) and ratio > 0.0:
+            ratios.append((role, ratio))
+        else:
+            msg = f"{role} NVML-counter/power-trace ratio is missing"
+            if args.require_counter_trace_agreement:
+                failed.append(msg)
+            else:
+                warnings.append(msg)
+
+    for role, ratio in ratios:
+        if ratio < args.warn_counter_trace_ratio_low or ratio > args.warn_counter_trace_ratio_high:
+            msg = (
+                f"{role} NVML-counter/power-trace ratio {ratio:.4g} outside "
+                f"[{args.warn_counter_trace_ratio_low:.4g}, {args.warn_counter_trace_ratio_high:.4g}]"
+            )
+            if args.require_counter_trace_agreement:
+                failed.append(msg)
+            else:
+                warnings.append(msg)
+
+    return (not failed and not warnings, failed, warnings, test_ratio, baseline_ratio)
+
+
 def pair_gate_rows(
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
@@ -196,11 +244,13 @@ def pair_gate_rows(
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in summary_rows:
+        test_source = str(row.get("test_energy_source", ""))
+        baseline_source = str(row.get("baseline_energy_source", ""))
         test_samples = int(parse_float(row.get("test_power_samples"), 0.0))
         baseline_samples = int(parse_float(row.get("baseline_power_samples"), 0.0))
         grade, reliable_source, source_note = source_grade(
-            str(row.get("test_energy_source", "")),
-            str(row.get("baseline_energy_source", "")),
+            test_source,
+            baseline_source,
             test_samples,
             baseline_samples,
             args.min_power_samples,
@@ -232,6 +282,13 @@ def pair_gate_rows(
                 args,
             )
         )
+        trace_ok, trace_failed, trace_warnings, test_trace_ratio, baseline_trace_ratio = counter_trace_crosscheck(
+            test_source,
+            baseline_source,
+            row.get("test_energy_counter_vs_trace_ratio"),
+            row.get("baseline_energy_counter_vs_trace_ratio"),
+            args,
+        )
         test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
             str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
@@ -258,6 +315,9 @@ def pair_gate_rows(
         if not resolution_ok:
             failed.extend(resolution_failed)
         warnings.extend(resolution_warnings)
+        if args.require_counter_trace_agreement and not trace_ok:
+            failed.extend(trace_failed)
+        warnings.extend(trace_warnings)
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
         if not clock_stable:
@@ -294,6 +354,7 @@ def pair_gate_rows(
                 "no_intended_l2": no_l2,
                 "pure_fp16_candidate": pure,
                 "energy_source_reliable": reliable_source,
+                "energy_trace_crosscheck_pass": trace_ok,
                 "baseline_structural_match": baseline_ok,
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
@@ -321,6 +382,10 @@ def pair_gate_rows(
                 "clock_span_mhz": row.get("clock_span_mhz", ""),
                 "test_energy_source": row.get("test_energy_source", ""),
                 "baseline_energy_source": row.get("baseline_energy_source", ""),
+                "test_energy_counter_vs_trace_ratio": test_trace_ratio,
+                "baseline_energy_counter_vs_trace_ratio": baseline_trace_ratio,
+                "test_energy_counter_vs_trace_delta_j": row.get("test_energy_counter_vs_trace_delta_j", ""),
+                "baseline_energy_counter_vs_trace_delta_j": row.get("baseline_energy_counter_vs_trace_delta_j", ""),
                 "test_power_samples": test_samples,
                 "baseline_power_samples": baseline_samples,
                 "fail_reasons": "; ".join(failed),
@@ -431,6 +496,18 @@ def thread_gate_rows(
         else:
             grade = "mixed_or_unavailable"
             source_ok = False
+        thread_test_source = "nvml_total_energy_counter" if source_info.get("all_nvml") else ""
+        thread_baseline_source = "nvml_total_energy_counter" if source_info.get("all_nvml") else ""
+        if grade == "power_trace_fallback":
+            thread_test_source = "power_trace_integral"
+            thread_baseline_source = "power_trace_integral"
+        trace_ok, trace_failed, trace_warnings, test_trace_ratio, baseline_trace_ratio = counter_trace_crosscheck(
+            thread_test_source,
+            thread_baseline_source,
+            row.get("test_energy_counter_vs_trace_ratio_mean"),
+            row.get("baseline_energy_counter_vs_trace_ratio_mean"),
+            args,
+        )
 
         failed: List[str] = []
         warnings: List[str] = []
@@ -454,6 +531,9 @@ def thread_gate_rows(
         if not resolution_ok:
             failed.extend(resolution_failed)
         warnings.extend(resolution_warnings)
+        if args.require_counter_trace_agreement and not trace_ok:
+            failed.extend(trace_failed)
+        warnings.extend(trace_warnings)
         if args.require_ncu and not ncu_ok:
             failed.append(f"NCU validation failed or missing: test={test_ncu_note}; baseline={baseline_ncu_note}")
         if grade == "power_trace_fallback":
@@ -491,6 +571,7 @@ def thread_gate_rows(
                 "no_intended_l2": enough_no_l2,
                 "pure_fp16_candidate": enough_pure,
                 "energy_source_reliable": source_ok,
+                "energy_trace_crosscheck_pass": trace_ok,
                 "baseline_structural_match": baseline_ok,
                 "energy_signal_reliable": signal_ok,
                 "measurement_resolution_reliable": resolution_ok,
@@ -520,6 +601,13 @@ def thread_gate_rows(
                 "stats_scope": row.get("stats_scope", ""),
                 "test_energy_source_counts": source_info.get("test_energy_source_counts", ""),
                 "baseline_energy_source_counts": source_info.get("baseline_energy_source_counts", ""),
+                "test_energy_counter_vs_trace_ratio_mean": test_trace_ratio,
+                "baseline_energy_counter_vs_trace_ratio_mean": baseline_trace_ratio,
+                "test_energy_counter_vs_trace_delta_j_mean": row.get("test_energy_counter_vs_trace_delta_j_mean", ""),
+                "baseline_energy_counter_vs_trace_delta_j_mean": row.get(
+                    "baseline_energy_counter_vs_trace_delta_j_mean",
+                    "",
+                ),
                 "fail_reasons": "; ".join(failed),
                 "warnings": "; ".join(warnings),
             }
@@ -613,6 +701,9 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "min_baseline_elapsed_s": args.min_baseline_elapsed_s,
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
+            "warn_counter_trace_ratio_low": args.warn_counter_trace_ratio_low,
+            "warn_counter_trace_ratio_high": args.warn_counter_trace_ratio_high,
+            "require_counter_trace_agreement": bool(args.require_counter_trace_agreement),
             "require_ncu": bool(args.require_ncu),
             "ncu_summary": str(args.ncu_summary) if args.ncu_summary else "",
         },
@@ -632,6 +723,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
             "energy_signal_reliable requires incremental energy to be a configurable minimum fraction of test energy.",
             "measurement_resolution_reliable requires enough elapsed time and energy magnitude for stable measurement.",
+            "energy_trace_crosscheck_pass compares NVML total-energy delta with nvidia-smi power trace integration; "
+            "it is a warning by default because power.draw may be averaged over a different window.",
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
         ],
     }
@@ -656,6 +749,13 @@ def main() -> int:
     parser.add_argument("--min-test-energy-j", type=float, default=1.0)
     parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
     parser.add_argument("--require-baseline-elapsed", action="store_true")
+    parser.add_argument("--warn-counter-trace-ratio-low", type=float, default=0.5)
+    parser.add_argument("--warn-counter-trace-ratio-high", type=float, default=1.5)
+    parser.add_argument(
+        "--require-counter-trace-agreement",
+        action="store_true",
+        help="Fail quality gates when NVML-counter/power-trace ratio is missing or outside the warning band",
+    )
     parser.add_argument("--ncu-summary", type=Path, default=None, help="ncu_validation_summary.csv from validate_ncu_reports.py")
     parser.add_argument("--require-ncu", action="store_true", help="Require passing NCU validation for quality_pass")
     args = parser.parse_args()

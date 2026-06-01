@@ -143,6 +143,14 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("quality_pass is not true")
     if str(target.get("measurement_grade", "")) != "strict_nvml_counter":
         failed.append("measurement_grade is not strict_nvml_counter")
+    if str(target.get("measurement_grade", "")) == "strict_nvml_counter" and not parse_bool(
+        target.get("energy_trace_crosscheck_pass")
+    ):
+        msg = "NVML-counter/power-trace cross-check is missing or outside the warning band"
+        if args.require_counter_trace_agreement:
+            failed.append(msg)
+        else:
+            warnings.append(msg)
     if str(target.get("baseline_match_grade", "")) != "structural_baseline":
         failed.append("baseline_match_grade is not structural_baseline")
     if not parse_bool(target.get("energy_source_reliable")):
@@ -256,6 +264,7 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "threads_per_sm": target.get("threads_per_sm", ""),
         "measurement_grade": target.get("measurement_grade", ""),
         "baseline_match_grade": target.get("baseline_match_grade", ""),
+        "energy_trace_crosscheck_pass": target.get("energy_trace_crosscheck_pass", ""),
         "target_pass": target.get("target_pass", ""),
         "quality_pass": target.get("quality_pass", ""),
         "ncu_required": target.get("ncu_required", ""),
@@ -273,6 +282,19 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "incremental_power_w_mean": target.get("incremental_power_w_mean", ""),
         "test_energy_j_mean": target.get("test_energy_j_mean", ""),
         "incremental_energy_j_mean": target.get("incremental_energy_j_mean", ""),
+        "test_energy_counter_vs_trace_ratio_mean": target.get("test_energy_counter_vs_trace_ratio_mean", ""),
+        "baseline_energy_counter_vs_trace_ratio_mean": target.get(
+            "baseline_energy_counter_vs_trace_ratio_mean",
+            "",
+        ),
+        "test_energy_counter_vs_trace_delta_j_mean": target.get(
+            "test_energy_counter_vs_trace_delta_j_mean",
+            "",
+        ),
+        "baseline_energy_counter_vs_trace_delta_j_mean": target.get(
+            "baseline_energy_counter_vs_trace_delta_j_mean",
+            "",
+        ),
         "incremental_energy_fraction_mean": target.get("incremental_energy_fraction_mean", ""),
         "baseline_energy_fraction_mean": target.get("baseline_energy_fraction_mean", ""),
         "baseline_power_fraction_mean": target.get("baseline_power_fraction_mean", ""),
@@ -408,6 +430,14 @@ def plot_audit_metrics(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plot_metric(
         rows,
         outdir,
+        "test_energy_counter_vs_trace_ratio_mean",
+        "NVML energy / power-trace energy",
+        "Strict FP16 selected energy counter cross-check",
+        "strict_result_counter_trace_ratio.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
         "baseline_energy_fraction_mean",
         "Baseline-scaled energy / test energy",
         "Strict FP16 selected baseline energy fraction",
@@ -441,6 +471,11 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
         },
+        "counter_trace_crosscheck_thresholds": {
+            "warn_counter_trace_ratio_low": args.warn_counter_trace_ratio_low,
+            "warn_counter_trace_ratio_high": args.warn_counter_trace_ratio_high,
+            "require_counter_trace_agreement": bool(args.require_counter_trace_agreement),
+        },
         "counts": {
             "rows": len(rows),
             "audit_pass": sum(1 for r in rows if parse_bool(r.get("audit_pass"))),
@@ -472,6 +507,13 @@ def main() -> int:
     parser.add_argument("--min-test-energy-j", type=float, default=1.0)
     parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
     parser.add_argument("--require-baseline-elapsed", action="store_true")
+    parser.add_argument("--warn-counter-trace-ratio-low", type=float, default=0.5)
+    parser.add_argument("--warn-counter-trace-ratio-high", type=float, default=1.5)
+    parser.add_argument(
+        "--require-counter-trace-agreement",
+        action="store_true",
+        help="Fail audit when selected NVML-counter/power-trace ratio is missing or outside the warning band",
+    )
     parser.add_argument("--no-fail", action="store_true", help="Write audit files but return success even if audit fails")
     args = parser.parse_args()
 

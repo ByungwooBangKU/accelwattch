@@ -141,6 +141,8 @@ benchmark binary는 warmup 완료 후 CUDA event interval을 열기 직전에 en
 
 `nvidia-smi` power trace는 제거하지 않는다. H100처럼 `power.draw`가 averaging/smoothing된 값을 줄 수 있는 환경에서는 NVML total energy counter가 더 직접적인 최종 에너지 값이고, power trace는 clock/temperature/throttling 및 counter-vs-trace sanity check 용도다. runner는 지원되는 경우 `power.draw.average`와 `power.draw.instant`를 별도 컬럼으로 남긴다. 분석 결과에는 `energy_source`, `power_trace_energy_j`, `power_trace_query_modes`, `nvml_energy_delta_j`, `energy_counter_vs_trace_delta_j`, `energy_counter_vs_trace_ratio`가 함께 기록된다.
 
+`quality_gate.py`는 NVML counter 기반 energy와 power trace 적분값의 ratio도 확인한다. 기본값은 warning-only이며, H100/Ampere 이후 `power.draw`가 다른 시간 window의 평균값일 수 있기 때문이다. 이 sanity check까지 hard gate로 쓰려면 `--require-counter-trace-agreement`를 추가한다.
+
 ### Quality gate policy
 
 `analyze_results.py`가 만든 수치는 바로 최종값으로 채택하지 않고, `quality_gate.py`로 다음 조건을 확인한다.
@@ -158,6 +160,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | enough valid repeats | thread point별 `valid_no_l2_count >= max(3, ceil(run_count/2))` |
 | stable clock | 기본값으로 `clock_span_mhz <= 60` |
 | reliable energy source | `nvml_total_energy_counter` 우선. 미지원 시 power trace fallback은 최소 sample 수를 만족할 때만 diagnostic grade로 통과 |
+| counter-vs-trace cross-check | NVML counter energy와 `nvidia-smi` power trace 적분값의 ratio를 warning band로 확인. 기본은 warning-only |
 | reliable energy signal | 기본값으로 `incremental_energy_fraction >= 0.01`이고 `baseline_energy_fraction <= 0.99`. 0.05 미만은 warning |
 | measurement resolution | 기본값으로 test/baseline elapsed time >= 0.25 s, test energy >= 1 J, incremental energy >= 0.1 J |
 | structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
@@ -316,7 +319,7 @@ python3 scripts/compare_architectures.py \
   --outdir results/architecture_compare_fp16
 ```
 
-`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `resource_audit/thread_resource_occupancy.csv`에서 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 측정 해상도도 gate에 포함되어 test/baseline duration과 Joule 단위 신호가 너무 작으면 fail된다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
+`audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `resource_audit/thread_resource_occupancy.csv`에서 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 측정 해상도도 gate에 포함되어 test/baseline duration과 Joule 단위 신호가 너무 작으면 fail된다. NVML counter와 power trace 적분값의 cross-check는 기본적으로 warning이며, trace agreement까지 필수 조건으로 보려면 `--require-counter-trace-agreement`를 사용한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
 
 주요 산출물은 다음과 같다.
 
@@ -375,6 +378,7 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/strict_fp16_audit/figures/strict_result_tensor_model_utilization.png` | strict selected target의 dense Tensor Core model utilization 비교 |
 | `results/strict_fp16_audit/figures/strict_result_incremental_energy_fraction.png` | strict selected target의 incremental energy signal fraction 비교 |
 | `results/strict_fp16_audit/figures/strict_result_incremental_energy_j.png` | strict selected target의 incremental energy magnitude 비교 |
+| `results/strict_fp16_audit/figures/strict_result_counter_trace_ratio.png` | strict selected target의 NVML energy counter / power trace energy sanity ratio |
 | `results/strict_fp16_audit/figures/strict_result_baseline_energy_fraction.png` | strict selected target의 baseline-scaled energy fraction 비교 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
@@ -458,8 +462,10 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `pair_index`, `repeat_index` | baseline/test pair 번호와 runner 반복 번호 |
 | `test_avg_power_w` | test run의 평균 power |
 | `baseline_avg_power_w` | baseline run의 평균 power |
-| `test_energy_j` | test power trace를 test elapsed interval로 적분/스케일한 energy |
-| `baseline_energy_j` | baseline run 자체 elapsed interval의 energy. duration이 다를 수 있으므로 pJ/FLOP 계산에는 직접 빼지 않음 |
+| `test_energy_j` | test run의 selected energy. NVML total-energy counter가 있으면 그 값을 쓰고, 없으면 power trace 적분값으로 fallback |
+| `baseline_energy_j` | baseline run 자체 selected energy. duration이 다를 수 있으므로 pJ/FLOP 계산에는 직접 빼지 않음 |
+| `test_energy_counter_vs_trace_ratio` | NVML total-energy delta / power trace 적분 energy. 최종 energy source가 NVML일 때 trace sanity check 용도 |
+| `baseline_energy_counter_vs_trace_ratio` | baseline run의 NVML total-energy delta / power trace 적분 energy |
 | `baseline_scaled_energy_j` | baseline 평균 power × test elapsed time |
 | `incremental_power_w` | test 평균 power - baseline 평균 power |
 | `incremental_energy_j` | test_energy_j - baseline_scaled_energy_j |
@@ -497,6 +503,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `tensor_model_utilization_pct_mean` | thread point별 dense Tensor Core peak model 대비 평균 utilization |
 | `incremental_energy_fraction_mean` | thread point별 평균 incremental energy signal fraction |
 | `incremental_energy_j_mean` | thread point별 평균 incremental energy magnitude |
+| `test_energy_counter_vs_trace_ratio_mean` | thread point별 평균 test NVML-counter/power-trace ratio |
+| `baseline_energy_counter_vs_trace_ratio_mean` | thread point별 평균 baseline NVML-counter/power-trace ratio |
 | `baseline_energy_fraction_mean` | thread point별 평균 baseline-scaled energy fraction |
 | `matmul_input_pj_per_bit_mean` | thread point별 logical input bit 기준 pJ/bit |
 | `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
@@ -545,6 +553,7 @@ Memory policy sanity 예시:
 3. Nsight Compute로 P0 kernel의 memory traffic과 spill을 검증한다.
 4. `summary.csv`의 `valid_basic`만으로 결과를 채택하지 않는다.
 5. H100/A100/RTX 3090은 power telemetry 범위와 정확도가 다르므로 GPU 간 비교 시 같은 clock 조건, default 조건, max stable 조건을 분리한다.
+6. NVML total-energy counter는 device-level 누적값이므로 MIG/공유 GPU/다른 tenant가 같은 물리 GPU에서 동시에 실행되면 job energy로 분리되지 않는다. 최종 pJ/bit는 exclusive GPU 환경에서 측정한다.
 
 ## Metric definitions
 
