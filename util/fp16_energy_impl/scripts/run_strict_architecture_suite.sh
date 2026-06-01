@@ -6,6 +6,9 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
+CMAKE_CUDA_FLAGS="${CMAKE_CUDA_FLAGS:-}"
+NVCC_BIN="${NVCC_BIN:-nvcc}"
+NCU_BIN="${NCU_BIN:-ncu}"
 NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 
 OUTDIR=""
@@ -81,7 +84,8 @@ Options:
   -h, --help           Show this help
 
 Environment overrides:
-  CMAKE_BIN, PYTHON_BIN, NVIDIA_SMI_BIN, MPLCONFIGDIR, NCU_METRICS
+  CMAKE_BIN, CMAKE_CUDA_FLAGS, NVCC_BIN, NCU_BIN, PYTHON_BIN, NVIDIA_SMI_BIN,
+  MPLCONFIGDIR, NCU_METRICS
 USAGE
 }
 
@@ -169,6 +173,8 @@ if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
     --out-json "${PREFLIGHT_JSON}"
     --out-csv "${PREFLIGHT_CSV}"
     --cmake-bin "${CMAKE_BIN}"
+    --nvcc-bin "${NVCC_BIN}"
+    --ncu-bin "${NCU_BIN}"
     --python-bin "${PYTHON_BIN}"
     --nvidia-smi-bin "${NVIDIA_SMI_BIN}"
   )
@@ -232,8 +238,8 @@ for spec in "${SPECS[@]}"; do
 
   echo "Strict FP16 suite target: ${label} (gpu=${gpu}, cuda_arch=${cuda_arch}, out=${run_dir})"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
-    printf 'DRY RUN: CMAKE_BIN=%q PYTHON_BIN=%q NVIDIA_SMI_BIN=%q %s\n' \
-      "${CMAKE_BIN}" "${PYTHON_BIN}" "${NVIDIA_SMI_BIN}" "$(quote_cmd "${cmd[@]}")"
+    printf 'DRY RUN: CMAKE_BIN=%q CMAKE_CUDA_FLAGS=%q NVCC_BIN=%q NCU_BIN=%q PYTHON_BIN=%q NVIDIA_SMI_BIN=%q %s\n' \
+      "${CMAKE_BIN}" "${CMAKE_CUDA_FLAGS}" "${NVCC_BIN}" "${NCU_BIN}" "${PYTHON_BIN}" "${NVIDIA_SMI_BIN}" "$(quote_cmd "${cmd[@]}")"
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "${label}" "${gpu}" "${cuda_arch}" "${nvidia_smi_id:-}" "${run_dir}" "dry_run" "0" >> "${RUN_STATUS_CSV}"
     COMPLETED_DIRS+=("${run_dir}")
@@ -241,7 +247,8 @@ for spec in "${SPECS[@]}"; do
   fi
 
   set +e
-  CMAKE_BIN="${CMAKE_BIN}" PYTHON_BIN="${PYTHON_BIN}" NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN}" "${cmd[@]}"
+  CMAKE_BIN="${CMAKE_BIN}" CMAKE_CUDA_FLAGS="${CMAKE_CUDA_FLAGS}" NVCC_BIN="${NVCC_BIN}" NCU_BIN="${NCU_BIN}" \
+    PYTHON_BIN="${PYTHON_BIN}" NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN}" "${cmd[@]}"
   rc=$?
   set -e
 

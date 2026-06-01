@@ -7,12 +7,13 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 
 EXPECTED_BY_ARCH = {
@@ -103,6 +104,26 @@ def command_available(name: str) -> bool:
     return bool(shutil.which(name))
 
 
+def parse_nvcc_release(text: str) -> Optional[Tuple[int, int]]:
+    match = re.search(r"release\s+(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def parse_nvidia_smi_cuda_version(text: str) -> Optional[Tuple[int, int]]:
+    match = re.search(r"CUDA Version\s*:?\s*(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def version_text(version: Optional[Tuple[int, int]]) -> str:
+    if version is None:
+        return ""
+    return f"{version[0]}.{version[1]}"
+
+
 def tool_result(name: str, cmd: List[str], required: bool, dry_run: bool) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "name": name,
@@ -140,6 +161,53 @@ def tool_result(name: str, cmd: List[str], required: bool, dry_run: bool) -> Dic
         result["pass"] = not required
         if required:
             result["fail_reasons"].append(f"{name} command failed")
+    return result
+
+
+def check_cuda_toolchain_compatibility(tools: List[Dict[str, Any]], dry_run: bool) -> Dict[str, Any]:
+    """Check that the selected nvcc runtime is not newer than the installed driver.
+
+    nvidia-smi reports the maximum CUDA runtime version supported by the driver.
+    A newer nvcc can compile successfully but produce a binary that fails at
+    cudaSetDevice with cudaErrorInsufficientDriver.
+    """
+    result: Dict[str, Any] = {
+        "checked": False,
+        "pass": True,
+        "nvcc_release": "",
+        "driver_cuda_version": "",
+        "fail_reasons": [],
+        "warnings": [],
+    }
+    if dry_run:
+        result["warnings"].append("dry-run: CUDA toolchain/driver compatibility was not checked")
+        return result
+
+    by_name = {str(tool.get("name", "")): tool for tool in tools}
+    nvcc = by_name.get("nvcc", {})
+    nvidia_smi = by_name.get("nvidia-smi", {})
+    if nvcc.get("returncode") != 0 or nvidia_smi.get("returncode") != 0:
+        result["warnings"].append("CUDA toolchain/driver compatibility skipped because nvcc or nvidia-smi failed")
+        return result
+
+    nvcc_text = "\n".join([str(nvcc.get("stdout", "")), str(nvcc.get("stderr", ""))])
+    smi_text = "\n".join([str(nvidia_smi.get("stdout", "")), str(nvidia_smi.get("stderr", ""))])
+    nvcc_version = parse_nvcc_release(nvcc_text)
+    driver_cuda = parse_nvidia_smi_cuda_version(smi_text)
+    result["checked"] = True
+    result["nvcc_release"] = version_text(nvcc_version)
+    result["driver_cuda_version"] = version_text(driver_cuda)
+
+    if nvcc_version is None:
+        result["warnings"].append("could not parse nvcc release version")
+    if driver_cuda is None:
+        result["warnings"].append("could not parse driver CUDA Version from nvidia-smi --version")
+    if nvcc_version is not None and driver_cuda is not None and nvcc_version > driver_cuda:
+        result["pass"] = False
+        result["fail_reasons"].append(
+            f"nvcc release {version_text(nvcc_version)} is newer than driver CUDA Version "
+            f"{version_text(driver_cuda)}; use an older NVCC_BIN/toolkit or update the driver"
+        )
     return result
 
 
@@ -263,6 +331,8 @@ def main() -> int:
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--out-csv", type=Path, required=True)
     parser.add_argument("--cmake-bin", default="cmake")
+    parser.add_argument("--nvcc-bin", default="nvcc")
+    parser.add_argument("--ncu-bin", default="ncu")
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--nvidia-smi-bin", default="nvidia-smi")
     parser.add_argument("--require-ncu", action="store_true")
@@ -282,11 +352,13 @@ def main() -> int:
         tool_result("python", [args.python_bin, "--version"], True, args.dry_run),
         tool_result("cmake", [args.cmake_bin, "--version"], True, args.dry_run),
         tool_result("nvidia-smi", [args.nvidia_smi_bin, "--version"], True, args.dry_run),
-        tool_result("nvcc", ["nvcc", "--version"], True, args.dry_run),
-        tool_result("ncu", ["ncu", "--version"], args.require_ncu, args.dry_run),
+        tool_result("nvcc", [args.nvcc_bin, "--version"], True, args.dry_run),
+        tool_result("ncu", [args.ncu_bin, "--version"], args.require_ncu, args.dry_run),
     ]
+    compatibility = check_cuda_toolchain_compatibility(tools, args.dry_run)
     for tool in tools:
         tool_failures.extend(tool.get("fail_reasons", []))
+    tool_failures.extend(compatibility.get("fail_reasons", []))
     failed.extend(tool_failures)
 
     apps: List[Dict[str, str]] = []
@@ -335,9 +407,11 @@ def main() -> int:
         "environment": {
             "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
             "CUDA_DEVICE_ORDER": os.environ.get("CUDA_DEVICE_ORDER", ""),
+            "CMAKE_CUDA_FLAGS": os.environ.get("CMAKE_CUDA_FLAGS", ""),
             "PATH": os.environ.get("PATH", ""),
         },
         "tool_results": tools,
+        "cuda_toolchain_compatibility": compatibility,
         "compute_apps_query": apps_result,
         "compute_apps": apps,
         "rows": rows,

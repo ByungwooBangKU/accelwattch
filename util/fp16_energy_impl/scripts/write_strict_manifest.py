@@ -58,7 +58,7 @@ def path_info(path: Path) -> Dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Write strict FP16 pipeline provenance manifest")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--status", required=True, choices=["started", "completed"])
+    parser.add_argument("--status", required=True, choices=["started", "completed", "failed"])
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
@@ -82,6 +82,8 @@ def main() -> int:
     parser.add_argument("--max-calibrated-repeats", required=True)
     parser.add_argument("--invocation", default="")
     parser.add_argument("--cmake-bin", default="cmake")
+    parser.add_argument("--nvcc-bin", default="nvcc")
+    parser.add_argument("--ncu-bin", default="ncu")
     parser.add_argument("--python-bin", default="python3")
     parser.add_argument("--nvidia-smi-bin", default="nvidia-smi")
     args = parser.parse_args()
@@ -114,8 +116,11 @@ def main() -> int:
             for key in [
                 "CUDA_VISIBLE_DEVICES",
                 "CUDA_DEVICE_ORDER",
+                "CMAKE_CUDA_FLAGS",
                 "MPLCONFIGDIR",
                 "NCU_METRICS",
+                "NCU_BIN",
+                "NVCC_BIN",
                 "PATH",
                 "LD_LIBRARY_PATH",
             ]
@@ -129,8 +134,8 @@ def main() -> int:
             "python": run_command([args.python_bin, "--version"]),
             "cmake": run_command([args.cmake_bin, "--version"]),
             "nvidia_smi": run_command([args.nvidia_smi_bin, "--version"]),
-            "nvcc": run_command(["nvcc", "--version"]),
-            "ncu": run_command(["ncu", "--version"]),
+            "nvcc": run_command([args.nvcc_bin, "--version"]),
+            "ncu": run_command([args.ncu_bin, "--version"]),
         },
         "artifacts": {
             "root": str(root),

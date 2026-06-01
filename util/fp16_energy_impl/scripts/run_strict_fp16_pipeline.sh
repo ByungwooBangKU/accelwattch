@@ -15,6 +15,9 @@ SAMPLE_MS=100
 THREADS_CSV="32,64,96,128,160,192,224,256,288,320,384"
 BUILD_DIR="build"
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
+CMAKE_CUDA_FLAGS="${CMAKE_CUDA_FLAGS:-}"
+NVCC_BIN="${NVCC_BIN:-nvcc}"
+NCU_BIN="${NCU_BIN:-ncu}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 SKIP_BUILD=0
@@ -31,7 +34,7 @@ Usage: run_strict_fp16_pipeline.sh [options]
 Runs the strict FP16 Tensor Core pJ/bit pipeline:
   build -> env capture -> runtime preflight -> matrix repeat calibration
   -> structural-baseline thread sweep -> analyze -> Nsight Compute no-L2 validation
-  -> quality gate --require-ncu
+  -> quality gate --require-ncu --require-ncu-tensor-activity
 
 Options:
   --gpu N              CUDA/NVML GPU index [0]
@@ -53,7 +56,8 @@ Options:
   -h, --help           Show this help
 
 Environment overrides:
-  CMAKE_BIN, PYTHON_BIN, NVIDIA_SMI_BIN, MPLCONFIGDIR, NCU_METRICS
+  CMAKE_BIN, CMAKE_CUDA_FLAGS, NVCC_BIN, NCU_BIN, PYTHON_BIN, NVIDIA_SMI_BIN,
+  MPLCONFIGDIR, NCU_METRICS
 USAGE
 }
 
@@ -146,16 +150,39 @@ write_manifest() {
     --max-calibrated-repeats "${MAX_CALIBRATED_REPEATS}" \
     --invocation "${ORIGINAL_INVOCATION}" \
     --cmake-bin "${CMAKE_BIN}" \
+    --nvcc-bin "${NVCC_BIN}" \
+    --ncu-bin "${NCU_BIN}" \
     --python-bin "${PYTHON_BIN}" \
     --nvidia-smi-bin "${NVIDIA_SMI_BIN}"
 }
 
+PIPELINE_DONE=0
+on_pipeline_exit() {
+  local rc=$?
+  if [[ "${rc}" -ne 0 && "${PIPELINE_DONE}" -eq 0 ]]; then
+    echo "Strict FP16 pipeline failed with exit code ${rc}; writing failed manifest: ${FINAL_MANIFEST}" >&2
+    set +e
+    write_manifest failed "${FINAL_MANIFEST}" >/dev/null 2>&1
+    set -e
+  fi
+  return "${rc}"
+}
+trap on_pipeline_exit EXIT
+
 write_manifest started "${START_MANIFEST}"
 
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
-  "${CMAKE_BIN}" -S "${ROOT}" -B "${BUILD_PATH}" \
-    -DCMAKE_BUILD_TYPE=Release \
+  CMAKE_CONFIGURE_ARGS=(
+    -S "${ROOT}"
+    -B "${BUILD_PATH}"
+    -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"
+    -DCMAKE_CUDA_COMPILER="${NVCC_BIN}"
+  )
+  if [[ -n "${CMAKE_CUDA_FLAGS}" ]]; then
+    CMAKE_CONFIGURE_ARGS+=(-DCMAKE_CUDA_FLAGS="${CMAKE_CUDA_FLAGS}")
+  fi
+  "${CMAKE_BIN}" "${CMAKE_CONFIGURE_ARGS[@]}"
   "${CMAKE_BIN}" --build "${BUILD_PATH}" --clean-first -j 2 2>&1 | tee "${BUILD_LOG}"
 fi
 
@@ -219,7 +246,8 @@ fi
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/summarize_kernel_resources.py" "${RESOURCE_ARGS[@]}"
 
-"${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \
+NCU_BIN="${NCU_BIN}" \
+  "${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \
   "${BINARY}" \
   "${NCDIR}" \
   "${GPU_ID}" \
@@ -235,6 +263,7 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/quality_gate.py" "${QUALITY_ARGS[@]}"
 
 write_manifest completed "${FINAL_MANIFEST}"
+PIPELINE_DONE=1
 
 cat <<EOF
 Strict FP16 pipeline complete:

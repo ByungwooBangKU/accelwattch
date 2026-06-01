@@ -10,6 +10,7 @@ mkdir -p "${OUTDIR}"
 IFS=',' read -r -a THREADS_LIST <<< "${THREADS_CSV}"
 
 DEFAULT_NCU_METRICS="smsp__inst_executed_pipe_tensor_op_hmma.sum,smsp__sass_thread_inst_executed_op_hmma_pred_on.sum,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum,dram__bytes_write.sum,lts__t_bytes_read.sum,lts__t_bytes_write.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum"
+NCU_BIN="${NCU_BIN:-ncu}"
 NCU_METRICS="${NCU_METRICS:-${DEFAULT_NCU_METRICS}}"
 NCU_BLOCKS_PER_SM="${NCU_BLOCKS_PER_SM:-8}"
 NCU_UNROLL="${NCU_UNROLL:-8}"
@@ -37,7 +38,7 @@ fi
 run_ncu() {
   local name="$1"; shift
   local kernel_regex="$1"; shift
-  ncu \
+  "${NCU_BIN}" \
     --target-processes all \
     --kernel-name regex:".*${kernel_regex}.*" \
     --section LaunchStats \
