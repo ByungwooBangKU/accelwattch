@@ -9,6 +9,8 @@ mkdir -p "${OUTDIR}"
 
 IFS=',' read -r -a THREADS_LIST <<< "${THREADS_CSV}"
 
+NCU_METRICS="${NCU_METRICS:-smsp__inst_executed_pipe_tensor_op_hmma.sum,smsp__sass_thread_inst_executed_op_hmma_pred_on.sum,dram__bytes_read.sum,dram__bytes_write.sum,lts__t_bytes_read.sum,lts__t_bytes_write.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum}"
+
 COMMON=(
   --device "${GPU_ID}"
   --blocks 0
@@ -29,6 +31,7 @@ run_ncu() {
     --section Occupancy \
     --section ComputeWorkloadAnalysis \
     --section MemoryWorkloadAnalysis \
+    --metrics "${NCU_METRICS}" \
     --print-summary per-kernel \
     --log-file "${OUTDIR}/${name}.ncu.txt" \
     "${BIN}" "${COMMON[@]}" "$@"

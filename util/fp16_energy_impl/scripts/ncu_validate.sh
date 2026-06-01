@@ -9,6 +9,7 @@ mkdir -p "${OUTDIR}"
 # Keep validation runs shorter than power runs. The section names are more stable
 # across Nsight Compute versions than individual metric names.
 COMMON=(--device "${GPU_ID}" --blocks 0 --blocks-per-sm 4 --threads 256 --warmup 1 --repeats 1 --unroll 8)
+NCU_METRICS="${NCU_METRICS:-smsp__inst_executed_pipe_tensor_op_hmma.sum,smsp__sass_thread_inst_executed_op_hmma_pred_on.sum,dram__bytes_read.sum,dram__bytes_write.sum,lts__t_bytes_read.sum,lts__t_bytes_write.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum}"
 
 run_ncu() {
   local name="$1"; shift
@@ -20,6 +21,7 @@ run_ncu() {
     --section ComputeWorkloadAnalysis \
     --section MemoryWorkloadAnalysis \
     --section SourceCounters \
+    --metrics "${NCU_METRICS}" \
     --print-summary per-kernel \
     --log-file "${OUTDIR}/${name}.ncu.txt" \
     "${BIN}" "${COMMON[@]}" "$@"

@@ -16,6 +16,7 @@
 | `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
 | `scripts/analyze_results.py` | NVML energy counter 우선 분석, power trace fallback, baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
 | `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
+| `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
 | `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
@@ -102,6 +103,21 @@ cmake --build build -j
 5. GPU별 `iters`/`repeats` 조정으로 power sample 수 확보.
 
 H100에서도 현재 Tensor Core kernel은 `mma.sync.m16n8k16` 두 개로 logical `m16n16k16`을 만드는 warp-level 경로를 사용한다. 따라서 A100/H100/RTX 3090 간 같은 HMMA 계열 FP16 matmul path 비교에는 사용할 수 있지만, H100 고유 WGMMA/TMA 경로의 최대 matmul energy를 측정하는 실험은 아니다. H100 WGMMA 경로까지 측정하려면 별도 kernel과 validation matrix를 추가해야 한다.
+
+Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--cuda-arch`만 바꾼다.
+
+```bash
+# A100
+./scripts/run_strict_fp16_pipeline.sh --gpu 0 --cuda-arch 80 --outdir results/strict_fp16_a100
+
+# RTX 3090
+./scripts/run_strict_fp16_pipeline.sh --gpu 0 --cuda-arch 86 --outdir results/strict_fp16_rtx3090
+
+# H100
+./scripts/run_strict_fp16_pipeline.sh --gpu 0 --cuda-arch 90 --outdir results/strict_fp16_h100
+```
+
+이 pipeline은 `fp16_matmul_thread_sweep_fine.json`의 structural baseline sweep을 실행하고, `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행한 뒤, `quality_gate.py --require-ncu`까지 실행한다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
 
 ### Energy source policy
 
@@ -364,6 +380,8 @@ results/ncu_*/figures/ncu_validation_summary.png
 ```
 
 strict mode에서는 explicit L2/DRAM/local counter metric이 없으면 fail로 처리한다. Nsight Compute 버전별 metric 이름 차이 때문에 counter가 빠진 경우, `ncu_validation_summary.csv`의 `fail_reasons`를 확인해 metric set을 조정한 뒤 다시 실행한다. `--allow-missing-counters`는 SASS token fallback을 쓰는 diagnostic 모드일 뿐, 최종 pJ/bit claim에는 사용하지 않는다.
+
+NCU helper는 parser가 요구하는 counter를 `--metrics`로 명시 수집한다. 기본 metric set은 `NCU_METRICS` 환경 변수로 override할 수 있다.
 
 P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 
