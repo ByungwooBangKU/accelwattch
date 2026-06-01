@@ -170,6 +170,9 @@ def load_result_dir(
                         "ncu_required",
                         "test_ncu_note",
                         "baseline_ncu_note",
+                        "tensor_peak_tflops_model_mean",
+                        "achieved_flops_per_sm_cycle_mean",
+                        "tensor_model_utilization_pct_mean",
                         "fail_reasons",
                         "warnings",
                     ):
@@ -236,6 +239,7 @@ def select_best_fp16(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             rejected["matmul_input_pj_per_bit_mean"] = math.nan
             rejected["tflops_mean"] = math.nan
             rejected["incremental_power_w_mean"] = math.nan
+            rejected["tensor_model_utilization_pct_mean"] = math.nan
             selected.append(rejected)
             continue
         else:
@@ -342,6 +346,28 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             fig.savefig(outdir / safe, dpi=160)
         plt.close(fig)
 
+        fig, ax = plt.subplots(figsize=(8.8, 5.2))
+        plotted = False
+        for label in sorted({str(r.get("architecture_label", "")) for r in rows}):
+            group = [r for r in rows if str(r.get("architecture_label", "")) == label]
+            group = sorted(group, key=lambda r: parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))))
+            xs = [parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))) for r in group]
+            ys = [parse_float(r.get("tensor_model_utilization_pct_mean")) for r in group]
+            if any(math.isfinite(y) for y in ys):
+                ax.plot(xs, ys, marker="^", label=label)
+                plotted = True
+        if plotted:
+            ax.set_xlabel("Launched threads per SM")
+            ax.set_ylabel("Dense Tensor Core model utilization (%)")
+            ax.set_title(f"Architecture thread sweep Tensor Core model utilization: {test_kernel} vs {baseline_kernel}")
+            ax.get_xaxis().set_major_formatter(ScalarFormatter())
+            ax.grid(True, axis="y", alpha=0.25)
+            ax.legend(loc="best")
+            fig.tight_layout()
+            safe = f"architecture_thread_sweep_model_util_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
+            fig.savefig(outdir / safe, dpi=160)
+        plt.close(fig)
+
 
 def plot_resource_compare(resource_rows: List[Dict[str, Any]], outdir: Path) -> None:
     rows = [r for r in resource_rows if str(r.get("role", "")) == "test"]
@@ -418,6 +444,13 @@ def main() -> int:
         "TFLOPS",
         "Best pure-FP16 throughput candidate by architecture",
         args.outdir / "architecture_best_tflops.png",
+    )
+    plot_bar(
+        best,
+        "tensor_model_utilization_pct_mean",
+        "Dense Tensor Core model utilization (%)",
+        "Best pure-FP16 Tensor Core model utilization by architecture",
+        args.outdir / "architecture_best_tensor_model_utilization.png",
     )
     plot_bar(
         best,

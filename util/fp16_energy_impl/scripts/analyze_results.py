@@ -14,6 +14,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 
+from architecture_models import tensor_peak_metrics
+
 
 def read_runs(path: Path) -> List[Dict[str, Any]]:
     runs_file = path / "runs.jsonl"
@@ -380,6 +382,8 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         total_energy = finite_float(s.get("power_energy_j"))
         total_pj_per_bit = total_energy / mem_bits * 1e12 if mem_bits > 0 and math.isfinite(total_energy) else math.nan
         memory_gbps = mem_bytes / elapsed_s / 1e9 if mem_bytes > 0 and elapsed_s > 0 else math.nan
+        tflops = finite_float(s.get("estimated_tflops", math.nan))
+        peak_metrics = tensor_peak_metrics(s, tflops)
         summaries.append(
             {
                 "condition": s["condition"],
@@ -390,6 +394,7 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "architecture_chip": s.get("architecture_chip", ""),
                 "gpu_product_class": s.get("gpu_product_class", ""),
                 "recommended_cuda_arch": s.get("recommended_cuda_arch", ""),
+                "sm_count": s.get("sm_count", ""),
                 "fp16_tensor_instruction_path": s.get("fp16_tensor_instruction_path", ""),
                 "wgmma_supported": bool(s.get("wgmma_supported", False)),
                 "benchmark_uses_wgmma": bool(s.get("benchmark_uses_wgmma", False)),
@@ -408,9 +413,10 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "memory_bytes": mem_bytes,
                 "memory_bits": mem_bits,
                 **matmul_bits,
+                **peak_metrics,
                 "suppress_output_store": bool(s.get("suppress_output_store", False)),
                 "expected_l2_touch": bool(mem_bytes > 0 or not s.get("suppress_output_store", False)),
-                "tflops": finite_float(s.get("estimated_tflops", math.nan)),
+                "tflops": tflops,
                 "memory_gbps": memory_gbps,
                 "test_avg_power_w": s.get("avg_power_w", math.nan),
                 "baseline_avg_power_w": math.nan,
@@ -510,6 +516,7 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         else math.nan
     )
     tflops = ops / elapsed_s / 1e12 if ops > 0 and elapsed_s > 0 else math.nan
+    peak_metrics = tensor_peak_metrics(t, tflops)
     gbps = mem_bytes / elapsed_s / 1e9 if mem_bytes > 0 and elapsed_s > 0 else math.nan
     pj_per_flop = inc_energy / ops * 1e12 if ops > 0 and math.isfinite(inc_energy) else math.nan
     w_per_tflops = inc_power / tflops if math.isfinite(inc_power) and math.isfinite(tflops) and tflops > 0 else math.nan
@@ -563,6 +570,7 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "architecture_chip": t.get("architecture_chip", ""),
         "gpu_product_class": t.get("gpu_product_class", ""),
         "recommended_cuda_arch": t.get("recommended_cuda_arch", ""),
+        "sm_count": t.get("sm_count", ""),
         "fp16_tensor_instruction_path": t.get("fp16_tensor_instruction_path", ""),
         "wgmma_supported": bool(t.get("wgmma_supported", False)),
         "benchmark_uses_wgmma": bool(t.get("benchmark_uses_wgmma", False)),
@@ -581,6 +589,7 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         "memory_bytes": mem_bytes,
         "memory_bits": mem_bits,
         **matmul_bits,
+        **peak_metrics,
         "suppress_output_store": bool(t.get("suppress_output_store", False)),
         "expected_l2_touch": expected_l2_touch,
         "tflops": tflops,
@@ -700,6 +709,9 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "incremental_energy_fraction",
         "baseline_power_fraction",
         "w_per_tflops",
+        "tensor_peak_tflops_model",
+        "achieved_flops_per_sm_cycle",
+        "tensor_model_utilization_pct",
         "avg_sm_clock_mhz",
         "clock_span_mhz",
         "max_temp_c",
@@ -720,6 +732,8 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "architecture_chip": first.get("architecture_chip", ""),
             "gpu_product_class": first.get("gpu_product_class", ""),
             "recommended_cuda_arch": first.get("recommended_cuda_arch", ""),
+            "sm_count": first.get("sm_count", ""),
+            "tensor_model_architecture_chip": first.get("tensor_model_architecture_chip", ""),
             "fp16_path": first.get("fp16_path", ""),
             "test_kernel": first.get("test_kernel", ""),
             "baseline_kernel": first.get("baseline_kernel", ""),
@@ -780,6 +794,9 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "matmul_input_pj_per_bit",
         "pj_per_flop",
         "incremental_power_w",
+        "tensor_peak_tflops_model",
+        "achieved_flops_per_sm_cycle",
+        "tensor_model_utilization_pct",
         "avg_sm_clock_mhz",
         "clock_span_mhz",
         "max_temp_c",
@@ -798,6 +815,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "architecture_chip": group[0].get("architecture_chip", ""),
             "gpu_product_class": group[0].get("gpu_product_class", ""),
             "recommended_cuda_arch": group[0].get("recommended_cuda_arch", ""),
+            "sm_count": group[0].get("sm_count", ""),
+            "tensor_model_architecture_chip": group[0].get("tensor_model_architecture_chip", ""),
             "fp16_path": fp16_path,
             "test_kernel": test_kernel,
             "baseline_kernel": baseline_kernel,

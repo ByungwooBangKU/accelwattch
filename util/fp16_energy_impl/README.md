@@ -15,6 +15,7 @@
 | `configs/p1_memory_policy_matrix.json` | P1 memory/cache policy 보정용 matrix |
 | `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
 | `scripts/analyze_results.py` | NVML energy counter 우선 분석, power trace fallback, baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
+| `scripts/architecture_models.py` | A100/H100/RTX3090 Tensor Core peak/occupancy normalization에 쓰는 architecture constants |
 | `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
 | `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
@@ -136,6 +137,8 @@ GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 최종 energy 계산은 timed loop 내부의 NVML 누적 에너지 카운터 delta를 우선 사용한다. 즉 `bench.json`의 `nvml_energy_supported=true`이고 `nvml_energy_delta_j > 0`이면 `power_energy_j`와 `avg_power_w`는 `nvmlDeviceGetTotalEnergyConsumption()` 기반 값이다. 카운터가 지원되지 않는 GPU/driver 조합에서는 기존 방식대로 `nvidia-smi --query-gpu=power.draw` trace를 host timed interval에 적분한 값을 fallback으로 사용한다.
 
+benchmark binary는 warmup 완료 후 CUDA event interval을 열기 직전에 energy counter를 읽고, `cudaEventSynchronize(stop)`으로 timed kernel 종료를 확인한 뒤 다시 읽는다. NVML device handle은 우선 CUDA device의 PCI bus id로 찾고, 실패 시 CUDA device index로 fallback한다. 따라서 `CUDA_VISIBLE_DEVICES`가 NVML index 순서를 바꾼 환경에서도 benchmark 내부 counter는 실행 중인 CUDA device와 같은 물리 GPU를 가리키도록 설계되어 있다.
+
 `nvidia-smi` power trace는 제거하지 않는다. H100처럼 `power.draw`가 averaging/smoothing된 값을 줄 수 있는 환경에서는 NVML total energy counter가 더 직접적인 최종 에너지 값이고, power trace는 clock/temperature/throttling 및 counter-vs-trace sanity check 용도다. runner는 지원되는 경우 `power.draw.average`와 `power.draw.instant`를 별도 컬럼으로 남긴다. 분석 결과에는 `energy_source`, `power_trace_energy_j`, `power_trace_query_modes`, `nvml_energy_delta_j`, `energy_counter_vs_trace_delta_j`, `energy_counter_vs_trace_ratio`가 함께 기록된다.
 
 ### Quality gate policy
@@ -177,6 +180,8 @@ python3 scripts/quality_gate.py \
 A100, H100, RTX 3090 비교는 같은 logical workload와 같은 instruction family를 비교하는 방식으로 해석한다. 현재 Tensor Core kernel은 세 GPU 모두에서 warp-level `mma.sync.m16n8k16` 두 개를 묶어 logical `m16n16k16`을 만들며, H100에서 지원되는 WGMMA 경로를 사용하지 않는다. 따라서 이 결과는 "H100의 최대 WGMMA matmul efficiency"가 아니라 "A100/H100/RTX3090에서 공통 HMMA FP16 path를 같은 baseline subtraction으로 측정한 값"이다.
 
 benchmark JSON과 분석 CSV에는 `architecture_generation`, `architecture_chip`, `recommended_cuda_arch`, `fp16_tensor_instruction_path`, `wgmma_supported`, `benchmark_uses_wgmma`가 기록된다. 오래된 결과 JSON도 `analyze_results.py`가 `device_name`과 `compute_capability`로 fallback 분류한다. Summary에는 `baseline_energy_fraction`, `incremental_energy_fraction`, `baseline_power_fraction`, `valid_no_l2`, `pure_fp16_candidate`, `separation_quality`가 추가되어, baseline이 너무 크거나 L2/global traffic이 예상되는 run을 pJ/bit 최종 후보에서 분리할 수 있다.
+
+분석 CSV는 architecture별 dense Tensor Core peak model도 함께 기록한다. `tensor_peak_tflops_model`은 측정 run의 `sm_count`와 평균 SM clock에서 계산한 dense FP16 Tensor Core peak이고, `achieved_flops_per_sm_cycle`와 `tensor_model_utilization_pct`는 실제 measured TFLOPS가 그 common HMMA model 대비 어느 정도인지 보여준다. 이 값은 thread sweep target을 해석하기 위한 normalization metric이며, pJ/bit의 energy source를 대체하지 않는다. H100에서는 WGMMA 최대 경로가 아니라 이 benchmark가 실제 사용하는 warp-level HMMA `m16n8k16` pair path 기준으로 해석한다.
 
 ## 5. 실험 전 환경 수집
 
@@ -319,7 +324,9 @@ python3 scripts/compare_architectures.py \
 | `architecture_quality_gates.csv` | 여러 결과 디렉터리의 `quality_gates.csv`를 architecture tag와 함께 병합한 파일 |
 | `architecture_best_matmul_input_pj_per_bit.png` | GPU architecture별 best logical matmul input pJ/bit 비교 |
 | `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |
+| `architecture_best_tensor_model_utilization.png` | GPU architecture별 best 후보의 dense Tensor Core model utilization 비교 |
 | `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교 |
+| `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교 |
 | `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교 |
 | `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
 
@@ -450,6 +457,9 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `w_per_tflops` | incremental power / achieved TFLOPS |
 | `avg_gpu_util_pct`, `max_gpu_util_pct` | test interval 안의 `nvidia-smi utilization.gpu` 평균/최대값 |
 | `avg_sm_util_pct`, `max_sm_util_pct` | test interval 안의 `nvidia-smi dmon -s u` `sm` 컬럼 평균/최대값 |
+| `tensor_peak_tflops_model` | run의 SM count와 평균 SM clock으로 계산한 dense FP16 Tensor Core peak model |
+| `achieved_flops_per_sm_cycle` | measured TFLOPS를 SM count와 평균 SM clock으로 나눈 FLOP/SM/cycle |
+| `tensor_model_utilization_pct` | measured TFLOPS / `tensor_peak_tflops_model` × 100 |
 | `suppress_output_store` | compute kernel의 final global output store를 제거했는지 여부 |
 | `expected_l2_touch` | timed kernel이 의도적으로 global/L2 traffic을 만들 것으로 예상되는지 여부 |
 | `valid_basic` | power sample, work estimate, positive incremental power/energy에 대한 최소 sanity flag. Nsight 검증을 대체하지 않음 |
@@ -467,6 +477,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `avg_sm_util_pct_mean` | thread point별 평균 SM utilization |
 | `avg_gpu_util_pct_mean` | dmon SM utilization이 없을 때 fallback으로 쓰는 평균 GPU utilization |
 | `tflops_mean` | thread point별 평균 Tensor Core throughput |
+| `tensor_model_utilization_pct_mean` | thread point별 dense Tensor Core peak model 대비 평균 utilization |
 | `matmul_input_pj_per_bit_mean` | thread point별 logical input bit 기준 pJ/bit |
 | `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
 

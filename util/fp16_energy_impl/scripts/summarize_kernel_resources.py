@@ -12,29 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+from architecture_models import ARCH_MODELS
 
 ARCH_LIMITS: Dict[str, Dict[str, Any]] = {
-    "80": {
-        "architecture_chip": "ga100",
-        "registers_per_sm": 65536,
-        "max_threads_per_sm": 2048,
-        "max_blocks_per_sm": 32,
-        "max_warps_per_sm": 64,
-    },
-    "86": {
-        "architecture_chip": "ga102",
-        "registers_per_sm": 65536,
-        "max_threads_per_sm": 1536,
-        "max_blocks_per_sm": 16,
-        "max_warps_per_sm": 48,
-    },
-    "90": {
-        "architecture_chip": "gh100",
-        "registers_per_sm": 65536,
-        "max_threads_per_sm": 2048,
-        "max_blocks_per_sm": 32,
-        "max_warps_per_sm": 64,
-    },
+    str(model["recommended_cuda_arch"]): model
+    for model in ARCH_MODELS.values()
 }
 
 KERNEL_RE = re.compile(
