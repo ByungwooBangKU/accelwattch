@@ -19,6 +19,7 @@
 | `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
 | `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
 | `scripts/report_strict_results.py` | strict audit/architecture compare 산출물을 최종 검토용 Markdown report와 dashboard figure로 요약 |
+| `scripts/smoke_strict_pipeline.py` | GPU 없이 strict audit/report target-selection invariant를 synthetic fixture로 회귀 검증 |
 | `scripts/postprocess_strict_architectures.sh` | A100/H100/RTX3090 결과 디렉터리를 받아 audit/compare/report/visualization을 한 번에 생성 |
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
@@ -408,6 +409,14 @@ python3 scripts/report_strict_results.py \
 `audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. `quality_gate_summary.json`에 여러 `selected_targets`가 있으면 `--require-kernel/--require-baseline`과 일치하는 target을 골라 audit하며, 요구 kernel/baseline target이 없으면 실패한다. 또한 selected target이 current quality gate의 `quality_gate_selected_target=true`, `util_reference_scope=quality_pass`, `util_saturated=true`, `target_selection_note=quality_gate_first_saturation_point` evidence를 갖는지도 확인해, 오래된 selection logic으로 만든 결과가 strict report에 섞이지 않게 한다. 또한 `strict_pipeline_manifest.json`이 `fp16-strict-pipeline-manifest-v1`, `status=completed`이고 git head, binary SHA256, quality/NCU/resource 산출물 evidence를 담고 있는지도 확인한다. 최종 report는 여기에 suite preflight가 `overall_pass=true`이고 `dry_run=false`였는지, 그리고 `architecture_models/architecture_model_summary.csv`가 required architecture의 peak model을 담고 reference 재계산 오차가 1% 이내인지도 추가로 요구한다. `postprocess_strict_architectures.sh`의 최종 exit status도 audit pass와 report requirement pass가 모두 true일 때만 success다. `resource_audit/thread_resource_occupancy.csv`에서는 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 측정 해상도도 gate에 포함되어 test/baseline duration과 Joule 단위 신호가 너무 작으면 fail된다. NVML counter와 power trace 적분값의 cross-check는 기본적으로 warning이며, trace agreement까지 필수 조건으로 보려면 `--require-counter-trace-agreement`를 사용한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
 
 `compare_architectures.py`도 quality gate 결과가 있는 디렉터리에서는 기본적으로 `target_pass=true`인 thread point만 `architecture_best_fp16.csv`와 best summary figure에 사용한다. `quality_pass=true`지만 utilization saturation target이 아닌 row는 diagnostic으로 남기되, 최종 best pJ/bit 그림에는 올리지 않는다. Diagnostic 후보까지 강제로 best table에 넣어야 할 때만 `--allow-diagnostic-best`를 사용한다.
+
+Strict audit/report의 기본 invariant는 GPU 없이도 smoke test로 확인할 수 있다.
+
+```bash
+python3 scripts/smoke_strict_pipeline.py
+```
+
+이 smoke는 synthetic GH100 결과 디렉터리를 만들고, `selected_targets`의 첫 항목이 요구 kernel이 아닌 경우에도 `tensor_mma_f16acc/tensor_baseline_u32` target을 정확히 선택하는지 확인한다. 또한 요구 target이 없으면 audit이 실패하는지, report의 `required kernel target selected` requirement가 pass로 전달되는지도 검증한다. 실제 A100/H100/RTX3090 pJ/bit claim을 대체하지 않고, strict postprocess code path의 회귀 검사용이다.
 
 주요 산출물은 다음과 같다.
 
