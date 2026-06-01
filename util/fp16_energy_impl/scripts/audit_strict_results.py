@@ -108,6 +108,82 @@ def find_resource_row(rows: List[Dict[str, Any]], role: str, kernel: str, thread
     return {}
 
 
+def select_target(
+    targets: Any,
+    quality_rows: List[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    target_rows = [dict(row) for row in targets if isinstance(row, dict)] if isinstance(targets, list) else []
+    matching_targets = [
+        row
+        for row in target_rows
+        if str(row.get("test_kernel", "")) == args.require_kernel
+        and str(row.get("baseline_kernel", "")) == args.require_baseline
+    ]
+    if matching_targets:
+        return (
+            dict(matching_targets[0]),
+            {
+                "target_selection_source": "selected_targets_required_kernel_baseline",
+                "selected_target_count": len(target_rows),
+                "matching_selected_target_count": len(matching_targets),
+            },
+        )
+    if target_rows:
+        return (
+            dict(target_rows[0]),
+            {
+                "target_selection_source": "selected_targets_no_required_match_first_fallback",
+                "selected_target_count": len(target_rows),
+                "matching_selected_target_count": 0,
+            },
+        )
+
+    # Keep useful context in failed audits.
+    thread_rows = [r for r in quality_rows if str(r.get("scope", "")) == "thread_sweep"]
+    matching_quality = [
+        row
+        for row in thread_rows
+        if str(row.get("test_kernel", "")) == args.require_kernel
+        and str(row.get("baseline_kernel", "")) == args.require_baseline
+    ]
+    if matching_quality:
+        return (
+            dict(matching_quality[0]),
+            {
+                "target_selection_source": "quality_rows_required_kernel_baseline_fallback",
+                "selected_target_count": 0,
+                "matching_selected_target_count": 0,
+            },
+        )
+    if thread_rows:
+        return (
+            dict(thread_rows[0]),
+            {
+                "target_selection_source": "quality_rows_first_thread_fallback",
+                "selected_target_count": 0,
+                "matching_selected_target_count": 0,
+            },
+        )
+    if quality_rows:
+        return (
+            dict(quality_rows[0]),
+            {
+                "target_selection_source": "quality_rows_first_fallback",
+                "selected_target_count": 0,
+                "matching_selected_target_count": 0,
+            },
+        )
+    return (
+        {},
+        {
+            "target_selection_source": "missing",
+            "selected_target_count": 0,
+            "matching_selected_target_count": 0,
+        },
+    )
+
+
 def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     summary = read_json(path / "quality_gate_summary.json")
     manifest = read_json(path / "strict_pipeline_manifest.json")
@@ -115,12 +191,7 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     ncu_rows = read_csv(path / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
     resource_rows = read_csv(path / "resource_audit" / "thread_resource_occupancy.csv")
     targets = summary.get("selected_targets") or []
-    target = dict(targets[0]) if targets else {}
-
-    if not target and quality_rows:
-        # Keep useful context in failed audits.
-        thread_rows = [r for r in quality_rows if str(r.get("scope", "")) == "thread_sweep"]
-        target = dict(thread_rows[0]) if thread_rows else dict(quality_rows[0])
+    target, target_selection = select_target(targets, quality_rows, args)
 
     chip = str(target.get("architecture_chip", "") or "unknown")
     generation = str(target.get("architecture_generation", "") or "unknown")
@@ -182,6 +253,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
 
     if not targets:
         failed.append("quality_gate_summary selected_targets is empty")
+    if int(target_selection.get("matching_selected_target_count", 0)) <= 0:
+        failed.append(
+            "quality_gate_summary has no selected target matching "
+            f"{args.require_kernel}/{args.require_baseline}"
+        )
+    if int(target_selection.get("matching_selected_target_count", 0)) > 1:
+        warnings.append(
+            "quality_gate_summary has multiple selected targets matching "
+            f"{args.require_kernel}/{args.require_baseline}; using the first"
+        )
     if not parse_bool(target.get("target_pass")):
         failed.append("target_pass is not true")
     if not parse_bool(target.get("quality_pass")):
@@ -358,6 +439,9 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "threads_per_sm": target.get("threads_per_sm", ""),
         "measurement_grade": target.get("measurement_grade", ""),
         "baseline_match_grade": target.get("baseline_match_grade", ""),
+        "target_selection_source": target_selection.get("target_selection_source", ""),
+        "selected_target_count": target_selection.get("selected_target_count", ""),
+        "matching_selected_target_count": target_selection.get("matching_selected_target_count", ""),
         "benchmark_schema_current": target.get("benchmark_schema_current", ""),
         "test_benchmark_schema_versions": target.get(
             "test_benchmark_schema_versions",

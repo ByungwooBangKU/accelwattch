@@ -204,6 +204,11 @@ def requirement_rows(
         str(row.get("baseline_match_grade", "")) == "structural_baseline" for row in audit_rows
     )
     schema_current = bool(audit_rows) and all(parse_bool(row.get("benchmark_schema_current")) for row in audit_rows)
+    required_target = bool(audit_rows) and all(
+        parse_float(row.get("matching_selected_target_count"), 0.0) >= 1.0
+        and str(row.get("target_selection_source", "")) == "selected_targets_required_kernel_baseline"
+        for row in audit_rows
+    )
     quality_selection = bool(audit_rows) and all(
         parse_bool(row.get("quality_gate_selected_target"))
         and parse_bool(row.get("util_saturated"))
@@ -286,6 +291,11 @@ def requirement_rows(
         row("structural baseline separation", structural, "baseline_match_grade=structural_baseline"),
         row("current benchmark schema", schema_current, "benchmark_schema_current=true"),
         row(
+            "required kernel target selected",
+            required_target,
+            "selected target matches required test/baseline kernel",
+        ),
+        row(
             "quality-gated utilization target",
             quality_selection,
             "quality_gate_selected_target=true and util_reference_scope=quality_pass",
@@ -325,6 +335,8 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "gpu": row.get("gpu", ""),
                 "publishable": parse_bool(row.get("audit_pass")),
                 "selection_note": "audit_pass" if parse_bool(row.get("audit_pass")) else "audit_failed",
+                "target_selection_source": row.get("target_selection_source", ""),
+                "matching_selected_target_count": row.get("matching_selected_target_count", ""),
                 "threads_per_sm": row.get("threads_per_sm", ""),
                 "threads": row.get("threads", ""),
                 "matmul_input_pj_per_bit": row.get("matmul_input_pj_per_bit_mean", ""),
@@ -458,6 +470,7 @@ def write_markdown(
                     "Arch",
                     "GPU",
                     "Publishable",
+                    "Target source",
                     "Threads/SM",
                     "Threads/block",
                     "pJ/bit",
@@ -476,6 +489,7 @@ def write_markdown(
                         r.get("architecture_chip", ""),
                         r.get("gpu", ""),
                         yes_no(r.get("publishable")),
+                        r.get("target_selection_source", ""),
                         fmt_value(r.get("threads_per_sm")),
                         fmt_value(r.get("threads")),
                         fmt_value(r.get("matmul_input_pj_per_bit")),
