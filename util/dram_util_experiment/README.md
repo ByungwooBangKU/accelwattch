@@ -740,40 +740,44 @@ for value in values:
 
 ## 12. Memory Hierarchy Lower-Bound 실험
 
-`hierarchy_pjbit_cupy.py`는 A100/H100처럼 세대 간 pJ/bit 결과가 직관과 다를 때 원인을 좁히기 위한 새 실험이다. 논문식 접근에 맞춰 DRAM stream 한 점만 보지 않고, 같은 loop/address/pattern 구조를 다음 네 단계로 분리한다.
+`hierarchy_pjbit_cupy.py`는 A100/H100처럼 세대 간 pJ/bit 결과가 직관과 다를 때 원인을 좁히기 위한 새 실험이다. 논문식 접근에 맞춰 DRAM stream 한 점만 보지 않고, 같은 loop/address/pattern 구조를 다음 네 단계로 분리한다. 기존 workload/stage 이름에는 `control_*`이 남아 있지만, 여기서 control은 GPU control unit이 아니라 실제 global read/write를 하지 않는 no-read baseline loop를 뜻한다.
 
 ```text
-control_l2
+l2_loop_baseline
+  legacy stage/workload prefix: control_l2
   L2 크기 working set에 해당하는 loop/address/pattern 생성만 수행
   global memory access 없음
 
-l2
+l2_read_total
+  legacy stage/workload prefix: l2
   L2보다 작은 buffer를 반복 접근
   read는 L2-resident hit를 의도
   write는 L2/store path resident case로 보고 NCU writeback 확인 필요
 
-control_dram
+dram_loop_baseline
+  legacy stage/workload prefix: control_dram
   DRAM stream 크기 working set에 해당하는 loop/address/pattern 생성만 수행
   global memory access 없음
 
-dram
+dram_read_total
+  legacy stage/workload prefix: dram
   L2보다 훨씬 큰 buffer를 streaming 접근
 ```
 
 이 실험의 목적은 다음 값을 분리해서 보는 것이다.
 
 ```text
-L2 path lower bound
-  l2 - control_l2
+L2 read increment
+  l2_read_total - l2_loop_baseline
 
-DRAM stream lower bound
-  dram - control_dram
+DRAM read increment total
+  dram_read_total - dram_loop_baseline
 
-DRAM over L2 rough estimate
-  (dram - control_dram) - (l2 - control_l2)
+Post-L2 off-chip increment
+  dram_read_increment_total - l2_read_increment
 ```
 
-주의: 이 값도 DRAM rail-only pJ/bit은 아니다. NVML GPU/board dynamic power 기반 lower-bound 성격이며, 최종 해석은 NCU의 physical DRAM/L2 bytes와 함께 확인해야 한다. 특히 `write:random`은 xorshift pattern generation ALU가 포함되므로 compute-mixed case로 분리해서 본다.
+주의: 이 값도 DRAM rail-only pJ/bit은 아니다. NVML GPU/board dynamic power 기반 lower-bound 성격이며, 최종 해석은 NCU의 physical DRAM/L2 bytes와 함께 확인해야 한다. `post_l2_offchip_increment`는 MC + GPU PHY + HBM PHY/core에 가장 가까운 관측값이지만 HBM-only는 아니다. 특히 `write:random`은 xorshift pattern generation ALU가 포함되므로 compute-mixed case로 분리해서 본다.
 
 기본 실행:
 
@@ -801,6 +805,7 @@ H100도 같은 조건으로 실행한다.
 ```text
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_summary.csv
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_analysis.csv
+reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_term_definitions.csv
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_trace.csv
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_metadata.json
 reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*.png
@@ -811,19 +816,21 @@ reports/<gpu_name>_<YYYYMMDDHHMM>/hierarchy_pjbit_*_bandwidth.png
 
 이미지 해석:
 
-1. 기본 `*.png`: phase별 dynamic power, raw pJ/nominal-bit, nominal throughput, control-subtracted estimate를 한 장에 요약한다.
+1. 기본 `*.png`: phase별 dynamic power, raw pJ/nominal-bit, nominal throughput, no-read-baseline-subtracted estimate를 한 장에 요약한다.
 2. `*_power_trace.png`: NVML power timeline과 phase span을 함께 보여준다. baseline 분리, phase 안정화, gap 구간 이상 여부를 확인한다.
-3. `*_decomposition.png`: `L2-control`, `DRAM-control`, `DRAM-over-L2`를 비교하는 핵심 이미지다. A100/H100/RTX 3090 세대 비교는 이 그림을 우선 본다.
+3. `*_decomposition.png`: `L2 read increment`, `DRAM read increment total`, `Post-L2 off-chip increment`를 비교하는 핵심 이미지다. A100/H100/RTX 3090 세대 비교는 이 그림을 우선 본다.
 4. `*_bandwidth.png`: pJ/bit denominator로 들어간 nominal bandwidth를 phase별로 표시한다. NCU physical bytes와 denominator가 어긋나는지 확인할 때 같이 본다.
 
 해석 순서:
 
-1. `summary.csv`에서 `control_*`의 pJ/nominal-bit가 너무 크면 loop/address/pattern overhead가 결과를 지배하는 것이다.
-2. `analysis.csv`의 `l2_minus_control_pj_per_nominal_bit`와 `dram_minus_control_pj_per_nominal_bit`를 비교한다.
-3. A100/H100 비교는 `dram_pj_per_nominal_bit`보다 `dram_minus_control_pj_per_nominal_bit`를 우선한다.
+1. `summary.csv`에서 legacy `control_*` stage, 즉 `*_loop_baseline`의 pJ/nominal-bit가 너무 크면 loop/address/pattern overhead가 결과를 지배하는 것이다.
+2. `analysis.csv`의 `l2_read_increment_pj_per_nominal_bit`와 `dram_read_increment_total_pj_per_nominal_bit`를 비교한다.
+3. A100/H100 비교는 `dram_read_total_pj_per_nominal_bit`보다 `dram_read_increment_total_pj_per_nominal_bit`를 우선한다.
 4. `write:random`은 최종 DRAM 비교에서 제외하거나 별도 compute-mixed 결과로 보고한다.
 5. NCU로 `dram__bytes_*`, `lts__t_sectors_*`, `smsp__inst_executed_pipe_*`를 확인해 physical traffic과 compute 혼입을 검증한다.
-6. `l2_minus_control_pj_per_nominal_bit`가 작게 음수이면 L2 energy가 음수라는 뜻이 아니라 matched-control이 active L2 phase보다 더 높은 board dynamic power를 보인 over-subtraction이다. 이 경우 lower-bound 해석에서는 `l2_minus_control_clamped_pj_per_nominal_bit=0`으로 보고 `dram_over_l2_clamped_pj_per_nominal_bit`를 함께 사용한다.
+6. `l2_read_increment_pj_per_nominal_bit`가 작게 음수이면 L2 energy가 음수라는 뜻이 아니라 matched no-read baseline이 active L2 phase보다 더 높은 board dynamic power를 보인 over-subtraction이다. 이 경우 lower-bound 해석에서는 `l2_read_increment_clamped_pj_per_nominal_bit=0`으로 보고 `post_l2_offchip_increment_clamped_pj_per_nominal_bit`를 함께 사용한다.
+
+`analysis.csv`에는 기존 자동화와의 호환을 위해 `l2_minus_control_*`, `dram_minus_control_*`, `dram_over_l2_*` legacy 컬럼도 남겨둔다. 새 보고서와 plot에서는 `*_loop_baseline`, `*_read_increment`, `post_l2_offchip_increment` 이름을 우선 사용한다.
 
 diagnostic 옵션:
 
@@ -877,6 +884,8 @@ l2_write_zero
 control_dram_write_zero
 dram_write_zero
 ```
+
+`control_*` workload 이름은 script/API 호환을 위해 유지한다. 보고서에서는 각각 `l2_loop_baseline`, `dram_loop_baseline`으로 해석한다.
 
 write pattern은 `zero`, `const`, `address`, `toggle`, `random`을 지원한다.
 

@@ -2,13 +2,13 @@
 """Memory-hierarchy lower-bound experiment for GPU data movement energy.
 
 This experiment complements dram_pjbit_cupy.py.  Instead of reporting only
-board-level dynamic pJ per user-visible DRAM bit, it separates matched control,
-L2-resident, and DRAM-streaming phases:
+board-level dynamic pJ per user-visible DRAM bit, it separates matched no-read
+baseline loops, L2-resident phases, and DRAM-streaming phases:
 
-    control_l2    address/pattern loop only, normalized to the L2 buffer size
-    l2            same loop shape on a buffer intended to stay resident in L2
-    control_dram  address/pattern loop only, normalized to the DRAM buffer size
-    dram          same loop shape on a buffer much larger than L2
+    control_l2    legacy name for the L2 no-read loop baseline
+    l2            L2 read/write total phase
+    control_dram  legacy name for the DRAM no-read loop baseline
+    dram          DRAM/HBM streaming total phase
 
 The result is still not a DRAM-rail-only number.  It is a lower-bound style
 microbenchmark decomposition of NVML GPU/board dynamic power, designed to be
@@ -34,6 +34,79 @@ import dram_pjbit_cupy as base
 cp = base.cp
 plt = base.plt
 pynvml = base.pynvml
+
+TERM_DEFINITIONS = [
+    {
+        "component": "l2_loop_baseline",
+        "legacy_component": "control_l2",
+        "display_name_en": "L2 loop baseline",
+        "display_name_kr": "L2 기준 루프 비용",
+        "note_kr": (
+            "L2 read 없이 같은 loop/index/accumulator만 수행한 기준 비용; "
+            "물리 memory path 비용 아님"
+        ),
+    },
+    {
+        "component": "l2_read_total",
+        "legacy_component": "l2",
+        "display_name_en": "L2 read total",
+        "display_name_kr": "L2 read 전체 비용",
+        "note_kr": (
+            "L2-resident load의 board-level 전체 비용; "
+            "L2 기준 루프 + L2 read 순증분 포함"
+        ),
+    },
+    {
+        "component": "l2_read_increment",
+        "legacy_component": "l2_minus_control",
+        "display_name_en": "L2 read increment",
+        "display_name_kr": "L2 read 순증분 비용",
+        "note_kr": (
+            "L2 기준 루프 대비 L2 read가 추가한 비용; "
+            "SM/RF/LSU/L2 read path 근사"
+        ),
+    },
+    {
+        "component": "dram_loop_baseline",
+        "legacy_component": "control_dram",
+        "display_name_en": "DRAM loop baseline",
+        "display_name_kr": "DRAM 기준 루프 비용",
+        "note_kr": (
+            "DRAM read 없이 같은 loop/index/accumulator만 수행한 기준 비용; "
+            "물리 memory path 비용 아님"
+        ),
+    },
+    {
+        "component": "dram_read_total",
+        "legacy_component": "dram",
+        "display_name_en": "DRAM read total",
+        "display_name_kr": "DRAM read 전체 비용",
+        "note_kr": (
+            "DRAM/HBM streaming load의 board-level 전체 비용; "
+            "DRAM 기준 루프 + L2 read + L2 이후 off-chip 비용 포함"
+        ),
+    },
+    {
+        "component": "dram_read_increment_total",
+        "legacy_component": "dram_minus_control",
+        "display_name_en": "DRAM read increment total",
+        "display_name_kr": "DRAM read 순증분 총비용",
+        "note_kr": (
+            "DRAM 기준 루프 대비 DRAM read가 추가한 총비용; "
+            "L2 read + L2 이후 off-chip 비용 포함"
+        ),
+    },
+    {
+        "component": "post_l2_offchip_increment",
+        "legacy_component": "dram_over_l2",
+        "display_name_en": "Post-L2 off-chip increment",
+        "display_name_kr": "L2 이후 off-chip 추가 비용",
+        "note_kr": (
+            "DRAM read 순증분 총비용에서 L2 read 순증분을 제거한 값; "
+            "MC + GPU PHY + HBM PHY/core에 가장 가까운 관측값이지만 HBM-only는 아님"
+        ),
+    },
+]
 
 
 KERNEL_CODE = r"""
@@ -346,7 +419,7 @@ def save_rows(path: Path, rows: list[dict]) -> None:
             if key not in fieldnames:
                 fieldnames.append(key)
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -358,10 +431,24 @@ def save_trace(path: Path, samples: list[base.PowerSample]) -> None:
         "temp_gpu_c", "pstate", "phase",
     ]
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         for s in samples:
             writer.writerow({k: getattr(s, k) for k in fieldnames})
+
+
+def write_term_definitions_csv(path: Path) -> None:
+    fieldnames = [
+        "component",
+        "legacy_component",
+        "display_name_en",
+        "display_name_kr",
+        "note_kr",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(TERM_DEFINITIONS)
 
 
 def make_analysis_rows(rows: list[dict]) -> list[dict]:
@@ -394,22 +481,34 @@ def make_analysis_rows(rows: list[dict]) -> list[dict]:
         out.append({
             "mode": mode,
             "pattern": pattern,
+            "l2_loop_baseline_pj_per_nominal_bit": ctrl_l2["pj_per_nominal_bit"],
             "control_l2_pj_per_nominal_bit": ctrl_l2["pj_per_nominal_bit"],
+            "l2_read_total_pj_per_nominal_bit": l2["pj_per_nominal_bit"],
             "l2_pj_per_nominal_bit": l2["pj_per_nominal_bit"],
+            "dram_loop_baseline_pj_per_nominal_bit": ctrl_dram["pj_per_nominal_bit"],
             "control_dram_pj_per_nominal_bit": ctrl_dram["pj_per_nominal_bit"],
+            "dram_read_total_pj_per_nominal_bit": dram["pj_per_nominal_bit"],
             "dram_pj_per_nominal_bit": dram["pj_per_nominal_bit"],
+            "l2_read_increment_power_w": l2_power_delta,
             "l2_minus_control_power_w": l2_power_delta,
+            "dram_read_increment_total_power_w": dram_power_delta,
             "dram_minus_control_power_w": dram_power_delta,
+            "l2_read_increment_pj_per_nominal_bit": l2_pj_delta,
             "l2_minus_control_pj_per_nominal_bit": l2_pj_delta,
+            "l2_read_increment_clamped_pj_per_nominal_bit": l2_pj_delta_clamped,
             "l2_minus_control_clamped_pj_per_nominal_bit": l2_pj_delta_clamped,
+            "dram_read_increment_total_pj_per_nominal_bit": dram_pj_delta,
             "dram_minus_control_pj_per_nominal_bit": dram_pj_delta,
+            "post_l2_offchip_increment_pj_per_nominal_bit": dram_over_l2,
             "dram_over_l2_pj_per_nominal_bit": dram_over_l2,
+            "post_l2_offchip_increment_clamped_pj_per_nominal_bit": dram_over_l2_clamped,
             "dram_over_l2_clamped_pj_per_nominal_bit": dram_over_l2_clamped,
             "dram_nominal_bandwidth_gbs": dram["nominal_bandwidth_gbs"],
             "l2_nominal_bandwidth_gbs": l2["nominal_bandwidth_gbs"],
             "notes": (
                 "Power deltas are board-level dynamic lower-bound estimates. "
-                "Use clamped columns when L2-control is negative from over-subtraction/noise. "
+                "Legacy control_* names mean matched no-read baseline loops, not GPU control units. "
+                "Use clamped columns when L2 read increment is negative from over-subtraction/noise. "
                 "Use NCU physical DRAM/L2 bytes for final denominator checks."
             ),
         })
@@ -427,9 +526,9 @@ def stage_color(stage: str) -> str:
 
 def short_row_label(row: dict) -> str:
     stage_label = {
-        "control_l2": "ctrl L2",
+        "control_l2": "L2 loop\nbaseline",
         "l2": "L2",
-        "control_dram": "ctrl DRAM",
+        "control_dram": "DRAM loop\nbaseline",
         "dram": "DRAM",
     }.get(str(row["stage"]), str(row["stage"]))
     if row["mode"] == "read":
@@ -483,12 +582,12 @@ def save_plot(path: Path, gpu_name: str, rows: list[dict], analysis_rows: list[d
         ]
         ax = axes[1, 1]
         ax.bar(np.arange(len(a_labels)) - 0.2,
-               [r["l2_minus_control_pj_per_nominal_bit"] for r in analysis_rows],
-               width=0.4, label="L2 - control", color="#4c78a8")
+               [r["l2_read_increment_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.4, label="L2 read increment", color="#4c78a8")
         ax.bar(np.arange(len(a_labels)) + 0.2,
-               [r["dram_minus_control_pj_per_nominal_bit"] for r in analysis_rows],
-               width=0.4, label="DRAM - control", color="#e45756")
-        ax.set_title("Control-subtracted estimates")
+               [r["dram_read_increment_total_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.4, label="DRAM read increment total", color="#e45756")
+        ax.set_title("No-read-baseline-subtracted estimates")
         ax.set_ylabel("pJ/nominal bit")
         ax.set_xticks(np.arange(len(a_labels)))
         ax.set_xticklabels(a_labels, rotation=45, ha="right")
@@ -571,15 +670,15 @@ def save_decomposition_plot(path: Path, gpu_name: str,
         a_labels = [analysis_label(r) for r in analysis_rows]
         ax = axes[1, 0]
         ax.bar(np.arange(len(a_labels)) - 0.25,
-               [r["l2_minus_control_pj_per_nominal_bit"] for r in analysis_rows],
-               width=0.25, label="L2 - ctrl L2", color="#4c78a8")
+               [r["l2_read_increment_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.25, label="L2 read increment", color="#4c78a8")
         ax.bar(np.arange(len(a_labels)),
-               [r["dram_minus_control_pj_per_nominal_bit"] for r in analysis_rows],
-               width=0.25, label="DRAM - ctrl DRAM", color="#e45756")
+               [r["dram_read_increment_total_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.25, label="DRAM read increment total", color="#e45756")
         ax.bar(np.arange(len(a_labels)) + 0.25,
-               [r["dram_over_l2_clamped_pj_per_nominal_bit"] for r in analysis_rows],
-               width=0.25, label="DRAM over max(L2, 0)", color="#b279a2")
-        ax.set_title("Control-subtracted lower-bound estimates")
+               [r["post_l2_offchip_increment_clamped_pj_per_nominal_bit"] for r in analysis_rows],
+               width=0.25, label="Post-L2 off-chip inc.", color="#b279a2")
+        ax.set_title("No-read-baseline-subtracted lower-bound estimates")
         ax.set_ylabel("pJ/nominal bit")
         ax.set_xticks(np.arange(len(a_labels)))
         ax.set_xticklabels(a_labels, rotation=45, ha="right")
@@ -590,20 +689,20 @@ def save_decomposition_plot(path: Path, gpu_name: str,
         ax = axes[1, 1]
         ax.scatter(
             [r["l2_nominal_bandwidth_gbs"] for r in analysis_rows],
-            [r["l2_minus_control_power_w"] for r in analysis_rows],
-            s=70, color="#4c78a8", label="L2 - control")
+            [r["l2_read_increment_power_w"] for r in analysis_rows],
+            s=70, color="#4c78a8", label="L2 read increment")
         ax.scatter(
             [r["dram_nominal_bandwidth_gbs"] for r in analysis_rows],
-            [r["dram_minus_control_power_w"] for r in analysis_rows],
-            s=70, color="#e45756", label="DRAM - control")
+            [r["dram_read_increment_total_power_w"] for r in analysis_rows],
+            s=70, color="#e45756", label="DRAM read increment total")
         for r in analysis_rows:
             label = analysis_label(r)
             ax.annotate(label, (r["dram_nominal_bandwidth_gbs"],
-                                r["dram_minus_control_power_w"]),
+                                r["dram_read_increment_total_power_w"]),
                         textcoords="offset points", xytext=(5, 4), fontsize=8)
-        ax.set_title("Control-subtracted power vs nominal bandwidth")
+        ax.set_title("Baseline-subtracted power vs nominal bandwidth")
         ax.set_xlabel("nominal bandwidth (GB/s)")
-        ax.set_ylabel("W above matched control")
+        ax.set_ylabel("W above matched no-read baseline")
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=8)
     else:
@@ -638,7 +737,7 @@ def save_bandwidth_plot(path: Path, gpu_name: str, rows: list[dict]) -> None:
     ax.set_xticklabels(labels, rotation=75, ha="right", fontsize=8)
     ax.grid(axis="y", alpha=0.25)
     fig.text(0.01, 0.02,
-             "control phases use loop-equivalent nominal bytes; NCU physical bytes "
+             "no-read baseline phases use loop-equivalent nominal bytes; NCU physical bytes "
              "should be used for final cache/DRAM denominator validation.",
              fontsize=8)
     fig.tight_layout(rect=(0, 0.05, 1, 1))
@@ -792,6 +891,7 @@ def main() -> None:
     summary_csv = out_dir / f"{stem}_summary.csv"
     trace_csv = out_dir / f"{stem}_trace.csv"
     analysis_csv = out_dir / f"{stem}_analysis.csv"
+    term_definitions_csv = out_dir / f"{stem}_term_definitions.csv"
     metadata_json = out_dir / f"{stem}_metadata.json"
     png = out_dir / f"{stem}.png"
     power_trace_png = out_dir / f"{stem}_power_trace.png"
@@ -802,6 +902,7 @@ def main() -> None:
     save_rows(summary_csv, rows)
     save_trace(trace_csv, poller.samples)
     save_rows(analysis_csv, analysis_rows)
+    write_term_definitions_csv(term_definitions_csv)
     save_plot(png, gpu_name, rows, analysis_rows)
     save_power_trace_plot(power_trace_png, gpu_name, idle_power_w, rows, poller.samples)
     save_decomposition_plot(decomposition_png, gpu_name, rows, analysis_rows)
@@ -835,9 +936,12 @@ def main() -> None:
             "decomposition": str(decomposition_png),
             "bandwidth": str(bandwidth_png),
         },
+        "term_definitions_csv": str(term_definitions_csv),
+        "term_definitions": TERM_DEFINITIONS,
         "notes": [
             "This is not DRAM rail-only energy.",
-            "control phases normalize loop/address/pattern overhead to the same nominal bytes.",
+            "Legacy control_* workload names mean no-read baseline loops, not GPU control units.",
+            "Baseline phases normalize loop/address/pattern overhead to the same nominal bytes.",
             "l2 phases are intended to be L2-resident, but writeback behavior must be checked by NCU.",
             "dram phases use a buffer much larger than L2.",
             "Use NCU physical DRAM/L2 bytes to validate denominator and cache residency.",
@@ -848,6 +952,7 @@ def main() -> None:
 
     print(f"[save] {summary_csv}")
     print(f"[save] {analysis_csv}")
+    print(f"[save] {term_definitions_csv}")
     print(f"[save] {trace_csv}")
     print(f"[save] {metadata_json}")
     print(f"[save] {png}")
@@ -862,16 +967,16 @@ def main() -> None:
               f"{row['dynamic_power_w']:>10.1f} "
               f"{base.fmt_or_na(row['pj_per_nominal_bit']):>10}")
     print()
-    print(f"{'mode/pattern':<18} {'L2-control':>12} {'DRAM-control':>14} "
-          f"{'DRAM-over-L2':>14} {'clamped':>10}")
+    print(f"{'mode/pattern':<18} {'L2 incr.':>12} {'DRAM incr.':>14} "
+          f"{'Post-L2':>14} {'clamped':>10}")
     print("-" * 73)
     for row in analysis_rows:
         label = row["mode"] if row["mode"] == "read" else f"write:{row['pattern']}"
         print(f"{label:<18} "
-              f"{base.fmt_or_na(row['l2_minus_control_pj_per_nominal_bit']):>12} "
-              f"{base.fmt_or_na(row['dram_minus_control_pj_per_nominal_bit']):>14} "
-              f"{base.fmt_or_na(row['dram_over_l2_pj_per_nominal_bit']):>14} "
-              f"{base.fmt_or_na(row['dram_over_l2_clamped_pj_per_nominal_bit']):>10}")
+              f"{base.fmt_or_na(row['l2_read_increment_pj_per_nominal_bit']):>12} "
+              f"{base.fmt_or_na(row['dram_read_increment_total_pj_per_nominal_bit']):>14} "
+              f"{base.fmt_or_na(row['post_l2_offchip_increment_pj_per_nominal_bit']):>14} "
+              f"{base.fmt_or_na(row['post_l2_offchip_increment_clamped_pj_per_nominal_bit']):>10}")
 
 
 if __name__ == "__main__":
