@@ -83,9 +83,24 @@ def normalize_thread(value: Any) -> str:
     return str(value or "")
 
 
-def find_ncu_row(rows: List[Dict[str, Any]], kernel: str, threads: str) -> Dict[str, Any]:
+def find_ncu_row(rows: List[Dict[str, Any]], kernel: str, threads: str, blocks_per_sm: str) -> Dict[str, Any]:
+    blocks_per_sm = normalize_thread(blocks_per_sm)
+    for row in rows:
+        if (
+            str(row.get("kernel", "")) == kernel
+            and normalize_thread(row.get("threads", "")) == threads
+            and normalize_thread(row.get("validation_blocks_per_sm", "")) == blocks_per_sm
+        ):
+            return row
     for row in rows:
         if str(row.get("kernel", "")) == kernel and normalize_thread(row.get("threads", "")) == threads:
+            return row
+    for row in rows:
+        if (
+            str(row.get("kernel", "")) == kernel
+            and not str(row.get("threads", ""))
+            and normalize_thread(row.get("validation_blocks_per_sm", "")) == blocks_per_sm
+        ):
             return row
     for row in rows:
         if str(row.get("kernel", "")) == kernel and not str(row.get("threads", "")):
@@ -93,7 +108,32 @@ def find_ncu_row(rows: List[Dict[str, Any]], kernel: str, threads: str) -> Dict[
     return {}
 
 
-def find_resource_row(rows: List[Dict[str, Any]], role: str, kernel: str, threads: str, unroll: str) -> Dict[str, Any]:
+def find_resource_row(
+    rows: List[Dict[str, Any]],
+    role: str,
+    kernel: str,
+    threads: str,
+    unroll: str,
+    blocks_per_sm: str,
+) -> Dict[str, Any]:
+    blocks_per_sm = normalize_thread(blocks_per_sm)
+    for row in rows:
+        if (
+            str(row.get("role", "")) == role
+            and str(row.get("kernel", "")) == kernel
+            and normalize_thread(row.get("threads", "")) == threads
+            and (not unroll or normalize_thread(row.get("unroll", "")) == normalize_thread(unroll))
+            and normalize_thread(row.get("blocks_per_sm_requested", "")) == blocks_per_sm
+        ):
+            return row
+    for row in rows:
+        if (
+            str(row.get("role", "")) == role
+            and str(row.get("kernel", "")) == kernel
+            and normalize_thread(row.get("threads", "")) == threads
+            and normalize_thread(row.get("blocks_per_sm_requested", "")) == blocks_per_sm
+        ):
+            return row
     for row in rows:
         if (
             str(row.get("role", "")) == role
@@ -204,11 +244,19 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     test_kernel = str(target.get("test_kernel", "") or "")
     baseline_kernel = str(target.get("baseline_kernel", "") or "")
     threads = normalize_thread(target.get("threads", ""))
+    blocks_per_sm = normalize_thread(target.get("blocks_per_sm_requested", ""))
     unroll = normalize_thread(target.get("unroll", ""))
-    test_ncu = find_ncu_row(ncu_rows, test_kernel, threads)
-    baseline_ncu = find_ncu_row(ncu_rows, baseline_kernel, threads)
-    test_resource = find_resource_row(resource_rows, "test", test_kernel, threads, unroll)
-    baseline_resource = find_resource_row(resource_rows, "baseline", baseline_kernel, threads, unroll)
+    test_ncu = find_ncu_row(ncu_rows, test_kernel, threads, blocks_per_sm)
+    baseline_ncu = find_ncu_row(ncu_rows, baseline_kernel, threads, blocks_per_sm)
+    test_resource = find_resource_row(resource_rows, "test", test_kernel, threads, unroll, blocks_per_sm)
+    baseline_resource = find_resource_row(
+        resource_rows,
+        "baseline",
+        baseline_kernel,
+        threads,
+        unroll,
+        blocks_per_sm,
+    )
 
     failed: List[str] = []
     warnings: List[str] = []
@@ -458,9 +506,9 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     if not ncu_rows:
         failed.append("ncu_validation_summary.csv is missing or empty")
     if ncu_rows and not test_ncu:
-        failed.append("missing NCU validation row for selected test kernel/thread")
+        failed.append("missing NCU validation row for selected test kernel/thread/blocks_per_sm")
     if ncu_rows and not baseline_ncu:
-        failed.append("missing NCU validation row for selected baseline kernel/thread")
+        failed.append("missing NCU validation row for selected baseline kernel/thread/blocks_per_sm")
     if test_ncu and not parse_bool(test_ncu.get("validation_pass")):
         failed.append("selected test NCU validation did not pass")
     if baseline_ncu and not parse_bool(baseline_ncu.get("validation_pass")):
@@ -474,9 +522,9 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     if not resource_rows:
         failed.append("resource_audit/thread_resource_occupancy.csv is missing or empty")
     if resource_rows and not test_resource:
-        failed.append("missing resource audit row for selected test kernel/thread")
+        failed.append("missing resource audit row for selected test kernel/thread/blocks_per_sm")
     if resource_rows and not baseline_resource:
-        failed.append("missing resource audit row for selected baseline kernel/thread")
+        failed.append("missing resource audit row for selected baseline kernel/thread/blocks_per_sm")
     if test_resource and parse_bool(test_resource.get("has_spills")):
         failed.append("selected test kernel has ptxas stack/spill usage")
     if baseline_resource and parse_bool(baseline_resource.get("has_spills")):
@@ -491,6 +539,7 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "test_kernel": test_kernel,
         "baseline_kernel": baseline_kernel,
         "threads": threads,
+        "blocks_per_sm_requested": blocks_per_sm,
         "unroll": unroll,
         "threads_per_sm": target.get("threads_per_sm", ""),
         "measurement_grade": target.get("measurement_grade", ""),
@@ -513,6 +562,9 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "pipeline_cuda_arch": manifest_params.get("cuda_arch", "") if manifest_params else "",
         "pipeline_nvidia_smi_id": manifest_params.get("nvidia_smi_id", "") if manifest_params else "",
         "pipeline_threads": manifest_params.get("threads", "") if manifest_params else "",
+        "pipeline_ncu_blocks_per_sm_csv": (
+            manifest_params.get("ncu_blocks_per_sm_csv", "") if manifest_params else ""
+        ),
         "pipeline_skip_preflight": manifest_params.get("skip_preflight", "") if manifest_params else "",
         "pipeline_allow_compute_apps": manifest_params.get("allow_compute_apps", "") if manifest_params else "",
         "pipeline_diagnostic_no_ncu": manifest_params.get("diagnostic_no_ncu", "") if manifest_params else "",

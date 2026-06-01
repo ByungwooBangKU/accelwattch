@@ -13,6 +13,7 @@ OUTDIR=""
 REPEAT=10
 SAMPLE_MS=100
 THREADS_CSV="32,64,96,128,160,192,224,256,288,320,384"
+NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV:-8}"
 MATRIX_OVERRIDE=""
 BUILD_DIR="build"
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
@@ -47,6 +48,8 @@ Options:
   --repeat N           Matrix repeat count [10]
   --sample-ms N        nvidia-smi power sample interval [100]
   --threads CSV        Threads/block list for NCU validation [32,64,96,128,160,192,224,256,288,320,384]
+  --ncu-blocks-per-sm-csv CSV
+                       Blocks/SM list for NCU validation [8]
   --matrix FILE        Experiment matrix [configs/fp16_matmul_thread_sweep_fine.json]
   --build-dir DIR      Build directory relative to fp16_energy_impl [build]
   --skip-build         Reuse existing binary
@@ -63,7 +66,7 @@ Options:
 
 Environment overrides:
   CMAKE_BIN, CMAKE_CUDA_FLAGS, NVCC_BIN, NCU_BIN, PYTHON_BIN, NVIDIA_SMI_BIN,
-  MPLCONFIGDIR, NCU_METRICS
+  MPLCONFIGDIR, NCU_METRICS, NCU_BLOCKS_PER_SM_CSV
 USAGE
 }
 
@@ -76,6 +79,7 @@ while [[ $# -gt 0 ]]; do
     --repeat) REPEAT="$2"; shift 2 ;;
     --sample-ms) SAMPLE_MS="$2"; shift 2 ;;
     --threads) THREADS_CSV="$2"; shift 2 ;;
+    --ncu-blocks-per-sm-csv) NCU_BLOCKS_PER_SM_CSV="$2"; shift 2 ;;
     --matrix) MATRIX_OVERRIDE="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
@@ -254,6 +258,7 @@ write_manifest() {
     --repeat "${REPEAT}" \
     --sample-ms "${SAMPLE_MS}" \
     --threads "${THREADS_CSV}" \
+    --ncu-blocks-per-sm-csv "${NCU_BLOCKS_PER_SM_CSV}" \
     --skip-build "${SKIP_BUILD}" \
     --skip-preflight "${SKIP_PREFLIGHT}" \
     --allow-compute-apps "${ALLOW_COMPUTE_APPS}" \
@@ -382,7 +387,7 @@ fi
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/summarize_kernel_resources.py" "${RESOURCE_ARGS[@]}"
 
-NCU_BIN="${NCU_BIN}" \
+NCU_BIN="${NCU_BIN}" NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV}" \
   "${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \
   "${BINARY}" \
   "${NCDIR}" \

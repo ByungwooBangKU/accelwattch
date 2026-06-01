@@ -77,6 +77,7 @@ def target_row(test_kernel: str, baseline_kernel: str, threads: int) -> Dict[str
         "threads": threads,
         "unroll": 16,
         "threads_per_sm": 1024,
+        "blocks_per_sm_requested": 8,
         "measurement_grade": "strict_nvml_counter",
         "baseline_match_grade": "structural_baseline",
         "target_pass": "true",
@@ -150,6 +151,7 @@ def resource_row(role: str, kernel: str, threads: int) -> Dict[str, Any]:
         "role": role,
         "kernel": kernel,
         "threads": threads,
+        "blocks_per_sm_requested": 8,
         "unroll": 16,
         "registers_per_thread": 48 if role == "test" else 24,
         "thread_occupancy_pct_model": 50.0,
@@ -350,6 +352,7 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
                 "cuda_arch": "90",
                 "nvidia_smi_id": "GPU-synthetic",
                 "threads": "",
+                "ncu_blocks_per_sm_csv": "8",
                 "skip_preflight": False,
                 "allow_compute_apps": False,
                 "diagnostic_no_ncu": False,
@@ -455,6 +458,9 @@ def assert_requirement_fail(path: Path, requirement: str) -> None:
 
 
 def smoke(base: Path, env: Dict[str, str]) -> None:
+    import analyze_results
+    import quality_gate as quality_gate_module
+
     good = base / "good"
     no_required = base / "no_required"
     no_tensor_activity = base / "no_tensor_activity"
@@ -529,6 +535,34 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     ):
         if not (architecture_model_smoke / artifact).exists():
             raise AssertionError(f"Architecture model smoke did not write {artifact}")
+
+    launch_shape_rows = [
+        {
+            "fp16_path": "tensor_mma_f16acc_vs_tensor_baseline_mov",
+            "test_kernel": "tensor_mma_f16acc",
+            "baseline_kernel": "tensor_baseline_mov",
+            "threads": threads,
+            "blocks_per_sm_requested": blocks_per_sm,
+            "threads_per_sm": threads * blocks_per_sm,
+            "valid_basic": True,
+            "expected_l2_touch": False,
+            "test_energy_source": "nvml_total_energy_counter",
+            "baseline_energy_source": "nvml_total_energy_counter",
+            "test_power_samples": 4,
+            "baseline_power_samples": 4,
+        }
+        for threads, blocks_per_sm in ((64, 4), (64, 8), (128, 4))
+    ]
+    shape_summary = analyze_results.aggregate_thread_sweep(launch_shape_rows)
+    shape_keys = {(str(row.get("threads")), str(row.get("blocks_per_sm_requested"))) for row in shape_summary}
+    if ("64", "4") not in shape_keys or ("64", "8") not in shape_keys:
+        raise AssertionError(f"Thread sweep aggregation collapsed distinct launch shapes: {shape_summary}")
+    source_keys = set(quality_gate_module.source_counts_by_thread(launch_shape_rows))
+    if (
+        ("tensor_mma_f16acc", "tensor_baseline_mov", "64", "4") not in source_keys
+        or ("tensor_mma_f16acc", "tensor_baseline_mov", "64", "8") not in source_keys
+    ):
+        raise AssertionError(f"Quality gate source grouping collapsed distinct launch shapes: {source_keys}")
 
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"

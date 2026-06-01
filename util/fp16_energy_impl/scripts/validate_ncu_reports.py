@@ -137,16 +137,16 @@ def parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
-def parse_report_name(path: Path) -> Tuple[str, str]:
+def parse_report_name(path: Path) -> Tuple[str, str, str]:
     stem = path.name
     for suffix in (".ncu.txt", ".txt", ".log", ".csv"):
         if stem.endswith(suffix):
             stem = stem[: -len(suffix)]
             break
-    match = re.match(r"(?P<kernel>.+)_t(?P<threads>\d+)$", stem)
+    match = re.match(r"(?P<kernel>.+)_t(?P<threads>\d+)(?:_b(?P<blocks_per_sm>\d+))?$", stem)
     if match:
-        return match.group("kernel"), match.group("threads")
-    return stem, ""
+        return match.group("kernel"), match.group("threads"), match.group("blocks_per_sm") or ""
+    return stem, "", ""
 
 
 def numeric_values_from_line(line: str) -> List[float]:
@@ -260,7 +260,7 @@ def profiler_errors(text: str) -> List[str]:
 
 def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     text = path.read_text(errors="replace")
-    kernel, threads = parse_report_name(path)
+    kernel, threads, report_blocks_per_sm = parse_report_name(path)
     metrics = extract_metrics(text)
     sources = metric_sources(metrics)
     errors = profiler_errors(text)
@@ -376,7 +376,7 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "report": str(path),
         "kernel": kernel,
         "threads": threads,
-        "validation_blocks_per_sm": args.benchmark_blocks_per_sm,
+        "validation_blocks_per_sm": report_blocks_per_sm or args.benchmark_blocks_per_sm,
         "validation_unroll": args.benchmark_unroll,
         "validation_suppress_output_store": args.benchmark_suppress_output_store,
         "validation_warmup": args.benchmark_warmup,

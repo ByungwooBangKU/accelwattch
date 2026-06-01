@@ -963,11 +963,15 @@ def grouped_metric_stats(rows: List[Dict[str, Any]], metric: str) -> List[Dict[s
 
 
 def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    thread_values = {int(r["threads"]) for r in rows if str(r.get("threads", "")).isdigit()}
-    if len(thread_values) < 2:
+    launch_shapes = {
+        (int(r["threads"]), str(r.get("blocks_per_sm_requested", "")))
+        for r in rows
+        if str(r.get("threads", "")).isdigit()
+    }
+    if len(launch_shapes) < 2:
         return []
 
-    by_variant: Dict[Tuple[str, str, str, int], List[Dict[str, Any]]] = defaultdict(list)
+    by_variant: Dict[Tuple[str, str, str, int, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
         try:
             threads = int(row["threads"])
@@ -978,6 +982,7 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             str(row.get("test_kernel", "")),
             str(row.get("baseline_kernel", "")),
             threads,
+            str(row.get("blocks_per_sm_requested", "")),
         )
         by_variant[key].append(row)
 
@@ -1017,7 +1022,7 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "max_temp_c",
     ]
     out: List[Dict[str, Any]] = []
-    for (fp16_path, test_kernel, baseline_kernel, threads), group in by_variant.items():
+    for (fp16_path, test_kernel, baseline_kernel, threads, blocks_per_sm), group in by_variant.items():
         valid_no_l2 = [
             r for r in group
             if bool(r.get("valid_basic", False)) and not bool(r.get("expected_l2_touch", True))
@@ -1083,7 +1088,11 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "baseline_kernel": baseline_kernel,
             "threads": threads,
             "threads_per_sm": finite_float(group[0].get("threads_per_sm")),
-            "blocks_per_sm_requested": group[0].get("blocks_per_sm_requested", ""),
+            "blocks_per_sm_requested": blocks_per_sm,
+            "launch_shape": f"t{threads}_b{blocks_per_sm or 'unknown'}",
+            "condition_names": "; ".join(
+                sorted({str(r.get("condition", "")) for r in group if str(r.get("condition", ""))})
+            ),
             "unroll": group[0].get("unroll", ""),
             "suppress_output_store": all(bool(r.get("suppress_output_store", False)) for r in group),
             "run_count": len(group),
@@ -1188,7 +1197,15 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 row["selection_status"] = "not_valid_no_l2_candidate"
                 row["selection_note"] = "valid_no_l2_count did not meet required_valid_no_l2_count"
 
-    return sorted(out, key=lambda r: (str(r["test_kernel"]), int(r["threads"])))
+    return sorted(
+        out,
+        key=lambda r: (
+            str(r["test_kernel"]),
+            finite_float(r.get("threads_per_sm"), finite_float(r.get("threads"), math.inf)),
+            finite_float(r.get("blocks_per_sm_requested"), math.inf),
+            finite_float(r.get("threads"), math.inf),
+        ),
+    )
 
 
 def aggregate_work_slope(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1435,7 +1452,14 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
         by_kernel[(str(row["test_kernel"]), str(row["baseline_kernel"]))].append(row)
 
     for (test_kernel, baseline_kernel), rows in by_kernel.items():
-        rows = sorted(rows, key=lambda r: int(r["threads"]))
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                finite_float(r.get("threads_per_sm"), finite_float(r.get("threads"), math.inf)),
+                finite_float(r.get("blocks_per_sm_requested"), math.inf),
+                finite_float(r.get("threads"), math.inf),
+            ),
+        )
         xs = []
         for r in rows:
             threads_per_sm = finite_float(r.get("threads_per_sm"))
@@ -1446,19 +1470,31 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
         tflops = [finite_float(r.get("tflops_mean")) for r in rows]
         selected = [r for r in rows if bool(r.get("selected_optimal", False))]
 
+        def shape_label(row: Dict[str, Any], include_pjbit: bool = False) -> str:
+            threads = str(row.get("threads", ""))
+            blocks = str(row.get("blocks_per_sm_requested", ""))
+            label = f"t{threads}"
+            if blocks:
+                label += f"/b{blocks}"
+            if include_pjbit:
+                pj = finite_float(row.get("matmul_input_pj_per_bit_mean"))
+                if math.isfinite(pj):
+                    label += f"\n{pj:.3g} pJ/b"
+            return label
+
         fig, ax1 = plt.subplots(figsize=(8, 4.8))
         util_label = "avg SM util" if has_sm_util else "avg GPU util"
         ylabel = "Avg SM utilization (%)" if has_sm_util else "Avg GPU utilization (%)"
         ax1.plot(xs, util, marker="o", label=util_label)
         ax1.set_xlabel("Launched threads per SM")
         ax1.set_ylabel(ylabel)
-        ax1.set_xticks(xs)
+        ax1.set_xticks(sorted({x for x in xs if math.isfinite(x)}))
         ax1.get_xaxis().set_major_formatter(ScalarFormatter())
         ax1.grid(True, axis="y", alpha=0.3)
         for x, y, row in zip(xs, util, rows):
             if math.isfinite(y):
                 ax1.annotate(
-                    str(row["threads"]),
+                    shape_label(row, include_pjbit=True),
                     (x, y),
                     textcoords="offset points",
                     xytext=(0, 6),
@@ -1479,7 +1515,7 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
         lines, labels = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines + lines2, labels + labels2, loc="best")
-        plt.title(f"Thread sweep: {test_kernel} vs {baseline_kernel} (labels: threads/block)")
+        plt.title(f"Thread sweep: {test_kernel} vs {baseline_kernel} (labels: t=threads/block, b=blocks/SM)")
         plt.tight_layout()
         safe_name = f"thread_sweep_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
         plt.savefig(figdir / safe_name, dpi=160)
@@ -1497,13 +1533,13 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
             ax.axhline(0.0, color="0.3", linewidth=0.8, alpha=0.6)
             ax.set_xlabel("Launched threads per SM")
             ax.set_ylabel("pJ/logical input bit")
-            ax.set_xticks(xs)
+            ax.set_xticks(sorted({x for x in xs if math.isfinite(x)}))
             ax.get_xaxis().set_major_formatter(ScalarFormatter())
             ax.grid(True, axis="y", alpha=0.3)
             for x, y, row in zip(xs, pjbit, rows):
                 if math.isfinite(y):
                     ax.annotate(
-                        f"{row['threads']}\n{y:.3g}",
+                        f"{shape_label(row)}\n{y:.3g}",
                         (x, y),
                         textcoords="offset points",
                         xytext=(0, 7 if y >= 0 else -18),

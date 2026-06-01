@@ -425,7 +425,10 @@ def selected_annotation(row: Dict[str, Any]) -> str:
         label = "selected\nnot target"
     threads = str(row.get("threads", ""))
     if threads:
-        label += f"\n{threads} th/block"
+        blocks = str(row.get("blocks_per_sm_requested", ""))
+        label += f"\nt{threads}"
+        if blocks:
+            label += f"/b{blocks}"
     pjbit = parse_float(row.get("matmul_input_pj_per_bit_mean"))
     if math.isfinite(pjbit):
         label += f"\n{pjbit:.3g} pJ/b"

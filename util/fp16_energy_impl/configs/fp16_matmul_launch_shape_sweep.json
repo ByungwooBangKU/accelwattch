@@ -1,0 +1,29 @@
+{
+  "description": "Launch-shape sweep for FP16 Tensor Core logical m16n16k16. Sweeps both threads/block and blocks/SM so target threads/SM is not tied to the default blocks_per_sm=8 assumption. Uses tensor_baseline_mov no-memory warp-sync structural baseline and suppresses output stores.",
+  "defaults": {
+    "blocks": 0,
+    "warmup": 2,
+    "repeats": 2,
+    "iters": 1000000,
+    "unroll": 8,
+    "suppress_output_store": true
+  },
+  "conditions": [
+    {"name": "launch_shape_tensor_mma_f16acc_t032_b01", "args": {"threads": 32, "blocks_per_sm": 1}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t032_b02", "args": {"threads": 32, "blocks_per_sm": 2}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t032_b04", "args": {"threads": 32, "blocks_per_sm": 4}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t032_b08", "args": {"threads": 32, "blocks_per_sm": 8}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t064_b01", "args": {"threads": 64, "blocks_per_sm": 1}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t064_b02", "args": {"threads": 64, "blocks_per_sm": 2}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t064_b04", "args": {"threads": 64, "blocks_per_sm": 4}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t064_b08", "args": {"threads": 64, "blocks_per_sm": 8}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t128_b01", "args": {"threads": 128, "blocks_per_sm": 1}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t128_b02", "args": {"threads": 128, "blocks_per_sm": 2}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t128_b04", "args": {"threads": 128, "blocks_per_sm": 4}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t128_b08", "args": {"threads": 128, "blocks_per_sm": 8}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t256_b01", "args": {"threads": 256, "blocks_per_sm": 1}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t256_b02", "args": {"threads": 256, "blocks_per_sm": 2}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t256_b04", "args": {"threads": 256, "blocks_per_sm": 4}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}},
+    {"name": "launch_shape_tensor_mma_f16acc_t256_b08", "args": {"threads": 256, "blocks_per_sm": 8}, "baseline": {"kernel": "tensor_baseline_mov"}, "test": {"kernel": "tensor_mma_f16acc"}}
+  ]
+}

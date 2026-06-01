@@ -43,18 +43,37 @@ def read_csv(path: Path) -> List[Dict[str, Any]]:
         return list(csv.DictReader(f))
 
 
-def load_ncu_validation(path: Path | None) -> Dict[Tuple[str, str], Dict[str, Any]]:
+def normalize_int_text(value: Any) -> str:
+    text = str(value or "")
+    parsed = parse_float(text)
+    if math.isfinite(parsed):
+        return str(int(round(parsed)))
+    return text
+
+
+def load_ncu_validation(path: Path | None) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
     if path is None:
         return {}
     rows = read_csv(path)
-    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for row in rows:
-        out[(str(row.get("kernel", "")), str(row.get("threads", "")))] = row
+        out[
+            (
+                str(row.get("kernel", "")),
+                normalize_int_text(row.get("threads", "")),
+                normalize_int_text(row.get("validation_blocks_per_sm", "")),
+            )
+        ] = row
     return out
 
 
-def ncu_status(kernel: str, threads: Any, ncu_rows: Dict[Tuple[str, str], Dict[str, Any]]) -> Tuple[bool, str]:
-    row = ncu_row(kernel, threads, ncu_rows)
+def ncu_status(
+    kernel: str,
+    threads: Any,
+    blocks_per_sm: Any,
+    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
+) -> Tuple[bool, str]:
+    row = ncu_row(kernel, threads, blocks_per_sm, ncu_rows)
     if not row:
         return (False, "missing NCU validation row")
     if parse_bool(row.get("validation_pass")):
@@ -63,13 +82,21 @@ def ncu_status(kernel: str, threads: Any, ncu_rows: Dict[Tuple[str, str], Dict[s
     return (False, reason)
 
 
-def ncu_row(kernel: str, threads: Any, ncu_rows: Dict[Tuple[str, str], Dict[str, Any]]) -> Dict[str, Any]:
-    thread_text = str(threads)
-    if "." in thread_text:
-        value = parse_float(thread_text)
-        if math.isfinite(value):
-            thread_text = str(int(value))
-    return ncu_rows.get((kernel, thread_text)) or ncu_rows.get((kernel, "")) or {}
+def ncu_row(
+    kernel: str,
+    threads: Any,
+    blocks_per_sm: Any,
+    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
+) -> Dict[str, Any]:
+    thread_text = normalize_int_text(threads)
+    blocks_text = normalize_int_text(blocks_per_sm)
+    return (
+        ncu_rows.get((kernel, thread_text, blocks_text))
+        or ncu_rows.get((kernel, thread_text, ""))
+        or ncu_rows.get((kernel, "", blocks_text))
+        or ncu_rows.get((kernel, "", ""))
+        or {}
+    )
 
 
 def ncu_context_status(
@@ -452,7 +479,7 @@ def matmul_denominator_quality(
 def pair_gate_rows(
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
-    ncu_rows: Dict[Tuple[str, str], Dict[str, Any]],
+    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in summary_rows:
@@ -503,12 +530,21 @@ def pair_gate_rows(
         )
         schema_ok, schema_failed, schema_warnings, schema_info = benchmark_schema_quality(row, args)
         denom_ok, denom_failed, denom_warnings, denom_info = matmul_denominator_quality(row, args)
-        test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
-        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
-        baseline_ncu_ok, baseline_ncu_note = ncu_status(
-            str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
+        blocks_per_sm = row.get("blocks_per_sm_requested", "")
+        test_ncu_ok, test_ncu_note = ncu_status(
+            str(row.get("test_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
         )
-        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows)
+        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
+        baseline_ncu_ok, baseline_ncu_note = ncu_status(
+            str(row.get("baseline_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
+        )
+        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
         test_context_ok, test_context_failed, test_context_warnings = ncu_context_status(row, test_ncu, args)
         baseline_context_ok, baseline_context_failed, baseline_context_warnings = ncu_context_status(
@@ -669,13 +705,18 @@ def pair_gate_rows(
     return out
 
 
-def source_counts_by_thread(summary_rows: Iterable[Dict[str, Any]]) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    grouped: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+def source_counts_by_thread(summary_rows: Iterable[Dict[str, Any]]) -> Dict[Tuple[str, str, str, str], Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in summary_rows:
-        key = (str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")), str(row.get("threads", "")))
+        key = (
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+            normalize_int_text(row.get("threads", "")),
+            normalize_int_text(row.get("blocks_per_sm_requested", "")),
+        )
         grouped[key].append(row)
 
-    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    out: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
     for key, rows in grouped.items():
         test_counts = Counter(str(r.get("test_energy_source", "")) for r in rows)
         base_counts = Counter(str(r.get("baseline_energy_source", "")) for r in rows)
@@ -712,7 +753,7 @@ def thread_gate_rows(
     thread_rows: List[Dict[str, Any]],
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
-    ncu_rows: Dict[Tuple[str, str], Dict[str, Any]],
+    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     source_by_thread = source_counts_by_thread(summary_rows)
     out: List[Dict[str, Any]] = []
@@ -746,18 +787,32 @@ def thread_gate_rows(
         sm_util_observed = math.isfinite(util)
         selected = parse_bool(row.get("selected_optimal"))
 
-        source_key = (str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")), str(row.get("threads", "")))
+        blocks_per_sm = row.get("blocks_per_sm_requested", "")
+        source_key = (
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+            normalize_int_text(row.get("threads", "")),
+            normalize_int_text(blocks_per_sm),
+        )
         source_info = source_by_thread.get(source_key, {})
         baseline_grade, baseline_ok, baseline_note = baseline_match_grade(
             str(row.get("test_kernel", "")),
             str(row.get("baseline_kernel", "")),
         )
-        test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
-        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
-        baseline_ncu_ok, baseline_ncu_note = ncu_status(
-            str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
+        test_ncu_ok, test_ncu_note = ncu_status(
+            str(row.get("test_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
         )
-        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows)
+        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
+        baseline_ncu_ok, baseline_ncu_note = ncu_status(
+            str(row.get("baseline_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
+        )
+        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
         test_context_ok, test_context_failed, test_context_warnings = ncu_context_status(row, test_ncu, args)
         baseline_context_ok, baseline_context_failed, baseline_context_warnings = ncu_context_status(

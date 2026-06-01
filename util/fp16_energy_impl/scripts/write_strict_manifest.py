@@ -76,6 +76,7 @@ def main() -> int:
     parser.add_argument("--repeat", required=True)
     parser.add_argument("--sample-ms", required=True)
     parser.add_argument("--threads", required=True)
+    parser.add_argument("--ncu-blocks-per-sm-csv", required=True)
     parser.add_argument("--skip-build", required=True)
     parser.add_argument("--skip-preflight", required=True)
     parser.add_argument("--allow-compute-apps", required=True)
@@ -107,6 +108,7 @@ def main() -> int:
             "repeat": args.repeat,
             "sample_ms": args.sample_ms,
             "threads": args.threads,
+            "ncu_blocks_per_sm_csv": args.ncu_blocks_per_sm_csv,
             "build_dir": args.build_dir,
             "skip_build": args.skip_build,
             "skip_preflight": args.skip_preflight,
@@ -125,6 +127,7 @@ def main() -> int:
                 "CMAKE_CUDA_FLAGS",
                 "MPLCONFIGDIR",
                 "NCU_METRICS",
+                "NCU_BLOCKS_PER_SM_CSV",
                 "NCU_BIN",
                 "NVCC_BIN",
                 "PATH",

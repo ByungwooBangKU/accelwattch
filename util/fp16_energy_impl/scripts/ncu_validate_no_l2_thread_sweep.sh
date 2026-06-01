@@ -13,6 +13,7 @@ DEFAULT_NCU_METRICS="smsp__inst_executed_pipe_tensor_op_hmma.sum,smsp__sass_thre
 NCU_BIN="${NCU_BIN:-ncu}"
 NCU_METRICS="${NCU_METRICS:-${DEFAULT_NCU_METRICS}}"
 NCU_BLOCKS_PER_SM="${NCU_BLOCKS_PER_SM:-8}"
+NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV:-${NCU_BLOCKS_PER_SM}}"
 NCU_UNROLL="${NCU_UNROLL:-8}"
 NCU_WARMUP="${NCU_WARMUP:-1}"
 NCU_REPEATS="${NCU_REPEATS:-1}"
@@ -24,18 +25,10 @@ NCU_BASELINE_KERNEL="${NCU_BASELINE_KERNEL:-tensor_baseline_mov}"
 NCU_SUPPRESS_OUTPUT_STORE_BOOL="false"
 NCU_FAILURES_CSV="${OUTDIR}/ncu_run_failures.csv"
 
-COMMON=(
-  --device "${GPU_ID}"
-  --blocks 0
-  --blocks-per-sm "${NCU_BLOCKS_PER_SM}"
-  --warmup "${NCU_WARMUP}"
-  --repeats "${NCU_REPEATS}"
-  --unroll "${NCU_UNROLL}"
-)
 if [[ "${NCU_SUPPRESS_OUTPUT_STORE}" != "0" ]]; then
-  COMMON+=(--suppress-output-store)
   NCU_SUPPRESS_OUTPUT_STORE_BOOL="true"
 fi
+IFS=',' read -r -a BLOCKS_PER_SM_LIST <<< "${NCU_BLOCKS_PER_SM_CSV}"
 
 csv_field() {
   local value="${1//\"/\"\"}"
@@ -44,8 +37,20 @@ csv_field() {
 
 run_ncu() {
   local name="$1"; shift
+  local blocks_per_sm="$1"; shift
   local kernel_regex="$1"; shift
   local log_file="${OUTDIR}/${name}.ncu.txt"
+  local common=(
+    --device "${GPU_ID}"
+    --blocks 0
+    --blocks-per-sm "${blocks_per_sm}"
+    --warmup "${NCU_WARMUP}"
+    --repeats "${NCU_REPEATS}"
+    --unroll "${NCU_UNROLL}"
+  )
+  if [[ "${NCU_SUPPRESS_OUTPUT_STORE}" != "0" ]]; then
+    common+=(--suppress-output-store)
+  fi
   local cmd=(
     "${NCU_BIN}"
     --target-processes all \
@@ -57,7 +62,7 @@ run_ncu() {
     --metrics "${NCU_METRICS}" \
     --print-summary per-kernel \
     --log-file "${log_file}" \
-    "${BIN}" "${COMMON[@]}" "$@"
+    "${BIN}" "${common[@]}" "$@"
   )
   set +e
   "${cmd[@]}"
@@ -81,14 +86,20 @@ run_ncu() {
 }
 
 for threads in "${THREADS_LIST[@]}"; do
-  run_ncu "tensor_mma_f16acc_t${threads}" "tensor_mma_f16acc" \
-    --kernel tensor_mma_f16acc \
-    --threads "${threads}" \
-    --iters "${NCU_ITERS}"
-  run_ncu "${NCU_BASELINE_KERNEL}_t${threads}" "${NCU_BASELINE_KERNEL}" \
-    --kernel "${NCU_BASELINE_KERNEL}" \
-    --threads "${threads}" \
-    --iters "${NCU_ITERS}"
+  for blocks_per_sm in "${BLOCKS_PER_SM_LIST[@]}"; do
+    suffix="t${threads}"
+    if [[ "${NCU_BLOCKS_PER_SM_CSV}" != "${NCU_BLOCKS_PER_SM}" || "${blocks_per_sm}" != "${NCU_BLOCKS_PER_SM}" ]]; then
+      suffix="${suffix}_b${blocks_per_sm}"
+    fi
+    run_ncu "tensor_mma_f16acc_${suffix}" "${blocks_per_sm}" "tensor_mma_f16acc" \
+      --kernel tensor_mma_f16acc \
+      --threads "${threads}" \
+      --iters "${NCU_ITERS}"
+    run_ncu "${NCU_BASELINE_KERNEL}_${suffix}" "${blocks_per_sm}" "${NCU_BASELINE_KERNEL}" \
+      --kernel "${NCU_BASELINE_KERNEL}" \
+      --threads "${threads}" \
+      --iters "${NCU_ITERS}"
+  done
 done
 
 VALIDATE_ARGS=(

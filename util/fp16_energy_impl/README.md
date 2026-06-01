@@ -12,6 +12,7 @@
 | `configs/fp16_matmul_thread_sweep.json` | L2/global output store를 억제한 Tensor Core thread-count sweep matrix |
 | `configs/fp16_matmul_thread_sweep_fine.json` | 낮은 thread 후보까지 포함한 Tensor Core fine thread-count sweep matrix |
 | `configs/fp16_matmul_thread_sweep_low_append.json` | 기존 fine sweep 결과 디렉터리에 32/64/96/128 후보를 append하는 matrix |
+| `configs/fp16_matmul_launch_shape_sweep.json` | `threads/block`와 `blocks/SM`을 함께 훑어 `blocks_per_sm=8` 고정 가정을 검증하는 launch-shape sweep matrix |
 | `configs/fp16_matmul_work_slope_mov.json` | 같은 thread 조건에서 unroll/work amount를 바꾸는 `tensor_baseline_mov` slope diagnostic matrix |
 | `configs/p1_memory_policy_matrix.json` | P1 memory/cache policy 보정용 matrix |
 | `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
@@ -174,7 +175,7 @@ GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   --outdir results/strict_fp16_h100
 ```
 
-이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, build 전에 `strict_pipeline_preflight.json/csv`로 toolchain/GPU/process 상태를 검사한 뒤, 환경 수집 후 짧은 CUDA runtime preflight를 실행한다. 또한 시작 시 `strict_pipeline_manifest_start.json`, 완료 시 `strict_pipeline_manifest.json`을 남겨 실행 인자, git head, tool version, binary hash, preflight/quality/NCU/resource 산출물 존재 여부를 고정한다. 이 단계가 실패하면 driver/runtime mismatch 또는 오래된 binary 문제이므로 긴 sweep을 시작하지 않는다. Runtime preflight JSON은 이어서 `verify_architecture.py --strict-chip --require-common-hmma`로 검증한다. 즉 `--cuda-arch 80`은 A100/GA100, `86`은 RTX 3090/GA102, `90`은 H100/GH100 metadata와 맞아야 하며, 공통 HMMA path가 아니라 WGMMA를 쓴 경우 strict pipeline은 중단된다. 이후 `calibrate_matrix.py`로 기본 `fp16_matmul_thread_sweep_fine.json`의 test/baseline timed duration이 기본 1초 이상이 되도록 per-role `repeats`를 GPU별로 보정하고, 보정된 `calibrated_matrix.json`으로 structural baseline sweep을 실행한다. 이 calibration은 기존 matrix의 repeats를 기본적으로 줄이지 않고, 필요한 경우만 늘린다. `--matrix`로 다른 matrix를 지정할 수 있고, `--no-calibrate-matrix`를 주면 원본 matrix를 그대로 사용한다. Sweep 뒤에는 `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`까지 실행한다. NCU가 performance counter 권한 문제 등으로 실패하면 `ncu_no_l2_thread_sweep/ncu_run_failures.csv`에 실패 kernel, exit code, log path, 재현 command가 남는다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
+이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, build 전에 `strict_pipeline_preflight.json/csv`로 toolchain/GPU/process 상태를 검사한 뒤, 환경 수집 후 짧은 CUDA runtime preflight를 실행한다. 또한 시작 시 `strict_pipeline_manifest_start.json`, 완료 시 `strict_pipeline_manifest.json`을 남겨 실행 인자, git head, tool version, binary hash, NCU `blocks/SM` validation list, preflight/quality/NCU/resource 산출물 존재 여부를 고정한다. 이 단계가 실패하면 driver/runtime mismatch 또는 오래된 binary 문제이므로 긴 sweep을 시작하지 않는다. Runtime preflight JSON은 이어서 `verify_architecture.py --strict-chip --require-common-hmma`로 검증한다. 즉 `--cuda-arch 80`은 A100/GA100, `86`은 RTX 3090/GA102, `90`은 H100/GH100 metadata와 맞아야 하며, 공통 HMMA path가 아니라 WGMMA를 쓴 경우 strict pipeline은 중단된다. 이후 `calibrate_matrix.py`로 기본 `fp16_matmul_thread_sweep_fine.json`의 test/baseline timed duration이 기본 1초 이상이 되도록 per-role `repeats`를 GPU별로 보정하고, 보정된 `calibrated_matrix.json`으로 structural baseline sweep을 실행한다. 이 calibration은 기존 matrix의 repeats를 기본적으로 줄이지 않고, 필요한 경우만 늘린다. `--matrix`로 다른 matrix를 지정할 수 있고, `--no-calibrate-matrix`를 주면 원본 matrix를 그대로 사용한다. Sweep 뒤에는 `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`까지 실행한다. NCU가 performance counter 권한 문제 등으로 실패하면 `ncu_no_l2_thread_sweep/ncu_run_failures.csv`에 실패 kernel, exit code, log path, 재현 command가 남는다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
 
 Calibration만 별도로 실행할 수도 있다. 새 장비에서는 binary probe를 사용하고, 이미 짧은 diagnostic run을 분석한 뒤에는 `summary.csv`를 이용해 반복 수를 재계산할 수 있다.
 
@@ -398,6 +399,29 @@ python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gp
 
 여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 최종 `target_pass` 선택 기준은 strict `quality_pass=true` 후보 중 max SM utilization에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다.
 
+`blocks_per_sm=8`이 최적이라는 가정도 별도 확인할 수 있다. `configs/fp16_matmul_launch_shape_sweep.json`은 `threads/block = 32,64,128,256`과 `blocks/SM = 1,2,4,8`을 함께 훑어 같은 launched `threads_per_sm`이라도 다른 launch shape가 SM utilization, pJ/bit, baseline subtraction 안정성에 어떤 영향을 주는지 확인한다. `analyze_results.py`는 `thread_sweep_summary.csv`를 `threads`와 `blocks_per_sm_requested` 둘 다로 집계하고, `quality_gate.py`와 NCU validation context도 blocks/SM을 같이 매칭한다.
+
+```bash
+./scripts/run_strict_fp16_pipeline.sh \
+  --gpu 0 \
+  --cuda-arch 86 \
+  --matrix configs/fp16_matmul_launch_shape_sweep.json \
+  --threads 32,64,128,256 \
+  --ncu-blocks-per-sm-csv 1,2,4,8 \
+  --outdir results/strict_fp16_launch_shape_rtx3090
+```
+
+Nsight Compute validation도 여러 blocks/SM을 함께 확인할 수 있다.
+
+```bash
+NCU_BLOCKS_PER_SM_CSV=1,2,4,8 \
+  ./scripts/ncu_validate_no_l2_thread_sweep.sh \
+  build/fp16_energy_bench \
+  results/ncu_launch_shape_gpu0 \
+  0 \
+  32,64,128,256
+```
+
 2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 logical `m16n16k16`이며, 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*16) * 16 = 8192 bit/logical MMA`다. 이 run은 이전 matrix의 `baseline_nop` 기반 legacy diagnostic 결과이며, Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다. 현재 strict matrix는 `tensor_baseline_mov` no-memory warp-sync baseline을 사용하므로 최종 pJ/bit는 재실행 후 `quality_gate.py`의 `target_pass=true` 결과를 사용한다.
 
 | Sweep | 후보 threads/block | Selected threads/SM | Selected threads/block | valid no-L2 | Avg SM util (%) | TFLOPS | `matmul_input_pj_per_bit` |
@@ -588,7 +612,7 @@ Thread sweep에서 선택된 후보가 L2/global memory를 의도적으로 touch
   32,64,128,256,512,1024
 ```
 
-이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 기본 `tensor_baseline_mov`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. Helper는 기본적으로 strict matrix와 같은 `blocks_per_sm=8`, `unroll=8`, `suppress_output_store=true` context를 `ncu_validation_summary.csv`에 기록하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`는 이 context가 측정 row와 맞는지와 test kernel의 Tensor pipe activity evidence가 있는지도 확인한다. `tensor_baseline_mov`는 ptxas가 register-move-only loop를 제거하지 못하도록 no-memory warp-sync step을 사용한다. 필요한 경우 `NCU_BASELINE_KERNEL`, `NCU_BLOCKS_PER_SM`, `NCU_UNROLL`, `NCU_SUPPRESS_OUTPUT_STORE`, `NCU_ITERS`, `NCU_REPEATS`, `NCU_WARMUP`, `NCU_MIN_TENSOR_ACTIVITY_PCT` 환경변수로 profiler validation run의 launch context와 Tensor activity threshold를 override한다. Diagnostic run에서만 `NCU_REQUIRE_TENSOR_ACTIVITY=0`으로 Tensor activity hard gate를 끌 수 있다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
+이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 기본 `tensor_baseline_mov`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. Helper는 기본적으로 strict matrix와 같은 `blocks_per_sm=8`, `unroll=8`, `suppress_output_store=true` context를 `ncu_validation_summary.csv`에 기록하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`는 이 context가 측정 row와 맞는지와 test kernel의 Tensor pipe activity evidence가 있는지도 확인한다. Launch-shape sweep처럼 여러 `blocks/SM`을 검증할 때는 `NCU_BLOCKS_PER_SM_CSV=1,2,4,8` 또는 pipeline의 `--ncu-blocks-per-sm-csv 1,2,4,8`을 사용하며, validation report 이름과 quality/audit 매칭은 `threads + blocks_per_sm`를 함께 사용한다. `tensor_baseline_mov`는 ptxas가 register-move-only loop를 제거하지 못하도록 no-memory warp-sync step을 사용한다. 필요한 경우 `NCU_BASELINE_KERNEL`, `NCU_BLOCKS_PER_SM`, `NCU_BLOCKS_PER_SM_CSV`, `NCU_UNROLL`, `NCU_SUPPRESS_OUTPUT_STORE`, `NCU_ITERS`, `NCU_REPEATS`, `NCU_WARMUP`, `NCU_MIN_TENSOR_ACTIVITY_PCT` 환경변수로 profiler validation run의 launch context와 Tensor activity threshold를 override한다. Diagnostic run에서만 `NCU_REQUIRE_TENSOR_ACTIVITY=0`으로 Tensor activity hard gate를 끌 수 있다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
 
 두 validation helper는 실행 후 `validate_ncu_reports.py`를 호출해 다음 산출물을 만든다.
 

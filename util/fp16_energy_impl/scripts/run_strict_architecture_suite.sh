@@ -15,7 +15,9 @@ OUTDIR=""
 REPEAT=10
 SAMPLE_MS=100
 THREADS_CSV="32,64,96,128,160,192,224,256,288,320,384"
+NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV:-8}"
 BUILD_DIR="build"
+MATRIX_OVERRIDE=""
 CALIBRATE_MATRIX=1
 TARGET_TEST_S=1.0
 TARGET_BASELINE_S=1.0
@@ -59,7 +61,11 @@ Options:
   --repeat N           Matrix repeat count passed to each strict run [10]
   --sample-ms N        nvidia-smi power sample interval [100]
   --threads CSV        Threads/block list [32,64,96,128,160,192,224,256,288,320,384]
+  --ncu-blocks-per-sm-csv CSV
+                       Blocks/SM list for NCU validation [8]
   --build-dir DIR      Build directory relative to fp16_energy_impl [build]
+  --matrix FILE        Experiment matrix passed to each strict pipeline
+                       [configs/fp16_matmul_thread_sweep_fine.json]
   --no-calibrate-matrix
                        Use the base matrix without GPU-specific repeat calibration
   --target-test-s S     Target test CUDA-event duration for calibration [1.0]
@@ -85,7 +91,7 @@ Options:
 
 Environment overrides:
   CMAKE_BIN, CMAKE_CUDA_FLAGS, NVCC_BIN, NCU_BIN, PYTHON_BIN, NVIDIA_SMI_BIN,
-  MPLCONFIGDIR, NCU_METRICS
+  MPLCONFIGDIR, NCU_METRICS, NCU_BLOCKS_PER_SM_CSV
 USAGE
 }
 
@@ -96,7 +102,9 @@ while [[ $# -gt 0 ]]; do
     --repeat) REPEAT="$2"; shift 2 ;;
     --sample-ms) SAMPLE_MS="$2"; shift 2 ;;
     --threads) THREADS_CSV="$2"; shift 2 ;;
+    --ncu-blocks-per-sm-csv) NCU_BLOCKS_PER_SM_CSV="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
+    --matrix) MATRIX_OVERRIDE="$2"; shift 2 ;;
     --no-calibrate-matrix) CALIBRATE_MATRIX=0; shift ;;
     --target-test-s) TARGET_TEST_S="$2"; shift 2 ;;
     --target-baseline-s) TARGET_BASELINE_S="$2"; shift 2 ;;
@@ -221,11 +229,15 @@ for spec in "${SPECS[@]}"; do
     --repeat "${REPEAT}"
     --sample-ms "${SAMPLE_MS}"
     --threads "${THREADS_CSV}"
+    --ncu-blocks-per-sm-csv "${NCU_BLOCKS_PER_SM_CSV}"
     --build-dir "${BUILD_DIR}"
     --target-test-s "${TARGET_TEST_S}"
     --target-baseline-s "${TARGET_BASELINE_S}"
     --max-calibrated-repeats "${MAX_CALIBRATED_REPEATS}"
   )
+  if [[ -n "${MATRIX_OVERRIDE}" ]]; then
+    cmd+=(--matrix "${MATRIX_OVERRIDE}")
+  fi
   if [[ -n "${nvidia_smi_id:-}" ]]; then
     cmd+=(--nvidia-smi-id "${nvidia_smi_id}")
   fi
