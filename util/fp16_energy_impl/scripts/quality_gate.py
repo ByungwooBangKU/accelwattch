@@ -78,6 +78,31 @@ def source_grade(test_source: str, baseline_source: str, test_samples: int, base
     return ("mixed_or_unavailable", False, "energy source unavailable")
 
 
+def baseline_match_grade(test_kernel: str, baseline_kernel: str) -> Tuple[str, bool, str]:
+    expected = {
+        "tensor_mma_f16acc": "tensor_baseline_u32",
+        "tensor_mma_f32acc": "tensor_baseline_f32",
+        "fp16_half2": "baseline_regmove",
+    }.get(test_kernel)
+    if expected is None:
+        return ("not_applicable", True, "no strict baseline mapping for this kernel")
+    if baseline_kernel == expected:
+        return ("structural_baseline", True, f"matched structural baseline {expected}")
+    if test_kernel.startswith("tensor_mma") and baseline_kernel == "baseline_nop":
+        return (
+            "generic_nop_baseline",
+            False,
+            f"rerun with {expected}; baseline_nop is only a weak loop baseline for Tensor Core separation",
+        )
+    if test_kernel == "fp16_half2" and baseline_kernel == "baseline_nop":
+        return (
+            "generic_nop_baseline",
+            False,
+            "rerun/use baseline_regmove for the stricter CUDA-core FP16 separation",
+        )
+    return ("baseline_mismatch", False, f"expected {expected}")
+
+
 def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in summary_rows:
@@ -89,6 +114,10 @@ def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namesp
             test_samples,
             baseline_samples,
             args.min_power_samples,
+        )
+        baseline_grade, baseline_ok, baseline_note = baseline_match_grade(
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
         )
         positive = parse_bool(row.get("valid_basic"))
         no_l2 = parse_bool(row.get("valid_no_l2"))
@@ -112,6 +141,8 @@ def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namesp
             failed.append("test/baseline energy source mismatch")
         if not reliable_source:
             failed.append(source_note)
+        if not baseline_ok:
+            failed.append(baseline_note)
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
         if not clock_stable:
@@ -134,12 +165,14 @@ def pair_gate_rows(summary_rows: Iterable[Dict[str, Any]], args: argparse.Namesp
                 "threads": row.get("threads", ""),
                 "threads_per_sm": row.get("threads_per_sm", ""),
                 "measurement_grade": grade,
+                "baseline_match_grade": baseline_grade,
                 "quality_pass": not failed,
                 "target_pass": False,
                 "positive_increment": positive,
                 "no_intended_l2": no_l2,
                 "pure_fp16_candidate": pure,
                 "energy_source_reliable": reliable_source,
+                "baseline_structural_match": baseline_ok,
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_available,
                 "common_hmma_path": common_hmma,
@@ -221,6 +254,10 @@ def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[D
 
         source_key = (str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")), str(row.get("threads", "")))
         source_info = source_by_thread.get(source_key, {})
+        baseline_grade, baseline_ok, baseline_note = baseline_match_grade(
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+        )
         if source_info.get("all_nvml"):
             grade = "strict_nvml_counter"
             source_ok = True
@@ -248,6 +285,8 @@ def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[D
             failed.append("SM/GPU utilization missing")
         if not source_ok:
             failed.append("energy source is unavailable or undersampled")
+        if not baseline_ok:
+            failed.append(baseline_note)
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
 
@@ -270,6 +309,7 @@ def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[D
                 "valid_no_l2_count": valid_no_l2,
                 "pure_fp16_candidate_count": pure_count,
                 "measurement_grade": grade,
+                "baseline_match_grade": baseline_grade,
                 "quality_pass": quality_pass,
                 "target_pass": target_pass,
                 "selected_optimal": selected,
@@ -277,6 +317,7 @@ def thread_gate_rows(thread_rows: List[Dict[str, Any]], summary_rows: Iterable[D
                 "no_intended_l2": enough_no_l2,
                 "pure_fp16_candidate": enough_pure,
                 "energy_source_reliable": source_ok,
+                "baseline_structural_match": baseline_ok,
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_observed,
                 "avg_sm_util_pct_mean": row.get("avg_sm_util_pct_mean", ""),
@@ -362,7 +403,11 @@ def plot_thread_quality(rows: List[Dict[str, Any]], figdir: Path) -> None:
 
 
 def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
-    targets = [r for r in rows if r.get("scope") == "thread_sweep" and parse_bool(r.get("selected_optimal"))]
+    targets = [r for r in rows if r.get("scope") == "thread_sweep" and parse_bool(r.get("target_pass"))]
+    selected_diagnostics = [
+        r for r in rows
+        if r.get("scope") == "thread_sweep" and parse_bool(r.get("selected_optimal")) and not parse_bool(r.get("target_pass"))
+    ]
     payload = {
         "input": str(input_dir),
         "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -380,10 +425,12 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "target_pass": sum(1 for r in rows if parse_bool(r.get("target_pass"))),
         },
         "selected_targets": targets,
+        "selected_diagnostics": selected_diagnostics,
         "notes": [
             "valid_no_l2 means valid_basic=True and the benchmark metadata does not expect global/L2 traffic.",
             "It is not a physical proof of zero L2 traffic; Nsight Compute memory counters are still required.",
             "strict_nvml_counter is preferred for H100/A100/RTX3090 comparison; power_trace_fallback is diagnostic.",
+            "Tensor Core final candidates must use tensor_baseline_u32/f32, not the legacy baseline_nop.",
         ],
     }
     with (input_dir / "quality_gate_summary.json").open("w") as f:

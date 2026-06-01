@@ -125,10 +125,11 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | enough valid repeats | thread point별 `valid_no_l2_count >= max(3, ceil(run_count/2))` |
 | stable clock | 기본값으로 `clock_span_mhz <= 60` |
 | reliable energy source | `nvml_total_energy_counter` 우선. 미지원 시 power trace fallback은 최소 sample 수를 만족할 때만 diagnostic grade로 통과 |
+| structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
 | utilization target | SM utilization 최대값에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
 
-출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다.
+출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이며 `quality_gate_summary.json`의 `selected_targets`에 들어간다. 기존 sweep logic이 고른 point라도 strict gate를 통과하지 못하면 `selected_diagnostics`로만 남긴다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다. `baseline_match_grade=generic_nop_baseline`인 결과는 utilization diagnostic으로만 보고, 최종 FP16 pJ/bit에는 쓰지 않는다.
 
 ### Architecture comparison policy
 
@@ -215,9 +216,10 @@ python3 scripts/run_experiment.py \
   --outdir results/fp16_matmul_thread_sweep_gpu0
 
 python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_gpu0
+python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_gpu0
 ```
 
-이 sweep은 `threads = 32, 64, 128, 256, 512, 1024`를 훑는다. Matrix default의 `suppress_output_store=true`가 test와 `baseline_nop` timed kernel의 final global store를 끄므로, 의도된 timed-loop L2/global memory traffic 없이 Tensor Core utilization만 비교한다. 분석기는 `thread_sweep_summary.csv`를 만들고, `valid_basic=True`이며 `expected_l2_touch=False`인 후보 중 dmon `avg_sm_util_pct_mean`이 포화되는 가장 작은 `threads_per_sm` point를 `selected_optimal=True`로 표시한다. SM utilization이 없으면 `avg_gpu_util_pct_mean`으로 fallback한다.
+이 sweep은 `threads = 32, 64, 128, 256, 512, 1024`를 훑는다. Matrix default의 `suppress_output_store=true`가 test와 `tensor_baseline_u32` timed kernel의 final global store를 끄므로, 의도된 timed-loop L2/global memory traffic 없이 Tensor Core utilization만 비교한다. 분석기는 `thread_sweep_summary.csv`를 만들고, `valid_basic=True`이며 `expected_l2_touch=False`인 후보 중 dmon `avg_sm_util_pct_mean`이 포화되는 가장 작은 `threads_per_sm` point를 `selected_optimal=True`로 표시한다. SM utilization이 없으면 `avg_gpu_util_pct_mean`으로 fallback한다.
 
 Coarse sweep에서 유효 후보가 좁혀지면 fine sweep을 추가로 실행한다. Fine matrix는 `threads = 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384`를 훑는다. 160 이상 후보는 test `repeats=2`, baseline `repeats=20`을 사용한다. 32/64/96/128 후보는 duration과 sample 수를 맞추기 위해 각각 더 큰 repeats를 사용한다.
 
@@ -236,13 +238,13 @@ python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gp
 
 여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 선택 기준은 max SM utilization에서 0.1 percentage point 이내로 포화된 후보 중 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다.
 
-2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 logical `m16n16k16`이며, 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*16) * 16 = 8192 bit/logical MMA`다. Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다.
+2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 logical `m16n16k16`이며, 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*16) * 16 = 8192 bit/logical MMA`다. 이 run은 이전 matrix의 `baseline_nop` 기반 legacy diagnostic 결과이며, Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다. 현재 strict matrix는 `tensor_baseline_u32`를 사용하므로 최종 pJ/bit는 재실행 후 `quality_gate.py`의 `target_pass=true` 결과를 사용한다.
 
 | Sweep | 후보 threads/block | Selected threads/SM | Selected threads/block | valid no-L2 | Avg SM util (%) | TFLOPS | `matmul_input_pj_per_bit` |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Fine + dmon SM util | 32,64,96,128,160,192,224,256,288,320,384 | 512 | 64 | 9/10 | 100.000 +/- 0.000 | 159.1 | 0.2514 +/- 0.0142 pJ/bit |
 
-Fine + dmon run에서는 `threads_per_sm=512`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 target thread count는 512 threads/SM, 즉 64 threads/block로 지정한다. pJ/bit 자체는 224 threads/block 후보에서 `0.0819 +/- 0.0121 pJ/bit`로 더 낮게 관찰되었지만, valid no-L2 count가 5/10이고 incremental power가 3.23 W 수준이라 target saturation point로 채택하지 않았다. 256 threads/block 이상 후보는 baseline subtraction 후 incremental power가 음수로 나와 `all_runs_no_valid`로 집계되었다. 이 값들은 board-level `nvidia-smi` power trace와 baseline subtraction 기반 estimate이므로, 최종 수치 채택 전에는 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
+Fine + dmon legacy run에서는 `threads_per_sm=512`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 후보 thread count는 512 threads/SM, 즉 64 threads/block이다. pJ/bit 자체는 224 threads/block 후보에서 `0.0819 +/- 0.0121 pJ/bit`로 더 낮게 관찰되었지만, valid no-L2 count가 5/10이고 incremental power가 3.23 W 수준이라 target saturation point로 채택하지 않았다. 256 threads/block 이상 후보는 baseline subtraction 후 incremental power가 음수로 나와 `all_runs_no_valid`로 집계되었다. 이 값들은 board-level `nvidia-smi` power trace와 `baseline_nop` subtraction 기반 estimate이므로, 최종 수치 채택 전에는 현재 matrix로 재실행하고 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
 
 여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 `analyze_results.py`를 먼저 실행하고, 다음처럼 묶는다.
 
@@ -258,7 +260,8 @@ python3 scripts/compare_architectures.py \
 
 | 파일 | 내용 |
 |---|---|
-| `architecture_best_fp16.csv` | 결과 디렉터리별 pure FP16 후보 중 utilization/valid count 기준 best row |
+| `architecture_best_fp16.csv` | 결과 디렉터리별 quality-gated pure FP16 후보 중 best row. gate가 실패하면 `quality_rejected=True`와 `selection_note=quality_gate_failed_no_best`로 표시 |
+| `architecture_quality_gates.csv` | 여러 결과 디렉터리의 `quality_gates.csv`를 architecture tag와 함께 병합한 파일 |
 | `architecture_best_matmul_input_pj_per_bit.png` | GPU architecture별 best logical matmul input pJ/bit 비교 |
 | `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |
 | `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교 |
@@ -337,7 +340,7 @@ Thread sweep에서 선택된 후보가 L2/global memory를 의도적으로 touch
   32,64,128,256,512,1024
 ```
 
-이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 `baseline_nop`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
+이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 `tensor_baseline_u32`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
 
 P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 

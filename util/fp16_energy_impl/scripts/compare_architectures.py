@@ -34,6 +34,12 @@ def read_csv(path: Path) -> List[Dict[str, Any]]:
         return list(csv.DictReader(f))
 
 
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -117,29 +123,57 @@ def result_label(path: Path, row: Optional[Dict[str, Any]] = None) -> str:
     return path.name
 
 
-def load_result_dir(path: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def load_result_dir(
+    path: Path,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     condition_rows = read_csv(path / "condition_summary.csv")
     summary_rows = read_csv(path / "summary.csv")
     thread_rows = read_csv(path / "thread_sweep_summary.csv")
+    quality_rows = read_csv(path / "quality_gates.csv")
     seed_row = (condition_rows or summary_rows or [{}])[0]
     arch = classify_from_row(seed_row)
     label = result_label(path, arch)
+
+    quality_thread: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for row in quality_rows:
+        if str(row.get("scope", "")) != "thread_sweep":
+            continue
+        key = (str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")), str(row.get("threads", "")))
+        quality_thread[key] = row
 
     def enrich(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out = []
         for row in rows:
             row_arch = classify_from_row({**arch, **row})
-            out.append(
-                {
-                    **row,
-                    **row_arch,
-                    "input_dir": str(path),
-                    "architecture_label": label,
-                }
-            )
+            enriched = {
+                **row,
+                **row_arch,
+                "input_dir": str(path),
+                "architecture_label": label,
+            }
+            if "threads" in row:
+                key = (
+                    str(row.get("test_kernel", "")),
+                    str(row.get("baseline_kernel", "")),
+                    str(row.get("threads", "")),
+                )
+                q = quality_thread.get(key)
+                if q:
+                    for qkey in (
+                        "measurement_grade",
+                        "baseline_match_grade",
+                        "quality_pass",
+                        "target_pass",
+                        "baseline_structural_match",
+                        "energy_source_reliable",
+                        "fail_reasons",
+                        "warnings",
+                    ):
+                        enriched[qkey] = q.get(qkey, "")
+            out.append(enriched)
         return out
 
-    return enrich(condition_rows), enrich(summary_rows), enrich(thread_rows)
+    return enrich(condition_rows), enrich(summary_rows), enrich(thread_rows), enrich(quality_rows)
 
 
 def is_fp16_candidate(row: Dict[str, Any]) -> bool:
@@ -160,6 +194,32 @@ def select_best_fp16(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     selected: List[Dict[str, Any]] = []
     for group in by_input.values():
+        strict_targets = [row for row in group if parse_bool(row.get("target_pass"))]
+        strict_quality = [row for row in group if parse_bool(row.get("quality_pass"))]
+        has_quality_info = any("quality_pass" in row for row in group)
+        if strict_targets:
+            pool = strict_targets
+            selection_note = "quality_gate_target_pass"
+        elif strict_quality:
+            pool = strict_quality
+            selection_note = "quality_gate_quality_pass_no_target"
+        elif has_quality_info:
+            rejected = dict(max(group, key=lambda row: (
+                int(parse_float(row.get("pure_fp16_candidate_count"), 0.0)),
+                int(parse_float(row.get("valid_no_l2_count"), 0.0)),
+                int(parse_float(row.get("valid_count"), 0.0)),
+            )))
+            rejected["selection_note"] = "quality_gate_failed_no_best"
+            rejected["quality_rejected"] = True
+            rejected["matmul_input_pj_per_bit_mean"] = math.nan
+            rejected["tflops_mean"] = math.nan
+            rejected["incremental_power_w_mean"] = math.nan
+            selected.append(rejected)
+            continue
+        else:
+            pool = group
+            selection_note = "legacy_or_no_quality_gate"
+
         def score(row: Dict[str, Any]) -> Tuple[int, int, int, float, float]:
             pure_count = int(parse_float(row.get("pure_fp16_candidate_count"), 0.0))
             valid_no_l2 = int(parse_float(row.get("valid_no_l2_count"), 0.0))
@@ -170,7 +230,10 @@ def select_best_fp16(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             tflops = parse_float(row.get("tflops_mean"), -math.inf)
             return (pure_count, valid_no_l2, valid, util, tflops)
 
-        selected.append(max(group, key=score))
+        best = dict(max(pool, key=score))
+        best["selection_note"] = selection_note
+        best["quality_rejected"] = False
+        selected.append(best)
     return selected
 
 
@@ -267,19 +330,23 @@ def main() -> int:
     all_conditions: List[Dict[str, Any]] = []
     all_summary: List[Dict[str, Any]] = []
     all_threads: List[Dict[str, Any]] = []
+    all_quality: List[Dict[str, Any]] = []
     for path in args.input:
-        conditions, summary, threads = load_result_dir(path)
+        conditions, summary, threads, quality = load_result_dir(path)
         if not conditions and not summary:
             raise SystemExit(f"{path} has no summary.csv or condition_summary.csv; run analyze_results.py first")
         all_conditions.extend(conditions)
         all_summary.extend(summary)
         all_threads.extend(threads)
+        all_quality.extend(quality)
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    best = select_best_fp16(all_conditions)
+    best_source = all_threads if all_threads else all_conditions
+    best = select_best_fp16(best_source)
     write_csv(args.outdir / "architecture_condition_summary.csv", all_conditions)
     write_csv(args.outdir / "architecture_summary_rows.csv", all_summary)
     write_csv(args.outdir / "architecture_thread_sweep_summary.csv", all_threads)
+    write_csv(args.outdir / "architecture_quality_gates.csv", all_quality)
     write_csv(args.outdir / "architecture_best_fp16.csv", best)
 
     plot_bar(

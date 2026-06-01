@@ -28,6 +28,8 @@ run_ncu() {
 run_ncu fp16_half2 --kernel fp16_half2 --iters 20000
 run_ncu baseline_nop --kernel baseline_nop --iters 20000
 run_ncu baseline_regmove --kernel baseline_regmove --iters 20000
+run_ncu tensor_baseline_u32 --kernel tensor_baseline_u32 --iters 20000
+run_ncu tensor_baseline_f32 --kernel tensor_baseline_f32 --iters 20000
 run_ncu tensor_mma_f16acc --kernel tensor_mma_f16acc --iters 20000
 run_ncu tensor_mma_f32acc --kernel tensor_mma_f32acc --iters 20000
 

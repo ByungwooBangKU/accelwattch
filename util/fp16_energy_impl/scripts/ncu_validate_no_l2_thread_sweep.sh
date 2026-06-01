@@ -39,8 +39,8 @@ for threads in "${THREADS_LIST[@]}"; do
     --kernel tensor_mma_f16acc \
     --threads "${threads}" \
     --iters 20000
-  run_ncu "baseline_nop_t${threads}" "baseline_nop" \
-    --kernel baseline_nop \
+  run_ncu "tensor_baseline_u32_t${threads}" "tensor_baseline_u32" \
+    --kernel tensor_baseline_u32 \
     --threads "${threads}" \
     --iters 20000
 done
