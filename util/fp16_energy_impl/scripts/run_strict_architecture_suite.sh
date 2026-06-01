@@ -149,10 +149,13 @@ mkdir -p "${OUTDIR}/runs"
 PREFLIGHT_JSON="${OUTDIR}/strict_architecture_suite_preflight.json"
 PREFLIGHT_CSV="${OUTDIR}/strict_architecture_suite_preflight.csv"
 RUN_STATUS_CSV="${OUTDIR}/strict_architecture_suite_runs.csv"
+SUITE_SUMMARY_JSON="${OUTDIR}/strict_architecture_suite_summary.json"
 printf 'label,gpu,cuda_arch,nvidia_smi_id,result_dir,status,exit_code\n' > "${RUN_STATUS_CSV}"
 
 COMPLETED_DIRS=()
 SUITE_FAILED=0
+EARLY_RC=""
+POSTPROCESS_RC=""
 
 if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
   PREFLIGHT_ARGS=()
@@ -248,7 +251,8 @@ for spec in "${SPECS[@]}"; do
       "${label}" "${gpu}" "${cuda_arch}" "${nvidia_smi_id:-}" "${run_dir}" "failed" "${rc}" >> "${RUN_STATUS_CSV}"
     SUITE_FAILED=1
     if [[ "${CONTINUE_ON_FAIL}" -eq 0 ]]; then
-      exit "${rc}"
+      EARLY_RC="${rc}"
+      break
     fi
   fi
 done
@@ -281,19 +285,51 @@ if [[ "${NO_POSTPROCESS}" -eq 0 && "${#COMPLETED_DIRS[@]}" -gt 0 ]]; then
     MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_suite}" "${post_cmd[@]}"
     rc=$?
     set -e
+    POSTPROCESS_RC="${rc}"
     if [[ "${rc}" -ne 0 ]]; then
       SUITE_FAILED=1
-      if [[ "${NO_FAIL}" -eq 0 ]]; then
-        exit "${rc}"
-      fi
     fi
   fi
 fi
+
+SUMMARY_ARGS=(--out "${SUITE_SUMMARY_JSON}" --outdir "${OUTDIR}" --run-status-csv "${RUN_STATUS_CSV}")
+for spec in "${SPECS[@]}"; do
+  SUMMARY_ARGS+=(--spec "${spec}")
+done
+if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
+  SUMMARY_ARGS+=(--preflight-json "${PREFLIGHT_JSON}")
+fi
+if [[ -n "${POSTPROCESS_DIR}" ]]; then
+  SUMMARY_ARGS+=(--postprocess-dir "${POSTPROCESS_DIR}")
+fi
+if [[ -n "${POSTPROCESS_RC}" ]]; then
+  SUMMARY_ARGS+=(--postprocess-exit-code "${POSTPROCESS_RC}")
+fi
+if [[ "${NO_POSTPROCESS}" -eq 1 || "${DRY_RUN}" -eq 1 || "${#COMPLETED_DIRS[@]}" -eq 0 ]]; then
+  SUMMARY_ARGS+=(--postprocess-skipped)
+fi
+if [[ "${SUITE_FAILED}" -ne 0 ]]; then
+  SUMMARY_ARGS+=(--suite-failed 1)
+else
+  SUMMARY_ARGS+=(--suite-failed 0)
+fi
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  SUMMARY_ARGS+=(--dry-run)
+fi
+if [[ "${SKIP_PREFLIGHT}" -eq 1 ]]; then
+  SUMMARY_ARGS+=(--skip-preflight)
+fi
+if [[ "${NO_POSTPROCESS}" -eq 1 ]]; then
+  SUMMARY_ARGS+=(--no-postprocess)
+fi
+SUMMARY_ARGS+=(--require-architectures "${REQUIRE_ARCHITECTURES}")
+"${PYTHON_BIN}" "${SCRIPT_DIR}/write_strict_suite_summary.py" "${SUMMARY_ARGS[@]}"
 
 cat <<EOF
 Strict FP16 architecture suite complete:
   output root: ${OUTDIR}
   preflight: ${PREFLIGHT_JSON}
+  suite summary: ${SUITE_SUMMARY_JSON}
   run status: ${RUN_STATUS_CSV}
   postprocess: ${POSTPROCESS_DIR}
   completed runs: ${#COMPLETED_DIRS[@]}
@@ -301,5 +337,11 @@ Strict FP16 architecture suite complete:
 EOF
 
 if [[ "${NO_FAIL}" -eq 0 && "${SUITE_FAILED}" -ne 0 ]]; then
+  if [[ -n "${EARLY_RC}" && "${EARLY_RC}" -ne 0 ]]; then
+    exit "${EARLY_RC}"
+  fi
+  if [[ -n "${POSTPROCESS_RC}" && "${POSTPROCESS_RC}" -ne 0 ]]; then
+    exit "${POSTPROCESS_RC}"
+  fi
   exit 1
 fi

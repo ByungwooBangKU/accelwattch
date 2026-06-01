@@ -24,6 +24,7 @@
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/run_strict_architecture_suite.sh` | 여러 GPU spec의 strict pipeline을 순차 실행하고 audit/compare/report까지 자동 생성 |
 | `scripts/preflight_strict_architecture_suite.py` | suite 실행 전 tool, GPU target, active compute process 상태를 JSON/CSV로 검사 |
+| `scripts/write_strict_suite_summary.py` | suite-level publishability, energy policy, preflight/run/postprocess provenance를 JSON으로 고정 |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/calibrate_matrix.py` | GPU별 timed duration을 맞추기 위해 matrix의 per-role `repeats`를 probe 또는 기존 `summary.csv` 기준으로 보정 |
 | `scripts/verify_architecture.py` | runtime preflight JSON의 compute capability/chip/common-HMMA metadata가 요청한 CUDA architecture와 맞는지 검증 |
@@ -141,6 +142,8 @@ Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--c
 GPU가 서로 다른 서버에 있으면 각 서버에서 `run_strict_fp16_pipeline.sh`를 실행해 결과 디렉터리를 한 곳으로 복사한 뒤 `postprocess_strict_architectures.sh`를 실행한다. 단일 GPU만 재실험할 때는 suite helper에 `--require-architectures gh100`처럼 현재 architecture만 지정하거나 `--no-postprocess`를 사용한다.
 
 Preflight에서 다른 compute process가 보이면 기본적으로 중단한다. Suite helper가 만든 preflight JSON/CSV는 postprocess report까지 전달되어 completion evidence matrix의 필수 항목으로 표시된다. 공유 장비에서 diagnostic만 하고 싶을 때는 `--allow-compute-apps`를 명시하고, `ncu`가 없는 local smoke는 `--diagnostic-no-ncu` 또는 `--skip-preflight`로만 수행한다. 최종 A100/H100/RTX3090 pJ/bit claim에는 이 예외 옵션을 쓰지 않는다.
+
+Suite helper는 마지막에 `strict_architecture_suite_summary.json`도 쓴다. 이 파일의 `checks.publishable_pass=true`일 때만 suite 전체를 최종 보고 가능한 실행으로 본다. `--dry-run`, `--skip-preflight`, `--no-postprocess`, preflight 실패, run 실패, audit/report requirement 실패 중 하나라도 있으면 `diagnostic_only=true` 또는 `publishable_pass=false`로 남는다. Summary에는 `power.txt` 기준의 energy policy도 기록되어, 최종 pJ/bit claim은 `nvml_total_energy_counter` / `strict_nvml_counter` selected target만 사용하고 `nvidia-smi` power trace는 fallback 또는 sanity check로만 취급한다.
 
 Scheduler, Docker, Slurm 등에서 `CUDA_VISIBLE_DEVICES`가 GPU 순서를 바꾸는 경우 `--gpu`는 CUDA device ordinal이고, telemetry용 `nvidia-smi` 대상은 UUID로 명시할 수 있다.
 
@@ -444,6 +447,7 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/strict_fp16_suite/strict_architecture_suite_preflight.json` | suite 실행 전 tool/GPU/process preflight 결과 |
 | `results/strict_fp16_suite/strict_architecture_suite_preflight.csv` | suite target별 preflight pass/fail 요약 |
 | `results/strict_fp16_suite/strict_architecture_suite_runs.csv` | suite target별 strict run 결과 디렉터리와 exit code |
+| `results/strict_fp16_suite/strict_architecture_suite_summary.json` | suite-level `publishable_pass`, diagnostic flag, required energy policy, preflight/run/postprocess provenance |
 | `results/p0_gpu0/runtime_preflight.json` | strict pipeline 시작 전 CUDA runtime/GPU metadata probe |
 | `results/p0_gpu0/architecture_preflight.json` | requested CUDA arch, detected chip, common-HMMA path 검증 결과 |
 | `results/p0_gpu0/calibrated_matrix.json` | strict pipeline에서 GPU별 duration target에 맞춰 생성한 matrix |
