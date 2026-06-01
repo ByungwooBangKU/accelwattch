@@ -176,6 +176,14 @@ def requirement_rows(
         str(row.get("baseline_match_grade", "")) == "structural_baseline" for row in audit_rows
     )
     schema_current = bool(audit_rows) and all(parse_bool(row.get("benchmark_schema_current")) for row in audit_rows)
+    pipeline_manifest = bool(audit_rows) and all(
+        parse_bool(row.get("pipeline_manifest_present"))
+        and str(row.get("pipeline_manifest_schema", "")) == "fp16-strict-pipeline-manifest-v1"
+        and str(row.get("pipeline_status", "")) == "completed"
+        and str(row.get("pipeline_git_head", "")).strip()
+        and str(row.get("pipeline_binary_sha256", "")).strip()
+        for row in audit_rows
+    )
     ncu = bool(audit_rows) and all(parse_bool(row.get("ncu_validation_pass")) for row in audit_rows)
     ncu_context = bool(audit_rows) and all(
         parse_bool(row.get("ncu_validation_context_match")) for row in audit_rows
@@ -213,6 +221,11 @@ def requirement_rows(
         row("NVML total-energy counter source", strict_sources, "measurement_grade=strict_nvml_counter"),
         row("structural baseline separation", structural, "baseline_match_grade=structural_baseline"),
         row("current benchmark schema", schema_current, "benchmark_schema_current=true"),
+        row(
+            "strict pipeline provenance manifest",
+            pipeline_manifest,
+            "strict_pipeline_manifest.json schema/status/git/binary hash",
+        ),
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
         row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),
         row("ptxas resource audit has no spills", no_spill, "test/baseline_resource_has_spills=false"),
@@ -246,6 +259,8 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "measurement_grade": row.get("measurement_grade", ""),
                 "baseline_match_grade": row.get("baseline_match_grade", ""),
                 "benchmark_schema_current": row.get("benchmark_schema_current", ""),
+                "pipeline_status": row.get("pipeline_status", ""),
+                "pipeline_git_head": row.get("pipeline_git_head", ""),
                 "ncu_validation_pass": row.get("ncu_validation_pass", ""),
                 "ncu_validation_context_match": row.get("ncu_validation_context_match", ""),
                 "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),

@@ -5,6 +5,7 @@ GPU_ID="${1:-0}"
 OUT="${2:-results/env.txt}"
 BINARY="${3:-build/fp16_energy_bench}"
 CUDA_DEVICE_INDEX="${4:-${GPU_ID}}"
+NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 mkdir -p "$(dirname "${OUT}")"
 {
   echo "# date"
@@ -13,23 +14,23 @@ mkdir -p "$(dirname "${OUT}")"
   echo "# CUDA_VISIBLE_DEVICES"
   echo "${CUDA_VISIBLE_DEVICES:-<unset>}"
   echo
-  echo "# nvidia-smi -L"
-  nvidia-smi -L || true
+  echo "# ${NVIDIA_SMI_BIN} -L"
+  "${NVIDIA_SMI_BIN}" -L || true
   echo
-  echo "# nvidia-smi -q"
-  nvidia-smi -i "${GPU_ID}" -q || true
+  echo "# ${NVIDIA_SMI_BIN} -q"
+  "${NVIDIA_SMI_BIN}" -i "${GPU_ID}" -q || true
   echo
-  echo "# nvidia-smi compact GPU query"
-  if ! nvidia-smi -i "${GPU_ID}" \
+  echo "# ${NVIDIA_SMI_BIN} compact GPU query"
+  if ! "${NVIDIA_SMI_BIN}" -i "${GPU_ID}" \
     --query-gpu=index,uuid,pci.bus_id,name,driver_version,power.limit,power.draw,power.draw.average,power.draw.instant,pstate,clocks.sm,clocks.mem,temperature.gpu \
     --format=csv; then
-    nvidia-smi -i "${GPU_ID}" \
+    "${NVIDIA_SMI_BIN}" -i "${GPU_ID}" \
       --query-gpu=index,uuid,pci.bus_id,name,driver_version,power.limit,power.draw,pstate,clocks.sm,clocks.mem,temperature.gpu \
       --format=csv || true
   fi
   echo
-  echo "# nvidia-smi compute apps"
-  nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv || true
+  echo "# ${NVIDIA_SMI_BIN} compute apps"
+  "${NVIDIA_SMI_BIN}" --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv || true
   echo
   echo "# nvcc --version"
   nvcc --version || true

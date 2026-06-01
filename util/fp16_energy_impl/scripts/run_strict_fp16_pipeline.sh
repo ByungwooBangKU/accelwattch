@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ORIGINAL_ARGS=("$@")
+ORIGINAL_INVOCATION="$(printf '%q ' "$0" "${ORIGINAL_ARGS[@]}")"
 
 GPU_ID=0
 NVIDIA_SMI_ID=""
@@ -14,6 +16,7 @@ THREADS_CSV="32,64,96,128,160,192,224,256,288,320,384"
 BUILD_DIR="build"
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 SKIP_BUILD=0
 DIAGNOSTIC_NO_NCU=0
 CALIBRATE_MATRIX=1
@@ -50,7 +53,7 @@ Options:
   -h, --help           Show this help
 
 Environment overrides:
-  CMAKE_BIN, PYTHON_BIN, MPLCONFIGDIR, NCU_METRICS
+  CMAKE_BIN, PYTHON_BIN, NVIDIA_SMI_BIN, MPLCONFIGDIR, NCU_METRICS
 USAGE
 }
 
@@ -100,6 +103,8 @@ BUILD_LOG="${OUTDIR}/build_ptxas.log"
 RESOURCE_DIR="${OUTDIR}/resource_audit"
 BASE_MATRIX="${ROOT}/configs/fp16_matmul_thread_sweep_fine.json"
 MATRIX_PATH="${BASE_MATRIX}"
+START_MANIFEST="${OUTDIR}/strict_pipeline_manifest_start.json"
+FINAL_MANIFEST="${OUTDIR}/strict_pipeline_manifest.json"
 
 if [[ -z "${NVIDIA_SMI_ID}" ]]; then
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -112,6 +117,41 @@ fi
 
 mkdir -p "${OUTDIR}"
 
+write_manifest() {
+  local status="$1"
+  local out="$2"
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/write_strict_manifest.py" \
+    --out "${out}" \
+    --status "${status}" \
+    --root "${ROOT}" \
+    --outdir "${OUTDIR}" \
+    --binary "${BINARY}" \
+    --build-dir "${BUILD_DIR}" \
+    --build-log "${BUILD_LOG}" \
+    --resource-dir "${RESOURCE_DIR}" \
+    --ncu-dir "${NCDIR}" \
+    --base-matrix "${BASE_MATRIX}" \
+    --matrix "${MATRIX_PATH}" \
+    --gpu "${GPU_ID}" \
+    --nvidia-smi-id "${NVIDIA_SMI_ID}" \
+    --cuda-arch "${CUDA_ARCH}" \
+    --repeat "${REPEAT}" \
+    --sample-ms "${SAMPLE_MS}" \
+    --threads "${THREADS_CSV}" \
+    --skip-build "${SKIP_BUILD}" \
+    --diagnostic-no-ncu "${DIAGNOSTIC_NO_NCU}" \
+    --calibrate-matrix "${CALIBRATE_MATRIX}" \
+    --target-test-s "${TARGET_TEST_S}" \
+    --target-baseline-s "${TARGET_BASELINE_S}" \
+    --max-calibrated-repeats "${MAX_CALIBRATED_REPEATS}" \
+    --invocation "${ORIGINAL_INVOCATION}" \
+    --cmake-bin "${CMAKE_BIN}" \
+    --python-bin "${PYTHON_BIN}" \
+    --nvidia-smi-bin "${NVIDIA_SMI_BIN}"
+}
+
+write_manifest started "${START_MANIFEST}"
+
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
   "${CMAKE_BIN}" -S "${ROOT}" -B "${BUILD_PATH}" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -119,7 +159,8 @@ if [[ "${SKIP_BUILD}" -eq 0 ]]; then
   "${CMAKE_BIN}" --build "${BUILD_PATH}" --clean-first -j 2 2>&1 | tee "${BUILD_LOG}"
 fi
 
-"${SCRIPT_DIR}/query_env.sh" "${NVIDIA_SMI_ID}" "${ENV_OUT}" "${BINARY}" "${GPU_ID}"
+NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN}" \
+  "${SCRIPT_DIR}/query_env.sh" "${NVIDIA_SMI_ID}" "${ENV_OUT}" "${BINARY}" "${GPU_ID}"
 
 RUNTIME_PREFLIGHT_JSON="${OUTDIR}/runtime_preflight.json"
 ARCH_PREFLIGHT_JSON="${OUTDIR}/architecture_preflight.json"
@@ -154,10 +195,13 @@ if [[ "${CALIBRATE_MATRIX}" -eq 1 ]]; then
     --max-repeats "${MAX_CALIBRATED_REPEATS}"
 fi
 
+write_manifest started "${START_MANIFEST}"
+
 "${PYTHON_BIN}" "${SCRIPT_DIR}/run_experiment.py" \
   --binary "${BINARY}" \
   --matrix "${MATRIX_PATH}" \
   --gpu "${GPU_ID}" \
+  --nvidia-smi "${NVIDIA_SMI_BIN}" \
   --nvidia-smi-id "${NVIDIA_SMI_ID}" \
   --sample-ms "${SAMPLE_MS}" \
   --repeat "${REPEAT}" \
@@ -189,9 +233,13 @@ fi
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/quality_gate.py" "${QUALITY_ARGS[@]}"
 
+write_manifest completed "${FINAL_MANIFEST}"
+
 cat <<EOF
 Strict FP16 pipeline complete:
   results: ${OUTDIR}
+  start manifest: ${START_MANIFEST}
+  final manifest: ${FINAL_MANIFEST}
   resource audit: ${RESOURCE_DIR}/kernel_resource_summary.csv
   NCU validation: ${NCDIR}/ncu_validation_summary.csv
   quality gate: ${OUTDIR}/quality_gates.csv

@@ -110,6 +110,7 @@ def find_resource_row(rows: List[Dict[str, Any]], role: str, kernel: str, thread
 
 def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     summary = read_json(path / "quality_gate_summary.json")
+    manifest = read_json(path / "strict_pipeline_manifest.json")
     quality_rows = read_csv(path / "quality_gates.csv")
     ncu_rows = read_csv(path / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
     resource_rows = read_csv(path / "resource_audit" / "thread_resource_occupancy.csv")
@@ -135,6 +136,50 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
 
     failed: List[str] = []
     warnings: List[str] = []
+    manifest_schema = str(manifest.get("manifest_schema", "") or "")
+    manifest_status = str(manifest.get("status", "") or "")
+    manifest_params = manifest.get("parameters") if isinstance(manifest.get("parameters"), dict) else {}
+    manifest_git = manifest.get("git") if isinstance(manifest.get("git"), dict) else {}
+    manifest_artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    manifest_head = ""
+    if isinstance(manifest_git.get("head"), dict):
+        manifest_head = str(manifest_git["head"].get("stdout", "") or "")
+    manifest_binary = manifest_artifacts.get("binary") if isinstance(manifest_artifacts.get("binary"), dict) else {}
+    manifest_quality_summary = (
+        manifest_artifacts.get("quality_gate_summary")
+        if isinstance(manifest_artifacts.get("quality_gate_summary"), dict)
+        else {}
+    )
+    manifest_ncu_summary = (
+        manifest_artifacts.get("ncu_validation_summary")
+        if isinstance(manifest_artifacts.get("ncu_validation_summary"), dict)
+        else {}
+    )
+    manifest_resource_audit = (
+        manifest_artifacts.get("resource_audit")
+        if isinstance(manifest_artifacts.get("resource_audit"), dict)
+        else {}
+    )
+
+    if not manifest:
+        failed.append("strict_pipeline_manifest.json is missing or empty")
+    if manifest_schema != "fp16-strict-pipeline-manifest-v1":
+        failed.append("strict_pipeline_manifest.json schema is not fp16-strict-pipeline-manifest-v1")
+    if manifest_status != "completed":
+        failed.append("strict_pipeline_manifest.json status is not completed")
+    if parse_bool(manifest_params.get("diagnostic_no_ncu")):
+        failed.append("strict pipeline manifest indicates diagnostic_no_ncu=1")
+    if not manifest_head:
+        failed.append("strict pipeline manifest git head is missing")
+    if not str(manifest_binary.get("sha256", "") or ""):
+        failed.append("strict pipeline manifest binary sha256 is missing")
+    if not parse_bool(manifest_quality_summary.get("exists")):
+        failed.append("strict pipeline manifest did not record quality_gate_summary.json")
+    if not parse_bool(manifest_ncu_summary.get("exists")):
+        failed.append("strict pipeline manifest did not record NCU validation summary")
+    if not parse_bool(manifest_resource_audit.get("exists")):
+        failed.append("strict pipeline manifest did not record resource audit")
+
     if not targets:
         failed.append("quality_gate_summary selected_targets is empty")
     if not parse_bool(target.get("target_pass")):
@@ -312,6 +357,15 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
             "baseline_benchmark_schema_versions",
             target.get("baseline_benchmark_schema_version", ""),
         ),
+        "pipeline_manifest_present": bool(manifest),
+        "pipeline_manifest_schema": manifest_schema,
+        "pipeline_status": manifest_status,
+        "pipeline_cuda_arch": manifest_params.get("cuda_arch", "") if manifest_params else "",
+        "pipeline_threads": manifest_params.get("threads", "") if manifest_params else "",
+        "pipeline_diagnostic_no_ncu": manifest_params.get("diagnostic_no_ncu", "") if manifest_params else "",
+        "pipeline_git_head": manifest_head,
+        "pipeline_binary_sha256": manifest_binary.get("sha256", "") if manifest_binary else "",
+        "pipeline_invocation": manifest.get("invocation", ""),
         "energy_trace_crosscheck_pass": target.get("energy_trace_crosscheck_pass", ""),
         "target_pass": target.get("target_pass", ""),
         "quality_pass": target.get("quality_pass", ""),
@@ -555,6 +609,10 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
         },
         "benchmark_schema_thresholds": {
             "expected_benchmark_schema_version": "fp16-energy-bench-v2",
+        },
+        "pipeline_manifest_thresholds": {
+            "expected_manifest_schema": "fp16-strict-pipeline-manifest-v1",
+            "expected_status": "completed",
         },
         "matmul_denominator_thresholds": {
             "expected_matmul_input_bits_per_logical_mma": args.expected_matmul_input_bits_per_logical_mma,
