@@ -22,6 +22,7 @@
 | `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
 | `scripts/report_strict_results.py` | strict audit/architecture compare 산출물을 최종 검토용 Markdown report와 dashboard figure로 요약 |
 | `scripts/smoke_strict_pipeline.py` | GPU 없이 strict audit/report target-selection invariant를 synthetic fixture로 회귀 검증 |
+| `scripts/install_gpu_toolchain.sh` | GPU별 CUDA/Nsight Compute conda toolchain 설치와 strict pipeline용 env file 생성 |
 | `scripts/postprocess_strict_architectures.sh` | A100/H100/RTX3090 결과 디렉터리를 받아 audit/compare/report/visualization을 한 번에 생성 |
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
@@ -86,6 +87,54 @@ cmake --build build -j
 ```bash
 cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES="90"
 ```
+
+### 3.1 GPU별 toolchain / Nsight Compute 설치
+
+Strict pipeline은 `cmake`, `nvcc`, `ncu`, `python/matplotlib`, `nvidia-smi`가 필요하다. 서버의 기본 PATH가 불안정하거나 CUDA toolkit이 여러 개 섞여 있으면 아래 installer로 user-space conda/mamba 환경을 만든다. 이 스크립트는 NVIDIA driver를 설치하거나 업데이트하지 않는다. Driver와 NVML/libcuda는 host 또는 cluster image에 이미 있어야 한다.
+
+기본 설치 CUDA toolkit은 12.1이다. A100/H100/RTX 3090 공통 HMMA benchmark에는 충분하고, 새 toolkit이 오래된 driver보다 앞서서 `CUDA driver version is insufficient for CUDA runtime version`가 나는 상황을 피하기 쉽다. 필요하면 `--cuda-version 12.4`처럼 override한다.
+
+```bash
+cd /home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl
+
+# RTX 3090 / GA102 / sm86
+./scripts/install_gpu_toolchain.sh --gpu-kind rtx3090
+
+# A100 / GA100 / sm80
+./scripts/install_gpu_toolchain.sh --gpu-kind a100
+
+# H100 / GH100 / sm90
+./scripts/install_gpu_toolchain.sh --gpu-kind h100
+```
+
+설치되는 주요 package는 `cuda-nvcc`, `cuda-cudart-dev`, `cuda-cudart-static_linux-64`, `cuda-cccl`, `cuda-libraries-dev`, `nsight-compute`, `cmake`, `ninja`, `python`, `matplotlib`이다. 설치 후 스크립트는 다음 두 파일을 만든다.
+
+| 파일 | 내용 |
+|---|---|
+| `env/toolchain_<gpu-kind>_sm<arch>_cuda<version>.sh` | `CMAKE_BIN`, `NVCC_BIN`, `NCU_BIN`, `PYTHON_BIN`, `NVIDIA_SMI_BIN`, `CMAKE_CUDA_FLAGS`, `CPATH`, `LIBRARY_PATH` export |
+| `env/run_strict_<gpu-kind>_sm<arch>_cuda<version>.sh` | launch-shape strict pipeline 실행 예시 |
+
+예를 들어 RTX 3090에서 설치 후 launch-shape strict pipeline을 실행하려면:
+
+```bash
+source env/toolchain_rtx3090_sm86_cuda121.sh
+
+./scripts/run_strict_fp16_pipeline.sh \
+  --gpu 0 \
+  --cuda-arch 86 \
+  --matrix configs/fp16_matmul_launch_shape_sweep.json \
+  --threads 32,64,128,256 \
+  --ncu-blocks-per-sm-csv 1,2,4,8 \
+  --outdir results/strict_fp16_launch_shape_rtx3090
+```
+
+설치와 동시에 CMake build smoke까지 확인하려면 `--build-smoke`를 붙인다.
+
+```bash
+./scripts/install_gpu_toolchain.sh --gpu-kind h100 --build-smoke
+```
+
+공유 서버나 Docker/Slurm 환경에서 GPU auto-detect가 안 되면 `--gpu-kind` 또는 `--cuda-arch`를 명시한다. `CUDA_VISIBLE_DEVICES` 때문에 CUDA ordinal과 physical GPU id가 다르면 strict pipeline 실행 시 `--nvidia-smi-id GPU-...`를 함께 넘긴다. Nsight Compute가 `ERR_NVGPUCTRPERM`으로 실패하면 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 이 경우 cluster/admin policy로 profiling counter 접근을 허용하거나 권한 있는 job에서 NCU validation을 실행해야 한다.
 
 ## 4. A100/H100 실행 범위와 자동화 범위
 
