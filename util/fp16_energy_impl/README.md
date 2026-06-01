@@ -209,7 +209,7 @@ NCU_BIN=/path/to/ncu \
   --outdir results/strict_fp16_rtx3090_suite
 ```
 
-Preflight는 `nvidia-smi --version`의 `CUDA Version`과 `nvcc --version`의 release도 비교한다. `nvcc`가 드라이버가 지원하는 CUDA runtime보다 새 버전이면 compile은 성공해도 runtime preflight에서 `CUDA driver version is insufficient for CUDA runtime version`로 실패할 수 있으므로, 그 경우는 더 낮은 `NVCC_BIN`/toolkit을 쓰거나 드라이버를 업데이트해야 한다.
+Preflight는 `nvidia-smi --version`의 `CUDA Version`과 `nvcc --version`의 release도 비교한다. `nvcc`가 드라이버가 지원하는 CUDA runtime보다 새 버전이면 compile은 성공해도 runtime preflight에서 `CUDA driver version is insufficient for CUDA runtime version`로 실패할 수 있으므로, 그 경우는 더 낮은 `NVCC_BIN`/toolkit을 쓰거나 드라이버를 업데이트해야 한다. 이 mismatch는 `strict_pipeline_preflight.json/csv`의 `toolchain_compatibility_pass=false`, `toolchain_nvcc_release`, `toolchain_driver_cuda_version`, `toolchain_recommended_cuda_toolkit`, `toolchain_recovery_commands`에 남아, 예를 들어 RTX 3090에서는 `install_gpu_toolchain.sh --gpu-kind rtx3090 --cuda-version 12.1`로 복구할 수 있음을 바로 확인할 수 있다.
 
 Suite helper는 마지막에 `strict_architecture_suite_summary.json`도 쓴다. 이 파일의 `checks.publishable_pass=true`일 때만 suite 전체를 최종 보고 가능한 실행으로 본다. `--dry-run`, `--skip-preflight`, `--no-postprocess`, preflight 실패, run 실패, audit/report requirement 실패 중 하나라도 있으면 `diagnostic_only=true` 또는 `publishable_pass=false`로 남는다. Summary에는 아래 energy policy도 기록되어, 최종 pJ/bit claim은 `nvml_total_energy_counter` / `strict_nvml_counter` selected target만 사용하고 `nvidia-smi` power trace는 fallback 또는 sanity check로만 취급한다.
 
@@ -331,6 +331,8 @@ A100, H100, RTX 3090 비교는 같은 logical workload와 같은 instruction fam
 benchmark JSON과 분석 CSV에는 `architecture_generation`, `architecture_chip`, `recommended_cuda_arch`, `fp16_tensor_instruction_path`, `wgmma_supported`, `benchmark_uses_wgmma`가 기록된다. 오래된 결과 JSON도 `analyze_results.py`가 `device_name`과 `compute_capability`로 fallback 분류한다. Summary에는 `baseline_energy_fraction`, `incremental_energy_fraction`, `baseline_power_fraction`, `valid_no_l2`, `pure_fp16_candidate`, `separation_quality`가 추가되어, baseline이 너무 크거나 L2/global traffic이 예상되는 run을 pJ/bit 최종 후보에서 분리할 수 있다.
 
 분석 CSV는 architecture별 dense Tensor Core peak model도 함께 기록한다. `tensor_peak_tflops_model`은 측정 run의 `sm_count`와 평균 SM clock에서 계산한 dense FP16 Tensor Core peak이고, `achieved_flops_per_sm_cycle`와 `tensor_model_utilization_pct`는 실제 measured TFLOPS가 그 common HMMA model 대비 어느 정도인지 보여준다. 이 값은 thread sweep target을 해석하기 위한 normalization metric이며, pJ/bit의 energy source를 대체하지 않는다. H100에서는 WGMMA 최대 경로가 아니라 이 benchmark가 실제 사용하는 warp-level HMMA `m16n8k16` pair path 기준으로 해석한다. `architecture_models.py`에는 reference dense/sparse TFLOPS, product/reference source URL, Tensor Core architecture source URL을 같이 둔다. H100 public product table의 FP16 Tensor Core 값은 sparsity footnote가 붙어 있고, Hopper architecture table은 dense/sparse throughput을 분리해 제시하므로 dense reference는 common HMMA dense model 기준으로 둔다.
+
+`compare_architectures.py`는 launch-shape sweep 비교에서 `threads`만이 아니라 `threads_per_sm`과 `blocks_per_sm_requested`까지 보존한다. 따라서 `threads=64, blocks/SM=4`와 `threads=64, blocks/SM=8`처럼 thread/block은 같지만 SM당 resident thread 수가 다른 후보가 quality gate/target marker와 pJ/bit annotation에서 서로 덮이지 않는다.
 
 Architecture model 자체의 내부 일관성은 GPU 없이도 확인할 수 있다. 아래 명령은 `dense_tensor_fp16_flop_per_sm_cycle * reference_sm_count * reference_boost_clock_mhz`로 reference dense TFLOPS를 재계산하고, reference table 값과의 오차를 CSV/figure로 남긴다. 또한 per-SM Tensor Core capacity와 thread/register/block resource limit figure를 생성한다.
 

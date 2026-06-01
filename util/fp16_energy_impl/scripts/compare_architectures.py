@@ -40,6 +40,13 @@ def parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def normalize_int_text(value: Any) -> str:
+    parsed = parse_float(value)
+    if math.isfinite(parsed):
+        return str(int(round(parsed)))
+    return str(value or "")
+
+
 def parse_csv_list(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -138,11 +145,16 @@ def load_result_dir(
     arch = classify_from_row(seed_row)
     label = result_label(path, arch)
 
-    quality_thread: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    quality_thread: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
     for row in quality_rows:
         if str(row.get("scope", "")) != "thread_sweep":
             continue
-        key = (str(row.get("test_kernel", "")), str(row.get("baseline_kernel", "")), str(row.get("threads", "")))
+        key = (
+            str(row.get("test_kernel", "")),
+            str(row.get("baseline_kernel", "")),
+            normalize_int_text(row.get("threads", "")),
+            normalize_int_text(row.get("blocks_per_sm_requested", "")),
+        )
         quality_thread[key] = row
 
     def enrich(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -159,9 +171,11 @@ def load_result_dir(
                 key = (
                     str(row.get("test_kernel", "")),
                     str(row.get("baseline_kernel", "")),
-                    str(row.get("threads", "")),
+                    normalize_int_text(row.get("threads", "")),
+                    normalize_int_text(row.get("blocks_per_sm_requested", "")),
                 )
-                q = quality_thread.get(key)
+                legacy_key = (key[0], key[1], key[2], "")
+                q = quality_thread.get(key) or quality_thread.get(legacy_key)
                 if q:
                     for qkey in (
                         "measurement_grade",

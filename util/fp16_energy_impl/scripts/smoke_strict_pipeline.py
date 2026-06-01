@@ -42,6 +42,12 @@ def write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
         writer.writerows(row_list)
 
 
+def write_executable(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+
+
 def read_single_csv_row(path: Path) -> Dict[str, str]:
     with path.open() as f:
         rows = list(csv.DictReader(f))
@@ -166,6 +172,7 @@ def compare_thread_row(
     pjbit: float,
     *,
     target: bool,
+    blocks_per_sm: int = 8,
     measurement_grade: str = "strict_nvml_counter",
 ) -> Dict[str, Any]:
     row = target_row("tensor_mma_f16acc", "tensor_baseline_mov", threads)
@@ -174,6 +181,7 @@ def compare_thread_row(
         {
             "measurement_grade": measurement_grade,
             "threads_per_sm": threads_per_sm,
+            "blocks_per_sm_requested": blocks_per_sm,
             "avg_sm_util_pct_mean": sm_util,
             "matmul_input_pj_per_bit_mean": pjbit,
             "tflops_mean": 600.0 + sm_util,
@@ -199,7 +207,8 @@ def compare_thread_row(
 def write_compare_dir(path: Path, *, measurement_grade: str = "strict_nvml_counter") -> None:
     rows = [
         compare_thread_row(32, 256, 60.0, 0.22, target=False, measurement_grade=measurement_grade),
-        compare_thread_row(64, 512, 96.0, 0.18, target=True, measurement_grade=measurement_grade),
+        compare_thread_row(64, 256, 95.8, 0.18, target=True, blocks_per_sm=4, measurement_grade=measurement_grade),
+        compare_thread_row(64, 512, 96.1, 0.17, target=False, blocks_per_sm=8, measurement_grade=measurement_grade),
         compare_thread_row(96, 768, 96.05, 0.17, target=False, measurement_grade=measurement_grade),
     ]
     seed = {
@@ -513,6 +522,82 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     if "nvidia-smi GPU metadata query returned incomplete output" not in bad_preflight_row.get("fail_reasons", ""):
         raise AssertionError(f"Preflight CSV missed malformed GPU metadata failure: {bad_preflight_row}")
 
+    fake_nvcc = base / "fake_nvcc_13_2"
+    fake_nvidia_smi = base / "fake_nvidia_smi_cuda_13_1"
+    write_executable(
+        fake_nvcc,
+        """#!/usr/bin/env bash
+cat <<'EOF'
+nvcc: NVIDIA (R) Cuda compiler driver
+Cuda compilation tools, release 13.2, V13.2.78
+EOF
+""",
+    )
+    write_executable(
+        fake_nvidia_smi,
+        """#!/usr/bin/env bash
+case "$*" in
+  *--version*)
+    echo "NVIDIA-SMI 570.00 Driver Version: 570.00 CUDA Version: 13.1"
+    exit 0
+    ;;
+  *--query-compute-apps*)
+    exit 0
+    ;;
+  *--query-gpu*)
+    echo "0, GPU-synthetic-3090, 00000000:01:00.0, NVIDIA GeForce RTX 3090, 570.00, 350.00, 25.0, P8, 210, 9751, 45"
+    exit 0
+    ;;
+esac
+echo "unexpected fake nvidia-smi args: $*" >&2
+exit 1
+""",
+    )
+    compat_preflight_json = base / "bad_compat_preflight.json"
+    compat_preflight_csv = base / "bad_compat_preflight.csv"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "preflight_strict_architecture_suite.py"),
+            "--spec",
+            "rtx3090:0:86",
+            "--out-json",
+            str(compat_preflight_json),
+            "--out-csv",
+            str(compat_preflight_csv),
+            "--cmake-bin",
+            "/bin/true",
+            "--nvcc-bin",
+            str(fake_nvcc),
+            "--ncu-bin",
+            "/bin/true",
+            "--nvidia-smi-bin",
+            str(fake_nvidia_smi),
+            "--require-ncu",
+            "--no-fail",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    compat_row = read_single_csv_row(compat_preflight_csv)
+    if compat_row.get("required_tools_pass") != "False":
+        raise AssertionError(f"Preflight CSV did not fail incompatible nvcc: {compat_row}")
+    if compat_row.get("toolchain_compatibility_pass") != "False":
+        raise AssertionError(f"Preflight CSV missed toolchain compatibility failure: {compat_row}")
+    if compat_row.get("toolchain_nvcc_release") != "13.2":
+        raise AssertionError(f"Preflight CSV missed nvcc release: {compat_row}")
+    if compat_row.get("toolchain_driver_cuda_version") != "13.1":
+        raise AssertionError(f"Preflight CSV missed driver CUDA version: {compat_row}")
+    recovery = compat_row.get("toolchain_recovery_commands", "")
+    if "--gpu-kind rtx3090 --cuda-version 12.1" not in recovery:
+        raise AssertionError(f"Preflight CSV missed RTX3090 recovery command: {compat_row}")
+    compat_payload = json.loads(compat_preflight_json.read_text())
+    compat = compat_payload.get("cuda_toolchain_compatibility", {})
+    if not compat.get("needs_compatible_toolchain"):
+        raise AssertionError(f"Preflight JSON missed needs_compatible_toolchain: {compat}")
+    if "Recommended strict-suite toolkit: CUDA 12.1" not in "; ".join(compat.get("fail_reasons", [])):
+        raise AssertionError(f"Preflight JSON missed recommended toolkit reason: {compat}")
+
     architecture_model_smoke = base / "architecture_model_smoke"
     run(
         [
@@ -598,6 +683,18 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     for missing_chip in ("ga100", "ga102"):
         if coverage.get(missing_chip, {}).get("coverage_status") != "missing_result":
             raise AssertionError(f"Strict coverage did not mark {missing_chip} as missing_result: {coverage}")
+    compare_threads = read_csv_rows(compare_out / "architecture_thread_sweep_summary.csv")
+    duplicate_launch_shapes = {
+        row.get("blocks_per_sm_requested"): row
+        for row in compare_threads
+        if row.get("threads") == "64"
+    }
+    if set(duplicate_launch_shapes) != {"4", "8"}:
+        raise AssertionError(f"Architecture compare collapsed launch shapes: {duplicate_launch_shapes}")
+    if duplicate_launch_shapes["4"].get("target_pass") != "true":
+        raise AssertionError(f"Architecture compare lost target_pass for blocks/SM=4: {duplicate_launch_shapes}")
+    if duplicate_launch_shapes["8"].get("target_pass") != "false":
+        raise AssertionError(f"Architecture compare copied target_pass across blocks/SM=8: {duplicate_launch_shapes}")
 
     run(
         [

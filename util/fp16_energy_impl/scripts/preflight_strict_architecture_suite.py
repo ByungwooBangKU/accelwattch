@@ -22,6 +22,14 @@ EXPECTED_BY_ARCH = {
     "90": {"chip": "gh100", "generation": "hopper", "name_tokens": ["H100"]},
 }
 
+GPU_KIND_BY_ARCH = {
+    "80": "a100",
+    "86": "rtx3090",
+    "90": "h100",
+}
+
+DEFAULT_CONDA_CUDA_VERSION = (12, 1)
+
 
 def run_command(cmd: List[str], timeout_s: float = 10.0) -> Dict[str, Any]:
     try:
@@ -164,7 +172,34 @@ def tool_result(name: str, cmd: List[str], required: bool, dry_run: bool) -> Dic
     return result
 
 
-def check_cuda_toolchain_compatibility(tools: List[Dict[str, Any]], dry_run: bool) -> Dict[str, Any]:
+def compatible_toolkit_version(driver_cuda: Optional[Tuple[int, int]]) -> str:
+    """Return a conservative toolkit version that should run on the detected driver."""
+    if driver_cuda is not None and driver_cuda < DEFAULT_CONDA_CUDA_VERSION:
+        return version_text(driver_cuda)
+    return version_text(DEFAULT_CONDA_CUDA_VERSION)
+
+
+def toolchain_recovery_commands(specs: List[Dict[str, str]], cuda_version: str) -> List[str]:
+    commands: List[str] = []
+    seen: set[Tuple[str, str]] = set()
+    cuda_tag = cuda_version.replace(".", "")
+    for spec in specs:
+        arch = spec.get("cuda_arch", "")
+        kind = GPU_KIND_BY_ARCH.get(arch, "auto")
+        key = (kind, arch)
+        if key in seen:
+            continue
+        seen.add(key)
+        commands.append(f"./scripts/install_gpu_toolchain.sh --gpu-kind {kind} --cuda-version {cuda_version}")
+        commands.append(f"source env/toolchain_{kind}_sm{arch}_cuda{cuda_tag}.sh")
+    return commands
+
+
+def check_cuda_toolchain_compatibility(
+    tools: List[Dict[str, Any]],
+    dry_run: bool,
+    specs: List[Dict[str, str]],
+) -> Dict[str, Any]:
     """Check that the selected nvcc runtime is not newer than the installed driver.
 
     nvidia-smi reports the maximum CUDA runtime version supported by the driver.
@@ -176,6 +211,10 @@ def check_cuda_toolchain_compatibility(tools: List[Dict[str, Any]], dry_run: boo
         "pass": True,
         "nvcc_release": "",
         "driver_cuda_version": "",
+        "needs_compatible_toolchain": False,
+        "recommended_cuda_toolkit": "",
+        "recovery_commands": [],
+        "recovery_note": "",
         "fail_reasons": [],
         "warnings": [],
     }
@@ -203,10 +242,21 @@ def check_cuda_toolchain_compatibility(tools: List[Dict[str, Any]], dry_run: boo
     if driver_cuda is None:
         result["warnings"].append("could not parse driver CUDA Version from nvidia-smi --version")
     if nvcc_version is not None and driver_cuda is not None and nvcc_version > driver_cuda:
+        recommended_cuda = compatible_toolkit_version(driver_cuda)
+        recovery_commands = toolchain_recovery_commands(specs, recommended_cuda)
         result["pass"] = False
+        result["needs_compatible_toolchain"] = True
+        result["recommended_cuda_toolkit"] = recommended_cuda
+        result["recovery_commands"] = recovery_commands
+        result["recovery_note"] = (
+            "Use an NVCC/toolkit whose release is <= the driver CUDA Version before running strict sweeps. "
+            "The generated env file pins CMAKE_BIN/NVCC_BIN/NCU_BIN/PYTHON_BIN/NVIDIA_SMI_BIN for the pipeline."
+        )
         result["fail_reasons"].append(
             f"nvcc release {version_text(nvcc_version)} is newer than driver CUDA Version "
-            f"{version_text(driver_cuda)}; use an older NVCC_BIN/toolkit or update the driver"
+            f"{version_text(driver_cuda)}; use an older NVCC_BIN/toolkit or update the driver. "
+            f"Recommended strict-suite toolkit: CUDA {recommended_cuda}. "
+            f"Recovery: {' && '.join(recovery_commands)}"
         )
     return result
 
@@ -309,6 +359,13 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "overall_preflight_pass",
         "publishable_preflight_pass",
         "required_tool_fail_reasons",
+        "toolchain_compatibility_pass",
+        "toolchain_needs_compatible_toolchain",
+        "toolchain_nvcc_release",
+        "toolchain_driver_cuda_version",
+        "toolchain_recommended_cuda_toolkit",
+        "toolchain_recovery_commands",
+        "toolchain_recovery_note",
         "overall_fail_reasons",
         "fail_reasons",
         "warnings",
@@ -322,6 +379,7 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             out["required_tool_fail_reasons"] = "; ".join(row.get("required_tool_fail_reasons", []))
             out["overall_fail_reasons"] = "; ".join(row.get("overall_fail_reasons", []))
             out["warnings"] = "; ".join(row.get("warnings", []))
+            out["toolchain_recovery_commands"] = " && ".join(row.get("toolchain_recovery_commands", []))
             writer.writerow({key: out.get(key, "") for key in keys})
 
 
@@ -355,7 +413,7 @@ def main() -> int:
         tool_result("nvcc", [args.nvcc_bin, "--version"], True, args.dry_run),
         tool_result("ncu", [args.ncu_bin, "--version"], args.require_ncu, args.dry_run),
     ]
-    compatibility = check_cuda_toolchain_compatibility(tools, args.dry_run)
+    compatibility = check_cuda_toolchain_compatibility(tools, args.dry_run, specs)
     for tool in tools:
         tool_failures.extend(tool.get("fail_reasons", []))
     tool_failures.extend(compatibility.get("fail_reasons", []))
@@ -392,6 +450,13 @@ def main() -> int:
         row_failures = list(row.get("fail_reasons", []))
         row["required_tools_pass"] = required_tools_pass
         row["required_tool_fail_reasons"] = tool_failures
+        row["toolchain_compatibility_pass"] = compatibility.get("pass", "")
+        row["toolchain_needs_compatible_toolchain"] = compatibility.get("needs_compatible_toolchain", "")
+        row["toolchain_nvcc_release"] = compatibility.get("nvcc_release", "")
+        row["toolchain_driver_cuda_version"] = compatibility.get("driver_cuda_version", "")
+        row["toolchain_recommended_cuda_toolkit"] = compatibility.get("recommended_cuda_toolkit", "")
+        row["toolchain_recovery_commands"] = compatibility.get("recovery_commands", [])
+        row["toolchain_recovery_note"] = compatibility.get("recovery_note", "")
         row["overall_preflight_pass"] = overall_pass
         row["publishable_preflight_pass"] = overall_pass and not args.dry_run
         row["overall_fail_reasons"] = failed
