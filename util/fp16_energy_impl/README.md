@@ -23,7 +23,7 @@
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
 | `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
-| `scripts/validate_ncu_reports.py` | Nsight Compute text report에서 HMMA/no-L2/local-spill evidence를 자동 판정 |
+| `scripts/validate_ncu_reports.py` | Nsight Compute text report에서 HMMA/no-L2/local-spill evidence를 자동 판정하고 memory counter를 normalized bytes로 요약 |
 | `scripts/lock_clocks.sh` | GPU clock lock helper |
 | `scripts/reset_clocks.sh` | GPU clock reset helper |
 | `scripts/query_env.sh` | 실험 환경 metadata 수집 |
@@ -361,6 +361,7 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/quality_gate_summary.json` | 선택된 target point와 gate threshold 요약 |
 | `results/ncu_*/ncu_validation_summary.csv` | Nsight Compute report별 HMMA/no-L2/local-spill 자동 검증 |
 | `results/ncu_*/figures/ncu_validation_summary.png` | NCU validation pass/fail 시각화 |
+| `results/ncu_*/figures/ncu_memory_counter_bytes.png` | NCU DRAM/L2/local memory counter의 normalized bytes 시각화 |
 | `results/p0_gpu0/resource_audit/kernel_resource_summary.csv` | ptxas kernel별 registers/thread, stack/spill bytes |
 | `results/p0_gpu0/resource_audit/thread_resource_occupancy.csv` | thread sweep 후보별 static resource occupancy model |
 | `results/p0_gpu0/resource_audit/figures/thread_sweep_resource_occupancy.png` | launched threads/SM 대비 static occupancy와 measured SM utilization 비교 |
@@ -428,7 +429,7 @@ results/ncu_*/ncu_validation_summary.json
 results/ncu_*/figures/ncu_validation_summary.png
 ```
 
-strict mode에서는 explicit L2/DRAM/local counter metric이 없으면 fail로 처리한다. Nsight Compute 버전별 metric 이름 차이 때문에 counter가 빠진 경우, `ncu_validation_summary.csv`의 `fail_reasons`를 확인해 metric set을 조정한 뒤 다시 실행한다. `--allow-missing-counters`는 SASS token fallback을 쓰는 diagnostic 모드일 뿐, 최종 pJ/bit claim에는 사용하지 않는다.
+strict mode에서는 explicit DRAM/L2/local counter class가 모두 있어야 pass된다. Nsight Compute 버전별 metric 이름 차이 때문에 counter가 빠진 경우, `ncu_validation_summary.csv`의 `fail_reasons`와 `*_counter_sources`를 확인해 metric set을 조정한 뒤 다시 실행한다. `--allow-missing-counters`는 SASS token fallback을 쓰는 diagnostic 모드일 뿐, 최종 pJ/bit claim에는 사용하지 않는다. metric 이름에 `sectors`가 들어간 counter는 기본 32 bytes/sector로 normalized bytes로 변환한 뒤 threshold와 비교한다. 필요한 경우 `validate_ncu_reports.py --l2-sector-bytes`, `--dram-sector-bytes`, `--local-sector-bytes`로 조정한다.
 
 NCU helper는 parser가 요구하는 counter를 `--metrics`로 명시 수집한다. 기본 metric set은 `NCU_METRICS` 환경 변수로 override할 수 있다.
 
