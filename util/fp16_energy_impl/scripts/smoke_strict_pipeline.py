@@ -291,6 +291,22 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
     wrong = target_row("fp16_half2", "baseline_regmove", 64)
     required = target_row("tensor_mma_f16acc", "tensor_baseline_u32", 128)
     selected_targets = [wrong, required] if include_required_target else [wrong]
+    write_preflight(path / "strict_pipeline_preflight.json")
+    write_csv(
+        path / "strict_pipeline_preflight.csv",
+        [
+            {
+                "label": "synthetic",
+                "gpu": "0",
+                "cuda_arch": "90",
+                "nvidia_smi_id": "GPU-synthetic",
+                "preflight_pass": "True",
+                "required_tools_pass": "True",
+                "overall_preflight_pass": "True",
+                "publishable_preflight_pass": "True",
+            }
+        ],
+    )
     write_json(path / "quality_gate_summary.json", {"selected_targets": selected_targets})
     write_csv(path / "quality_gates.csv", [wrong, required])
     write_csv(
@@ -316,10 +332,19 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
         {
             "manifest_schema": "fp16-strict-pipeline-manifest-v1",
             "status": "completed",
-            "parameters": {"cuda_arch": "90", "threads": "", "diagnostic_no_ncu": False},
+            "parameters": {
+                "cuda_arch": "90",
+                "nvidia_smi_id": "GPU-synthetic",
+                "threads": "",
+                "skip_preflight": False,
+                "allow_compute_apps": False,
+                "diagnostic_no_ncu": False,
+            },
             "git": {"head": {"stdout": "synthetic-smoke"}},
             "artifacts": {
                 "binary": {"sha256": "0" * 64},
+                "pipeline_preflight_json": {"exists": True},
+                "pipeline_preflight_csv": {"exists": True},
                 "quality_gate_summary": {"exists": True},
                 "ncu_validation_summary": {"exists": True},
                 "resource_audit": {"exists": True},
@@ -371,7 +396,23 @@ def write_preflight(path: Path) -> None:
         {
             "preflight_schema": "fp16-strict-architecture-suite-preflight-v1",
             "overall_pass": True,
+            "required_tools_pass": True,
             "dry_run": False,
+            "cuda_toolchain_compatibility": {
+                "checked": True,
+                "pass": True,
+                "nvcc_release": "12.4",
+                "driver_cuda_version": "12.4",
+            },
+            "rows": [
+                {
+                    "label": "synthetic",
+                    "gpu": "0",
+                    "cuda_arch": "90",
+                    "nvidia_smi_id": "GPU-synthetic",
+                    "preflight_pass": True,
+                }
+            ],
         },
     )
 
@@ -561,6 +602,10 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
         raise AssertionError(f"Strict audit did not record required target selection: {good_row}")
     if good_row.get("selected_target_count") != "2" or good_row.get("matching_selected_target_count") != "1":
         raise AssertionError(f"Strict audit target-selection counts are wrong: {good_row}")
+    if good_row.get("pipeline_preflight_overall_pass") != "True":
+        raise AssertionError(f"Strict audit did not carry passing pipeline preflight evidence: {good_row}")
+    if good_row.get("pipeline_preflight_toolchain_pass") != "True":
+        raise AssertionError(f"Strict audit did not carry passing toolchain compatibility evidence: {good_row}")
 
     audit_bad = base / "audit_no_required"
     run(
@@ -631,6 +676,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     )
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "required kernel target selected")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "suite preflight passed")
+    assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "strict pipeline preflight passed")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "architecture model metadata")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "NCU Tensor activity observed")
     report_row = read_single_csv_row(report_dir / "fp16_strict_report_summary.csv")

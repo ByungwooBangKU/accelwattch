@@ -55,6 +55,10 @@ def read_json(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def artifact_exists(info: Any) -> bool:
+    return isinstance(info, dict) and parse_bool(info.get("exists"))
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -187,6 +191,7 @@ def select_target(
 def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     summary = read_json(path / "quality_gate_summary.json")
     manifest = read_json(path / "strict_pipeline_manifest.json")
+    pipeline_preflight = read_json(path / "strict_pipeline_preflight.json")
     quality_rows = read_csv(path / "quality_gates.csv")
     ncu_rows = read_csv(path / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
     resource_rows = read_csv(path / "resource_audit" / "thread_resource_occupancy.csv")
@@ -221,6 +226,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         if isinstance(manifest_artifacts.get("quality_gate_summary"), dict)
         else {}
     )
+    manifest_pipeline_preflight_json = (
+        manifest_artifacts.get("pipeline_preflight_json")
+        if isinstance(manifest_artifacts.get("pipeline_preflight_json"), dict)
+        else {}
+    )
+    manifest_pipeline_preflight_csv = (
+        manifest_artifacts.get("pipeline_preflight_csv")
+        if isinstance(manifest_artifacts.get("pipeline_preflight_csv"), dict)
+        else {}
+    )
     manifest_ncu_summary = (
         manifest_artifacts.get("ncu_validation_summary")
         if isinstance(manifest_artifacts.get("ncu_validation_summary"), dict)
@@ -238,6 +253,10 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("strict_pipeline_manifest.json schema is not fp16-strict-pipeline-manifest-v1")
     if manifest_status != "completed":
         failed.append("strict_pipeline_manifest.json status is not completed")
+    if parse_bool(manifest_params.get("skip_preflight")):
+        failed.append("strict pipeline manifest indicates skip_preflight=1")
+    if parse_bool(manifest_params.get("allow_compute_apps")):
+        failed.append("strict pipeline manifest indicates allow_compute_apps=1")
     if parse_bool(manifest_params.get("diagnostic_no_ncu")):
         failed.append("strict pipeline manifest indicates diagnostic_no_ncu=1")
     if not manifest_head:
@@ -246,10 +265,47 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("strict pipeline manifest binary sha256 is missing")
     if not parse_bool(manifest_quality_summary.get("exists")):
         failed.append("strict pipeline manifest did not record quality_gate_summary.json")
+    if not artifact_exists(manifest_pipeline_preflight_json):
+        failed.append("strict pipeline manifest did not record strict_pipeline_preflight.json")
+    if not artifact_exists(manifest_pipeline_preflight_csv):
+        failed.append("strict pipeline manifest did not record strict_pipeline_preflight.csv")
     if not parse_bool(manifest_ncu_summary.get("exists")):
         failed.append("strict pipeline manifest did not record NCU validation summary")
     if not parse_bool(manifest_resource_audit.get("exists")):
         failed.append("strict pipeline manifest did not record resource audit")
+
+    pipeline_preflight_schema = str(pipeline_preflight.get("preflight_schema", "") or "")
+    pipeline_preflight_rows = (
+        pipeline_preflight.get("rows") if isinstance(pipeline_preflight.get("rows"), list) else []
+    )
+    pipeline_preflight_matching_rows = [
+        row
+        for row in pipeline_preflight_rows
+        if isinstance(row, dict)
+        and str(row.get("cuda_arch", "") or "") == str(manifest_params.get("cuda_arch", "") or "")
+        and str(row.get("nvidia_smi_id", "") or "") == str(manifest_params.get("nvidia_smi_id", "") or "")
+    ]
+    pipeline_toolchain = (
+        pipeline_preflight.get("cuda_toolchain_compatibility")
+        if isinstance(pipeline_preflight.get("cuda_toolchain_compatibility"), dict)
+        else {}
+    )
+    if not pipeline_preflight:
+        failed.append("strict_pipeline_preflight.json is missing or empty")
+    if not (path / "strict_pipeline_preflight.csv").exists():
+        failed.append("strict_pipeline_preflight.csv is missing")
+    if pipeline_preflight_schema != "fp16-strict-architecture-suite-preflight-v1":
+        failed.append("strict_pipeline_preflight.json schema is not fp16-strict-architecture-suite-preflight-v1")
+    if parse_bool(pipeline_preflight.get("dry_run")):
+        failed.append("strict_pipeline_preflight.json has dry_run=true")
+    if not parse_bool(pipeline_preflight.get("overall_pass")):
+        failed.append("strict_pipeline_preflight.json overall_pass is not true")
+    if not parse_bool(pipeline_preflight.get("required_tools_pass")):
+        failed.append("strict_pipeline_preflight.json required_tools_pass is not true")
+    if pipeline_toolchain and not parse_bool(pipeline_toolchain.get("pass")):
+        failed.append("strict_pipeline_preflight.json CUDA toolchain compatibility did not pass")
+    if not pipeline_preflight_matching_rows:
+        failed.append("strict_pipeline_preflight.json has no row matching manifest cuda_arch/nvidia_smi_id")
 
     if not targets:
         failed.append("quality_gate_summary selected_targets is empty")
@@ -455,10 +511,29 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "pipeline_manifest_schema": manifest_schema,
         "pipeline_status": manifest_status,
         "pipeline_cuda_arch": manifest_params.get("cuda_arch", "") if manifest_params else "",
+        "pipeline_nvidia_smi_id": manifest_params.get("nvidia_smi_id", "") if manifest_params else "",
         "pipeline_threads": manifest_params.get("threads", "") if manifest_params else "",
+        "pipeline_skip_preflight": manifest_params.get("skip_preflight", "") if manifest_params else "",
+        "pipeline_allow_compute_apps": manifest_params.get("allow_compute_apps", "") if manifest_params else "",
         "pipeline_diagnostic_no_ncu": manifest_params.get("diagnostic_no_ncu", "") if manifest_params else "",
         "pipeline_git_head": manifest_head,
         "pipeline_binary_sha256": manifest_binary.get("sha256", "") if manifest_binary else "",
+        "pipeline_preflight_schema": pipeline_preflight_schema,
+        "pipeline_preflight_overall_pass": pipeline_preflight.get("overall_pass", "") if pipeline_preflight else "",
+        "pipeline_preflight_required_tools_pass": (
+            pipeline_preflight.get("required_tools_pass", "") if pipeline_preflight else ""
+        ),
+        "pipeline_preflight_dry_run": pipeline_preflight.get("dry_run", "") if pipeline_preflight else "",
+        "pipeline_preflight_toolchain_pass": (
+            pipeline_toolchain.get("pass", "") if pipeline_toolchain else ""
+        ),
+        "pipeline_preflight_nvcc_release": (
+            pipeline_toolchain.get("nvcc_release", "") if pipeline_toolchain else ""
+        ),
+        "pipeline_preflight_driver_cuda_version": (
+            pipeline_toolchain.get("driver_cuda_version", "") if pipeline_toolchain else ""
+        ),
+        "pipeline_preflight_matching_row_count": len(pipeline_preflight_matching_rows),
         "pipeline_invocation": manifest.get("invocation", ""),
         "energy_trace_crosscheck_pass": target.get("energy_trace_crosscheck_pass", ""),
         "target_pass": target.get("target_pass", ""),
@@ -713,6 +788,9 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
         "pipeline_manifest_thresholds": {
             "expected_manifest_schema": "fp16-strict-pipeline-manifest-v1",
             "expected_status": "completed",
+            "expected_preflight_schema": "fp16-strict-architecture-suite-preflight-v1",
+            "require_pipeline_preflight_overall_pass": True,
+            "require_pipeline_toolchain_compatibility": True,
         },
         "matmul_denominator_thresholds": {
             "expected_matmul_input_bits_per_logical_mma": args.expected_matmul_input_bits_per_logical_mma,

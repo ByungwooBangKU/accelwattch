@@ -232,6 +232,17 @@ def requirement_rows(
         and str(row.get("pipeline_binary_sha256", "")).strip()
         for row in audit_rows
     )
+    pipeline_preflight = bool(audit_rows) and all(
+        str(row.get("pipeline_preflight_schema", "")) == "fp16-strict-architecture-suite-preflight-v1"
+        and parse_bool(row.get("pipeline_preflight_overall_pass"))
+        and parse_bool(row.get("pipeline_preflight_required_tools_pass"))
+        and not parse_bool(row.get("pipeline_preflight_dry_run"))
+        and parse_bool(row.get("pipeline_preflight_toolchain_pass"))
+        and parse_float(row.get("pipeline_preflight_matching_row_count")) >= 1.0
+        and not parse_bool(row.get("pipeline_skip_preflight"))
+        and not parse_bool(row.get("pipeline_allow_compute_apps"))
+        for row in audit_rows
+    )
     ncu = bool(audit_rows) and all(parse_bool(row.get("ncu_validation_pass")) for row in audit_rows)
     ncu_context = bool(audit_rows) and all(
         parse_bool(row.get("ncu_validation_context_match")) for row in audit_rows
@@ -331,6 +342,11 @@ def requirement_rows(
             "strict pipeline provenance manifest",
             pipeline_manifest,
             "strict_pipeline_manifest.json schema/status/git/binary hash",
+        ),
+        row(
+            "strict pipeline preflight passed",
+            pipeline_preflight,
+            "strict_pipeline_preflight.json overall/toolchain pass and matching target row",
         ),
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
         row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),
@@ -607,8 +623,8 @@ def write_markdown(
             "- Use only rows with `Publishable=yes` for final pJ/bit claims.",
             "- `pJ/bit` is logical FP16 matmul input-bit energy, not DRAM bit energy.",
             "- `target_pass` is selected only after all quality gates pass; invalid high-utilization rows cannot define the utilization reference point.",
-            "- `strict_nvml_counter` plus structural baseline, NCU validation, resource audit, and measurement-resolution gates are required for A100/H100/RTX3090 comparison.",
-            "- Suite preflight must pass with `dry_run=false`; dry-run output is command validation only.",
+            "- `strict_nvml_counter` plus structural baseline, pipeline preflight, NCU validation, resource audit, and measurement-resolution gates are required for A100/H100/RTX3090 comparison.",
+            "- Pipeline and suite preflight must pass with `dry_run=false`; dry-run output is command validation only.",
             "- Missing A100 or H100 strict rows means the architecture comparison is incomplete, even if RTX 3090 diagnostics exist.",
             "",
         ]
