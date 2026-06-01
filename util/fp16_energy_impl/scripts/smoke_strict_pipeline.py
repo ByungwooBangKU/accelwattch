@@ -550,12 +550,20 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     )
     for artifact in (
         "architecture_best_fp16.csv",
+        "architecture_strict_coverage.csv",
+        "architecture_strict_coverage.png",
         "architecture_thread_sweep_util_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
         "architecture_thread_sweep_pjbit_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
         "architecture_thread_sweep_energy_fraction_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
     ):
         if not (compare_out / artifact).exists():
             raise AssertionError(f"Architecture compare smoke did not write {artifact}")
+    coverage = {row.get("architecture_chip"): row for row in read_csv_rows(compare_out / "architecture_strict_coverage.csv")}
+    if coverage.get("gh100", {}).get("coverage_status") != "strict_pass":
+        raise AssertionError(f"Strict coverage did not mark GH100 as strict_pass: {coverage}")
+    for missing_chip in ("ga100", "ga102"):
+        if coverage.get(missing_chip, {}).get("coverage_status") != "missing_result":
+            raise AssertionError(f"Strict coverage did not mark {missing_chip} as missing_result: {coverage}")
 
     run(
         [
@@ -574,6 +582,12 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
         raise AssertionError(f"Power-trace compare row was not rejected by default: {compare_power_row}")
     if compare_power_row.get("selection_note") != "quality_gate_target_pass_without_strict_nvml_counter":
         raise AssertionError(f"Unexpected power-trace compare rejection note: {compare_power_row}")
+    power_coverage = {
+        row.get("architecture_chip"): row
+        for row in read_csv_rows(compare_power_trace_out / "architecture_strict_coverage.csv")
+    }
+    if power_coverage.get("gh100", {}).get("coverage_status") != "diagnostic_or_rejected_only":
+        raise AssertionError(f"Power-trace coverage did not stay diagnostic: {power_coverage}")
 
     run(
         [

@@ -40,6 +40,10 @@ def parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def parse_csv_list(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -688,10 +692,152 @@ def plot_resource_compare(resource_rows: List[Dict[str, Any]], outdir: Path) -> 
         plt.close(fig)
 
 
+def coverage_rows(
+    best_rows: List[Dict[str, Any]],
+    thread_rows: List[Dict[str, Any]],
+    condition_rows: List[Dict[str, Any]],
+    required_architectures: List[str],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    chips = sorted(
+        set(required_architectures)
+        | {str(row.get("architecture_chip", "")) for row in condition_rows if str(row.get("architecture_chip", ""))}
+        | {str(row.get("architecture_chip", "")) for row in thread_rows if str(row.get("architecture_chip", ""))}
+        | {str(row.get("architecture_chip", "")) for row in best_rows if str(row.get("architecture_chip", ""))}
+    )
+    for chip in chips:
+        chip_conditions = [row for row in condition_rows if str(row.get("architecture_chip", "")) == chip]
+        chip_threads = [row for row in thread_rows if str(row.get("architecture_chip", "")) == chip]
+        chip_best = [row for row in best_rows if str(row.get("architecture_chip", "")) == chip]
+        strict_targets = [
+            row for row in chip_threads
+            if parse_bool(row.get("target_pass"))
+            and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+        ]
+        diagnostic_targets = [
+            row for row in chip_threads
+            if parse_bool(row.get("target_pass"))
+            and str(row.get("measurement_grade", "")) != "strict_nvml_counter"
+        ]
+        quality_pass = [row for row in chip_threads if parse_bool(row.get("quality_pass"))]
+        strict_best = [
+            row for row in chip_best
+            if not parse_bool(row.get("quality_rejected"))
+            and parse_bool(row.get("target_pass"))
+            and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+        ]
+        if strict_targets and strict_best:
+            status = "strict_pass"
+            publishable = True
+        elif chip_conditions or chip_threads or chip_best:
+            status = "diagnostic_or_rejected_only"
+            publishable = False
+        else:
+            status = "missing_result"
+            publishable = False
+
+        def best_score(row: Dict[str, Any]) -> Tuple[float, float]:
+            pjbit = parse_float(row.get("matmul_input_pj_per_bit_mean"), math.inf)
+            util = parse_float(row.get("avg_sm_util_pct_mean"), -math.inf)
+            return (pjbit if math.isfinite(pjbit) else math.inf, -util if math.isfinite(util) else math.inf)
+
+        selected = min(strict_best, key=best_score) if strict_best else (chip_best[0] if chip_best else {})
+        input_dirs = sorted({
+            str(row.get("input_dir", ""))
+            for row in [*chip_conditions, *chip_threads, *chip_best]
+            if str(row.get("input_dir", "")).strip()
+        })
+        rows.append(
+            {
+                "architecture_chip": chip,
+                "required": chip in required_architectures,
+                "coverage_status": status,
+                "publishable": publishable,
+                "input_dir_count": len(input_dirs),
+                "input_dirs": ";".join(input_dirs),
+                "thread_row_count": len(chip_threads),
+                "strict_target_count": len(strict_targets),
+                "diagnostic_target_count": len(diagnostic_targets),
+                "quality_pass_count": len(quality_pass),
+                "best_selection_note": selected.get("selection_note", ""),
+                "best_quality_rejected": selected.get("quality_rejected", ""),
+                "best_gpu": selected.get("gpu", ""),
+                "best_threads": selected.get("threads", ""),
+                "best_threads_per_sm": selected.get("threads_per_sm", ""),
+                "best_matmul_input_pj_per_bit_mean": selected.get("matmul_input_pj_per_bit_mean", ""),
+                "best_tflops_mean": selected.get("tflops_mean", ""),
+                "best_tensor_model_utilization_pct_mean": selected.get("tensor_model_utilization_pct_mean", ""),
+                "best_measurement_grade": selected.get("measurement_grade", ""),
+                "best_target_pass": selected.get("target_pass", ""),
+                "best_baseline_match_grade": selected.get("baseline_match_grade", ""),
+            }
+        )
+    return rows
+
+
+def plot_coverage(rows: List[Dict[str, Any]], outdir: Path) -> None:
+    if not rows:
+        return
+    required = [row for row in rows if parse_bool(row.get("required"))]
+    plot_rows = required if required else rows
+    labels = [str(row.get("architecture_chip", "")) for row in plot_rows]
+    values = [
+        2 if str(row.get("coverage_status", "")) == "strict_pass"
+        else (1 if str(row.get("coverage_status", "")) == "diagnostic_or_rejected_only" else 0)
+        for row in plot_rows
+    ]
+    colors = [
+        "tab:green" if value == 2 else ("tab:orange" if value == 1 else "tab:red")
+        for value in values
+    ]
+    fig, ax = plt.subplots(figsize=(8.0, max(3.2, 0.65 * len(plot_rows) + 1.8)))
+    y = list(range(len(plot_rows)))
+    ax.barh(y, values, color=colors, alpha=0.85)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.set_xlim(0, 2.35)
+    ax.set_xticks([0, 1, 2])
+    ax.set_xticklabels(["missing", "diagnostic", "strict"])
+    ax.set_xlabel("Strict comparison coverage")
+    ax.set_title("Required architecture coverage for FP16 pJ/bit comparison")
+    ax.grid(True, axis="x", alpha=0.25)
+    for idx, row in enumerate(plot_rows):
+        status = str(row.get("coverage_status", ""))
+        pjbit = parse_float(row.get("best_matmul_input_pj_per_bit_mean"))
+        detail = status
+        if math.isfinite(pjbit):
+            detail += f"\n{pjbit:.3g} pJ/b"
+        elif status == "missing_result":
+            detail += "\nno result dir"
+        else:
+            detail += "\nno strict best"
+        ax.annotate(
+            detail,
+            (values[idx], idx),
+            textcoords="offset points",
+            xytext=(6, 0),
+            va="center",
+            fontsize=8,
+        )
+    fig.tight_layout()
+    fig.savefig(outdir / "architecture_strict_coverage.png", dpi=160)
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare analyzed FP16 energy result directories")
     parser.add_argument("--input", type=Path, nargs="+", required=True, help="One or more analyzed result dirs")
     parser.add_argument("--outdir", type=Path, required=True, help="Output directory for comparison CSVs/figures")
+    parser.add_argument(
+        "--require-architectures",
+        default="ga100,gh100,ga102",
+        help="Required architecture chips for coverage CSV/figure [ga100,gh100,ga102]",
+    )
+    parser.add_argument(
+        "--fail-on-missing-required-architectures",
+        action="store_true",
+        help="Return nonzero when any required architecture lacks a strict NVML-counter target",
+    )
     parser.add_argument(
         "--allow-diagnostic-best",
         action="store_true",
@@ -733,12 +879,15 @@ def main() -> int:
         allow_diagnostic_fallback=args.allow_diagnostic_best,
         allow_legacy_best=args.allow_legacy_best,
     )
+    required_architectures = parse_csv_list(args.require_architectures)
+    coverage = coverage_rows(best, all_threads, all_conditions, required_architectures)
     write_csv(args.outdir / "architecture_condition_summary.csv", all_conditions)
     write_csv(args.outdir / "architecture_summary_rows.csv", all_summary)
     write_csv(args.outdir / "architecture_thread_sweep_summary.csv", all_threads)
     write_csv(args.outdir / "architecture_quality_gates.csv", all_quality)
     write_csv(args.outdir / "architecture_resource_occupancy.csv", all_resources)
     write_csv(args.outdir / "architecture_best_fp16.csv", best)
+    write_csv(args.outdir / "architecture_strict_coverage.csv", coverage)
 
     plot_bar(
         best,
@@ -777,10 +926,19 @@ def main() -> int:
     )
     plot_thread_compare(all_threads, args.outdir)
     plot_resource_compare(all_resources, args.outdir)
+    plot_coverage(coverage, args.outdir)
 
     print(f"Wrote: {args.outdir / 'architecture_condition_summary.csv'}")
     print(f"Wrote: {args.outdir / 'architecture_best_fp16.csv'}")
+    print(f"Wrote: {args.outdir / 'architecture_strict_coverage.csv'}")
     print(f"Wrote figures under: {args.outdir}")
+    missing = [
+        row for row in coverage
+        if parse_bool(row.get("required")) and not parse_bool(row.get("publishable"))
+    ]
+    if args.fail_on_missing_required_architectures and missing:
+        missing_chips = ",".join(str(row.get("architecture_chip", "")) for row in missing)
+        raise SystemExit(f"Missing strict publishable architecture coverage: {missing_chips}")
     return 0
 
 

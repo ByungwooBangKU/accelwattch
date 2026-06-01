@@ -457,6 +457,7 @@ python3 scripts/smoke_strict_pipeline.py
 | 파일 | 내용 |
 |---|---|
 | `architecture_best_fp16.csv` | 결과 디렉터리별 `target_pass=true` 및 `measurement_grade=strict_nvml_counter` pure FP16 후보 중 best row. strict target이 없으면 `quality_rejected=True`와 `selection_note=quality_gate_no_target_pass`, `quality_gate_target_pass_without_strict_nvml_counter`, `missing_quality_gate_no_best` 등으로 표시 |
+| `architecture_strict_coverage.csv`, `architecture_strict_coverage.png` | required architecture(`ga100,gh100,ga102` 기본값)별 strict NVML target coverage. 누락/diagnostic-only/strict-pass 상태를 명시해 일부 GPU 결과가 전체 비교처럼 보이지 않게 함 |
 | `architecture_quality_gates.csv` | 여러 결과 디렉터리의 `quality_gates.csv`를 architecture tag와 함께 병합한 파일 |
 | `architecture_best_matmul_input_pj_per_bit.png` | GPU architecture별 best logical matmul input pJ/bit 비교 |
 | `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |
