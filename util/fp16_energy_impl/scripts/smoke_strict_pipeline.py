@@ -413,6 +413,37 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     write_model_dir(model_dir)
     write_preflight(preflight)
 
+    bad_preflight_json = base / "bad_toolchain_preflight.json"
+    bad_preflight_csv = base / "bad_toolchain_preflight.csv"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "preflight_strict_architecture_suite.py"),
+            "--spec",
+            "rtx3090:0:86",
+            "--out-json",
+            str(bad_preflight_json),
+            "--out-csv",
+            str(bad_preflight_csv),
+            "--cmake-bin",
+            str(base / "missing-cmake"),
+            "--nvidia-smi-bin",
+            "/bin/true",
+            "--no-fail",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    bad_preflight_row = read_single_csv_row(bad_preflight_csv)
+    if bad_preflight_row.get("required_tools_pass") != "False":
+        raise AssertionError(f"Preflight CSV did not expose toolchain failure: {bad_preflight_row}")
+    if bad_preflight_row.get("overall_preflight_pass") != "False":
+        raise AssertionError(f"Preflight CSV did not expose overall failure: {bad_preflight_row}")
+    if "cmake not found on PATH" not in bad_preflight_row.get("required_tool_fail_reasons", ""):
+        raise AssertionError(f"Preflight CSV missed required tool failure reason: {bad_preflight_row}")
+    if "nvidia-smi GPU metadata query returned incomplete output" not in bad_preflight_row.get("fail_reasons", ""):
+        raise AssertionError(f"Preflight CSV missed malformed GPU metadata failure: {bad_preflight_row}")
+
     architecture_model_smoke = base / "architecture_model_smoke"
     run(
         [

@@ -174,6 +174,16 @@ def check_spec(
             failed.append(cp.get("stderr") or cp.get("stdout") or "nvidia-smi GPU metadata query failed")
         else:
             gpu_query = parse_gpu_query(str(cp.get("stdout", "")))
+            missing_fields = [
+                field
+                for field in ("index", "uuid", "pci.bus_id", "name", "driver_version", "power.limit")
+                if not str(gpu_query.get(field, "")).strip()
+            ]
+            if missing_fields:
+                failed.append(
+                    "nvidia-smi GPU metadata query returned incomplete output; missing "
+                    + ",".join(missing_fields)
+                )
 
     gpu_name = gpu_query.get("name", "")
     gpu_uuid = gpu_query.get("uuid", "")
@@ -227,6 +237,11 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "power_limit_w",
         "active_compute_app_count",
         "preflight_pass",
+        "required_tools_pass",
+        "overall_preflight_pass",
+        "publishable_preflight_pass",
+        "required_tool_fail_reasons",
+        "overall_fail_reasons",
         "fail_reasons",
         "warnings",
     ]
@@ -236,6 +251,8 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         for row in rows:
             out = dict(row)
             out["fail_reasons"] = "; ".join(row.get("fail_reasons", []))
+            out["required_tool_fail_reasons"] = "; ".join(row.get("required_tool_fail_reasons", []))
+            out["overall_fail_reasons"] = "; ".join(row.get("overall_fail_reasons", []))
             out["warnings"] = "; ".join(row.get("warnings", []))
             writer.writerow({key: out.get(key, "") for key in keys})
 
@@ -255,6 +272,7 @@ def main() -> int:
     args = parser.parse_args()
 
     failed: List[str] = []
+    tool_failures: List[str] = []
     try:
         specs = [parse_spec(text) for text in args.spec]
     except ValueError as exc:
@@ -268,7 +286,8 @@ def main() -> int:
         tool_result("ncu", ["ncu", "--version"], args.require_ncu, args.dry_run),
     ]
     for tool in tools:
-        failed.extend(tool.get("fail_reasons", []))
+        tool_failures.extend(tool.get("fail_reasons", []))
+    failed.extend(tool_failures)
 
     apps: List[Dict[str, str]] = []
     apps_result: Dict[str, Any] = {"skipped": bool(args.dry_run)}
@@ -295,11 +314,23 @@ def main() -> int:
     ]
     for row in rows:
         failed.extend(row.get("fail_reasons", []))
+    overall_pass = not failed
+    required_tools_pass = not tool_failures
+    for row in rows:
+        row_failures = list(row.get("fail_reasons", []))
+        row["required_tools_pass"] = required_tools_pass
+        row["required_tool_fail_reasons"] = tool_failures
+        row["overall_preflight_pass"] = overall_pass
+        row["publishable_preflight_pass"] = overall_pass and not args.dry_run
+        row["overall_fail_reasons"] = failed
+        row["target_fail_reasons"] = row_failures
 
     payload = {
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "preflight_schema": "fp16-strict-architecture-suite-preflight-v1",
-        "overall_pass": not failed,
+        "overall_pass": overall_pass,
+        "required_tools_pass": required_tools_pass,
+        "required_tool_fail_reasons": tool_failures,
         "dry_run": bool(args.dry_run),
         "environment": {
             "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
