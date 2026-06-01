@@ -224,6 +224,7 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "measurement_grade": row.get("measurement_grade", ""),
                 "baseline_match_grade": row.get("baseline_match_grade", ""),
                 "ncu_validation_pass": row.get("ncu_validation_pass", ""),
+                "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),
                 "fail_reasons": row.get("fail_reasons", ""),
             }
             for row in audit_rows
@@ -244,6 +245,7 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
             "measurement_grade": row.get("measurement_grade", ""),
             "baseline_match_grade": row.get("baseline_match_grade", ""),
             "ncu_validation_pass": row.get("ncu_validation_pass", ""),
+            "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),
             "fail_reasons": row.get("fail_reasons", ""),
         }
         for row in best_rows
@@ -332,6 +334,7 @@ def write_markdown(
                     "Energy source",
                     "Baseline",
                     "NCU",
+                    "NCU tensor %",
                 ],
                 [
                     [
@@ -347,6 +350,7 @@ def write_markdown(
                         r.get("measurement_grade", ""),
                         r.get("baseline_match_grade", ""),
                         yes_no(r.get("ncu_validation_pass")),
+                        fmt_value(r.get("ncu_tensor_activity_pct")),
                     ]
                     for r in rows
                 ],

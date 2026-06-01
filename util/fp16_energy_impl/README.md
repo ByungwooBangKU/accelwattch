@@ -25,7 +25,7 @@
 | `scripts/calibrate_matrix.py` | GPU별 timed duration을 맞추기 위해 matrix의 per-role `repeats`를 probe 또는 기존 `summary.csv` 기준으로 보정 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
 | `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
-| `scripts/validate_ncu_reports.py` | Nsight Compute text report에서 HMMA/no-L2/local-spill evidence를 자동 판정하고 memory counter를 normalized bytes로 요약 |
+| `scripts/validate_ncu_reports.py` | Nsight Compute text report에서 HMMA/no-L2/local-spill/tensor-activity evidence를 자동 판정하고 memory counter를 normalized bytes로 요약 |
 | `scripts/lock_clocks.sh` | GPU clock lock helper |
 | `scripts/reset_clocks.sh` | GPU clock reset helper |
 | `scripts/query_env.sh` | 실험 환경 metadata 수집 |
@@ -187,6 +187,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | structural baseline | Tensor Core는 `tensor_baseline_u32/f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
 | NCU validation | 최종 claim에는 `validate_ncu_reports.py`가 만든 `ncu_validation_summary.csv`를 `--require-ncu`로 연결 |
+| NCU tensor activity | explicit metric 또는 `ComputeWorkloadAnalysis` section에서 Tensor activity percentage를 추출해 selected Tensor Core point의 profiler-side utilization evidence로 기록 |
 | ptxas resource audit | selected test/baseline kernel의 register/thread와 stack/spill bytes를 build log에서 추출 |
 | utilization target | SM utilization 최대값에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
 
@@ -396,6 +397,7 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/ncu_*/ncu_validation_summary.csv` | Nsight Compute report별 HMMA/no-L2/local-spill 자동 검증 |
 | `results/ncu_*/figures/ncu_validation_summary.png` | NCU validation pass/fail 시각화 |
 | `results/ncu_*/figures/ncu_memory_counter_bytes.png` | NCU DRAM/L2/local memory counter의 normalized bytes 시각화 |
+| `results/ncu_*/figures/ncu_activity_pct.png` | NCU Tensor/SM activity percentage 시각화 |
 | `results/p0_gpu0/resource_audit/kernel_resource_summary.csv` | ptxas kernel별 registers/thread, stack/spill bytes |
 | `results/p0_gpu0/resource_audit/thread_resource_occupancy.csv` | thread sweep 후보별 static resource occupancy model |
 | `results/p0_gpu0/resource_audit/figures/thread_sweep_resource_occupancy.png` | launched threads/SM 대비 static occupancy와 measured SM utilization 비교 |
@@ -406,6 +408,7 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/strict_fp16_audit/figures/strict_result_elapsed_s.png` | strict selected target의 test duration 비교 |
 | `results/strict_fp16_audit/figures/strict_result_sm_utilization.png` | strict selected target의 SM utilization 비교 |
 | `results/strict_fp16_audit/figures/strict_result_tensor_model_utilization.png` | strict selected target의 dense Tensor Core model utilization 비교 |
+| `results/strict_fp16_audit/figures/strict_result_ncu_tensor_activity.png` | strict selected target의 NCU Tensor activity 비교 |
 | `results/strict_fp16_audit/figures/strict_result_incremental_energy_fraction.png` | strict selected target의 incremental energy signal fraction 비교 |
 | `results/strict_fp16_audit/figures/strict_result_incremental_energy_j.png` | strict selected target의 incremental energy magnitude 비교 |
 | `results/strict_fp16_audit/figures/strict_result_counter_trace_ratio.png` | strict selected target의 NVML energy counter / power trace energy sanity ratio |
@@ -470,6 +473,8 @@ results/ncu_*/figures/ncu_validation_summary.png
 
 strict mode에서는 explicit DRAM/L2/local counter class가 모두 있어야 pass된다. Nsight Compute 버전별 metric 이름 차이 때문에 counter가 빠진 경우, `ncu_validation_summary.csv`의 `fail_reasons`와 `*_counter_sources`를 확인해 metric set을 조정한 뒤 다시 실행한다. `--allow-missing-counters`는 SASS token fallback을 쓰는 diagnostic 모드일 뿐, 최종 pJ/bit claim에는 사용하지 않는다. metric 이름에 `sectors`가 들어간 counter는 기본 32 bytes/sector로 normalized bytes로 변환한 뒤 threshold와 비교한다. 필요한 경우 `validate_ncu_reports.py --l2-sector-bytes`, `--dram-sector-bytes`, `--local-sector-bytes`로 조정한다.
 
+NCU helper는 memory counter 외에 `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed`와 `sm__throughput.avg.pct_of_peak_sustained_elapsed`도 기본 metric set에 포함한다. `validate_ncu_reports.py`는 이 explicit metric이 없으면 `ComputeWorkloadAnalysis` section label에서 Tensor/SM activity percentage를 best-effort로 추출한다. 이 값은 `nvidia-smi dmon` SM utilization을 대체하지 않고, HMMA 경로가 실제 Tensor pipe를 사용했다는 profiler-side 보조 evidence로 사용한다. 최종 audit에서 이 evidence를 hard gate로 만들려면 `audit_strict_results.py --require-ncu-tensor-activity`를 사용한다.
+
 NCU helper는 parser가 요구하는 counter를 `--metrics`로 명시 수집한다. 기본 metric set은 `NCU_METRICS` 환경 변수로 override할 수 있다.
 
 P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
@@ -510,6 +515,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `w_per_tflops` | incremental power / achieved TFLOPS |
 | `avg_gpu_util_pct`, `max_gpu_util_pct` | test interval 안의 `nvidia-smi utilization.gpu` 평균/최대값 |
 | `avg_sm_util_pct`, `max_sm_util_pct` | test interval 안의 `nvidia-smi dmon -s u` `sm` 컬럼 평균/최대값 |
+| `test_ncu_tensor_activity_pct`, `baseline_ncu_tensor_activity_pct` | NCU validation report에서 추출한 Tensor pipe activity percentage |
 | `tensor_peak_tflops_model` | run의 SM count와 평균 SM clock으로 계산한 dense FP16 Tensor Core peak model |
 | `achieved_flops_per_sm_cycle` | measured TFLOPS를 SM count와 평균 SM clock으로 나눈 FLOP/SM/cycle |
 | `tensor_model_utilization_pct` | measured TFLOPS / `tensor_peak_tflops_model` × 100 |

@@ -41,6 +41,18 @@ METRIC_ALIASES = {
         "smsp__inst_executed_pipe_tensor.sum",
         "sm__inst_executed_pipe_tensor.sum",
     ],
+    "tensor_activity_pct": [
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
+        "smsp__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+        "smsp__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
+    ],
+    "sm_activity_pct": [
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+        "sm__throughput.avg.pct_of_peak_sustained_active",
+        "sm__cycles_active.avg.pct_of_peak_sustained_elapsed",
+        "sm__cycles_active.avg.pct_of_peak_sustained_active",
+    ],
     "dram_bytes_read": [
         "dram__bytes_read.sum",
         "dram__sectors_read.sum",
@@ -96,6 +108,7 @@ PROFILER_ERROR_PATTERNS = [
 GLOBAL_MEMORY_TOKENS = re.compile(r"\b(LDG|STG|LD\.GLOBAL|ST\.GLOBAL|ATOM\.GLOBAL)\b", re.IGNORECASE)
 LOCAL_MEMORY_TOKENS = re.compile(r"\b(LDL|STL|LOCAL)\b", re.IGNORECASE)
 HMMA_TOKENS = re.compile(r"\b(HMMA|MMA\.SYNC)\b", re.IGNORECASE)
+PERCENT_LINE = re.compile(r"(?:%|pct|percent)", re.IGNORECASE)
 
 
 def parse_float(value: Any, default: float = math.nan) -> float:
@@ -161,8 +174,36 @@ def extract_metrics(text: str) -> Dict[str, float]:
                 if values:
                     metrics[name] = values[-1]
                     sources[name] = matched_alias
+    fallback = extract_activity_percentages(text)
+    for name, (value, source) in fallback.items():
+        if name not in metrics:
+            metrics[name] = value
+            sources[name] = source
     metrics["_sources"] = sources  # type: ignore[assignment]
     return metrics
+
+
+def extract_activity_percentages(text: str) -> Dict[str, Tuple[float, str]]:
+    """Best-effort parser for Nsight Compute section labels.
+
+    Explicit metric IDs are preferred. This fallback catches ComputeWorkloadAnalysis
+    section rows whose labels vary by Nsight Compute version.
+    """
+    out: Dict[str, Tuple[float, str]] = {}
+    for line in text.splitlines():
+        lowered = line.lower()
+        if not PERCENT_LINE.search(line):
+            continue
+        values = numeric_values_from_line(line)
+        candidates = [value for value in values if 0.0 <= value <= 100.0]
+        if not candidates:
+            continue
+        value = candidates[-1]
+        if "tensor" in lowered and any(token in lowered for token in ("active", "throughput", "util", "pipe")):
+            out["tensor_activity_pct"] = (max(value, out.get("tensor_activity_pct", (0.0, ""))[0]), "section_label")
+        if "sm" in lowered and any(token in lowered for token in ("active", "throughput", "busy", "util")):
+            out["sm_activity_pct"] = (max(value, out.get("sm_activity_pct", (0.0, ""))[0]), "section_label")
+    return out
 
 
 def metric_sources(metrics: Dict[str, Any]) -> Dict[str, str]:
@@ -233,6 +274,15 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         or (not hmma_metric_present and hmma_token_seen)
     )
     hmma_ok = (hmma_seen if expected_hmma else (not hmma_seen if baseline_tensor else True))
+    tensor_activity_pct = metrics.get("tensor_activity_pct", math.nan)
+    sm_activity_pct = metrics.get("sm_activity_pct", math.nan)
+    tensor_activity_present = math.isfinite(tensor_activity_pct)
+    sm_activity_present = math.isfinite(sm_activity_pct)
+    tensor_activity_observed = (
+        expected_hmma
+        and tensor_activity_present
+        and tensor_activity_pct > args.min_tensor_activity_pct
+    )
 
     dram_present = class_present(metrics, "dram")
     l2_present = class_present(metrics, "l2")
@@ -279,6 +329,12 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         fail_reasons.append("profiler errors: " + ",".join(errors))
     if expected_hmma and not hmma_ok:
         fail_reasons.append("missing HMMA/Tensor Core instruction evidence")
+    if expected_hmma and args.require_tensor_activity and not tensor_activity_observed:
+        fail_reasons.append(
+            f"tensor activity is missing or below {args.min_tensor_activity_pct:g}%"
+        )
+    elif expected_hmma and not tensor_activity_present:
+        warnings.append("tensor activity percentage was not found in NCU report")
     if baseline_tensor and not hmma_ok:
         fail_reasons.append("baseline shows unexpected HMMA/Tensor Core evidence")
     if not memory_complete and not args.allow_missing_counters:
@@ -322,6 +378,13 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "no_local_spill": no_local,
         "hmma_inst": metrics.get("hmma_inst", math.nan),
         "tensor_inst": metrics.get("tensor_inst", math.nan),
+        "tensor_activity_pct": tensor_activity_pct,
+        "sm_activity_pct": sm_activity_pct,
+        "tensor_activity_present": tensor_activity_present,
+        "sm_activity_present": sm_activity_present,
+        "tensor_activity_observed": tensor_activity_observed,
+        "tensor_activity_source": sources.get("tensor_activity_pct", ""),
+        "sm_activity_source": sources.get("sm_activity_pct", ""),
         "dram_counter_total": dram_total if math.isfinite(dram_total) else math.nan,
         "l2_counter_total": l2_total if math.isfinite(l2_total) else math.nan,
         "local_counter_total": local_total if math.isfinite(local_total) else math.nan,
@@ -359,6 +422,13 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "no_local_spill",
         "hmma_inst",
         "tensor_inst",
+        "tensor_activity_pct",
+        "sm_activity_pct",
+        "tensor_activity_present",
+        "sm_activity_present",
+        "tensor_activity_observed",
+        "tensor_activity_source",
+        "sm_activity_source",
         "dram_counter_total",
         "l2_counter_total",
         "local_counter_total",
@@ -434,6 +504,42 @@ def plot_memory_counters(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plt.close(fig)
 
 
+def plot_activity(rows: List[Dict[str, Any]], outdir: Path) -> None:
+    if not rows:
+        return
+    ordered = sorted(rows, key=lambda r: (str(r.get("kernel", "")), parse_float(r.get("threads"), -1.0)))
+    tensor = [parse_float(r.get("tensor_activity_pct")) for r in ordered]
+    sm = [parse_float(r.get("sm_activity_pct")) for r in ordered]
+    if not any(math.isfinite(v) for v in tensor + sm):
+        return
+    labels = [f"{r['kernel']}\n{r['threads'] or '-'}" for r in ordered]
+    xs = list(range(len(ordered)))
+    width = 0.36
+    outdir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(max(8.0, 0.6 * len(ordered)), 4.8))
+    ax.bar(
+        [x - width / 2 for x in xs],
+        [v if math.isfinite(v) else 0.0 for v in tensor],
+        width=width,
+        label="Tensor activity",
+    )
+    ax.bar(
+        [x + width / 2 for x in xs],
+        [v if math.isfinite(v) else 0.0 for v in sm],
+        width=width,
+        label="SM activity",
+    )
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("Activity (% of peak/sustained metric)")
+    ax.set_title("Nsight Compute activity evidence")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(outdir / "ncu_activity_pct.png", dpi=160)
+    plt.close(fig)
+
+
 def summarize(rows: List[Dict[str, Any]], input_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     counts = Counter("pass" if parse_bool(r.get("validation_pass")) else "fail" for r in rows)
     return {
@@ -447,6 +553,8 @@ def summarize(rows: List[Dict[str, Any]], input_dir: Path, args: argparse.Namesp
             "dram_sector_bytes": args.dram_sector_bytes,
             "local_sector_bytes": args.local_sector_bytes,
             "allow_missing_counters": args.allow_missing_counters,
+            "min_tensor_activity_pct": args.min_tensor_activity_pct,
+            "require_tensor_activity": args.require_tensor_activity,
         },
         "counts": {
             "reports": len(rows),
@@ -458,6 +566,8 @@ def summarize(rows: List[Dict[str, Any]], input_dir: Path, args: argparse.Namesp
             "Counters with 'sectors' in the metric ID are normalized to bytes before thresholding.",
             "Token fallback is diagnostic only; use explicit counters for final pJ/bit claims.",
             "Rows with validation_pass=false must not be used as final pure-FP16 evidence.",
+            "Tensor/SM activity percentages are parsed from explicit metric IDs when available, "
+            "falling back to ComputeWorkloadAnalysis section labels.",
         ],
     }
 
@@ -472,6 +582,12 @@ def main() -> int:
     parser.add_argument("--l2-sector-bytes", type=float, default=32.0)
     parser.add_argument("--dram-sector-bytes", type=float, default=32.0)
     parser.add_argument("--local-sector-bytes", type=float, default=32.0)
+    parser.add_argument("--min-tensor-activity-pct", type=float, default=0.0)
+    parser.add_argument(
+        "--require-tensor-activity",
+        action="store_true",
+        help="Fail tensor_mma_* rows when tensor activity percentage is missing or below threshold",
+    )
     parser.add_argument(
         "--allow-missing-counters",
         action="store_true",
@@ -487,6 +603,7 @@ def main() -> int:
         json.dump(summarize(rows, args.input, args), f, indent=2)
     plot_summary(rows, outdir / "figures")
     plot_memory_counters(rows, outdir / "figures")
+    plot_activity(rows, outdir / "figures")
 
     print(f"Wrote: {outdir / 'ncu_validation_summary.csv'}")
     print(f"Wrote: {outdir / 'ncu_validation_summary.json'}")

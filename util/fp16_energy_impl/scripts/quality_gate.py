@@ -54,18 +54,22 @@ def load_ncu_validation(path: Path | None) -> Dict[Tuple[str, str], Dict[str, An
 
 
 def ncu_status(kernel: str, threads: Any, ncu_rows: Dict[Tuple[str, str], Dict[str, Any]]) -> Tuple[bool, str]:
-    thread_text = str(threads)
-    if "." in thread_text:
-        value = parse_float(thread_text)
-        if math.isfinite(value):
-            thread_text = str(int(value))
-    row = ncu_rows.get((kernel, thread_text)) or ncu_rows.get((kernel, ""))
+    row = ncu_row(kernel, threads, ncu_rows)
     if not row:
         return (False, "missing NCU validation row")
     if parse_bool(row.get("validation_pass")):
         return (True, "NCU validation passed")
     reason = str(row.get("fail_reasons", "") or "NCU validation failed")
     return (False, reason)
+
+
+def ncu_row(kernel: str, threads: Any, ncu_rows: Dict[Tuple[str, str], Dict[str, Any]]) -> Dict[str, Any]:
+    thread_text = str(threads)
+    if "." in thread_text:
+        value = parse_float(thread_text)
+        if math.isfinite(value):
+            thread_text = str(int(value))
+    return ncu_rows.get((kernel, thread_text)) or ncu_rows.get((kernel, "")) or {}
 
 
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
@@ -290,9 +294,11 @@ def pair_gate_rows(
             args,
         )
         test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
+        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
             str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
         )
+        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows)
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
 
         failed: List[str] = []
@@ -362,6 +368,12 @@ def pair_gate_rows(
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
                 "baseline_ncu_note": baseline_ncu_note,
+                "test_ncu_tensor_activity_pct": test_ncu.get("tensor_activity_pct", ""),
+                "baseline_ncu_tensor_activity_pct": baseline_ncu.get("tensor_activity_pct", ""),
+                "test_ncu_sm_activity_pct": test_ncu.get("sm_activity_pct", ""),
+                "baseline_ncu_sm_activity_pct": baseline_ncu.get("sm_activity_pct", ""),
+                "test_ncu_tensor_activity_observed": test_ncu.get("tensor_activity_observed", ""),
+                "baseline_ncu_tensor_activity_observed": baseline_ncu.get("tensor_activity_observed", ""),
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_available,
                 "common_hmma_path": common_hmma,
@@ -480,9 +492,11 @@ def thread_gate_rows(
             str(row.get("baseline_kernel", "")),
         )
         test_ncu_ok, test_ncu_note = ncu_status(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
+        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), ncu_rows)
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
             str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows
         )
+        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), ncu_rows)
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
         if source_info.get("all_nvml"):
             grade = "strict_nvml_counter"
@@ -579,6 +593,12 @@ def thread_gate_rows(
                 "ncu_required": bool(args.require_ncu),
                 "test_ncu_note": test_ncu_note,
                 "baseline_ncu_note": baseline_ncu_note,
+                "test_ncu_tensor_activity_pct": test_ncu.get("tensor_activity_pct", ""),
+                "baseline_ncu_tensor_activity_pct": baseline_ncu.get("tensor_activity_pct", ""),
+                "test_ncu_sm_activity_pct": test_ncu.get("sm_activity_pct", ""),
+                "baseline_ncu_sm_activity_pct": baseline_ncu.get("sm_activity_pct", ""),
+                "test_ncu_tensor_activity_observed": test_ncu.get("tensor_activity_observed", ""),
+                "baseline_ncu_tensor_activity_observed": baseline_ncu.get("tensor_activity_observed", ""),
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_observed,
                 "avg_sm_util_pct_mean": row.get("avg_sm_util_pct_mean", ""),

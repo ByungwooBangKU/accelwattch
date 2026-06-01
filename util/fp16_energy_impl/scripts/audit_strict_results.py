@@ -240,6 +240,12 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("selected test NCU validation did not pass")
     if baseline_ncu and not parse_bool(baseline_ncu.get("validation_pass")):
         failed.append("selected baseline NCU validation did not pass")
+    if test_ncu and not parse_bool(test_ncu.get("tensor_activity_observed")):
+        msg = "selected test NCU tensor activity is missing or below threshold"
+        if args.require_ncu_tensor_activity:
+            failed.append(msg)
+        else:
+            warnings.append(msg)
     if not resource_rows:
         failed.append("resource_audit/thread_resource_occupancy.csv is missing or empty")
     if resource_rows and not test_resource:
@@ -308,6 +314,14 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_ncu_dram_counter_total": baseline_ncu.get("dram_counter_total", "") if baseline_ncu else "",
         "test_ncu_local_counter_total": test_ncu.get("local_counter_total", "") if test_ncu else "",
         "baseline_ncu_local_counter_total": baseline_ncu.get("local_counter_total", "") if baseline_ncu else "",
+        "test_ncu_tensor_activity_pct": test_ncu.get("tensor_activity_pct", "") if test_ncu else "",
+        "baseline_ncu_tensor_activity_pct": baseline_ncu.get("tensor_activity_pct", "") if baseline_ncu else "",
+        "test_ncu_sm_activity_pct": test_ncu.get("sm_activity_pct", "") if test_ncu else "",
+        "baseline_ncu_sm_activity_pct": baseline_ncu.get("sm_activity_pct", "") if baseline_ncu else "",
+        "test_ncu_tensor_activity_observed": test_ncu.get("tensor_activity_observed", "") if test_ncu else "",
+        "baseline_ncu_tensor_activity_observed": (
+            baseline_ncu.get("tensor_activity_observed", "") if baseline_ncu else ""
+        ),
         "test_registers_per_thread": test_resource.get("registers_per_thread", "") if test_resource else "",
         "baseline_registers_per_thread": baseline_resource.get("registers_per_thread", "") if baseline_resource else "",
         "test_thread_occupancy_pct_model": test_resource.get("thread_occupancy_pct_model", "") if test_resource else "",
@@ -414,6 +428,14 @@ def plot_audit_metrics(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plot_metric(
         rows,
         outdir,
+        "test_ncu_tensor_activity_pct",
+        "NCU tensor activity (%)",
+        "Strict FP16 selected NCU tensor activity",
+        "strict_result_ncu_tensor_activity.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
         "incremental_energy_fraction_mean",
         "Incremental energy / test energy",
         "Strict FP16 selected incremental energy signal",
@@ -476,6 +498,9 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
             "warn_counter_trace_ratio_high": args.warn_counter_trace_ratio_high,
             "require_counter_trace_agreement": bool(args.require_counter_trace_agreement),
         },
+        "ncu_activity_thresholds": {
+            "require_ncu_tensor_activity": bool(args.require_ncu_tensor_activity),
+        },
         "counts": {
             "rows": len(rows),
             "audit_pass": sum(1 for r in rows if parse_bool(r.get("audit_pass"))),
@@ -513,6 +538,11 @@ def main() -> int:
         "--require-counter-trace-agreement",
         action="store_true",
         help="Fail audit when selected NVML-counter/power-trace ratio is missing or outside the warning band",
+    )
+    parser.add_argument(
+        "--require-ncu-tensor-activity",
+        action="store_true",
+        help="Fail audit when selected tensor_mma test row lacks positive NCU tensor activity evidence",
     )
     parser.add_argument("--no-fail", action="store_true", help="Write audit files but return success even if audit fails")
     args = parser.parse_args()
