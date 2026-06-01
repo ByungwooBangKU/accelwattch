@@ -21,6 +21,7 @@ NCU_SUPPRESS_OUTPUT_STORE="${NCU_SUPPRESS_OUTPUT_STORE:-1}"
 NCU_REQUIRE_TENSOR_ACTIVITY="${NCU_REQUIRE_TENSOR_ACTIVITY:-1}"
 NCU_MIN_TENSOR_ACTIVITY_PCT="${NCU_MIN_TENSOR_ACTIVITY_PCT:-0.0}"
 NCU_SUPPRESS_OUTPUT_STORE_BOOL="false"
+NCU_FAILURES_CSV="${OUTDIR}/ncu_run_failures.csv"
 
 COMMON=(
   --device "${GPU_ID}"
@@ -35,10 +36,17 @@ if [[ "${NCU_SUPPRESS_OUTPUT_STORE}" != "0" ]]; then
   NCU_SUPPRESS_OUTPUT_STORE_BOOL="true"
 fi
 
+csv_field() {
+  local value="${1//\"/\"\"}"
+  printf '"%s"' "${value}"
+}
+
 run_ncu() {
   local name="$1"; shift
   local kernel_regex="$1"; shift
-  "${NCU_BIN}" \
+  local log_file="${OUTDIR}/${name}.ncu.txt"
+  local cmd=(
+    "${NCU_BIN}"
     --target-processes all \
     --kernel-name regex:".*${kernel_regex}.*" \
     --section LaunchStats \
@@ -47,8 +55,28 @@ run_ncu() {
     --section MemoryWorkloadAnalysis \
     --metrics "${NCU_METRICS}" \
     --print-summary per-kernel \
-    --log-file "${OUTDIR}/${name}.ncu.txt" \
+    --log-file "${log_file}" \
     "${BIN}" "${COMMON[@]}" "$@"
+  )
+  set +e
+  "${cmd[@]}"
+  local rc=$?
+  set -e
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ ! -f "${NCU_FAILURES_CSV}" ]]; then
+      printf 'name,returncode,log_file,command\n' > "${NCU_FAILURES_CSV}"
+    fi
+    local escaped_command
+    escaped_command="$(printf '%q ' "${cmd[@]}")"
+    {
+      csv_field "${name}"; printf ',%s,' "${rc}"
+      csv_field "${log_file}"; printf ','
+      csv_field "${escaped_command}"; printf '\n'
+    } >> "${NCU_FAILURES_CSV}"
+    echo "Nsight Compute failed for ${name} with exit code ${rc}; see ${log_file}" >&2
+    echo "Failure record: ${NCU_FAILURES_CSV}" >&2
+    return "${rc}"
+  fi
 }
 
 for threads in "${THREADS_LIST[@]}"; do

@@ -129,6 +129,98 @@ fi
 
 mkdir -p "${OUTDIR}"
 
+prepend_env_paths() {
+  local var_name="$1"
+  local paths_csv="$2"
+  local existing="${!var_name:-}"
+  local updated=""
+  local -a paths=()
+  IFS=',' read -r -a paths <<< "${paths_csv}"
+  for path in "${paths[@]}"; do
+    if [[ -z "${path}" ]]; then
+      continue
+    fi
+    if [[ -z "${updated}" ]]; then
+      updated="${path}"
+    else
+      updated="${updated}:${path}"
+    fi
+  done
+  if [[ -z "${updated}" ]]; then
+    return
+  fi
+  if [[ -n "${existing}" ]]; then
+    printf -v "${var_name}" '%s:%s' "${updated}" "${existing}"
+  else
+    printf -v "${var_name}" '%s' "${updated}"
+  fi
+  export "${var_name}"
+}
+
+apply_cuda_flag_env_overrides() {
+  if [[ -z "${CMAKE_CUDA_FLAGS}" ]]; then
+    return
+  fi
+
+  local -a include_paths=()
+  local -a library_paths=()
+  local -a cuda_flags=()
+  local flag
+  local expect_include=0
+  local expect_library=0
+  read -r -a cuda_flags <<< "${CMAKE_CUDA_FLAGS}"
+  for flag in "${cuda_flags[@]}"; do
+    if [[ "${expect_include}" -eq 1 ]]; then
+      include_paths+=("${flag}")
+      expect_include=0
+      continue
+    fi
+    if [[ "${expect_library}" -eq 1 ]]; then
+      library_paths+=("${flag}")
+      expect_library=0
+      continue
+    fi
+
+    case "${flag}" in
+      -I)
+        expect_include=1
+        ;;
+      -I*)
+        include_paths+=("${flag#-I}")
+        ;;
+      -isystem)
+        expect_include=1
+        ;;
+      -isystem=*)
+        include_paths+=("${flag#-isystem=}")
+        ;;
+      --include-path=*)
+        include_paths+=("${flag#--include-path=}")
+        ;;
+      -L)
+        expect_library=1
+        ;;
+      -L*)
+        library_paths+=("${flag#-L}")
+        ;;
+      --library-path=*)
+        library_paths+=("${flag#--library-path=}")
+        ;;
+    esac
+  done
+
+  if [[ "${#include_paths[@]}" -gt 0 ]]; then
+    local include_csv
+    include_csv="$(IFS=','; echo "${include_paths[*]}")"
+    prepend_env_paths CPATH "${include_csv}"
+  fi
+  if [[ "${#library_paths[@]}" -gt 0 ]]; then
+    local library_csv
+    library_csv="$(IFS=','; echo "${library_paths[*]}")"
+    prepend_env_paths LIBRARY_PATH "${library_csv}"
+  fi
+}
+
 write_manifest() {
   local status="$1"
   local out="$2"
@@ -205,6 +297,7 @@ if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
 fi
 
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
+  apply_cuda_flag_env_overrides
   CMAKE_CONFIGURE_ARGS=(
     -S "${ROOT}"
     -B "${BUILD_PATH}"

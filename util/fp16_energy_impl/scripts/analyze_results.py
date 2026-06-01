@@ -1106,6 +1106,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for key, value in stats.items():
                 row[f"{metric}_{key}"] = value
         row["selected_optimal"] = False
+        row["selection_status"] = "not_evaluated"
+        row["selection_note"] = ""
         out.append(row)
 
     by_kernel: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
@@ -1121,13 +1123,13 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         eligible = [r for r in group if has_enough_valid(r, "valid_no_l2_count")]
         if not eligible:
-            eligible = [r for r in group if int(r.get("valid_no_l2_count", 0)) > 0]
-        if not eligible:
-            eligible = [r for r in group if has_enough_valid(r, "valid_count")]
-        if not eligible:
-            eligible = [r for r in group if int(r.get("valid_count", 0)) > 0]
-        if not eligible:
-            eligible = group
+            for row in group:
+                row["selection_status"] = "no_valid_no_l2_candidate"
+                row["selection_note"] = (
+                    "selected_optimal is not set because no thread point met "
+                    "required_valid_no_l2_count"
+                )
+            continue
 
         def util_score(row: Dict[str, Any]) -> float:
             util = finite_float(row.get("avg_sm_util_pct_mean"), -math.inf)
@@ -1152,8 +1154,20 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # Select the first utilization-saturation point; use throughput only as a tie-break.
             return (threads_per_sm, -tflops, clock_span)
 
+        eligible_ids = {id(r) for r in eligible}
         best = min(target_pool, key=target_score)
         best["selected_optimal"] = True
+        best["selection_status"] = "selected_valid_no_l2_saturation_point"
+        best["selection_note"] = "first utilization saturation point among required valid no-L2 candidates"
+        for row in group:
+            if row is best:
+                continue
+            if id(row) in eligible_ids:
+                row["selection_status"] = "valid_no_l2_not_selected"
+                row["selection_note"] = "valid no-L2 candidate but not first saturation point"
+            else:
+                row["selection_status"] = "not_valid_no_l2_candidate"
+                row["selection_note"] = "valid_no_l2_count did not meet required_valid_no_l2_count"
 
     return sorted(out, key=lambda r: (str(r["test_kernel"]), int(r["threads"])))
 
