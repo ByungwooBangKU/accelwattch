@@ -387,9 +387,9 @@ python3 scripts/report_strict_results.py \
 | `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |
 | `architecture_best_tensor_model_utilization.png` | GPU architecture별 best 후보의 dense Tensor Core model utilization 비교 |
 | `architecture_best_incremental_energy_fraction.png` | GPU architecture별 best 후보의 incremental energy signal fraction 비교 |
-| `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교 |
-| `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교 |
-| `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교 |
+| `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교. marker는 `target_pass`, diagnostic `quality_pass`, fail, legacy/no-gate 상태를 구분 |
+| `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교. marker는 quality gate 상태를 구분 |
+| `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교. `target_pass` point에는 threads/block와 pJ/bit 값을 직접 표시 |
 | `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
 | `fp16_strict_report.md` | strict audit와 architecture compare를 묶은 publishability 중심 Markdown report |
 | `fp16_strict_report_dashboard.png` | selected TFLOPS 대비 logical pJ/bit dashboard |

@@ -310,6 +310,53 @@ def plot_bar(rows: List[Dict[str, Any]], metric: str, ylabel: str, title: str, p
     plt.close(fig)
 
 
+def quality_class(row: Dict[str, Any]) -> str:
+    has_quality = str(row.get("quality_pass", "")).strip() != ""
+    if parse_bool(row.get("target_pass")):
+        return "target"
+    if parse_bool(row.get("quality_pass")):
+        return "quality"
+    if has_quality:
+        return "failed"
+    return "legacy"
+
+
+def scatter_quality_point(ax: Any, x: float, y: float, row: Dict[str, Any], color: str) -> None:
+    if not math.isfinite(x) or not math.isfinite(y):
+        return
+    cls = quality_class(row)
+    if cls == "target":
+        ax.scatter([x], [y], marker="*", s=135, c=[color], edgecolors="black", linewidths=0.8, zorder=5)
+    elif cls == "quality":
+        ax.scatter([x], [y], marker="o", s=52, facecolors="white", edgecolors=color, linewidths=1.5, zorder=4)
+    elif cls == "failed":
+        ax.scatter([x], [y], marker="x", s=58, c="tab:red", linewidths=1.5, zorder=4)
+    else:
+        ax.scatter([x], [y], marker="s", s=38, facecolors="0.85", edgecolors=color, linewidths=1.0, zorder=4)
+
+
+def add_quality_legend(ax: Any) -> None:
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D([0], [0], marker="*", color="none", markerfacecolor="0.55", markeredgecolor="black",
+               label="target_pass", markersize=10),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="white", markeredgecolor="0.35",
+               label="quality_pass diagnostic", markersize=7),
+        Line2D([0], [0], marker="x", color="tab:red", label="quality fail", markersize=7),
+        Line2D([0], [0], marker="s", color="none", markerfacecolor="0.85", markeredgecolor="0.35",
+               label="legacy/no gate", markersize=6),
+    ]
+    ax.legend(handles=handles, loc="lower right", fontsize=8, frameon=True, title="gate state")
+
+
+def selected_annotation(row: Dict[str, Any]) -> str:
+    threads = str(row.get("threads", ""))
+    if quality_class(row) == "target":
+        return f"target\n{threads}"
+    return f"selected\nnot target\n{threads}"
+
+
 def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None:
     if not thread_rows:
         return
@@ -328,19 +375,30 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             if not any(math.isfinite(y) for y in ys):
                 ys = [parse_float(r.get("avg_gpu_util_pct_mean")) for r in group]
             if any(math.isfinite(y) for y in ys):
-                ax.plot(xs, ys, marker="o", label=label)
+                line = ax.plot(xs, ys, linewidth=1.2, alpha=0.75, label=label)[0]
+                for r, x, y in zip(group, xs, ys):
+                    scatter_quality_point(ax, x, y, r, line.get_color())
             for r, x, y in zip(group, xs, ys):
                 if bool(str(r.get("selected_optimal", "")).lower() == "true") and math.isfinite(x):
-                    ax.axvline(x, color="0.35", linestyle="--", linewidth=0.9, alpha=0.5)
+                    color = "tab:green" if quality_class(r) == "target" else "0.35"
+                    ax.axvline(x, color=color, linestyle="--", linewidth=0.9, alpha=0.55)
                     if math.isfinite(y):
-                        ax.annotate("selected", (x, y), textcoords="offset points", xytext=(4, 5), fontsize=8)
+                        ax.annotate(
+                            selected_annotation(r),
+                            (x, y),
+                            textcoords="offset points",
+                            xytext=(4, 5),
+                            fontsize=8,
+                        )
 
         ax.set_xlabel("Launched threads per SM")
         ax.set_ylabel("Avg SM utilization (%)")
         ax.set_title(f"Architecture thread sweep utilization: {test_kernel} vs {baseline_kernel}")
         ax.get_xaxis().set_major_formatter(ScalarFormatter())
         ax.grid(True, axis="y", alpha=0.25)
-        ax.legend(loc="best")
+        arch_legend = ax.legend(loc="best", title="architecture")
+        ax.add_artist(arch_legend)
+        add_quality_legend(ax)
         fig.tight_layout()
         safe = f"architecture_thread_sweep_util_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
         fig.savefig(outdir / safe, dpi=160)
@@ -354,7 +412,18 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             xs = [parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))) for r in group]
             ys = [parse_float(r.get("matmul_input_pj_per_bit_mean")) for r in group]
             if any(math.isfinite(y) for y in ys):
-                ax.plot(xs, ys, marker="D", label=label)
+                line = ax.plot(xs, ys, linewidth=1.2, alpha=0.75, label=label)[0]
+                for r, x, y in zip(group, xs, ys):
+                    scatter_quality_point(ax, x, y, r, line.get_color())
+                    if quality_class(r) == "target" and math.isfinite(x) and math.isfinite(y):
+                        ax.annotate(
+                            f"{r.get('threads', '')}\n{y:.3g} pJ/b",
+                            (x, y),
+                            textcoords="offset points",
+                            xytext=(0, 8),
+                            ha="center",
+                            fontsize=8,
+                        )
                 plotted = True
         if plotted:
             ax.axhline(0.0, color="0.35", linewidth=0.8)
@@ -363,7 +432,9 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             ax.set_title(f"Architecture thread sweep pJ/bit: {test_kernel} vs {baseline_kernel}")
             ax.get_xaxis().set_major_formatter(ScalarFormatter())
             ax.grid(True, axis="y", alpha=0.25)
-            ax.legend(loc="best")
+            arch_legend = ax.legend(loc="best", title="architecture")
+            ax.add_artist(arch_legend)
+            add_quality_legend(ax)
             fig.tight_layout()
             safe = f"architecture_thread_sweep_pjbit_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
             fig.savefig(outdir / safe, dpi=160)
@@ -377,7 +448,9 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             xs = [parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))) for r in group]
             ys = [parse_float(r.get("tensor_model_utilization_pct_mean")) for r in group]
             if any(math.isfinite(y) for y in ys):
-                ax.plot(xs, ys, marker="^", label=label)
+                line = ax.plot(xs, ys, linewidth=1.2, alpha=0.75, label=label)[0]
+                for r, x, y in zip(group, xs, ys):
+                    scatter_quality_point(ax, x, y, r, line.get_color())
                 plotted = True
         if plotted:
             ax.set_xlabel("Launched threads per SM")
@@ -385,7 +458,9 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             ax.set_title(f"Architecture thread sweep Tensor Core model utilization: {test_kernel} vs {baseline_kernel}")
             ax.get_xaxis().set_major_formatter(ScalarFormatter())
             ax.grid(True, axis="y", alpha=0.25)
-            ax.legend(loc="best")
+            arch_legend = ax.legend(loc="best", title="architecture")
+            ax.add_artist(arch_legend)
+            add_quality_legend(ax)
             fig.tight_layout()
             safe = f"architecture_thread_sweep_model_util_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
             fig.savefig(outdir / safe, dpi=160)
