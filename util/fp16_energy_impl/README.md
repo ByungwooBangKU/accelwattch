@@ -375,11 +375,13 @@ python3 scripts/report_strict_results.py \
 
 `audit_strict_results.py`는 각 결과가 `quality_gate.py --require-ncu`를 통과했고, `measurement_grade=strict_nvml_counter`, `baseline_match_grade=structural_baseline`, `ncu_validation_pass=true`인 selected target을 갖는지 확인한다. 또한 `resource_audit/thread_resource_occupancy.csv`에서 selected test/baseline kernel의 ptxas stack/spill usage가 없는지 확인하고, `tensor_model_utilization_pct_mean`이 유한/양수이며 기본적으로 105%를 넘지 않는지 확인한다. 이 sanity check가 실패하면 architecture model, clock telemetry, FLOP estimate 중 하나가 어긋났을 가능성이 크다. baseline subtraction 품질도 gate에 포함되어, 기본값으로 `incremental_energy_fraction_mean >= 0.01`이고 `baseline_energy_fraction_mean <= 0.99`인 selected target만 strict audit을 통과한다. 측정 해상도도 gate에 포함되어 test/baseline duration과 Joule 단위 신호가 너무 작으면 fail된다. NVML counter와 power trace 적분값의 cross-check는 기본적으로 warning이며, trace agreement까지 필수 조건으로 보려면 `--require-counter-trace-agreement`를 사용한다. 기본 required architecture는 `ga100,gh100,ga102`이며, 하나라도 빠지거나 legacy power-trace 결과가 섞이면 nonzero로 종료한다. 최종 A100/H100/RTX3090 comparison figure는 이 audit이 통과한 결과만 해석한다.
 
+`compare_architectures.py`도 quality gate 결과가 있는 디렉터리에서는 기본적으로 `target_pass=true`인 thread point만 `architecture_best_fp16.csv`와 best summary figure에 사용한다. `quality_pass=true`지만 utilization saturation target이 아닌 row는 diagnostic으로 남기되, 최종 best pJ/bit 그림에는 올리지 않는다. Diagnostic 후보까지 강제로 best table에 넣어야 할 때만 `--allow-diagnostic-best`를 사용한다.
+
 주요 산출물은 다음과 같다.
 
 | 파일 | 내용 |
 |---|---|
-| `architecture_best_fp16.csv` | 결과 디렉터리별 quality-gated pure FP16 후보 중 best row. gate가 실패하면 `quality_rejected=True`와 `selection_note=quality_gate_failed_no_best`로 표시 |
+| `architecture_best_fp16.csv` | 결과 디렉터리별 `target_pass=true` pure FP16 후보 중 best row. target이 없으면 `quality_rejected=True`와 `selection_note=quality_gate_no_target_pass` 또는 `quality_gate_failed_no_best`로 표시 |
 | `architecture_quality_gates.csv` | 여러 결과 디렉터리의 `quality_gates.csv`를 architecture tag와 함께 병합한 파일 |
 | `architecture_best_matmul_input_pj_per_bit.png` | GPU architecture별 best logical matmul input pJ/bit 비교 |
 | `architecture_best_tflops.png` | GPU architecture별 best FP16 throughput 비교 |

@@ -230,7 +230,7 @@ def is_fp16_candidate(row: Dict[str, Any]) -> bool:
     return pure_count > 0 or valid_no_l2 > 0 or valid > 0
 
 
-def select_best_fp16(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def select_best_fp16(rows: List[Dict[str, Any]], *, allow_diagnostic_fallback: bool = False) -> List[Dict[str, Any]]:
     by_input: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         if is_fp16_candidate(row):
@@ -244,16 +244,20 @@ def select_best_fp16(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if strict_targets:
             pool = strict_targets
             selection_note = "quality_gate_target_pass"
-        elif strict_quality:
+        elif strict_quality and allow_diagnostic_fallback:
             pool = strict_quality
-            selection_note = "quality_gate_quality_pass_no_target"
+            selection_note = "quality_gate_quality_pass_no_target_diagnostic"
         elif has_quality_info:
             rejected = dict(max(group, key=lambda row: (
                 int(parse_float(row.get("pure_fp16_candidate_count"), 0.0)),
                 int(parse_float(row.get("valid_no_l2_count"), 0.0)),
                 int(parse_float(row.get("valid_count"), 0.0)),
             )))
-            rejected["selection_note"] = "quality_gate_failed_no_best"
+            rejected["selection_note"] = (
+                "quality_gate_no_target_pass"
+                if strict_quality
+                else "quality_gate_failed_no_best"
+            )
             rejected["quality_rejected"] = True
             rejected["matmul_input_pj_per_bit_mean"] = math.nan
             rejected["tflops_mean"] = math.nan
@@ -423,6 +427,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare analyzed FP16 energy result directories")
     parser.add_argument("--input", type=Path, nargs="+", required=True, help="One or more analyzed result dirs")
     parser.add_argument("--outdir", type=Path, required=True, help="Output directory for comparison CSVs/figures")
+    parser.add_argument(
+        "--allow-diagnostic-best",
+        action="store_true",
+        help=(
+            "Permit quality_pass rows without target_pass to populate architecture_best_fp16.csv. "
+            "By default, quality-gated result directories require target_pass so final figures do not "
+            "promote non-saturated diagnostic candidates."
+        ),
+    )
     args = parser.parse_args()
 
     all_conditions: List[Dict[str, Any]] = []
@@ -442,7 +455,7 @@ def main() -> int:
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     best_source = all_threads if all_threads else all_conditions
-    best = select_best_fp16(best_source)
+    best = select_best_fp16(best_source, allow_diagnostic_fallback=args.allow_diagnostic_best)
     write_csv(args.outdir / "architecture_condition_summary.csv", all_conditions)
     write_csv(args.outdir / "architecture_summary_rows.csv", all_summary)
     write_csv(args.outdir / "architecture_thread_sweep_summary.csv", all_threads)
