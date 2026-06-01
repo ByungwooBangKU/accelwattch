@@ -168,6 +168,19 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     sm_util = parse_float(target.get("avg_sm_util_pct_mean"))
     if not math.isfinite(sm_util):
         warnings.append("avg_sm_util_pct_mean is missing")
+    model_util = parse_float(target.get("tensor_model_utilization_pct_mean"))
+    if not math.isfinite(model_util) or model_util <= 0.0:
+        failed.append("tensor_model_utilization_pct_mean is not positive/finite")
+    elif model_util > args.max_tensor_model_util_pct:
+        failed.append(
+            f"tensor_model_utilization_pct_mean exceeds {args.max_tensor_model_util_pct}; "
+            "check architecture model, clock telemetry, and FLOP estimate"
+        )
+    elif model_util < args.warn_tensor_model_util_pct:
+        warnings.append(
+            f"tensor_model_utilization_pct_mean is below {args.warn_tensor_model_util_pct}; "
+            "selected point may not be Tensor Core throughput saturated"
+        )
     if not ncu_rows:
         failed.append("ncu_validation_summary.csv is missing or empty")
     if ncu_rows and not test_ncu:
@@ -210,6 +223,9 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "required_valid_count": target.get("required_valid_count", ""),
         "avg_sm_util_pct_mean": target.get("avg_sm_util_pct_mean", ""),
         "tflops_mean": target.get("tflops_mean", ""),
+        "tensor_peak_tflops_model_mean": target.get("tensor_peak_tflops_model_mean", ""),
+        "achieved_flops_per_sm_cycle_mean": target.get("achieved_flops_per_sm_cycle_mean", ""),
+        "tensor_model_utilization_pct_mean": target.get("tensor_model_utilization_pct_mean", ""),
         "matmul_input_pj_per_bit_mean": target.get("matmul_input_pj_per_bit_mean", ""),
         "incremental_power_w_mean": target.get("incremental_power_w_mean", ""),
         "test_ncu_pass": test_ncu.get("validation_pass", "") if test_ncu else "",
@@ -248,6 +264,69 @@ def plot_audit(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plt.close(fig)
 
 
+def plot_metric(rows: List[Dict[str, Any]], outdir: Path, metric: str, ylabel: str, title: str, filename: str) -> None:
+    values = [parse_float(r.get(metric)) for r in rows]
+    if not any(math.isfinite(v) for v in values):
+        return
+    import matplotlib.pyplot as plt
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    labels = [str(r.get("architecture_chip") or Path(str(r.get("input_dir", ""))).name) for r in rows]
+    colors = ["tab:green" if parse_bool(r.get("audit_pass")) else "tab:red" for r in rows]
+    plot_values = [v if math.isfinite(v) else 0.0 for v in values]
+    fig, ax = plt.subplots(figsize=(max(7.0, 1.2 * len(rows)), 4.4))
+    ax.bar(range(len(rows)), plot_values, color=colors)
+    ax.set_xticks(range(len(rows)))
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.25)
+    for idx, value in enumerate(values):
+        if math.isfinite(value):
+            ax.annotate(f"{value:.3g}", (idx, plot_values[idx]), textcoords="offset points", xytext=(0, 5), ha="center")
+        else:
+            ax.annotate("missing", (idx, 0.0), textcoords="offset points", xytext=(0, 5), ha="center")
+    fig.tight_layout()
+    fig.savefig(outdir / filename, dpi=160)
+    plt.close(fig)
+
+
+def plot_audit_metrics(rows: List[Dict[str, Any]], outdir: Path) -> None:
+    plot_audit(rows, outdir)
+    plot_metric(
+        rows,
+        outdir,
+        "matmul_input_pj_per_bit_mean",
+        "pJ/logical input bit",
+        "Strict FP16 selected pJ/bit",
+        "strict_result_matmul_input_pj_per_bit.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
+        "tflops_mean",
+        "TFLOPS",
+        "Strict FP16 selected throughput",
+        "strict_result_tflops.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
+        "avg_sm_util_pct_mean",
+        "Avg SM utilization (%)",
+        "Strict FP16 selected SM utilization",
+        "strict_result_sm_utilization.png",
+    )
+    plot_metric(
+        rows,
+        outdir,
+        "tensor_model_utilization_pct_mean",
+        "Dense Tensor Core model utilization (%)",
+        "Strict FP16 selected Tensor Core model utilization",
+        "strict_result_tensor_model_utilization.png",
+    )
+
+
 def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
     required = [x.strip() for x in args.require_architectures.split(",") if x.strip()]
     passed = {str(r.get("architecture_chip", "")) for r in rows if parse_bool(r.get("audit_pass"))}
@@ -257,6 +336,10 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
         "input_dirs": [str(p) for p in args.input],
         "required_architectures": required,
         "missing_required_architectures": missing,
+        "tensor_model_thresholds": {
+            "max_tensor_model_util_pct": args.max_tensor_model_util_pct,
+            "warn_tensor_model_util_pct": args.warn_tensor_model_util_pct,
+        },
         "counts": {
             "rows": len(rows),
             "audit_pass": sum(1 for r in rows if parse_bool(r.get("audit_pass"))),
@@ -276,6 +359,8 @@ def main() -> int:
     parser.add_argument("--require-architectures", default="ga100,gh100,ga102")
     parser.add_argument("--require-kernel", default="tensor_mma_f16acc")
     parser.add_argument("--require-baseline", default="tensor_baseline_u32")
+    parser.add_argument("--max-tensor-model-util-pct", type=float, default=105.0)
+    parser.add_argument("--warn-tensor-model-util-pct", type=float, default=50.0)
     parser.add_argument("--no-fail", action="store_true", help="Write audit files but return success even if audit fails")
     args = parser.parse_args()
 
@@ -283,7 +368,7 @@ def main() -> int:
     args.outdir.mkdir(parents=True, exist_ok=True)
     write_csv(args.outdir / "strict_result_audit.csv", rows)
     write_json(args.outdir / "strict_result_audit.json", rows, args)
-    plot_audit(rows, args.outdir / "figures")
+    plot_audit_metrics(rows, args.outdir / "figures")
 
     required = [x.strip() for x in args.require_architectures.split(",") if x.strip()]
     passed = {str(r.get("architecture_chip", "")) for r in rows if parse_bool(r.get("audit_pass"))}

@@ -19,6 +19,8 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "reference_sm_count": 108,
         "reference_boost_clock_mhz": 1410.0,
         "reference_dense_tensor_fp16_tflops": 312.0,
+        "reference_sparse_tensor_fp16_tflops": 624.0,
+        "reference_source_url": "https://www.nvidia.com/en-us/data-center/a100/",
         "reference_note": "A100 SXM dense FP16 Tensor Core peak, no sparsity",
     },
     "ga102": {
@@ -33,6 +35,11 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "reference_sm_count": 82,
         "reference_boost_clock_mhz": 1695.0,
         "reference_dense_tensor_fp16_tflops": 142.0,
+        "reference_sparse_tensor_fp16_tflops": 284.0,
+        "reference_source_url": (
+            "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/"
+            "NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf"
+        ),
         "reference_note": "RTX 3090 FE dense FP16 Tensor Core peak, no sparsity",
     },
     "gh100": {
@@ -46,8 +53,13 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "dense_tensor_fp16_flop_per_sm_cycle": 4096.0,
         "reference_sm_count": 132,
         "reference_boost_clock_mhz": 1830.0,
-        "reference_dense_tensor_fp16_tflops": 989.0,
-        "reference_note": "H100 SXM dense FP16 Tensor Core peak model, no sparsity",
+        "reference_dense_tensor_fp16_tflops": 989.5,
+        "reference_sparse_tensor_fp16_tflops": 1979.0,
+        "reference_source_url": "https://www.nvidia.com/en-us/data-center/h100/",
+        "reference_note": (
+            "H100 SXM dense FP16 Tensor Core peak model, no sparsity; NVIDIA's public H100 "
+            "product table marks FP16 Tensor Core values with sparsity, so dense is half"
+        ),
     },
 }
 
@@ -120,6 +132,9 @@ def tensor_peak_metrics(row: Dict[str, Any], achieved_tflops: Any) -> Dict[str, 
     return {
         "tensor_model_architecture_chip": model.get("architecture_chip", ""),
         "tensor_model_reference_note": model.get("reference_note", ""),
+        "tensor_model_reference_url": model.get("reference_source_url", ""),
+        "tensor_model_reference_dense_tflops": model.get("reference_dense_tensor_fp16_tflops", math.nan),
+        "tensor_model_reference_sparse_tflops": model.get("reference_sparse_tensor_fp16_tflops", math.nan),
         "tensor_model_flop_per_sm_cycle": flops_per_sm_cycle,
         "tensor_peak_tflops_model": peak_tflops,
         "achieved_flops_per_sm_cycle": achieved_flops_per_sm_cycle,
