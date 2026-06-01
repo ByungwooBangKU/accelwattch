@@ -7,7 +7,7 @@ import argparse
 import csv
 import json
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -801,6 +801,23 @@ def metric_stats(values: List[float]) -> Dict[str, Any]:
     return {"n": n, "mean": mean, "std": std, "min": min(clean), "max": max(clean), "ci95": ci95}
 
 
+def formatted_counts(values: Iterable[Any]) -> str:
+    counts = Counter(str(value) for value in values if str(value))
+    return "; ".join(f"{key}:{counts[key]}" for key in sorted(counts))
+
+
+def stats_scope_note(scope: str) -> str:
+    if scope == "valid_no_l2":
+        return "stats use valid_basic rows with no intended L2/global traffic"
+    if scope == "valid_basic":
+        return "stats use valid_basic rows, but no valid_no_l2 row was available"
+    if scope == "all_runs_no_valid":
+        return "stats use all runs because no run passed valid_basic"
+    if scope == "all_runs_no_valid_basic":
+        return "stats use all runs because no run passed valid_basic"
+    return ""
+
+
 def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_cond: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -851,6 +868,7 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for cond, group in by_cond.items():
         valid = [r for r in group if bool(r.get("valid_basic", False))]
         stats_source = valid if valid else group
+        scope = "valid_basic" if valid else "all_runs_no_valid_basic"
         first = group[0]
         row: Dict[str, Any] = {
             "condition": cond,
@@ -877,6 +895,16 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "run_count": len(group),
             "valid_count": len(valid),
             "valid_no_l2_count": sum(1 for r in group if bool(r.get("valid_no_l2", False))),
+            "expected_l2_touch_count": sum(1 for r in group if bool(r.get("expected_l2_touch", True))),
+            "valid_basic_expected_l2_touch_count": sum(
+                1
+                for r in group
+                if bool(r.get("valid_basic", False)) and bool(r.get("expected_l2_touch", True))
+            ),
+            "invalid_or_nonpositive_increment_count": sum(
+                1 for r in group if str(r.get("separation_quality", "")) == "invalid_or_nonpositive_increment"
+            ),
+            "separation_quality_counts": formatted_counts(r.get("separation_quality", "") for r in group),
             "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
             "matmul_denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
             "matmul_denominator_valid_all": all(bool(r.get("matmul_denominator_valid", False)) for r in group),
@@ -890,7 +918,8 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 sorted({str(r.get("matmul_denominator_source", "")) for r in group if str(r.get("matmul_denominator_source", ""))})
             ),
             "invalid_count": len(group) - len(valid),
-            "stats_scope": "valid_basic" if valid else "all_runs_no_valid_basic",
+            "stats_scope": scope,
+            "stats_scope_note": stats_scope_note(scope),
         }
         for metric in metrics:
             stats = metric_stats([finite_float(r.get(metric)) for r in stats_source])
@@ -976,6 +1005,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ]
         valid = [r for r in group if bool(r.get("valid_basic", False))]
         stats_source = valid_no_l2 or valid or group
+        scope = "valid_no_l2" if valid_no_l2 else ("valid_basic" if valid else "all_runs_no_valid")
+        required_valid = 1 if len(group) <= 1 else max(3, math.ceil(len(group) * 0.5))
         row: Dict[str, Any] = {
             "gpu": group[0].get("gpu", ""),
             "architecture_generation": group[0].get("architecture_generation", ""),
@@ -1037,8 +1068,20 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "unroll": group[0].get("unroll", ""),
             "suppress_output_store": all(bool(r.get("suppress_output_store", False)) for r in group),
             "run_count": len(group),
+            "required_valid_no_l2_count": required_valid,
             "valid_count": len(valid),
             "valid_no_l2_count": len(valid_no_l2),
+            "valid_no_l2_requirement_met": len(valid_no_l2) >= required_valid,
+            "expected_l2_touch_count": sum(1 for r in group if bool(r.get("expected_l2_touch", True))),
+            "valid_basic_expected_l2_touch_count": sum(
+                1
+                for r in group
+                if bool(r.get("valid_basic", False)) and bool(r.get("expected_l2_touch", True))
+            ),
+            "invalid_or_nonpositive_increment_count": sum(
+                1 for r in group if str(r.get("separation_quality", "")) == "invalid_or_nonpositive_increment"
+            ),
+            "separation_quality_counts": formatted_counts(r.get("separation_quality", "") for r in group),
             "pure_fp16_candidate_count": sum(1 for r in group if bool(r.get("pure_fp16_candidate", False))),
             "matmul_denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
             "matmul_denominator_valid_all": all(bool(r.get("matmul_denominator_valid", False)) for r in group),
@@ -1054,7 +1097,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "matmul_denominator_note": "; ".join(
                 sorted({str(r.get("matmul_denominator_note", "")) for r in group if str(r.get("matmul_denominator_note", ""))})
             ),
-            "stats_scope": "valid_no_l2" if valid_no_l2 else ("valid_basic" if valid else "all_runs_no_valid"),
+            "stats_scope": scope,
+            "stats_scope_note": stats_scope_note(scope),
             "expected_l2_touch": any(bool(r.get("expected_l2_touch", True)) for r in stats_source),
         }
         for metric in metrics:
@@ -1123,6 +1167,7 @@ def plot_power_trace(summary: Dict[str, Any], figdir: Path) -> None:
     if not paths:
         return
     plt.figure(figsize=(9, 4.8))
+    plotted = False
     for label, p in paths:
         rows = read_power_csv(p)
         if not rows:
@@ -1132,6 +1177,10 @@ def plot_power_trace(summary: Dict[str, Any], figdir: Path) -> None:
         ys = [r["power_w"] for r in rows if r["power_w"] is not None]
         if xs and ys:
             plt.plot(xs, ys, label=label)
+            plotted = True
+    if not plotted:
+        plt.close()
+        return
     plt.xlabel("Time since logger start (s)")
     plt.ylabel("Power draw (W)")
     plt.title(f"Power trace: {summary['condition']}")

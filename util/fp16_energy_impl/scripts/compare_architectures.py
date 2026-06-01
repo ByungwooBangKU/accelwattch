@@ -384,6 +384,7 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
 
     for (test_kernel, baseline_kernel), rows in by_kernel.items():
         fig, ax = plt.subplots(figsize=(8.8, 5.2))
+        plotted = False
         for label in sorted({str(r.get("architecture_label", "")) for r in rows}):
             group = [r for r in rows if str(r.get("architecture_label", "")) == label]
             group = sorted(group, key=lambda r: parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))))
@@ -395,6 +396,7 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
                 line = ax.plot(xs, ys, linewidth=1.2, alpha=0.75, label=label)[0]
                 for r, x, y in zip(group, xs, ys):
                     scatter_quality_point(ax, x, y, r, line.get_color())
+                plotted = True
             for r, x, y in zip(group, xs, ys):
                 if bool(str(r.get("selected_optimal", "")).lower() == "true") and math.isfinite(x):
                     color = "tab:green" if quality_class(r) == "target" else "0.35"
@@ -408,17 +410,18 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
                             fontsize=8,
                         )
 
-        ax.set_xlabel("Launched threads per SM")
-        ax.set_ylabel("Avg SM utilization (%)")
-        ax.set_title(f"Architecture thread sweep utilization: {test_kernel} vs {baseline_kernel}")
-        ax.get_xaxis().set_major_formatter(ScalarFormatter())
-        ax.grid(True, axis="y", alpha=0.25)
-        arch_legend = ax.legend(loc="best", title="architecture")
-        ax.add_artist(arch_legend)
-        add_quality_legend(ax)
-        fig.tight_layout()
-        safe = f"architecture_thread_sweep_util_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
-        fig.savefig(outdir / safe, dpi=160)
+        if plotted:
+            ax.set_xlabel("Launched threads per SM")
+            ax.set_ylabel("Avg SM utilization (%)")
+            ax.set_title(f"Architecture thread sweep utilization: {test_kernel} vs {baseline_kernel}")
+            ax.get_xaxis().set_major_formatter(ScalarFormatter())
+            ax.grid(True, axis="y", alpha=0.25)
+            arch_legend = ax.legend(loc="best", title="architecture")
+            ax.add_artist(arch_legend)
+            add_quality_legend(ax)
+            fig.tight_layout()
+            safe = f"architecture_thread_sweep_util_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
+            fig.savefig(outdir / safe, dpi=160)
         plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(8.8, 5.2))

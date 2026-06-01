@@ -599,6 +599,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `valid_no_l2` | `valid_basic=True`이고 `expected_l2_touch=False`인 pair. 의도된 L2/global traffic이 없다는 metadata gate이며, 실제 L2 traffic 0을 증명하지는 않음 |
 | `pure_fp16_candidate` | `valid_no_l2=True`이고 kernel이 FP16 half2 또는 Tensor Core FP16 compute 계열인 후보 |
 | `separation_quality` | `pure_fp16_candidate_no_l2`, `valid_but_expected_l2_touch`, `invalid_or_nonpositive_increment` 등 baseline subtraction 품질 분류 |
+| `separation_quality_counts` | condition/thread point 안에서 각 `separation_quality` 값이 몇 번 나왔는지 요약 |
+| `stats_scope`, `stats_scope_note` | mean/std 계산에 어떤 row 집합을 썼는지와 그 이유. `all_runs_no_valid*`는 최종 후보가 아니라 diagnostic 통계 |
 
 `thread_sweep_summary.csv`의 핵심 컬럼은 다음이다.
 
@@ -606,7 +608,13 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 |---|---|
 | `threads` | threads per block |
 | `threads_per_sm` | launched threads per SM. 기본 matrix에서는 `threads * blocks_per_sm`와 같음 |
+| `required_valid_no_l2_count` | 해당 thread point가 최종 후보군에 들어가기 위해 필요한 최소 valid no-L2 반복 수. 기본은 `max(3, ceil(run_count/2))` |
 | `valid_no_l2_count` | `valid_basic=True`이고 `expected_l2_touch=False`인 반복 수 |
+| `valid_no_l2_requirement_met` | `valid_no_l2_count >= required_valid_no_l2_count` 여부 |
+| `expected_l2_touch_count` | metadata상 timed kernel이 global/L2 traffic을 의도한다고 분류된 반복 수 |
+| `valid_basic_expected_l2_touch_count` | energy/power sanity는 통과했지만 no-L2 조건은 만족하지 못한 반복 수 |
+| `invalid_or_nonpositive_increment_count` | baseline subtraction 뒤 incremental power/energy가 양수가 아니거나 reliable energy가 없어 `valid_basic`에 실패한 반복 수 |
+| `separation_quality_counts` | thread point별 `pure_fp16_candidate_no_l2`, `valid_but_expected_l2_touch`, `invalid_or_nonpositive_increment` 분포 |
 | `elapsed_s_mean`, `baseline_elapsed_s_mean` | thread point별 test/baseline 평균 CUDA event duration |
 | `avg_sm_util_pct_mean` | thread point별 평균 SM utilization |
 | `avg_gpu_util_pct_mean` | dmon SM utilization이 없을 때 fallback으로 쓰는 평균 GPU utilization |
@@ -625,7 +633,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `benchmark_schema_features_required_all` | 해당 thread point의 모든 반복이 required `schema_features`를 포함하는지 여부 |
 | `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
 
-`stats_scope=all_runs_no_valid`는 해당 thread point에서 `valid_basic=True`인 반복이 없었다는 뜻이다. 이 경우 mean/std는 plot과 원인 분석을 위한 전체 run 통계일 뿐, 최종 pJ/bit 후보로 쓰면 안 된다. `valid_no_l2` 역시 “코드가 의도적으로 L2/global memory를 touch하지 않는다”는 조건이지, hardware counter 기반 증명은 아니므로 최종 보고 전에는 Nsight Compute로 `MemoryWorkloadAnalysis`를 확인한다.
+`stats_scope=all_runs_no_valid` 또는 `all_runs_no_valid_basic`은 해당 thread point/condition에서 `valid_basic=True`인 반복이 없었다는 뜻이다. 이 경우 mean/std는 plot과 원인 분석을 위한 전체 run 통계일 뿐, 최종 pJ/bit 후보로 쓰면 안 된다. 원인은 `separation_quality_counts`, `invalid_or_nonpositive_increment_count`, `expected_l2_touch_count`로 분리해서 본다. `valid_no_l2` 역시 “코드가 의도적으로 L2/global memory를 touch하지 않는다”는 조건이지, hardware counter 기반 증명은 아니므로 최종 보고 전에는 Nsight Compute로 `MemoryWorkloadAnalysis`를 확인한다.
 
 코드와 표에서 baseline/control이라는 표현은 GPU의 control unit 에너지를 의미하지 않는다. 여기서는 같은 launch/loop/register 구조에서 FP16/HMMA instruction만 제거한 기준 루프 비용을 뜻한다. 최종 Tensor Core pJ/bit에는 `tensor_baseline_u32/f32` 같은 structural baseline을 사용하고, legacy `baseline_nop` 결과는 diagnostic으로만 본다.
 
