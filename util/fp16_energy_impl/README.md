@@ -380,7 +380,7 @@ python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_gpu0
 python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_gpu0
 ```
 
-이 sweep은 `threads = 32, 64, 128, 256, 512, 1024`를 훑는다. Matrix default의 `suppress_output_store=true`가 test와 `tensor_baseline_mov` timed kernel의 final global store를 끄므로, 의도된 timed-loop L2/global memory traffic 없이 Tensor Core utilization만 비교한다. `tensor_baseline_mov`는 no-memory warp-sync baseline이라 ptxas가 empty/register-move loop를 제거하는 문제를 피한다. 분석기는 `thread_sweep_summary.csv`를 만들고, 충분한 valid no-L2 후보 중 dmon `avg_sm_util_pct_mean`이 포화되는 가장 작은 `threads_per_sm` point를 `selected_optimal=True`로 표시한다. SM utilization이 없으면 `avg_gpu_util_pct_mean`으로 fallback한다.
+이 sweep은 `threads = 32, 64, 128, 256, 512, 1024`를 훑는다. Matrix default의 `suppress_output_store=true`가 test와 `tensor_baseline_mov` timed kernel의 final global store를 끄므로, 의도된 timed-loop L2/global memory traffic 없이 Tensor Core utilization만 비교한다. `tensor_baseline_mov`는 no-memory warp-sync baseline이라 ptxas가 empty/register-only loop를 제거하는 문제를 피한다. 분석기는 `thread_sweep_summary.csv`를 만들고, 충분한 valid no-L2 후보 중 dmon `avg_sm_util_pct_mean`이 포화되는 가장 작은 `threads_per_sm` point를 `selected_optimal=True`로 표시한다. SM utilization이 없으면 `avg_gpu_util_pct_mean`, 그것도 없으면 diagnostic plot/selection에 한해 dense Tensor Core peak model 대비 `tensor_model_utilization_pct_mean`으로 fallback한다.
 
 Coarse sweep에서 유효 후보가 좁혀지면 fine sweep을 추가로 실행한다. Fine matrix는 `threads = 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384`를 훑는다. 160 이상 후보는 test `repeats=2`, baseline `repeats=20`을 사용한다. 32/64/96/128 후보는 duration과 sample 수를 맞추기 위해 각각 더 큰 repeats를 사용한다.
 
@@ -420,6 +420,22 @@ NCU_BLOCKS_PER_SM_CSV=1,2,4,8 \
   results/ncu_launch_shape_gpu0 \
   0 \
   32,64,128,256
+```
+
+2026-06-02 RTX 3090 direct launch-shape diagnostic 결과는 `results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/`에 포함했다. 이 환경에서는 WSL이 background GPU telemetry와 Python/nested-shell child CUDA launch를 막아 `run_experiment.py`, dmon, NCU를 동시에 사용할 수 없었다. 따라서 benchmark binary를 foreground command로 직접 32회 실행하고, 에너지는 benchmark 내부 `nvmlDeviceGetTotalEnergyConsumption()` delta만 사용했다. `power.csv`, `sm_util.csv`, NCU validation이 없으므로 이 결과는 strict final target이 아니라 diagnostic이다. Analyzer는 measured SM/GPU utilization 대신 TFLOPS/reference dense peak 기반 `tensor_model_utilization_pct_mean`으로 saturation point를 표시했다.
+
+| Result dir | Utilization source | Selected diagnostic launch shape | Selected threads/SM | valid no-L2 | TFLOPS | `matmul_input_pj_per_bit` | Quality status |
+|---|---|---:|---:|---:|---:|---:|---|
+| `results/fp16_launch_shape_warpsync_rtx3090_20260602_direct` | TFLOPS/reference dense peak fallback | `threads=32`, `blocks/SM=8` | 256 | 1/1 | 154.56 | 0.2875 pJ/bit | `selected_optimal=true`, `target_pass=false` |
+
+이 diagnostic sweep에서는 `threads_per_sm=256`에서 throughput/model-utilization이 처음 포화되어 analyzer selection이 `t32/b8`을 표시했다. 더 큰 `threads_per_sm`에서도 pJ/bit가 더 낮게 보이는 지점이 있으나, 현재 run에는 measured SM util, clock trace, power trace cross-check, NCU no-L2/Tensor activity evidence가 없다. 특히 `threads=256, blocks/SM=2`는 baseline subtraction 뒤 incremental energy가 음수라 `stats_scope=all_runs_no_valid`로 남는다. 최종 보고용 RTX 3090/A100/H100 값은 strict pipeline에서 dmon/clock/NCU까지 통과한 `quality_gate_summary.json:selected_targets`만 사용한다.
+
+관련 figure:
+
+```text
+results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/figures/thread_sweep_tensor_mma_f16acc_vs_tensor_baseline_mov.png
+results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/figures/thread_sweep_pjbit_tensor_mma_f16acc_vs_tensor_baseline_mov.png
+results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/figures/quality_gate_thread_sweep_tensor_mma_f16acc_vs_tensor_baseline_mov.png
 ```
 
 2026-05-28 RTX 3090 local run 결과는 다음과 같다. 기준 matmul은 logical `m16n16k16`이며, 구현은 `mma.sync.m16n8k16` instruction 두 개로 N 방향 16 columns를 채운다. pJ/bit denominator는 A/B logical FP16 input bit인 `(16*16 + 16*16) * 16 = 8192 bit/logical MMA`다. 이 run은 이전 matrix의 `baseline_nop` 기반 legacy diagnostic 결과이며, Nsight Compute counter validation은 이 환경에서 `ncu`가 PATH에 없어 수행하지 못했다. 현재 strict matrix는 `tensor_baseline_mov` no-memory warp-sync baseline을 사용하므로 최종 pJ/bit는 재실행 후 `quality_gate.py`의 `target_pass=true` 결과를 사용한다.
@@ -612,7 +628,7 @@ Thread sweep에서 선택된 후보가 L2/global memory를 의도적으로 touch
   32,64,128,256,512,1024
 ```
 
-이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 기본 `tensor_baseline_mov`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. Helper는 기본적으로 strict matrix와 같은 `blocks_per_sm=8`, `unroll=8`, `suppress_output_store=true` context를 `ncu_validation_summary.csv`에 기록하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`는 이 context가 측정 row와 맞는지와 test kernel의 Tensor pipe activity evidence가 있는지도 확인한다. Launch-shape sweep처럼 여러 `blocks/SM`을 검증할 때는 `NCU_BLOCKS_PER_SM_CSV=1,2,4,8` 또는 pipeline의 `--ncu-blocks-per-sm-csv 1,2,4,8`을 사용하며, validation report 이름과 quality/audit 매칭은 `threads + blocks_per_sm`를 함께 사용한다. `tensor_baseline_mov`는 ptxas가 register-move-only loop를 제거하지 못하도록 no-memory warp-sync step을 사용한다. 필요한 경우 `NCU_BASELINE_KERNEL`, `NCU_BLOCKS_PER_SM`, `NCU_BLOCKS_PER_SM_CSV`, `NCU_UNROLL`, `NCU_SUPPRESS_OUTPUT_STORE`, `NCU_ITERS`, `NCU_REPEATS`, `NCU_WARMUP`, `NCU_MIN_TENSOR_ACTIVITY_PCT` 환경변수로 profiler validation run의 launch context와 Tensor activity threshold를 override한다. Diagnostic run에서만 `NCU_REQUIRE_TENSOR_ACTIVITY=0`으로 Tensor activity hard gate를 끌 수 있다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
+이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 기본 `tensor_baseline_mov`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. Helper는 기본적으로 strict matrix와 같은 `blocks_per_sm=8`, `unroll=8`, `suppress_output_store=true` context를 `ncu_validation_summary.csv`에 기록하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`는 이 context가 측정 row와 맞는지와 test kernel의 Tensor pipe activity evidence가 있는지도 확인한다. Launch-shape sweep처럼 여러 `blocks/SM`을 검증할 때는 `NCU_BLOCKS_PER_SM_CSV=1,2,4,8` 또는 pipeline의 `--ncu-blocks-per-sm-csv 1,2,4,8`을 사용하며, validation report 이름과 quality/audit 매칭은 `threads + blocks_per_sm`를 함께 사용한다. `tensor_baseline_mov`는 ptxas가 empty/register-only loop를 제거하지 못하도록 no-memory warp-sync step을 사용한다. 필요한 경우 `NCU_BASELINE_KERNEL`, `NCU_BLOCKS_PER_SM`, `NCU_BLOCKS_PER_SM_CSV`, `NCU_UNROLL`, `NCU_SUPPRESS_OUTPUT_STORE`, `NCU_ITERS`, `NCU_REPEATS`, `NCU_WARMUP`, `NCU_MIN_TENSOR_ACTIVITY_PCT` 환경변수로 profiler validation run의 launch context와 Tensor activity threshold를 override한다. Diagnostic run에서만 `NCU_REQUIRE_TENSOR_ACTIVITY=0`으로 Tensor activity hard gate를 끌 수 있다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
 
 두 validation helper는 실행 후 `validate_ncu_reports.py`를 호출해 다음 산출물을 만든다.
 
@@ -709,7 +725,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `avg_sm_util_pct_mean` | thread point별 평균 SM utilization |
 | `avg_gpu_util_pct_mean` | dmon SM utilization이 없을 때 fallback으로 쓰는 평균 GPU utilization |
 | `tflops_mean` | thread point별 평균 Tensor Core throughput |
-| `tensor_model_utilization_pct_mean` | thread point별 dense Tensor Core peak model 대비 평균 utilization |
+| `tensor_model_utilization_pct_mean` | thread point별 dense Tensor Core peak model 대비 평균 utilization. measured SM/GPU utilization이 모두 없을 때 diagnostic plot/selection fallback으로만 사용 |
 | `incremental_energy_fraction_mean` | thread point별 평균 incremental energy signal fraction |
 | `incremental_energy_j_mean` | thread point별 평균 incremental energy magnitude |
 | `test_energy_counter_vs_trace_ratio_mean` | thread point별 평균 test NVML-counter/power-trace ratio |

@@ -303,6 +303,10 @@ def tensor_peak_metrics(row: Dict[str, Any], achieved_tflops: Any) -> Dict[str, 
     flops_per_sm_cycle = parse_float(model.get("dense_tensor_fp16_flop_per_sm_cycle"))
     sm_count = parse_float(row.get("sm_count"))
     clock_mhz = parse_float(row.get("avg_sm_clock_mhz"))
+    clock_source = "measured_avg_sm_clock_mhz"
+    if not math.isfinite(clock_mhz) or clock_mhz <= 0.0:
+        clock_mhz = parse_float(model.get("reference_boost_clock_mhz"))
+        clock_source = "architecture_reference_boost_clock_mhz"
     tflops = parse_float(achieved_tflops)
 
     peak_tflops = (
@@ -335,6 +339,8 @@ def tensor_peak_metrics(row: Dict[str, Any], achieved_tflops: Any) -> Dict[str, 
         "tensor_model_reference_dense_tflops": model.get("reference_dense_tensor_fp16_tflops", math.nan),
         "tensor_model_reference_sparse_tflops": model.get("reference_sparse_tensor_fp16_tflops", math.nan),
         "tensor_model_flop_per_sm_cycle": flops_per_sm_cycle,
+        "tensor_model_clock_mhz": clock_mhz,
+        "tensor_model_clock_source": clock_source,
         "tensor_model_common_instruction_path": model.get(
             "common_tensor_instruction_path",
             COMMON_TENSOR_INSTRUCTION_PATH,

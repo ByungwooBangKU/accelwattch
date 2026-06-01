@@ -1163,6 +1163,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             util = finite_float(row.get("avg_sm_util_pct_mean"), -math.inf)
             if not math.isfinite(util):
                 util = finite_float(row.get("avg_gpu_util_pct_mean"), -math.inf)
+            if not math.isfinite(util):
+                util = finite_float(row.get("tensor_model_utilization_pct_mean"), -math.inf)
             return util if math.isfinite(util) else -math.inf
 
         max_util = max(util_score(row) for row in eligible)
@@ -1464,9 +1466,40 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
         for r in rows:
             threads_per_sm = finite_float(r.get("threads_per_sm"))
             xs.append(threads_per_sm if math.isfinite(threads_per_sm) else float(r["threads"]))
+        grouped_x: Dict[float, List[int]] = defaultdict(list)
+        for idx, x in enumerate(xs):
+            if math.isfinite(x):
+                grouped_x[x].append(idx)
+        plot_xs = list(xs)
+        label_offsets: Dict[int, Tuple[float, float]] = {}
+        for x, idxs in grouped_x.items():
+            n = len(idxs)
+            if n <= 1:
+                label_offsets[idxs[0]] = (0.0, 8.0)
+                continue
+            spread = max(2.0, 0.035 * x)
+            for order, idx in enumerate(idxs):
+                centered = order - (n - 1) / 2.0
+                plot_xs[idx] = x + centered * spread
+                label_offsets[idx] = (centered * 34.0, 8.0 + order * 8.0)
         sm_util = [finite_float(r.get("avg_sm_util_pct_mean")) for r in rows]
+        gpu_util = [finite_float(r.get("avg_gpu_util_pct_mean")) for r in rows]
+        model_util = [finite_float(r.get("tensor_model_utilization_pct_mean")) for r in rows]
         has_sm_util = any(math.isfinite(v) for v in sm_util)
-        util = sm_util if has_sm_util else [finite_float(r.get("avg_gpu_util_pct_mean")) for r in rows]
+        has_gpu_util = any(math.isfinite(v) for v in gpu_util)
+        has_model_util = any(math.isfinite(v) for v in model_util)
+        if has_sm_util:
+            util = sm_util
+            util_label = "avg SM util"
+            ylabel = "Avg SM utilization (%)"
+        elif has_gpu_util:
+            util = gpu_util
+            util_label = "avg GPU util"
+            ylabel = "Avg GPU utilization (%)"
+        else:
+            util = model_util
+            util_label = "Tensor model util"
+            ylabel = "Tensor model utilization (% of dense FP16 peak)"
         tflops = [finite_float(r.get("tflops_mean")) for r in rows]
         selected = [r for r in rows if bool(r.get("selected_optimal", False))]
 
@@ -1483,27 +1516,31 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
             return label
 
         fig, ax1 = plt.subplots(figsize=(8, 4.8))
-        util_label = "avg SM util" if has_sm_util else "avg GPU util"
-        ylabel = "Avg SM utilization (%)" if has_sm_util else "Avg GPU utilization (%)"
-        ax1.plot(xs, util, marker="o", label=util_label)
+        ax1.scatter(plot_xs, util, marker="o", label=util_label)
         ax1.set_xlabel("Launched threads per SM")
         ax1.set_ylabel(ylabel)
         ax1.set_xticks(sorted({x for x in xs if math.isfinite(x)}))
         ax1.get_xaxis().set_major_formatter(ScalarFormatter())
         ax1.grid(True, axis="y", alpha=0.3)
-        for x, y, row in zip(xs, util, rows):
+        if any(math.isfinite(v) for v in util):
+            util_vals = [v for v in util if math.isfinite(v)]
+            ymin, ymax = min(util_vals), max(util_vals)
+            pad = max(6.0, 0.18 * max(abs(ymax - ymin), 1.0))
+            ax1.set_ylim(max(0.0, ymin - pad), ymax + 2.2 * pad)
+        for idx, (x, y, row) in enumerate(zip(plot_xs, util, rows)):
             if math.isfinite(y):
+                dx, dy = label_offsets.get(idx, (0.0, 8.0))
                 ax1.annotate(
                     shape_label(row, include_pjbit=True),
                     (x, y),
                     textcoords="offset points",
-                    xytext=(0, 6),
+                    xytext=(dx, dy),
                     ha="center",
-                    fontsize=8,
+                    fontsize=7,
                 )
 
         ax2 = ax1.twinx()
-        ax2.plot(xs, tflops, marker="s", color="tab:orange", label="TFLOPS")
+        ax2.scatter(plot_xs, tflops, marker="s", color="tab:orange", label="TFLOPS")
         ax2.set_ylabel("TFLOPS")
 
         if selected:
@@ -1515,7 +1552,16 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
         lines, labels = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines + lines2, labels + labels2, loc="best")
-        plt.title(f"Thread sweep: {test_kernel} vs {baseline_kernel} (labels: t=threads/block, b=blocks/SM)")
+        title_note = ""
+        if not has_sm_util and not has_gpu_util and has_model_util:
+            title_note = " (no dmon telemetry; TFLOPS/peak fallback)"
+        plot_title = "Launch-shape sweep: utilization vs threads/SM"
+        if title_note:
+            plot_title += "\nlabels show t/b and pJ/b; no dmon telemetry -> TFLOPS/peak fallback"
+        else:
+            plot_title += "\nlabels show t/b and pJ/b"
+        ax1.set_title(plot_title, fontsize=11)
+        fig.set_size_inches(12.5, 5.8)
         plt.tight_layout()
         safe_name = f"thread_sweep_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
         plt.savefig(figdir / safe_name, dpi=160)
@@ -1528,23 +1574,29 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
                 ci = finite_float(r.get("matmul_input_pj_per_bit_ci95"), 0.0)
                 pjbit_ci.append(ci if math.isfinite(ci) and ci >= 0.0 else 0.0)
 
-            fig, ax = plt.subplots(figsize=(8, 4.8))
-            ax.errorbar(xs, pjbit, yerr=pjbit_ci, marker="D", capsize=3, color="tab:purple", label="pJ/bit")
+            fig, ax = plt.subplots(figsize=(12.5, 5.8))
+            ax.errorbar(plot_xs, pjbit, yerr=pjbit_ci, fmt="D", capsize=3, color="tab:purple", label="pJ/bit")
             ax.axhline(0.0, color="0.3", linewidth=0.8, alpha=0.6)
             ax.set_xlabel("Launched threads per SM")
             ax.set_ylabel("pJ/logical input bit")
             ax.set_xticks(sorted({x for x in xs if math.isfinite(x)}))
             ax.get_xaxis().set_major_formatter(ScalarFormatter())
             ax.grid(True, axis="y", alpha=0.3)
-            for x, y, row in zip(xs, pjbit, rows):
+            pjbit_vals = [v for v in pjbit if math.isfinite(v)]
+            if pjbit_vals:
+                ymin, ymax = min(pjbit_vals), max(pjbit_vals)
+                pad = max(0.06, 0.18 * max(abs(ymax - ymin), 0.1))
+                ax.set_ylim(ymin - 1.2 * pad, ymax + 1.2 * pad)
+            for idx, (x, y, row) in enumerate(zip(plot_xs, pjbit, rows)):
                 if math.isfinite(y):
+                    dx, dy = label_offsets.get(idx, (0.0, 8.0))
                     ax.annotate(
                         f"{shape_label(row)}\n{y:.3g}",
                         (x, y),
                         textcoords="offset points",
-                        xytext=(0, 7 if y >= 0 else -18),
+                        xytext=(dx, dy if y >= 0 else -18),
                         ha="center",
-                        fontsize=8,
+                        fontsize=7,
                     )
             if selected:
                 sx = finite_float(selected[0].get("threads_per_sm"))

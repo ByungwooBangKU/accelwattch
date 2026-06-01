@@ -1,0 +1,290 @@
+[
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b01",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 32,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b01_rep000_baseline_1780341022200281635",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b01_rep000_baseline_1780341022200281635/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b01",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 32,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b01_rep000_test_1780341022200503614",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b01_rep000_test_1780341022200503614/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b02",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 32,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b02_rep000_baseline_1780341022200741956",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b02_rep000_baseline_1780341022200741956/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b02",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 32,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b02_rep000_test_1780341022200940354",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b02_rep000_test_1780341022200940354/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b04",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 32,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b04_rep000_baseline_1780341022201153795",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b04_rep000_baseline_1780341022201153795/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b04",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 32,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b04_rep000_test_1780341022201353515",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b04_rep000_test_1780341022201353515/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b08",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 32,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b08_rep000_baseline_1780341022201554658",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b08_rep000_baseline_1780341022201554658/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t032_b08",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 32,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t032_b08_rep000_test_1780341022201754987",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t032_b08_rep000_test_1780341022201754987/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b01",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 64,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b01_rep000_baseline_1780341022201948202",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b01_rep000_baseline_1780341022201948202/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b01",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 64,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b01_rep000_test_1780341022202149447",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b01_rep000_test_1780341022202149447/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b02",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 64,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b02_rep000_baseline_1780341022202346016",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b02_rep000_baseline_1780341022202346016/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b02",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 64,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b02_rep000_test_1780341022202540348",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b02_rep000_test_1780341022202540348/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b04",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 64,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b04_rep000_baseline_1780341022202735189",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b04_rep000_baseline_1780341022202735189/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b04",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 64,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b04_rep000_test_1780341022202927083",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b04_rep000_test_1780341022202927083/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b08",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 64,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b08_rep000_baseline_1780341022203119383",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b08_rep000_baseline_1780341022203119383/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t064_b08",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 64,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t064_b08_rep000_test_1780341022203326014",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t064_b08_rep000_test_1780341022203326014/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b01",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 128,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b01_rep000_baseline_1780341022203520652",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b01_rep000_baseline_1780341022203520652/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b01",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 128,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b01_rep000_test_1780341022203716103",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b01_rep000_test_1780341022203716103/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b02",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 128,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b02_rep000_baseline_1780341022203910944",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b02_rep000_baseline_1780341022203910944/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b02",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 128,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b02_rep000_test_1780341022204107716",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b02_rep000_test_1780341022204107716/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b04",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 128,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b04_rep000_baseline_1780341022204377567",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b04_rep000_baseline_1780341022204377567/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b04",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 128,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b04_rep000_test_1780341022204614994",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b04_rep000_test_1780341022204614994/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b08",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 128,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b08_rep000_baseline_1780341022204839107",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b08_rep000_baseline_1780341022204839107/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t128_b08",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 128,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t128_b08_rep000_test_1780341022205042283",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t128_b08_rep000_test_1780341022205042283/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b01",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 256,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b01_rep000_baseline_1780341022205260704",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b01_rep000_baseline_1780341022205260704/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b01",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 256,
+    "blocks_per_sm": 1,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b01_rep000_test_1780341022205457781",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b01_rep000_test_1780341022205457781/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b02",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 256,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b02_rep000_baseline_1780341022205649573",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b02_rep000_baseline_1780341022205649573/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b02",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 256,
+    "blocks_per_sm": 2,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b02_rep000_test_1780341022205839739",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b02_rep000_test_1780341022205839739/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b04",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 256,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b04_rep000_baseline_1780341022206038544",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b04_rep000_baseline_1780341022206038544/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b04",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 256,
+    "blocks_per_sm": 4,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b04_rep000_test_1780341022206246700",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b04_rep000_test_1780341022206246700/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b08",
+    "role": "baseline",
+    "kernel": "tensor_baseline_mov",
+    "threads": 256,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b08_rep000_baseline_1780341022206440118",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b08_rep000_baseline_1780341022206440118/bench.json"
+  },
+  {
+    "condition": "launch_shape_tensor_mma_f16acc_t256_b08",
+    "role": "test",
+    "kernel": "tensor_mma_f16acc",
+    "threads": 256,
+    "blocks_per_sm": 8,
+    "run_id": "launch_shape_tensor_mma_f16acc_t256_b08_rep000_test_1780341022206633333",
+    "bench_json": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/raw/launch_shape_tensor_mma_f16acc_t256_b08_rep000_test_1780341022206633333/bench.json"
+  }
+]

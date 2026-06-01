@@ -679,10 +679,9 @@ __global__ void tensor_baseline_mov_kernel(uint32_t* __restrict__ out, int iters
   for (int i = 0; i < iters; ++i) {
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u) {
-      // Keep a side-effectful, no-memory Tensor baseline step. Pure register
-      // move cycles are optimized away for some unroll factors, while the
-      // warp barrier keeps the timed loop materialized without integer ALU or
-      // L2/global memory traffic.
+      // Keep a side-effectful, no-memory Tensor baseline step. Pure empty or
+      // register-use-only loops can be optimized away, while the warp barrier
+      // materializes the timed loop without L2/global memory traffic.
       asm volatile("bar.warp.sync 0xffffffff;\n");
     }
   }
