@@ -1,0 +1,61 @@
+{
+  "input": "results/fp16_matmul_thread_sweep_fine_m16n16_smutil_rtx3090_20260528",
+  "generated_utc": "2026-06-01T03:39:52.719089+00:00",
+  "thresholds": {
+    "max_clock_span_mhz": 60.0,
+    "min_power_samples": 3,
+    "min_sm_util_samples": 1,
+    "util_tolerance_pct": 0.1
+  },
+  "counts": {
+    "rows": 121,
+    "pair_rows": 110,
+    "thread_rows": 11,
+    "quality_pass": 61,
+    "target_pass": 1
+  },
+  "selected_targets": [
+    {
+      "scope": "thread_sweep",
+      "condition": "",
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "architecture_generation": "ampere",
+      "architecture_chip": "ga102",
+      "test_kernel": "tensor_mma_f16acc",
+      "baseline_kernel": "baseline_nop",
+      "threads": "64",
+      "threads_per_sm": "512.0",
+      "run_count": 10,
+      "required_valid_count": 5,
+      "valid_no_l2_count": 9,
+      "pure_fp16_candidate_count": 9,
+      "measurement_grade": "power_trace_fallback",
+      "quality_pass": true,
+      "target_pass": true,
+      "selected_optimal": true,
+      "util_saturated": true,
+      "no_intended_l2": true,
+      "pure_fp16_candidate": true,
+      "energy_source_reliable": true,
+      "clock_stable": true,
+      "sm_util_available": true,
+      "avg_sm_util_pct_mean": "100.0",
+      "avg_gpu_util_pct_mean": "99.93042328042328",
+      "tflops_mean": "159.1109183698642",
+      "matmul_input_pj_per_bit_mean": "0.25139814888770357",
+      "matmul_input_pj_per_bit_ci95": "0.014248796732169772",
+      "incremental_power_w_mean": "30.392466951334296",
+      "clock_span_mhz_mean": "0.0",
+      "stats_scope": "valid_no_l2",
+      "test_energy_source_counts": "power_trace_integral:10",
+      "baseline_energy_source_counts": "power_trace_integral:10",
+      "fail_reasons": "",
+      "warnings": "NVML energy counter was unavailable; using power trace fallback"
+    }
+  ],
+  "notes": [
+    "valid_no_l2 means valid_basic=True and the benchmark metadata does not expect global/L2 traffic.",
+    "It is not a physical proof of zero L2 traffic; Nsight Compute memory counters are still required.",
+    "strict_nvml_counter is preferred for H100/A100/RTX3090 comparison; power_trace_fallback is diagnostic."
+  ]
+}

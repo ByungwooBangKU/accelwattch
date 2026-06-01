@@ -15,6 +15,7 @@
 | `configs/p1_memory_policy_matrix.json` | P1 memory/cache policy 보정용 matrix |
 | `scripts/run_experiment.py` | benchmark 실행 + `nvidia-smi` power/clock/temp 및 dmon SM utilization logging |
 | `scripts/analyze_results.py` | NVML energy counter 우선 분석, power trace fallback, baseline subtraction, pJ/FLOP 계산, CSV/시각화 생성 |
+| `scripts/quality_gate.py` | 결과 채택 전 energy source, valid no-L2 반복 수, clock 안정성, SM utilization 포화 여부를 gate |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/ncu_validate.sh` | Nsight Compute validation run 예시 |
 | `scripts/ncu_validate_no_l2_thread_sweep.sh` | thread sweep 후보의 no-L2/global-memory validation run 예시 |
@@ -107,6 +108,28 @@ H100에서도 현재 Tensor Core kernel은 `mma.sync.m16n8k16` 두 개로 logica
 
 `nvidia-smi` power trace는 제거하지 않는다. H100처럼 `power.draw`가 averaging/smoothing된 값을 줄 수 있는 환경에서는 NVML total energy counter가 더 직접적인 최종 에너지 값이고, power trace는 clock/temperature/throttling 및 counter-vs-trace sanity check 용도다. 분석 결과에는 `energy_source`, `power_trace_energy_j`, `nvml_energy_delta_j`, `energy_counter_vs_trace_delta_j`, `energy_counter_vs_trace_ratio`가 함께 기록된다.
 
+### Quality gate policy
+
+`analyze_results.py`가 만든 수치는 바로 최종값으로 채택하지 않고, `quality_gate.py`로 다음 조건을 확인한다.
+
+```bash
+python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gpu0
+```
+
+Gate가 확인하는 핵심 조건은 다음과 같다.
+
+| Gate | 의미 |
+|---|---|
+| positive increment | baseline subtraction 뒤 incremental power/energy가 양수 |
+| no intended L2/global traffic | `suppress_output_store=true`이고 `memory_bytes_estimate=0`이라 timed kernel이 global/L2 traffic을 의도하지 않음 |
+| enough valid repeats | thread point별 `valid_no_l2_count >= max(3, ceil(run_count/2))` |
+| stable clock | 기본값으로 `clock_span_mhz <= 60` |
+| reliable energy source | `nvml_total_energy_counter` 우선. 미지원 시 power trace fallback은 최소 sample 수를 만족할 때만 diagnostic grade로 통과 |
+| common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
+| utilization target | SM utilization 최대값에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
+
+출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다.
+
 ### Architecture comparison policy
 
 A100, H100, RTX 3090 비교는 같은 logical workload와 같은 instruction family를 비교하는 방식으로 해석한다. 현재 Tensor Core kernel은 세 GPU 모두에서 warp-level `mma.sync.m16n8k16` 두 개를 묶어 logical `m16n16k16`을 만들며, H100에서 지원되는 WGMMA 경로를 사용하지 않는다. 따라서 이 결과는 "H100의 최대 WGMMA matmul efficiency"가 아니라 "A100/H100/RTX3090에서 공통 HMMA FP16 path를 같은 baseline subtraction으로 측정한 값"이다.
@@ -117,6 +140,19 @@ benchmark JSON과 분석 CSV에는 `architecture_generation`, `architecture_chip
 
 ```bash
 ./scripts/query_env.sh 0 results/env_gpu0.txt
+```
+
+세 번째 인자로 binary path를 넘기면 CUDA runtime probe와 resource-usage dump도 같이 시도한다.
+
+```bash
+./scripts/query_env.sh 0 results/env_gpu0.txt build/fp16_energy_bench
+```
+
+`cuobjdump`가 설치되어 있으면 `query_env.sh` 출력에 kernel별 resource usage가 포함된다. 설치되어 있지 않은 환경에서는 CMake가 이미 `-Xptxas=-v`로 build output에 register 수와 spill 정보를 출력하므로, 다음처럼 build log를 남겨 확인한다.
+
+```bash
+cmake --build build -j 2 2>&1 | tee results/build_ptxas.log
+rg "Used .* registers|spill" results/build_ptxas.log
 ```
 
 가능하면 GPU clock을 고정한다.
@@ -195,6 +231,7 @@ python3 scripts/run_experiment.py \
   --outdir results/fp16_matmul_thread_sweep_fine_gpu0
 
 python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_fine_gpu0
+python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gpu0
 ```
 
 여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 선택 기준은 max SM utilization에서 0.1 percentage point 이내로 포화된 후보 중 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다.
@@ -252,12 +289,15 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/summary.csv` | baseline/test pair별 baseline subtraction 결과 |
 | `results/p0_gpu0/condition_summary.csv` | condition별 반복 측정 통계(mean/std/min/max/95% CI) |
 | `results/p0_gpu0/thread_sweep_summary.csv` | thread-count sweep일 때 thread별 utilization/TFLOPS 집계와 `selected_optimal` 표시 |
+| `results/p0_gpu0/quality_gates.csv` | pair/thread point별 quality gate 통과 여부와 실패 이유 |
+| `results/p0_gpu0/quality_gate_summary.json` | 선택된 target point와 gate threshold 요약 |
 | `results/p0_gpu0/run_level_summary.csv` | run 단위 selected energy, NVML counter delta, power trace integration 결과 |
 | `results/p0_gpu0/figures/pj_per_flop_bar.png` | pJ/FLOP bar chart |
 | `results/p0_gpu0/figures/tflops_vs_pj_per_flop.png` | TFLOPS vs pJ/FLOP scatter |
 | `results/p0_gpu0/figures/fp16_energy_separation_stack.png` | test interval energy를 baseline-scaled energy와 FP16 incremental energy로 분리한 stack plot |
 | `results/p0_gpu0/figures/thread_sweep_*.png` | launched threads/SM별 SM utilization/TFLOPS plot |
 | `results/p0_gpu0/figures/thread_sweep_pjbit_*.png` | launched threads/SM별 matmul logical pJ/bit plot. label은 threads/block와 pJ/bit 값 |
+| `results/p0_gpu0/figures/quality_gate_thread_sweep_*.png` | quality gate pass/fail과 pJ/bit label이 포함된 thread sweep plot |
 | `results/p0_gpu0/figures/power_trace_*.png` | baseline/test power trace 비교 |
 | `results/p0_gpu0/figures/clock_*.png`, `temperature_*.png` | clock/temperature timeline |
 
@@ -335,6 +375,9 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `suppress_output_store` | compute kernel의 final global output store를 제거했는지 여부 |
 | `expected_l2_touch` | timed kernel이 의도적으로 global/L2 traffic을 만들 것으로 예상되는지 여부 |
 | `valid_basic` | power sample, work estimate, positive incremental power/energy에 대한 최소 sanity flag. Nsight 검증을 대체하지 않음 |
+| `valid_no_l2` | `valid_basic=True`이고 `expected_l2_touch=False`인 pair. 의도된 L2/global traffic이 없다는 metadata gate이며, 실제 L2 traffic 0을 증명하지는 않음 |
+| `pure_fp16_candidate` | `valid_no_l2=True`이고 kernel이 FP16 half2 또는 Tensor Core FP16 compute 계열인 후보 |
+| `separation_quality` | `pure_fp16_candidate_no_l2`, `valid_but_expected_l2_touch`, `invalid_or_nonpositive_increment` 등 baseline subtraction 품질 분류 |
 
 `thread_sweep_summary.csv`의 핵심 컬럼은 다음이다.
 
@@ -348,6 +391,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `tflops_mean` | thread point별 평균 Tensor Core throughput |
 | `matmul_input_pj_per_bit_mean` | thread point별 logical input bit 기준 pJ/bit |
 | `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point |
+
+`stats_scope=all_runs_no_valid`는 해당 thread point에서 `valid_basic=True`인 반복이 없었다는 뜻이다. 이 경우 mean/std는 plot과 원인 분석을 위한 전체 run 통계일 뿐, 최종 pJ/bit 후보로 쓰면 안 된다. `valid_no_l2` 역시 “코드가 의도적으로 L2/global memory를 touch하지 않는다”는 조건이지, hardware counter 기반 증명은 아니므로 최종 보고 전에는 Nsight Compute로 `MemoryWorkloadAnalysis`를 확인한다.
 
 최종 보고서에는 `p0_cuda_core_half2_vs_nop`과 `p0_cuda_core_half2_vs_regmove`를 모두 제시하는 것이 좋다. 두 baseline 간 차이는 baseline sensitivity로 취급한다. Tensor Core는 `f16acc`와 `f32acc`를 분리 보고한다.
 
