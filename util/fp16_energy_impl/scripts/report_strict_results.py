@@ -236,6 +236,11 @@ def requirement_rows(
     ncu_context = bool(audit_rows) and all(
         parse_bool(row.get("ncu_validation_context_match")) for row in audit_rows
     )
+    ncu_tensor_activity = bool(audit_rows) and all(
+        parse_bool(row.get("test_ncu_tensor_activity_observed"))
+        and parse_float(row.get("test_ncu_tensor_activity_pct")) > 0.0
+        for row in audit_rows
+    )
     no_spill = bool(audit_rows) and all(
         not parse_bool(row.get("test_resource_has_spills")) and not parse_bool(row.get("baseline_resource_has_spills"))
         for row in audit_rows
@@ -329,6 +334,11 @@ def requirement_rows(
         ),
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
         row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),
+        row(
+            "NCU Tensor activity observed",
+            ncu_tensor_activity,
+            "test_ncu_tensor_activity_observed=true and test_ncu_tensor_activity_pct > 0",
+        ),
         row("ptxas resource audit has no spills", no_spill, "test/baseline_resource_has_spills=false"),
         row(
             "logical m16n16k16 denominator",

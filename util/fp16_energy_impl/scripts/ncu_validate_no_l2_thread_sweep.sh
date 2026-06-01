@@ -17,6 +17,8 @@ NCU_WARMUP="${NCU_WARMUP:-1}"
 NCU_REPEATS="${NCU_REPEATS:-1}"
 NCU_ITERS="${NCU_ITERS:-20000}"
 NCU_SUPPRESS_OUTPUT_STORE="${NCU_SUPPRESS_OUTPUT_STORE:-1}"
+NCU_REQUIRE_TENSOR_ACTIVITY="${NCU_REQUIRE_TENSOR_ACTIVITY:-1}"
+NCU_MIN_TENSOR_ACTIVITY_PCT="${NCU_MIN_TENSOR_ACTIVITY_PCT:-0.0}"
 NCU_SUPPRESS_OUTPUT_STORE_BOOL="false"
 
 COMMON=(
@@ -59,7 +61,7 @@ for threads in "${THREADS_LIST[@]}"; do
     --iters "${NCU_ITERS}"
 done
 
-python3 "$(dirname "$0")/validate_ncu_reports.py" \
+VALIDATE_ARGS=(
   --input "${OUTDIR}" \
   --outdir "${OUTDIR}" \
   --benchmark-blocks-per-sm "${NCU_BLOCKS_PER_SM}" \
@@ -67,7 +69,14 @@ python3 "$(dirname "$0")/validate_ncu_reports.py" \
   --benchmark-suppress-output-store "${NCU_SUPPRESS_OUTPUT_STORE_BOOL}" \
   --benchmark-warmup "${NCU_WARMUP}" \
   --benchmark-repeats "${NCU_REPEATS}" \
-  --benchmark-iters "${NCU_ITERS}"
+  --benchmark-iters "${NCU_ITERS}" \
+  --min-tensor-activity-pct "${NCU_MIN_TENSOR_ACTIVITY_PCT}"
+)
+if [[ "${NCU_REQUIRE_TENSOR_ACTIVITY}" != "0" ]]; then
+  VALIDATE_ARGS+=(--require-tensor-activity)
+fi
+
+python3 "$(dirname "$0")/validate_ncu_reports.py" "${VALIDATE_ARGS[@]}"
 
 echo "Nsight Compute no-L2 thread-sweep reports written to ${OUTDIR}"
 echo "Acceptance check: timed tensor/baseline kernels should show no material L1/L2/DRAM global memory workload beyond profiler noise."

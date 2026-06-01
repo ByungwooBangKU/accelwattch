@@ -11,7 +11,7 @@ SUITE_PREFLIGHT_CSV=""
 REQUIRE_ARCHITECTURES="ga100,gh100,ga102"
 NO_FAIL=0
 REQUIRE_COUNTER_TRACE=0
-REQUIRE_NCU_TENSOR_ACTIVITY=0
+REQUIRE_NCU_TENSOR_ACTIVITY=1
 INPUTS=()
 
 usage() {
@@ -32,7 +32,9 @@ Options:
   --require-counter-trace-agreement
                         Make NVML-counter/power-trace agreement a hard audit gate
   --require-ncu-tensor-activity
-                        Make selected NCU tensor activity evidence a hard audit gate
+                        Keep selected NCU tensor activity evidence as a hard audit gate [default]
+  --no-require-ncu-tensor-activity
+                        Diagnostic mode: do not hard-fail missing selected NCU tensor activity
   --no-fail             Always return success after writing artifacts
   -h, --help            Show this help
 
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     --require-architectures) REQUIRE_ARCHITECTURES="$2"; shift 2 ;;
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
+    --no-require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=0; shift ;;
     --no-fail) NO_FAIL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;

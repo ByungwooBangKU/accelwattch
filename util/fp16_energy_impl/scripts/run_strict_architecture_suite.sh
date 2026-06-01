@@ -20,7 +20,7 @@ MAX_CALIBRATED_REPEATS=1000
 DIAGNOSTIC_NO_NCU=0
 REQUIRE_ARCHITECTURES="ga100,gh100,ga102"
 REQUIRE_COUNTER_TRACE=0
-REQUIRE_NCU_TENSOR_ACTIVITY=0
+REQUIRE_NCU_TENSOR_ACTIVITY=1
 CONTINUE_ON_FAIL=0
 SKIP_PREFLIGHT=0
 ALLOW_COMPUTE_APPS=0
@@ -69,7 +69,9 @@ Options:
   --require-counter-trace-agreement
                        Make NVML-counter/power-trace agreement a hard audit gate
   --require-ncu-tensor-activity
-                       Make selected NCU tensor activity evidence a hard audit gate
+                       Keep selected NCU tensor activity evidence as a hard audit gate [default]
+  --no-require-ncu-tensor-activity
+                       Diagnostic mode: do not hard-fail missing selected NCU tensor activity
   --continue-on-fail   Continue remaining specs after a strict run fails
   --skip-preflight     Skip suite-level tool/GPU/process checks before long runs
   --allow-compute-apps Allow active compute processes on target GPUs during preflight
@@ -99,6 +101,7 @@ while [[ $# -gt 0 ]]; do
     --require-architectures) REQUIRE_ARCHITECTURES="$2"; shift 2 ;;
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
+    --no-require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=0; shift ;;
     --continue-on-fail) CONTINUE_ON_FAIL=1; shift ;;
     --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
     --allow-compute-apps) ALLOW_COMPUTE_APPS=1; shift ;;

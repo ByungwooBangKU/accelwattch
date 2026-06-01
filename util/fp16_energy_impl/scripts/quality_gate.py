@@ -118,6 +118,22 @@ def ncu_context_status(
     return (not failed, failed, warnings)
 
 
+def ncu_tensor_activity_status(kernel: str, ncu: Dict[str, Any]) -> Tuple[bool, str]:
+    if not kernel.startswith("tensor_mma_"):
+        return (True, "not a tensor_mma test kernel")
+    if not ncu:
+        return (False, "missing NCU validation row for tensor activity")
+    if parse_bool(ncu.get("tensor_activity_observed")):
+        pct = parse_float(ncu.get("tensor_activity_pct"))
+        if math.isfinite(pct):
+            return (True, f"NCU tensor activity observed at {pct:.4g}%")
+        return (True, "NCU tensor activity observed")
+    pct = parse_float(ncu.get("tensor_activity_pct"))
+    if math.isfinite(pct):
+        return (False, f"NCU tensor activity not observed; tensor_activity_pct={pct:.4g}%")
+    return (False, "NCU tensor activity is missing")
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -495,6 +511,10 @@ def pair_gate_rows(
             args,
         )
         ncu_context_ok = bool(test_context_ok and baseline_context_ok)
+        test_tensor_activity_ok, test_tensor_activity_note = ncu_tensor_activity_status(
+            str(row.get("test_kernel", "")),
+            test_ncu,
+        )
 
         failed: List[str] = []
         warnings: List[str] = []
@@ -546,6 +566,10 @@ def pair_gate_rows(
                 f"baseline NCU context: {msg}"
                 for msg in baseline_context_failed + baseline_context_warnings
             )
+        if args.require_ncu and args.require_ncu_tensor_activity and not test_tensor_activity_ok:
+            failed.append(f"test NCU tensor activity: {test_tensor_activity_note}")
+        elif args.ncu_summary and not test_tensor_activity_ok:
+            warnings.append(f"test NCU tensor activity: {test_tensor_activity_note}")
 
         out.append(
             {
@@ -584,8 +608,10 @@ def pair_gate_rows(
                 "ncu_validation_pass": ncu_ok,
                 "ncu_validation_context_match": ncu_context_ok,
                 "ncu_required": bool(args.require_ncu),
+                "ncu_tensor_activity_required": bool(args.require_ncu_tensor_activity),
                 "test_ncu_note": test_ncu_note,
                 "baseline_ncu_note": baseline_ncu_note,
+                "test_ncu_tensor_activity_note": test_tensor_activity_note,
                 "test_ncu_validation_blocks_per_sm": test_ncu.get("validation_blocks_per_sm", ""),
                 "baseline_ncu_validation_blocks_per_sm": baseline_ncu.get("validation_blocks_per_sm", ""),
                 "test_ncu_validation_unroll": test_ncu.get("validation_unroll", ""),
@@ -734,6 +760,10 @@ def thread_gate_rows(
             args,
         )
         ncu_context_ok = bool(test_context_ok and baseline_context_ok)
+        test_tensor_activity_ok, test_tensor_activity_note = ncu_tensor_activity_status(
+            str(row.get("test_kernel", "")),
+            test_ncu,
+        )
         if source_info.get("all_nvml"):
             grade = "strict_nvml_counter"
             source_ok = True
@@ -797,6 +827,8 @@ def thread_gate_rows(
         if args.require_ncu and not ncu_context_ok:
             failed.extend([f"test NCU context: {msg}" for msg in test_context_failed])
             failed.extend([f"baseline NCU context: {msg}" for msg in baseline_context_failed])
+        if args.require_ncu and args.require_ncu_tensor_activity and not test_tensor_activity_ok:
+            failed.append(f"test NCU tensor activity: {test_tensor_activity_note}")
         if grade == "power_trace_fallback":
             warnings.append("NVML energy counter was unavailable; using power trace fallback")
         if args.ncu_summary and not args.require_ncu and not ncu_ok:
@@ -807,6 +839,8 @@ def thread_gate_rows(
                 f"baseline NCU context: {msg}"
                 for msg in baseline_context_failed + baseline_context_warnings
             )
+        if args.ncu_summary and not (args.require_ncu and args.require_ncu_tensor_activity) and not test_tensor_activity_ok:
+            warnings.append(f"test NCU tensor activity: {test_tensor_activity_note}")
 
         quality_pass = not failed
 
@@ -857,8 +891,10 @@ def thread_gate_rows(
                 "ncu_validation_pass": ncu_ok,
                 "ncu_validation_context_match": ncu_context_ok,
                 "ncu_required": bool(args.require_ncu),
+                "ncu_tensor_activity_required": bool(args.require_ncu_tensor_activity),
                 "test_ncu_note": test_ncu_note,
                 "baseline_ncu_note": baseline_ncu_note,
+                "test_ncu_tensor_activity_note": test_tensor_activity_note,
                 "test_ncu_validation_blocks_per_sm": test_ncu.get("validation_blocks_per_sm", ""),
                 "baseline_ncu_validation_blocks_per_sm": baseline_ncu.get("validation_blocks_per_sm", ""),
                 "test_ncu_validation_unroll": test_ncu.get("validation_unroll", ""),
@@ -1079,6 +1115,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "warn_counter_trace_ratio_high": args.warn_counter_trace_ratio_high,
             "require_counter_trace_agreement": bool(args.require_counter_trace_agreement),
             "require_ncu": bool(args.require_ncu),
+            "require_ncu_tensor_activity": bool(args.require_ncu_tensor_activity),
             "ncu_summary": str(args.ncu_summary) if args.ncu_summary else "",
         },
         "counts": {
@@ -1106,6 +1143,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "energy_trace_crosscheck_pass compares NVML total-energy delta with nvidia-smi power trace integration; "
             "it is a warning by default because power.draw may be averaged over a different window.",
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
+            "For Tensor Core final claims, --require-ncu-tensor-activity should also be enabled so "
+            "selected tensor_mma rows have profiler-side Tensor pipe activity evidence.",
         ],
     }
     with (input_dir / "quality_gate_summary.json").open("w") as f:
@@ -1141,6 +1180,11 @@ def main() -> int:
     )
     parser.add_argument("--ncu-summary", type=Path, default=None, help="ncu_validation_summary.csv from validate_ncu_reports.py")
     parser.add_argument("--require-ncu", action="store_true", help="Require passing NCU validation for quality_pass")
+    parser.add_argument(
+        "--require-ncu-tensor-activity",
+        action="store_true",
+        help="Require selected tensor_mma rows to have NCU Tensor pipe activity evidence",
+    )
     args = parser.parse_args()
 
     summary_rows = read_csv(args.input / "summary.csv")

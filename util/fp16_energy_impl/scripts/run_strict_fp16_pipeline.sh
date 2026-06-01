@@ -228,6 +228,7 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
 QUALITY_ARGS=(--input "${OUTDIR}" --ncu-summary "${NCDIR}/ncu_validation_summary.csv")
 if [[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]]; then
   QUALITY_ARGS+=(--require-ncu)
+  QUALITY_ARGS+=(--require-ncu-tensor-activity)
 fi
 
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
