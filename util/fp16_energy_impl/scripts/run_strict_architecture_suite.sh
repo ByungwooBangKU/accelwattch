@@ -22,6 +22,8 @@ REQUIRE_ARCHITECTURES="ga100,gh100,ga102"
 REQUIRE_COUNTER_TRACE=0
 REQUIRE_NCU_TENSOR_ACTIVITY=0
 CONTINUE_ON_FAIL=0
+SKIP_PREFLIGHT=0
+ALLOW_COMPUTE_APPS=0
 NO_POSTPROCESS=0
 NO_FAIL=0
 DRY_RUN=0
@@ -69,6 +71,8 @@ Options:
   --require-ncu-tensor-activity
                        Make selected NCU tensor activity evidence a hard audit gate
   --continue-on-fail   Continue remaining specs after a strict run fails
+  --skip-preflight     Skip suite-level tool/GPU/process checks before long runs
+  --allow-compute-apps Allow active compute processes on target GPUs during preflight
   --no-postprocess     Run pipelines only, skip audit/compare/report
   --no-fail            Write artifacts but return success even if a run/postprocess fails
   --dry-run            Print commands without executing them
@@ -96,6 +100,8 @@ while [[ $# -gt 0 ]]; do
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
     --continue-on-fail) CONTINUE_ON_FAIL=1; shift ;;
+    --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
+    --allow-compute-apps) ALLOW_COMPUTE_APPS=1; shift ;;
     --no-postprocess) NO_POSTPROCESS=1; shift ;;
     --no-fail) NO_FAIL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -140,11 +146,48 @@ validate_spec_field() {
 }
 
 mkdir -p "${OUTDIR}/runs"
+PREFLIGHT_JSON="${OUTDIR}/strict_architecture_suite_preflight.json"
+PREFLIGHT_CSV="${OUTDIR}/strict_architecture_suite_preflight.csv"
 RUN_STATUS_CSV="${OUTDIR}/strict_architecture_suite_runs.csv"
 printf 'label,gpu,cuda_arch,nvidia_smi_id,result_dir,status,exit_code\n' > "${RUN_STATUS_CSV}"
 
 COMPLETED_DIRS=()
 SUITE_FAILED=0
+
+if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
+  PREFLIGHT_ARGS=()
+  for spec in "${SPECS[@]}"; do
+    PREFLIGHT_ARGS+=(--spec "${spec}")
+  done
+  PREFLIGHT_ARGS+=(
+    --out-json "${PREFLIGHT_JSON}"
+    --out-csv "${PREFLIGHT_CSV}"
+    --cmake-bin "${CMAKE_BIN}"
+    --python-bin "${PYTHON_BIN}"
+    --nvidia-smi-bin "${NVIDIA_SMI_BIN}"
+  )
+  if [[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]]; then
+    PREFLIGHT_ARGS+=(--require-ncu)
+  fi
+  if [[ "${ALLOW_COMPUTE_APPS}" -eq 1 ]]; then
+    PREFLIGHT_ARGS+=(--allow-compute-apps)
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    PREFLIGHT_ARGS+=(--dry-run)
+  fi
+  if [[ "${NO_FAIL}" -eq 1 ]]; then
+    PREFLIGHT_ARGS+=(--no-fail)
+  fi
+
+  set +e
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/preflight_strict_architecture_suite.py" "${PREFLIGHT_ARGS[@]}"
+  rc=$?
+  set -e
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "Suite preflight failed. See ${PREFLIGHT_JSON} and ${PREFLIGHT_CSV}." >&2
+    exit "${rc}"
+  fi
+fi
 
 for spec in "${SPECS[@]}"; do
   IFS=':' read -r label gpu cuda_arch nvidia_smi_id extra <<< "${spec}"
@@ -247,6 +290,7 @@ fi
 cat <<EOF
 Strict FP16 architecture suite complete:
   output root: ${OUTDIR}
+  preflight: ${PREFLIGHT_JSON}
   run status: ${RUN_STATUS_CSV}
   postprocess: ${POSTPROCESS_DIR}
   completed runs: ${#COMPLETED_DIRS[@]}

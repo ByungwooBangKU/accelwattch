@@ -23,6 +23,7 @@
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/run_strict_architecture_suite.sh` | 여러 GPU spec의 strict pipeline을 순차 실행하고 audit/compare/report까지 자동 생성 |
+| `scripts/preflight_strict_architecture_suite.py` | suite 실행 전 tool, GPU target, active compute process 상태를 JSON/CSV로 검사 |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/calibrate_matrix.py` | GPU별 timed duration을 맞추기 위해 matrix의 per-role `repeats`를 probe 또는 기존 `summary.csv` 기준으로 보정 |
 | `scripts/verify_architecture.py` | runtime preflight JSON의 compute capability/chip/common-HMMA metadata가 요청한 CUDA architecture와 맞는지 검증 |
@@ -127,7 +128,7 @@ Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--c
 ./scripts/run_strict_fp16_pipeline.sh --gpu 0 --cuda-arch 90 --outdir results/strict_fp16_h100
 ```
 
-같은 서버에서 여러 대상 GPU를 볼 수 있으면 suite helper가 세 strict run과 postprocess를 한 번에 실행한다. 각 spec은 `label:CUDA_GPU:CUDA_ARCH[:NVIDIA_SMI_ID]` 형식이다.
+같은 서버에서 여러 대상 GPU를 볼 수 있으면 suite helper가 세 strict run과 postprocess를 한 번에 실행한다. 각 spec은 `label:CUDA_GPU:CUDA_ARCH[:NVIDIA_SMI_ID]` 형식이다. Suite helper는 긴 실험 전에 `strict_architecture_suite_preflight.json/csv`를 만들고, `cmake`/`nvcc`/`ncu`/`nvidia-smi`, GPU 이름과 arch 매칭, target GPU의 active compute process를 확인한다.
 
 ```bash
 ./scripts/run_strict_architecture_suite.sh \
@@ -138,6 +139,8 @@ Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--c
 ```
 
 GPU가 서로 다른 서버에 있으면 각 서버에서 `run_strict_fp16_pipeline.sh`를 실행해 결과 디렉터리를 한 곳으로 복사한 뒤 `postprocess_strict_architectures.sh`를 실행한다. 단일 GPU만 재실험할 때는 suite helper에 `--require-architectures gh100`처럼 현재 architecture만 지정하거나 `--no-postprocess`를 사용한다.
+
+Preflight에서 다른 compute process가 보이면 기본적으로 중단한다. 공유 장비에서 diagnostic만 하고 싶을 때는 `--allow-compute-apps`를 명시하고, `ncu`가 없는 local smoke는 `--diagnostic-no-ncu` 또는 `--skip-preflight`로만 수행한다. 최종 A100/H100/RTX3090 pJ/bit claim에는 이 예외 옵션을 쓰지 않는다.
 
 Scheduler, Docker, Slurm 등에서 `CUDA_VISIBLE_DEVICES`가 GPU 순서를 바꾸는 경우 `--gpu`는 CUDA device ordinal이고, telemetry용 `nvidia-smi` 대상은 UUID로 명시할 수 있다.
 
@@ -436,6 +439,9 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/raw/*/bench.json` | timed loop의 CUDA event timing과 optional NVML total-energy counter delta |
 | `results/p0_gpu0/strict_pipeline_manifest_start.json` | strict pipeline 시작 시점의 invocation, git/tool/env, binary/build/matrix provenance snapshot |
 | `results/p0_gpu0/strict_pipeline_manifest.json` | strict pipeline 완료 시점의 provenance snapshot. binary hash와 quality/NCU/resource 산출물 존재 여부를 포함 |
+| `results/strict_fp16_suite/strict_architecture_suite_preflight.json` | suite 실행 전 tool/GPU/process preflight 결과 |
+| `results/strict_fp16_suite/strict_architecture_suite_preflight.csv` | suite target별 preflight pass/fail 요약 |
+| `results/strict_fp16_suite/strict_architecture_suite_runs.csv` | suite target별 strict run 결과 디렉터리와 exit code |
 | `results/p0_gpu0/runtime_preflight.json` | strict pipeline 시작 전 CUDA runtime/GPU metadata probe |
 | `results/p0_gpu0/architecture_preflight.json` | requested CUDA arch, detected chip, common-HMMA path 검증 결과 |
 | `results/p0_gpu0/calibrated_matrix.json` | strict pipeline에서 GPU별 duration target에 맞춰 생성한 matrix |
