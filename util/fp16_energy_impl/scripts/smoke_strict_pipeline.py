@@ -157,11 +157,20 @@ def resource_row(role: str, kernel: str, threads: int) -> Dict[str, Any]:
     }
 
 
-def compare_thread_row(threads: int, threads_per_sm: int, sm_util: float, pjbit: float, *, target: bool) -> Dict[str, Any]:
+def compare_thread_row(
+    threads: int,
+    threads_per_sm: int,
+    sm_util: float,
+    pjbit: float,
+    *,
+    target: bool,
+    measurement_grade: str = "strict_nvml_counter",
+) -> Dict[str, Any]:
     row = target_row("tensor_mma_f16acc", "tensor_baseline_mov", threads)
     incremental_fraction = 0.03 if threads < 64 else (0.06 if target else 0.07)
     row.update(
         {
+            "measurement_grade": measurement_grade,
             "threads_per_sm": threads_per_sm,
             "avg_sm_util_pct_mean": sm_util,
             "matmul_input_pj_per_bit_mean": pjbit,
@@ -185,11 +194,11 @@ def compare_thread_row(threads: int, threads_per_sm: int, sm_util: float, pjbit:
     return row
 
 
-def write_compare_dir(path: Path) -> None:
+def write_compare_dir(path: Path, *, measurement_grade: str = "strict_nvml_counter") -> None:
     rows = [
-        compare_thread_row(32, 256, 60.0, 0.22, target=False),
-        compare_thread_row(64, 512, 96.0, 0.18, target=True),
-        compare_thread_row(96, 768, 96.05, 0.17, target=False),
+        compare_thread_row(32, 256, 60.0, 0.22, target=False, measurement_grade=measurement_grade),
+        compare_thread_row(64, 512, 96.0, 0.18, target=True, measurement_grade=measurement_grade),
+        compare_thread_row(96, 768, 96.05, 0.17, target=False, measurement_grade=measurement_grade),
     ]
     seed = {
         "gpu": "Synthetic H100",
@@ -215,7 +224,7 @@ def write_compare_dir(path: Path) -> None:
     )
 
 
-def quality_gate_summary_row() -> Dict[str, Any]:
+def quality_gate_summary_row(*, energy_source: str = "nvml_total_energy_counter") -> Dict[str, Any]:
     features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
     row = target_row("tensor_mma_f16acc", "tensor_baseline_mov", 128)
     row.update(
@@ -225,8 +234,8 @@ def quality_gate_summary_row() -> Dict[str, Any]:
             "fp16_path": "tensor_mma_f16acc_vs_tensor_baseline_mov",
             "blocks_per_sm_requested": 8,
             "suppress_output_store": "true",
-            "test_energy_source": "nvml_total_energy_counter",
-            "baseline_energy_source": "nvml_total_energy_counter",
+            "test_energy_source": energy_source,
+            "baseline_energy_source": energy_source,
             "test_power_samples": 10,
             "baseline_power_samples": 10,
             "valid_basic": "true",
@@ -253,9 +262,9 @@ def quality_gate_summary_row() -> Dict[str, Any]:
     return row
 
 
-def quality_gate_thread_row() -> Dict[str, Any]:
+def quality_gate_thread_row(*, energy_source: str = "nvml_total_energy_counter") -> Dict[str, Any]:
     features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
-    row = quality_gate_summary_row()
+    row = quality_gate_summary_row(energy_source=energy_source)
     row.update(
         {
             "run_count": 3,
@@ -275,9 +284,14 @@ def quality_gate_thread_row() -> Dict[str, Any]:
     return row
 
 
-def write_quality_gate_input(path: Path, *, tensor_activity_observed: bool) -> None:
-    write_csv(path / "summary.csv", [quality_gate_summary_row()])
-    write_csv(path / "thread_sweep_summary.csv", [quality_gate_thread_row()])
+def write_quality_gate_input(
+    path: Path,
+    *,
+    tensor_activity_observed: bool,
+    energy_source: str = "nvml_total_energy_counter",
+) -> None:
+    write_csv(path / "summary.csv", [quality_gate_summary_row(energy_source=energy_source)])
+    write_csv(path / "thread_sweep_summary.csv", [quality_gate_thread_row(energy_source=energy_source)])
     write_csv(
         path / "ncu_validation_summary.csv",
         [
@@ -515,7 +529,10 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
 
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"
+    compare_power_trace_input = base / "compare_power_trace_input"
+    compare_power_trace_out = base / "compare_power_trace_out"
     write_compare_dir(compare_input)
+    write_compare_dir(compare_power_trace_input, measurement_grade="power_trace_fallback")
     run(
         [
             sys.executable,
@@ -536,6 +553,24 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     ):
         if not (compare_out / artifact).exists():
             raise AssertionError(f"Architecture compare smoke did not write {artifact}")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "compare_architectures.py"),
+            "--input",
+            str(compare_power_trace_input),
+            "--outdir",
+            str(compare_power_trace_out),
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    compare_power_row = read_single_csv_row(compare_power_trace_out / "architecture_best_fp16.csv")
+    if compare_power_row.get("quality_rejected") != "True":
+        raise AssertionError(f"Power-trace compare row was not rejected by default: {compare_power_row}")
+    if compare_power_row.get("selection_note") != "quality_gate_target_pass_without_strict_nvml_counter":
+        raise AssertionError(f"Unexpected power-trace compare rejection note: {compare_power_row}")
 
     run(
         [
@@ -575,6 +610,36 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     qg_bad_rows = read_csv_rows(quality_gate_bad / "quality_gates.csv")
     if not any("test NCU tensor activity" in row.get("fail_reasons", "") for row in qg_bad_rows):
         raise AssertionError(f"Missing Tensor activity quality gate did not record the failure: {qg_bad_rows}")
+
+    quality_gate_power_trace = base / "quality_gate_power_trace"
+    write_quality_gate_input(
+        quality_gate_power_trace,
+        tensor_activity_observed=True,
+        energy_source="power_trace_integral",
+    )
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "quality_gate.py"),
+            "--input",
+            str(quality_gate_power_trace),
+            "--ncu-summary",
+            str(quality_gate_power_trace / "ncu_validation_summary.csv"),
+            "--require-ncu",
+            "--require-ncu-tensor-activity",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    qg_power_summary = json.loads((quality_gate_power_trace / "quality_gate_summary.json").read_text())
+    if qg_power_summary.get("selected_targets"):
+        raise AssertionError(f"Power-trace fallback quality gate selected a target by default: {qg_power_summary}")
+    qg_power_rows = read_csv_rows(quality_gate_power_trace / "quality_gates.csv")
+    if not any(
+        row.get("target_selection_note") == "quality_pass_non_strict_energy_source_diagnostic"
+        for row in qg_power_rows
+    ):
+        raise AssertionError(f"Power-trace fallback diagnostic note was not recorded: {qg_power_rows}")
 
     audit_good = base / "audit_good"
     run(

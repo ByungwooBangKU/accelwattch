@@ -253,7 +253,28 @@ def is_fp16_candidate(row: Dict[str, Any]) -> bool:
     return pure_count > 0 or valid_no_l2 > 0 or valid > 0
 
 
-def select_best_fp16(rows: List[Dict[str, Any]], *, allow_diagnostic_fallback: bool = False) -> List[Dict[str, Any]]:
+def reject_best_candidate(group: List[Dict[str, Any]], selection_note: str) -> Dict[str, Any]:
+    rejected = dict(max(group, key=lambda row: (
+        int(parse_float(row.get("pure_fp16_candidate_count"), 0.0)),
+        int(parse_float(row.get("valid_no_l2_count"), 0.0)),
+        int(parse_float(row.get("valid_count"), 0.0)),
+    )))
+    rejected["selection_note"] = selection_note
+    rejected["quality_rejected"] = True
+    rejected["target_pass"] = False
+    rejected["matmul_input_pj_per_bit_mean"] = math.nan
+    rejected["tflops_mean"] = math.nan
+    rejected["incremental_power_w_mean"] = math.nan
+    rejected["tensor_model_utilization_pct_mean"] = math.nan
+    return rejected
+
+
+def select_best_fp16(
+    rows: List[Dict[str, Any]],
+    *,
+    allow_diagnostic_fallback: bool = False,
+    allow_legacy_best: bool = False,
+) -> List[Dict[str, Any]]:
     by_input: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         if is_fp16_candidate(row):
@@ -261,36 +282,47 @@ def select_best_fp16(rows: List[Dict[str, Any]], *, allow_diagnostic_fallback: b
 
     selected: List[Dict[str, Any]] = []
     for group in by_input.values():
-        strict_targets = [row for row in group if parse_bool(row.get("target_pass"))]
-        strict_quality = [row for row in group if parse_bool(row.get("quality_pass"))]
-        has_quality_info = any("quality_pass" in row for row in group)
+        target_rows = [row for row in group if parse_bool(row.get("target_pass"))]
+        strict_targets = [
+            row
+            for row in target_rows
+            if str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+        ]
+        strict_quality = [
+            row
+            for row in group
+            if parse_bool(row.get("quality_pass"))
+            and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+        ]
+        diagnostic_quality = [row for row in group if parse_bool(row.get("quality_pass"))]
+        has_quality_info = any(
+            key in row
+            for row in group
+            for key in ("quality_pass", "target_pass", "measurement_grade")
+        )
         if strict_targets:
             pool = strict_targets
-            selection_note = "quality_gate_target_pass"
-        elif strict_quality and allow_diagnostic_fallback:
-            pool = strict_quality
+            selection_note = "quality_gate_strict_nvml_target_pass"
+        elif diagnostic_quality and allow_diagnostic_fallback:
+            pool = diagnostic_quality
             selection_note = "quality_gate_quality_pass_no_target_diagnostic"
         elif has_quality_info:
-            rejected = dict(max(group, key=lambda row: (
-                int(parse_float(row.get("pure_fp16_candidate_count"), 0.0)),
-                int(parse_float(row.get("valid_no_l2_count"), 0.0)),
-                int(parse_float(row.get("valid_count"), 0.0)),
-            )))
-            rejected["selection_note"] = (
-                "quality_gate_no_target_pass"
-                if strict_quality
-                else "quality_gate_failed_no_best"
-            )
-            rejected["quality_rejected"] = True
-            rejected["matmul_input_pj_per_bit_mean"] = math.nan
-            rejected["tflops_mean"] = math.nan
-            rejected["incremental_power_w_mean"] = math.nan
-            rejected["tensor_model_utilization_pct_mean"] = math.nan
-            selected.append(rejected)
+            if target_rows:
+                note = "quality_gate_target_pass_without_strict_nvml_counter"
+            elif strict_quality:
+                note = "quality_gate_no_target_pass"
+            elif diagnostic_quality:
+                note = "quality_gate_quality_pass_without_strict_nvml_counter"
+            else:
+                note = "quality_gate_failed_no_best"
+            selected.append(reject_best_candidate(group, note))
+            continue
+        elif not allow_legacy_best:
+            selected.append(reject_best_candidate(group, "missing_quality_gate_no_best"))
             continue
         else:
             pool = group
-            selection_note = "legacy_or_no_quality_gate"
+            selection_note = "legacy_or_no_quality_gate_diagnostic"
 
         def score(row: Dict[str, Any]) -> Tuple[int, int, int, float, float]:
             pure_count = int(parse_float(row.get("pure_fp16_candidate_count"), 0.0))
@@ -643,9 +675,17 @@ def main() -> int:
         "--allow-diagnostic-best",
         action="store_true",
         help=(
-            "Permit quality_pass rows without target_pass to populate architecture_best_fp16.csv. "
-            "By default, quality-gated result directories require target_pass so final figures do not "
-            "promote non-saturated diagnostic candidates."
+            "Permit quality_pass rows without a strict NVML-counter target_pass to populate "
+            "architecture_best_fp16.csv. By default, quality-gated result directories require "
+            "target_pass and measurement_grade=strict_nvml_counter."
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-best",
+        action="store_true",
+        help=(
+            "Diagnostic mode: permit result directories without quality gate metadata to populate "
+            "architecture_best_fp16.csv. Default strict comparison rejects legacy/no-gate inputs."
         ),
     )
     args = parser.parse_args()
@@ -667,7 +707,11 @@ def main() -> int:
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     best_source = all_threads if all_threads else all_conditions
-    best = select_best_fp16(best_source, allow_diagnostic_fallback=args.allow_diagnostic_best)
+    best = select_best_fp16(
+        best_source,
+        allow_diagnostic_fallback=args.allow_diagnostic_best,
+        allow_legacy_best=args.allow_legacy_best,
+    )
     write_csv(args.outdir / "architecture_condition_summary.csv", all_conditions)
     write_csv(args.outdir / "architecture_summary_rows.csv", all_summary)
     write_csv(args.outdir / "architecture_thread_sweep_summary.csv", all_threads)

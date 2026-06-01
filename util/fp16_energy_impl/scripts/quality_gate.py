@@ -977,10 +977,32 @@ def thread_gate_rows(
                 )
             continue
 
-        max_quality_util = max(util_value(row) for row in quality_rows)
+        target_pool = quality_rows
+        if not args.allow_power_trace_target:
+            target_pool = [
+                row for row in quality_rows
+                if str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+            ]
+
+        if not target_pool:
+            max_quality_util = max(util_value(row) for row in quality_rows)
+            for row in group:
+                row["util_reference_scope"] = "quality_pass_no_strict_nvml_counter"
+                row["util_reference_max_pct"] = max_quality_util
+                row["util_saturated"] = False
+                row["quality_gate_selected_target"] = False
+                row["target_pass"] = False
+                row["target_selection_note"] = (
+                    "quality_pass_non_strict_energy_source_diagnostic"
+                    if parse_bool(row.get("quality_pass"))
+                    else "not_quality_pass"
+                )
+            continue
+
+        max_quality_util = max(util_value(row) for row in target_pool)
         saturated = [
             row
-            for row in quality_rows
+            for row in target_pool
             if util_value(row) >= max_quality_util - args.util_tolerance_pct
         ]
 
@@ -999,6 +1021,7 @@ def thread_gate_rows(
         target = min(saturated, key=target_score) if saturated else None
         saturated_ids = {id(row) for row in saturated}
         target_id = id(target) if target is not None else None
+        target_pool_ids = {id(row) for row in target_pool}
         for row in group:
             row["util_reference_scope"] = "quality_pass"
             row["util_reference_max_pct"] = max_quality_util
@@ -1009,6 +1032,8 @@ def thread_gate_rows(
                 row["target_selection_note"] = "quality_gate_first_saturation_point"
             elif not parse_bool(row.get("quality_pass")):
                 row["target_selection_note"] = "not_quality_pass"
+            elif id(row) not in target_pool_ids:
+                row["target_selection_note"] = "quality_pass_non_strict_energy_source_diagnostic"
             elif id(row) in saturated_ids:
                 row["target_selection_note"] = "quality_pass_saturated_tie_loser"
             else:
@@ -1122,6 +1147,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "require_counter_trace_agreement": bool(args.require_counter_trace_agreement),
             "require_ncu": bool(args.require_ncu),
             "require_ncu_tensor_activity": bool(args.require_ncu_tensor_activity),
+            "allow_power_trace_target": bool(args.allow_power_trace_target),
             "ncu_summary": str(args.ncu_summary) if args.ncu_summary else "",
         },
         "counts": {
@@ -1136,7 +1162,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
         "notes": [
             "valid_no_l2 means valid_basic=True and the benchmark metadata does not expect global/L2 traffic.",
             "It is not a physical proof of zero L2 traffic; Nsight Compute memory counters are still required.",
-            "strict_nvml_counter is preferred for H100/A100/RTX3090 comparison; power_trace_fallback is diagnostic.",
+            "strict_nvml_counter is required for default target_pass selection; "
+            "power_trace_fallback stays diagnostic unless --allow-power-trace-target is used.",
             "Tensor Core final candidates must use tensor_baseline_mov/f32, not the legacy baseline_nop.",
             "energy_signal_reliable requires incremental energy to be a configurable minimum fraction of test energy.",
             "measurement_resolution_reliable requires enough elapsed time and energy magnitude for stable measurement.",
@@ -1190,6 +1217,14 @@ def main() -> int:
         "--require-ncu-tensor-activity",
         action="store_true",
         help="Require selected tensor_mma rows to have NCU Tensor pipe activity evidence",
+    )
+    parser.add_argument(
+        "--allow-power-trace-target",
+        action="store_true",
+        help=(
+            "Diagnostic mode: allow power_trace_fallback quality_pass rows to become target_pass. "
+            "Default target selection requires strict_nvml_counter."
+        ),
     )
     args = parser.parse_args()
 
