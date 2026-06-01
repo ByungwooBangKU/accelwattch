@@ -74,6 +74,8 @@ def fmt_value(value: Any, digits: int = 4, missing: str = "") -> str:
     if math.isfinite(parsed):
         return f"{parsed:.{digits}g}"
     text = str(value).strip() if value is not None else ""
+    if text.upper() in {"N/A", "[N/A]", "NAN"}:
+        return missing
     return text if text else missing
 
 
@@ -95,7 +97,12 @@ def relative_link(target: Path, base: Path) -> str:
     return os.path.relpath(target.resolve(), base.resolve()).replace(os.sep, "/")
 
 
-def load_inputs(audit_dir: Path | None, compare_dir: Path | None, suite_preflight_json: Path | None) -> Dict[str, Any]:
+def load_inputs(
+    audit_dir: Path | None,
+    compare_dir: Path | None,
+    architecture_model_dir: Path | None,
+    suite_preflight_json: Path | None,
+) -> Dict[str, Any]:
     audit_rows: List[Dict[str, Any]] = []
     audit_json: Dict[str, Any] = {}
     preflight_json: Dict[str, Any] = {}
@@ -103,6 +110,7 @@ def load_inputs(audit_dir: Path | None, compare_dir: Path | None, suite_prefligh
     thread_rows: List[Dict[str, Any]] = []
     quality_rows: List[Dict[str, Any]] = []
     resource_rows: List[Dict[str, Any]] = []
+    architecture_model_rows: List[Dict[str, Any]] = []
 
     if audit_dir:
         audit_rows = read_csv(audit_dir / "strict_result_audit.csv")
@@ -114,6 +122,8 @@ def load_inputs(audit_dir: Path | None, compare_dir: Path | None, suite_prefligh
         thread_rows = read_csv(compare_dir / "architecture_thread_sweep_summary.csv")
         quality_rows = read_csv(compare_dir / "architecture_quality_gates.csv")
         resource_rows = read_csv(compare_dir / "architecture_resource_occupancy.csv")
+    if architecture_model_dir:
+        architecture_model_rows = read_csv(architecture_model_dir / "architecture_model_summary.csv")
 
     return {
         "audit_rows": audit_rows,
@@ -123,10 +133,16 @@ def load_inputs(audit_dir: Path | None, compare_dir: Path | None, suite_prefligh
         "thread_rows": thread_rows,
         "quality_rows": quality_rows,
         "resource_rows": resource_rows,
+        "architecture_model_rows": architecture_model_rows,
     }
 
 
-def artifact_links(audit_dir: Path | None, compare_dir: Path | None, outdir: Path) -> List[str]:
+def artifact_links(
+    audit_dir: Path | None,
+    compare_dir: Path | None,
+    architecture_model_dir: Path | None,
+    outdir: Path,
+) -> List[str]:
     candidates: List[Path] = []
     if audit_dir:
         candidates.extend(
@@ -154,6 +170,12 @@ def artifact_links(audit_dir: Path | None, compare_dir: Path | None, outdir: Pat
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_pjbit_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_model_util_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_resource_occupancy_*.png")))
+    if architecture_model_dir:
+        candidates.extend(
+            [
+                architecture_model_dir / "architecture_model_dense_peak.png",
+            ]
+        )
 
     links = []
     seen = set()
@@ -169,6 +191,7 @@ def requirement_rows(
     audit_rows: List[Dict[str, Any]],
     audit_json: Dict[str, Any],
     preflight_json: Dict[str, Any],
+    architecture_model_rows: List[Dict[str, Any]],
     required_architectures: Sequence[str],
 ) -> List[Dict[str, Any]]:
     passed = {str(row.get("architecture_chip", "")) for row in audit_rows if parse_bool(row.get("audit_pass"))}
@@ -210,6 +233,17 @@ def requirement_rows(
     )
     model_util = bool(audit_rows) and all(
         parse_float(row.get("tensor_model_utilization_pct_mean")) > 0.0 for row in audit_rows
+    )
+    model_chips = {str(row.get("architecture_chip", "")) for row in architecture_model_rows}
+    missing_model_chips = [chip for chip in required_architectures if chip not in model_chips]
+    model_error_values = [
+        abs(parse_float(row.get("reference_error_pct")))
+        for row in architecture_model_rows
+        if math.isfinite(parse_float(row.get("reference_error_pct")))
+    ]
+    model_max_error = max(model_error_values) if model_error_values else math.nan
+    model_sanity = bool(architecture_model_rows) and not missing_model_chips and (
+        math.isfinite(model_max_error) and model_max_error <= 1.0
     )
     overall_json_pass = bool(audit_json.get("overall_pass", False))
     preflight_schema = str(preflight_json.get("preflight_schema", "") or "")
@@ -259,6 +293,14 @@ def requirement_rows(
         ),
         row("positive logical FP16 pJ/bit", positive_pjbit, "matmul_input_pj_per_bit_mean > 0"),
         row("positive Tensor Core model utilization", model_util, "tensor_model_utilization_pct_mean > 0"),
+        row(
+            "architecture peak model sanity",
+            model_sanity,
+            "chips="
+            + ",".join(sorted(model_chips))
+            + (f"; max_reference_error_pct={model_max_error:.3g}" if math.isfinite(model_max_error) else "")
+            + ("; missing=" + ",".join(missing_model_chips) if missing_model_chips else ""),
+        ),
     ]
 
 
@@ -348,8 +390,10 @@ def write_markdown(
     title: str,
     audit_dir: Path | None,
     compare_dir: Path | None,
+    architecture_model_dir: Path | None,
     rows: List[Dict[str, Any]],
     req_rows: List[Dict[str, Any]],
+    architecture_model_rows: List[Dict[str, Any]],
     audit_json: Dict[str, Any],
     suite_preflight_json: Path | None,
     suite_preflight_csv: Path | None,
@@ -372,6 +416,8 @@ def write_markdown(
         report.append(f"- Audit directory: `{audit_dir}`")
     if compare_dir:
         report.append(f"- Architecture compare directory: `{compare_dir}`")
+    if architecture_model_dir:
+        report.append(f"- Architecture model directory: `{architecture_model_dir}`")
     if suite_preflight_json:
         report.append(f"- Suite preflight JSON: `{suite_preflight_json}`")
     if suite_preflight_csv:
@@ -444,6 +490,40 @@ def write_markdown(
             ]
         )
 
+    if architecture_model_rows:
+        report.extend(
+            [
+                "## Architecture Model Sanity",
+                "",
+                markdown_table(
+                    [
+                        "Arch",
+                        "CUDA arch",
+                        "FLOP/SM/cycle",
+                        "SMs",
+                        "Clock MHz",
+                        "Reference TFLOPS",
+                        "Derived TFLOPS",
+                        "Error %",
+                    ],
+                    [
+                        [
+                            r.get("architecture_chip", ""),
+                            r.get("recommended_cuda_arch", ""),
+                            fmt_value(r.get("dense_tensor_fp16_flop_per_sm_cycle")),
+                            fmt_value(r.get("reference_sm_count")),
+                            fmt_value(r.get("reference_boost_clock_mhz")),
+                            fmt_value(r.get("reference_dense_tensor_fp16_tflops")),
+                            fmt_value(r.get("derived_dense_tensor_fp16_tflops")),
+                            fmt_value(r.get("reference_error_pct")),
+                        ]
+                        for r in architecture_model_rows
+                    ],
+                ),
+                "",
+            ]
+        )
+
     if links:
         report.extend(["## Figures", "", *links, ""])
 
@@ -467,6 +547,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a strict FP16 Markdown report")
     parser.add_argument("--audit-dir", type=Path, default=None, help="Directory from audit_strict_results.py")
     parser.add_argument("--compare-dir", type=Path, default=None, help="Directory from compare_architectures.py")
+    parser.add_argument("--architecture-model-dir", type=Path, default=None, help="Directory from architecture_models.py")
     parser.add_argument("--suite-preflight-json", type=Path, default=None)
     parser.add_argument("--suite-preflight-csv", type=Path, default=None)
     parser.add_argument("--outdir", type=Path, required=True)
@@ -478,11 +559,17 @@ def main() -> int:
         raise SystemExit("Provide --audit-dir, --compare-dir, or both")
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    loaded = load_inputs(args.audit_dir, args.compare_dir, args.suite_preflight_json)
+    loaded = load_inputs(args.audit_dir, args.compare_dir, args.architecture_model_dir, args.suite_preflight_json)
     required = [item.strip() for item in args.require_architectures.split(",") if item.strip()]
     rows = summary_rows(loaded["audit_rows"], loaded["best_rows"])
-    req_rows = requirement_rows(loaded["audit_rows"], loaded["audit_json"], loaded["preflight_json"], required)
-    links = artifact_links(args.audit_dir, args.compare_dir, args.outdir)
+    req_rows = requirement_rows(
+        loaded["audit_rows"],
+        loaded["audit_json"],
+        loaded["preflight_json"],
+        loaded["architecture_model_rows"],
+        required,
+    )
+    links = artifact_links(args.audit_dir, args.compare_dir, args.architecture_model_dir, args.outdir)
 
     write_csv(args.outdir / "fp16_strict_report_summary.csv", rows)
     write_csv(args.outdir / "fp16_strict_report_requirements.csv", req_rows)
@@ -494,8 +581,10 @@ def main() -> int:
         args.title,
         args.audit_dir,
         args.compare_dir,
+        args.architecture_model_dir,
         rows,
         req_rows,
+        loaded["architecture_model_rows"],
         loaded["audit_json"],
         args.suite_preflight_json,
         args.suite_preflight_csv,

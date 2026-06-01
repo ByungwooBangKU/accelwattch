@@ -119,6 +119,7 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
 REPORT_ARGS=(
   --audit-dir "${AUDIT_DIR}" \
   --compare-dir "${COMPARE_DIR}" \
+  --architecture-model-dir "${ARCH_MODEL_DIR}" \
   --outdir "${REPORT_DIR}" \
   --require-architectures "${REQUIRE_ARCHITECTURES}"
 )
