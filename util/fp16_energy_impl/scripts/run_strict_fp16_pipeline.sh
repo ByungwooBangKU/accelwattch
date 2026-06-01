@@ -16,14 +16,19 @@ CMAKE_BIN="${CMAKE_BIN:-cmake}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 SKIP_BUILD=0
 DIAGNOSTIC_NO_NCU=0
+CALIBRATE_MATRIX=1
+TARGET_TEST_S=1.0
+TARGET_BASELINE_S=1.0
+MAX_CALIBRATED_REPEATS=1000
 
 usage() {
   cat <<'USAGE'
 Usage: run_strict_fp16_pipeline.sh [options]
 
 Runs the strict FP16 Tensor Core pJ/bit pipeline:
-  build -> env capture -> structural-baseline thread sweep -> analyze
-  -> Nsight Compute no-L2 validation -> quality gate --require-ncu
+  build -> env capture -> runtime preflight -> matrix repeat calibration
+  -> structural-baseline thread sweep -> analyze -> Nsight Compute no-L2 validation
+  -> quality gate --require-ncu
 
 Options:
   --gpu N              CUDA/NVML GPU index [0]
@@ -35,6 +40,12 @@ Options:
   --threads CSV        Threads/block list for NCU validation [32,64,96,128,160,192,224,256,288,320,384]
   --build-dir DIR      Build directory relative to fp16_energy_impl [build]
   --skip-build         Reuse existing binary
+  --no-calibrate-matrix
+                        Use configs/fp16_matmul_thread_sweep_fine.json without GPU-specific repeat calibration
+  --target-test-s S     Target test CUDA-event duration for calibrated matrix [1.0]
+  --target-baseline-s S Target baseline CUDA-event duration for calibrated matrix [1.0]
+  --max-calibrated-repeats N
+                        Upper bound for calibrated per-role repeats [1000]
   --diagnostic-no-ncu  Do not require NCU in quality gate; for local diagnostic only
   -h, --help           Show this help
 
@@ -54,6 +65,10 @@ while [[ $# -gt 0 ]]; do
     --threads) THREADS_CSV="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --no-calibrate-matrix) CALIBRATE_MATRIX=0; shift ;;
+    --target-test-s) TARGET_TEST_S="$2"; shift 2 ;;
+    --target-baseline-s) TARGET_BASELINE_S="$2"; shift 2 ;;
+    --max-calibrated-repeats) MAX_CALIBRATED_REPEATS="$2"; shift 2 ;;
     --diagnostic-no-ncu) DIAGNOSTIC_NO_NCU=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -83,6 +98,8 @@ NCDIR="${OUTDIR}/ncu_no_l2_thread_sweep"
 ENV_OUT="${OUTDIR}/env_gpu${GPU_ID}.txt"
 BUILD_LOG="${OUTDIR}/build_ptxas.log"
 RESOURCE_DIR="${OUTDIR}/resource_audit"
+BASE_MATRIX="${ROOT}/configs/fp16_matmul_thread_sweep_fine.json"
+MATRIX_PATH="${BASE_MATRIX}"
 
 if [[ -z "${NVIDIA_SMI_ID}" ]]; then
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -116,9 +133,22 @@ RUNTIME_PREFLIGHT_JSON="${OUTDIR}/runtime_preflight.json"
   --suppress-output-store \
   --json-out "${RUNTIME_PREFLIGHT_JSON}"
 
+if [[ "${CALIBRATE_MATRIX}" -eq 1 ]]; then
+  MATRIX_PATH="${OUTDIR}/calibrated_matrix.json"
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/calibrate_matrix.py" \
+    --matrix "${BASE_MATRIX}" \
+    --out-matrix "${MATRIX_PATH}" \
+    --outdir "${OUTDIR}" \
+    --binary "${BINARY}" \
+    --gpu "${GPU_ID}" \
+    --target-test-s "${TARGET_TEST_S}" \
+    --target-baseline-s "${TARGET_BASELINE_S}" \
+    --max-repeats "${MAX_CALIBRATED_REPEATS}"
+fi
+
 "${PYTHON_BIN}" "${SCRIPT_DIR}/run_experiment.py" \
   --binary "${BINARY}" \
-  --matrix "${ROOT}/configs/fp16_matmul_thread_sweep_fine.json" \
+  --matrix "${MATRIX_PATH}" \
   --gpu "${GPU_ID}" \
   --nvidia-smi-id "${NVIDIA_SMI_ID}" \
   --sample-ms "${SAMPLE_MS}" \
