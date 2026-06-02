@@ -1216,6 +1216,7 @@ exit 1
         "architecture_strict_coverage.csv",
         "architecture_strict_coverage.png",
         "architecture_thread_sweep_util_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
+        "architecture_thread_sweep_util_pjbit_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
         "architecture_thread_sweep_pjbit_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
         "architecture_thread_sweep_energy_fraction_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
     ):

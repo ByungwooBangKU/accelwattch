@@ -178,6 +178,7 @@ def artifact_links(
             ]
         )
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_util_*.png")))
+        candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_util_pjbit_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_pjbit_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_model_util_*.png")))
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_energy_fraction_*.png")))

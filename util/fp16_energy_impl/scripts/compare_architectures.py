@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 from matplotlib.ticker import ScalarFormatter
 
 
@@ -614,6 +616,48 @@ def scatter_quality_point(ax: Any, x: float, y: float, row: Dict[str, Any], colo
         ax.scatter([x], [y], marker="s", s=38, facecolors="0.85", edgecolors=color, linewidths=1.0, zorder=4)
 
 
+def quality_marker_style(row: Dict[str, Any]) -> Dict[str, Any]:
+    cls = quality_class(row)
+    if cls == "target":
+        return {"marker": "*", "s": 150, "linewidths": 0.8}
+    if cls == "diagnostic_target":
+        return {"marker": "D", "s": 74, "linewidths": 0.8}
+    if cls == "quality":
+        return {"marker": "o", "s": 58, "linewidths": 1.3}
+    if cls == "failed":
+        return {"marker": "x", "s": 62, "linewidths": 1.5}
+    return {"marker": "s", "s": 42, "linewidths": 1.0}
+
+
+def scatter_quality_point_with_pjbit(
+    ax: Any,
+    x: float,
+    y: float,
+    row: Dict[str, Any],
+    *,
+    norm: Normalize,
+    cmap: str,
+    edge_color: str,
+) -> bool:
+    pjbit = parse_float(row.get("matmul_input_pj_per_bit_mean"))
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(pjbit)):
+        return False
+    style = quality_marker_style(row)
+    kwargs = {
+        "marker": style["marker"],
+        "s": style["s"],
+        "linewidths": style["linewidths"],
+        "c": [pjbit],
+        "cmap": cmap,
+        "norm": norm,
+        "zorder": 5 if quality_class(row) in {"target", "diagnostic_target"} else 4,
+    }
+    if style["marker"] != "x":
+        kwargs["edgecolors"] = "black" if quality_class(row) in {"target", "diagnostic_target"} else edge_color
+    ax.scatter([x], [y], **kwargs)
+    return True
+
+
 def add_quality_legend(ax: Any) -> None:
     from matplotlib.lines import Line2D
 
@@ -739,6 +783,110 @@ def plot_thread_compare(thread_rows: List[Dict[str, Any]], outdir: Path) -> None
             safe = f"architecture_thread_sweep_util_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
             fig.savefig(outdir / safe, dpi=160)
         plt.close(fig)
+
+        finite_pjbit_rows = [
+            r for r in rows if math.isfinite(parse_float(r.get("matmul_input_pj_per_bit_mean")))
+        ]
+        if finite_pjbit_rows:
+            pj_vals = [parse_float(r.get("matmul_input_pj_per_bit_mean")) for r in finite_pjbit_rows]
+            vmin = min(pj_vals)
+            vmax = max(pj_vals)
+            if vmin == vmax:
+                delta = abs(vmin) * 0.05 if vmin else 1.0
+                vmin -= delta
+                vmax += delta
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            cmap = "viridis_r"
+            fig, ax = plt.subplots(figsize=(9.4, 5.4))
+            plotted = False
+            for label in sorted({str(r.get("architecture_label", "")) for r in rows}):
+                group = [r for r in rows if str(r.get("architecture_label", "")) == label]
+                group = sorted(group, key=lambda r: parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))))
+                xs = [parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))) for r in group]
+                ys = [parse_float(r.get("avg_sm_util_pct_mean")) for r in group]
+                if not any(math.isfinite(y) for y in ys):
+                    ys = [parse_float(r.get("avg_gpu_util_pct_mean")) for r in group]
+                if not any(math.isfinite(y) for y in ys):
+                    continue
+                line = ax.plot(xs, ys, linewidth=1.0, alpha=0.35, label=label)[0]
+                edge_color = line.get_color()
+                finite_xs = [x for x in xs if math.isfinite(x)]
+                finite_ys = [y for y in ys if math.isfinite(y)]
+                x_max = max(finite_xs) if finite_xs else math.nan
+                y_max = max(finite_ys) if finite_ys else math.nan
+                for r, x, y in zip(group, xs, ys):
+                    plotted = scatter_quality_point_with_pjbit(
+                        ax,
+                        x,
+                        y,
+                        r,
+                        norm=norm,
+                        cmap=cmap,
+                        edge_color=edge_color,
+                    ) or plotted
+
+                label_rows = [
+                    r
+                    for r in group
+                    if quality_class(r) in {"target", "diagnostic_target"} or parse_bool(r.get("selected_optimal"))
+                ]
+                valid_no_l2 = [
+                    r
+                    for r in group
+                    if parse_float(r.get("matmul_input_pj_per_bit_mean"), math.inf) > 0.0
+                    and parse_float(r.get("valid_no_l2_count"), 0.0) > 0.0
+                ]
+                if valid_no_l2:
+                    label_rows.append(
+                        min(valid_no_l2, key=lambda r: parse_float(r.get("matmul_input_pj_per_bit_mean"), math.inf))
+                    )
+                seen_label_ids = set()
+                for r in label_rows:
+                    row_id = id(r)
+                    if row_id in seen_label_ids:
+                        continue
+                    seen_label_ids.add(row_id)
+                    x = parse_float(r.get("threads_per_sm"), parse_float(r.get("threads")))
+                    y = parse_float(r.get("avg_sm_util_pct_mean"))
+                    if not math.isfinite(y):
+                        y = parse_float(r.get("avg_gpu_util_pct_mean"))
+                    if not (math.isfinite(x) and math.isfinite(y)):
+                        continue
+                    label_text = selected_annotation(r)
+                    if quality_class(r) not in {"target", "diagnostic_target"} and not parse_bool(r.get("selected_optimal")):
+                        label_text = "lowest pJ/b\n" + label_text
+                    near_right = math.isfinite(x_max) and x >= x_max * 0.78
+                    near_top = (math.isfinite(y_max) and y >= y_max - 0.2) or y >= 98.0
+                    x_offset = -8 if near_right else 8
+                    y_offset = -34 if near_top else 8
+                    ax.annotate(
+                        label_text,
+                        (x, y),
+                        textcoords="offset points",
+                        xytext=(x_offset, y_offset),
+                        ha="right" if near_right else "left",
+                        va="top" if near_top else "bottom",
+                        fontsize=8,
+                        bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "none", "alpha": 0.76},
+                    )
+
+            if plotted:
+                ax.set_xlabel("Launched threads per SM")
+                ax.set_ylabel("Avg SM utilization (%)")
+                ax.set_title(
+                    f"Architecture thread sweep utilization colored by pJ/bit: {test_kernel} vs {baseline_kernel}"
+                )
+                ax.get_xaxis().set_major_formatter(ScalarFormatter())
+                ax.grid(True, axis="y", alpha=0.25)
+                arch_legend = ax.legend(loc="best", title="architecture")
+                ax.add_artist(arch_legend)
+                add_quality_legend(ax)
+                cbar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax)
+                cbar.set_label("pJ/logical input bit")
+                fig.tight_layout()
+                safe = f"architecture_thread_sweep_util_pjbit_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
+                fig.savefig(outdir / safe, dpi=160)
+            plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(8.8, 5.2))
         plotted = False
