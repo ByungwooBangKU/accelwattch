@@ -1,0 +1,241 @@
+{
+  "manifest_schema": "fp16-strict-pipeline-manifest-v1",
+  "status": "started",
+  "generated_utc": "2026-06-02T10:43:41.870231+00:00",
+  "generated_unix_ns": 1780397021870247372,
+  "invocation": "./scripts/run_strict_fp16_pipeline.sh --gpu 0 --cuda-arch 86 --matrix configs/fp16_matmul_launch_shape_sweep.json --threads 32\\,64\\,96\\,128\\,160\\,192\\,224\\,256\\,288\\,320\\,384 --ncu-blocks-per-sm-csv 1\\,2\\,4\\,8 --run-work-slope --outdir results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341 ",
+  "parameters": {
+    "gpu": "0",
+    "nvidia_smi_id": "0",
+    "cuda_arch": "86",
+    "repeat": "10",
+    "sample_ms": "100",
+    "threads": "32,64,96,128,160,192,224,256,288,320,384",
+    "ncu_blocks_per_sm_csv": "1,2,4,8",
+    "build_dir": "build",
+    "skip_build": "0",
+    "skip_preflight": "0",
+    "allow_compute_apps": "0",
+    "diagnostic_no_ncu": "0",
+    "calibrate_matrix": "1",
+    "target_test_s": "1.0",
+    "target_baseline_s": "1.0",
+    "max_calibrated_repeats": "1000",
+    "require_kernel": "tensor_mma_f16acc",
+    "require_baseline": "tensor_baseline_mov",
+    "run_work_slope": "1",
+    "work_slope_unrolls": "1,2,4,8,16",
+    "work_slope_iters": "2000000",
+    "work_slope_warmup": "2",
+    "work_slope_test_repeats": "2",
+    "work_slope_baseline_repeats": "30",
+    "work_slope_repeat": "1"
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "",
+    "CUDA_DEVICE_ORDER": "",
+    "CMAKE_CUDA_FLAGS": "-I/tmp/fp16-energy-sm86-cuda121/include -L/tmp/fp16-energy-sm86-cuda121/targets/x86_64-linux/lib",
+    "MPLCONFIGDIR": "/tmp/mpl_fp16_rtx3090_sm86",
+    "NCU_METRICS": "",
+    "NCU_BLOCKS_PER_SM_CSV": "",
+    "NCU_BIN": "/tmp/fp16-energy-sm86-cuda121/nsight-compute/2024.1.1/ncu",
+    "NVCC_BIN": "/tmp/fp16-energy-sm86-cuda121/bin/nvcc",
+    "PATH": "/tmp/fp16-energy-sm86-cuda121/bin:/home/bang001/.local/bin:/home/bang001/.local/bin:/home/bang001/.codex/tmp/arg0/codex-arg0sp7Awt:/home/bang001/.vscode-server/bin/8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e/bin/remote-cli:/home/bang001/.local/bin:/home/bang001/.nvm/versions/node/v22.19.0/bin:/home/bang001/.local/bin:/home/bang001/miniforge3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/usr/lib/wsl/lib:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS:/mnt/c/WINDOWS/System32/Wbem:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/:/mnt/c/WINDOWS/System32/OpenSSH/:/mnt/c/Program Files/cursor/resources/app/bin:/mnt/c/Program Files/Microsoft VS Code/bin:/mnt/c/Program Files/NVIDIA Corporation/Nsight Compute 2025.4.1/:/mnt/c/Program Files/Bandizip/:/mnt/c/Program Files/Git/cmd:/mnt/c/Program Files/PowerShell/7/:/mnt/c/Users/DMQA/AppData/Local/Microsoft/WindowsApps:/mnt/c/Users/DMQA/AppData/Local/Programs/Antigravity/bin:/snap/bin:/home/bang001/.vscode-server/extensions/openai.chatgpt-26.527.60818-linux-x64/bin/linux-x86_64",
+    "LD_LIBRARY_PATH": ""
+  },
+  "git": {
+    "head": {
+      "command": [
+        "git",
+        "rev-parse",
+        "HEAD"
+      ],
+      "returncode": 0,
+      "stdout": "e70160384e3f12384cb02fd25b8ff343c6c3969f",
+      "stderr": ""
+    },
+    "branch": {
+      "command": [
+        "git",
+        "branch",
+        "--show-current"
+      ],
+      "returncode": 0,
+      "stdout": "codex/fp16-energy-results",
+      "stderr": ""
+    },
+    "status_short": {
+      "command": [
+        "git",
+        "status",
+        "--short"
+      ],
+      "returncode": 0,
+      "stdout": "D ../dram_util_experiment/reports/.gitignore\n D ../dram_util_experiment/reports/pjbit_method.png\n D ../dram_util_experiment/reports/util_cupy_rtx_3090_20260417_183743.csv\n D ../dram_util_experiment/reports/util_cupy_rtx_3090_20260417_183743.png\n?? ../dram_util_experiment/hbm_interposer_energy_breakdown.svg\n?? ../dram_util_experiment/reports.zip\n?? ../dram_util_experiment/reports/nvidia_geforce_rtx_3090_202605181630/\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_analysis.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_analysis.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_bandwidth.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_metadata.json\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_quality_checks.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_summary.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_trace.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_173907_rtx3090_zero_recheck_rep1_write_patterns.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_analysis.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_analysis.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_bandwidth.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_metadata.json\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_quality_checks.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_summary.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_trace.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_174951_rtx3090_zero_recheck_rep2_write_patterns.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_analysis.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_analysis.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_bandwidth.png\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_metadata.json\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_quality_checks.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_summary.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_trace.csv\n?? ../dram_util_experiment/reports/pjbit_cupy_nvidia_geforce_rtx_3090_20260514_180035_rtx3090_zero_recheck_rep3_write_patterns.png\n?? ../dram_util_experiment/reports/rtx3090_zero_recheck_repeat_summary.csv\n?? ../dram_util_experiment/reports/rtx3090_zero_recheck_repeat_summary.png\n?? ../dram_util_experiment/reports1/\n?? tmp.txt\n?? ../power.txt",
+      "stderr": ""
+    }
+  },
+  "tool_versions": {
+    "python": {
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/bin/python",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "Python 3.10.20",
+      "stderr": ""
+    },
+    "cmake": {
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/bin/cmake",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "cmake version 4.3.3\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).",
+      "stderr": ""
+    },
+    "nvidia_smi": {
+      "command": [
+        "/usr/lib/wsl/lib/nvidia-smi",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "NVIDIA-SMI version  : 590.57\nNVML version        : 590.57\nDRIVER version      : 591.86\nCUDA Version        : 13.1",
+      "stderr": ""
+    },
+    "nvcc": {
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/bin/nvcc",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2023 NVIDIA Corporation\nBuilt on Mon_Apr__3_17:16:06_PDT_2023\nCuda compilation tools, release 12.1, V12.1.105\nBuild cuda_12.1.r12.1/compiler.32688072_0",
+      "stderr": ""
+    },
+    "ncu": {
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/nsight-compute/2024.1.1/ncu",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "NVIDIA (R) Nsight Compute Command Line Profiler\nCopyright (c) 2018-2024 NVIDIA Corporation\nVersion 2024.1.1.0 (build 33998838) (public-release)",
+      "stderr": ""
+    }
+  },
+  "artifacts": {
+    "root": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl",
+    "outdir": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341",
+    "binary": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/build/fp16_energy_bench",
+      "exists": true,
+      "is_file": true,
+      "size_bytes": 2332552,
+      "sha256": "fbd77e028f055e3c7be3e3d9e531e09989775013dd366fa7b3ccfba8aaba0534"
+    },
+    "build_log": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/build_ptxas.log",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "pipeline_preflight_json": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/strict_pipeline_preflight.json",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "pipeline_preflight_csv": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/strict_pipeline_preflight.csv",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "base_matrix": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/configs/fp16_matmul_launch_shape_sweep.json",
+      "exists": true,
+      "is_file": true,
+      "size_bytes": 3509,
+      "sha256": "f2ecb8866de06846dd295d43b386b6bc494702ee193d4e5279f8336e857bbe03"
+    },
+    "matrix": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/configs/fp16_matmul_launch_shape_sweep.json",
+      "exists": true,
+      "is_file": true,
+      "size_bytes": 3509,
+      "sha256": "f2ecb8866de06846dd295d43b386b6bc494702ee193d4e5279f8336e857bbe03"
+    },
+    "quality_gates": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/quality_gates.csv",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "quality_gate_summary": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/quality_gate_summary.json",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "ncu_permission_probe_json": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/ncu_permission_probe/ncu_permission_probe.json",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "ncu_permission_probe_csv": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/ncu_permission_probe/ncu_permission_probe.csv",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "ncu_permission_probe_log": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/ncu_permission_probe/ncu_permission_probe.ncu.txt",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "ncu_validation_summary": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/ncu_no_l2_thread_sweep/ncu_validation_summary.csv",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "resource_audit": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/resource_audit/thread_resource_occupancy.csv",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "work_slope_matrix": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/work_slope_matrix.json",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "work_slope_summary": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/work_slope_summary.csv",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    "work_slope_nested_summary": {
+      "path": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/work_slope/work_slope_summary.csv",
+      "exists": false,
+      "is_file": false,
+      "size_bytes": 0,
+      "sha256": ""
+    }
+  }
+}

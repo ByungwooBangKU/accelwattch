@@ -15,12 +15,13 @@
 
 ## 1. 현재 결론
 
-아직 최종 publishable strict pJ/bit 값은 없다. RTX 3090에서 여러 diagnostic sweep과 strict-like pipeline을 수행했지만, 현재 장비에서 Nsight Compute performance counter 접근이 `ERR_NVGPUCTRPERM`으로 막혀 no-L2/global-memory 조건과 Tensor Core HMMA activity를 hardware counter로 증명하지 못했다. 따라서 아래 pJ/bit 값은 모두 `baseline-subtracted incremental FP16 compute energy estimate`이며, 최종 A100/H100/RTX3090 비교값이 아니다.
+아직 최종 publishable strict pJ/bit 값은 없다. RTX 3090에서 여러 diagnostic sweep과 strict-like pipeline을 수행했고, 2026-06-02 19:43 KST에는 diagnostic flag 없이 strict NCU pipeline도 재실행했다. 이 run은 preflight/build/runtime/architecture check까지 통과했지만, 현재 WSL2/Windows host 장비에서 Nsight Compute performance counter 접근이 `ERR_NVGPUCTRPERM`으로 막혀 no-L2/global-memory 조건과 Tensor Core HMMA activity를 hardware counter로 증명하지 못했다. 따라서 아래 pJ/bit 값은 모두 `baseline-subtracted incremental FP16 compute energy estimate`이며, 최종 A100/H100/RTX3090 비교값이 아니다.
 
 현재까지 가장 의미 있는 RTX 3090 숫자는 다음 두 가지다.
 
 | 상태 | 결과 디렉터리 | 선택점 | TFLOPS | `matmul_input_pj_per_bit` | 해석 |
 |---|---|---:|---:|---:|---|
+| Strict NCU attempt | `results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341` | 없음 | 없음 | 없음 | `strict_pipeline_preflight.json`과 build/runtime/architecture preflight는 통과했지만 `ncu_permission_probe`가 `ERR_NVGPUCTRPERM`으로 실패. sweep/quality gate/work-slope는 실행되지 않음 |
 | Strict-like calibrated diagnostic | `results/strict_fp16_launch_shape_rtx3090_20260602_115550` | `threads=256`, `blocks/SM=1`, `threads/SM=256` | 159.148 | `0.30846 +/- 0.02532 pJ/bit` | Quality gate는 통과했지만 NCU no-L2/Tensor evidence가 없어 final strict claim은 아님 |
 | Latest no-NCU diagnostic | `results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100` | `threads=256`, `blocks/SM=1`, `threads/SM=256` | 159.825 | `0.18327 +/- 0.10838 pJ/bit` | `--diagnostic-no-ncu` 성격의 결과이며 energy source/measurement resolution gate가 실패함 |
 
@@ -51,7 +52,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 |---|---|---|
 | Baseline | `baseline_nop` 기반의 generic loop baseline | Tensor Core 전용 `tensor_baseline_mov` structural no-memory warp-sync baseline 사용 |
 | Matrix shape | 초기 문서와 legacy 결과에서 denominator가 명확하지 않거나 analyzer fallback 가능 | logical `m16n16k16`을 benchmark JSON에 직접 기록, 8192 input bits와 8192 FLOPs를 quality gate에서 확인 |
-| Thread 선택 | 고정 thread 후보 또는 coarse thread sweep | `threads/block = 32,64,128,256`과 `blocks/SM = 1,2,4,8` launch-shape sweep |
+| Thread 선택 | 고정 thread 후보 또는 coarse thread sweep | `threads/block = 32,64,96,128,160,192,224,256,288,320,384`와 `blocks/SM = 1,2,4,8` launch-shape sweep |
 | X축 기준 | 단순 thread count | `threads_per_sm = threads/block * blocks/SM`을 주요 x축으로 사용 |
 | Utilization 기준 | `nvidia-smi dmon`의 coarse SM utilization 중심 | Tensor Core matmul은 `tensor_model_utilization_pct_mean`을 target selection에 우선 사용, SM util은 보조 plot |
 | `blocks_per_sm=8` 가정 | 고정값처럼 쓰일 수 있었음 | 별도 sweep으로 검증, 현재 target은 `blocks/SM=1`의 첫 saturation point |
@@ -88,16 +89,18 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | `results/strict_fp16_launch_shape_rtx3090_20260602_115550` | calibrated launch-shape sweep | `threads=256`, `blocks/SM=1`, `threads/SM=256` | `0.30846 +/- 0.02532` | quality gate target은 있었지만 NCU hardware validation이 없어 strict final 아님 |
 | `results/strict_fp16_launch_shape_rtx3090_20260602_124900` | strict pipeline with NCU permission probe | 없음 | 없음 | `ERR_NVGPUCTRPERM`으로 calibration/sweep 전 중단 |
 | `results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100` | latest no-NCU diagnostic launch-shape sweep | `threads=256`, `blocks/SM=1`, `threads/SM=256` | `0.18327 +/- 0.10838` | quality pass 0/176, target pass 0/16, diagnostic only |
+| `results/strict_fp16_launch_shape_rtx3090_ncu_20260602_194341` | strict NCU pipeline retry, no diagnostic bypass | 없음 | 없음 | toolchain/preflight/build/runtime/architecture check pass, root and non-root NCU both `ERR_NVGPUCTRPERM`; failed manifest records `bench_build_git_commit=e70160384e3f` |
 | `/tmp/selected_work_slope_matrix.json` sanity check | selected-target matrix generation check | `threads=256`, `blocks/SM=1`, `unroll=1,2,4` | 측정값 없음 | `strict_fp16_launch_shape_rtx3090_20260602_115550`의 selected target과 같은 launch context로 matrix가 생성되는지 확인 |
 
 ## 5. Thread/SM sweep에서 배운 점
 
-현재 launch-shape sweep range는 다음과 같다.
+현재 launch-shape config의 sweep range는 다음과 같다.
 
 ```text
-threads/block: 32, 64, 128, 256
+threads/block: 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384
 blocks/SM:     1, 2, 4, 8
-threads/SM:    32, 64, 128, 256, 512, 1024, 2048
+threads/SM:    32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384,
+               512, 576, 640, 768, 896, 1024, 1152, 1280, 1536, 1792, 2048, 2304, 2560, 3072
 ```
 
 Tensor Core throughput은 RTX 3090에서 대략 `threads/SM=256` 근처부터 saturation에 도달한다. Strict-like calibrated sweep과 latest no-NCU diagnostic에서는 `threads=256`, `blocks/SM=1`, `threads/SM=256`이 첫 saturation point였다. Direct foreground diagnostic은 clock/SM telemetry가 없어 TFLOPS/reference peak fallback만 사용했으며, 이 fallback이 105%를 넘는 후보는 model/clock/accounting mismatch 가능성이 있으므로 selection에서 제외했다. 그 결과 direct diagnostic analyzer 선택점은 `threads=64`, `blocks/SM=2`, `threads/SM=128`로 바뀌었다.
@@ -126,7 +129,7 @@ results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100/figures/thread_swee
 
 ## 7. 아직 strict final이 아닌 이유
 
-1. RTX 3090 장비에서 Nsight Compute performance counter 접근이 막혀 `ERR_NVGPUCTRPERM`이 발생했다.
+1. RTX 3090 WSL2 장비에서 Nsight Compute performance counter 접근이 막혀 `ERR_NVGPUCTRPERM`이 발생했다. `ncu` 2024.1과 2026.1, Linux user와 `sudo` 모두 같은 결과였으므로 local Linux permission 문제가 아니라 Windows host NVIDIA performance counter policy 문제로 본다.
 2. 이 때문에 no-L2/global-memory traffic과 Tensor Core HMMA activity를 hardware counter로 확인하지 못했다.
 3. latest diagnostic run은 `measurement_grade=mixed_or_unavailable`이고 baseline elapsed time이 quality threshold보다 짧아 measurement resolution gate를 통과하지 못했다.
 4. A100과 H100 strict run은 아직 완료되지 않았다.
@@ -150,4 +153,4 @@ results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100/figures/thread_swee
 9. `--require-work-slope`를 사용할 경우 selected target과 같은 `threads`, `blocks/SM`, kernel/baseline pair에서 positive work-energy slope와 충분한 R2 evidence가 있어야 한다.
 10. A100/H100/RTX3090 비교는 세 GPU 결과가 모두 audit을 통과한 뒤 `postprocess_strict_architectures.sh`로 묶어야 한다.
 
-권한이 없는 local smoke나 pipeline sanity check는 계속 `--diagnostic-no-ncu`로 실행할 수 있다. 단, 이 결과는 README와 report에서 diagnostic-only로 표시하고 최종 pJ/bit 표에는 넣지 않는다.
+권한이 없는 local smoke나 pipeline sanity check는 계속 `--diagnostic-no-ncu`로 실행할 수 있다. 단, 이 결과는 README와 report에서 diagnostic-only로 표시하고 최종 pJ/bit 표에는 넣지 않는다. 현재 WSL2 RTX 3090에서 strict NCU를 재시도하려면 Windows host에서 NVIDIA Control Panel을 관리자 권한으로 열고 Developer settings의 GPU Performance Counters access를 all users로 허용한 뒤 `wsl --shutdown` 후 다시 실행해야 한다.

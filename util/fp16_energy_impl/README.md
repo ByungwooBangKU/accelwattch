@@ -126,7 +126,7 @@ source env/toolchain_rtx3090_sm86_cuda121.sh
   --gpu 0 \
   --cuda-arch 86 \
   --matrix configs/fp16_matmul_launch_shape_sweep.json \
-  --threads 32,64,128,256 \
+  --threads 32,64,96,128,160,192,224,256,288,320,384 \
   --ncu-blocks-per-sm-csv 1,2,4,8 \
   --outdir results/strict_fp16_launch_shape_rtx3090
 ```
@@ -137,7 +137,7 @@ source env/toolchain_rtx3090_sm86_cuda121.sh
 ./scripts/install_gpu_toolchain.sh --gpu-kind h100 --build-smoke
 ```
 
-공유 서버나 Docker/Slurm 환경에서 GPU auto-detect가 안 되면 `--gpu-kind` 또는 `--cuda-arch`를 명시한다. `CUDA_VISIBLE_DEVICES` 때문에 CUDA ordinal과 physical GPU id가 다르면 strict pipeline 실행 시 `--nvidia-smi-id GPU-...`를 함께 넘긴다. Nsight Compute가 `ERR_NVGPUCTRPERM`으로 실패하면 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 이 경우 cluster/admin policy로 profiling counter 접근을 허용하거나 권한 있는 job에서 NCU validation을 실행해야 한다. Strict pipeline은 긴 sweep 전에 `ncu_permission_probe/` 아래 짧은 probe log/JSON/CSV를 남기고, counter 권한이 없으면 즉시 중단한다. 권한 없는 local 확인만 할 때는 `--diagnostic-no-ncu`를 명시해야 하며, 이 결과는 최종 pJ/bit claim에 사용하지 않는다.
+공유 서버나 Docker/Slurm 환경에서 GPU auto-detect가 안 되면 `--gpu-kind` 또는 `--cuda-arch`를 명시한다. `CUDA_VISIBLE_DEVICES` 때문에 CUDA ordinal과 physical GPU id가 다르면 strict pipeline 실행 시 `--nvidia-smi-id GPU-...`를 함께 넘긴다. Nsight Compute가 `ERR_NVGPUCTRPERM`으로 실패하면 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 이 경우 cluster/admin policy로 profiling counter 접근을 허용하거나 권한 있는 job에서 NCU validation을 실행해야 한다. WSL2에서는 Linux `sudo`만으로 해결되지 않을 수 있으며, Windows host의 NVIDIA Control Panel에서 Developer settings와 GPU Performance Counters access를 허용한 뒤 WSL을 재시작해야 한다. Strict pipeline은 긴 sweep 전에 `ncu_permission_probe/` 아래 짧은 probe log/JSON/CSV를 남기고, counter 권한이 없으면 즉시 중단한다. 권한 없는 local 확인만 할 때는 `--diagnostic-no-ncu`를 명시해야 하며, 이 결과는 최종 pJ/bit claim에 사용하지 않는다.
 
 ## 4. A100/H100 실행 범위와 자동화 범위
 
@@ -475,14 +475,14 @@ python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gp
 
 여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 최종 `target_pass` 선택 기준은 Tensor Core matmul의 경우 strict `quality_pass=true` 후보 중 max `tensor_model_utilization_pct_mean`에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다. non-Tensor Core kernel은 measured SM/GPU utilization을 selection metric으로 사용한다.
 
-`blocks_per_sm=8`이 최적이라는 가정도 별도 확인할 수 있다. `configs/fp16_matmul_launch_shape_sweep.json`은 `threads/block = 32,64,128,256`과 `blocks/SM = 1,2,4,8`을 함께 훑어 같은 launched `threads_per_sm`이라도 다른 launch shape가 SM utilization, pJ/bit, baseline subtraction 안정성에 어떤 영향을 주는지 확인한다. `analyze_results.py`는 `thread_sweep_summary.csv`를 `threads`와 `blocks_per_sm_requested` 둘 다로 집계하고, `quality_gate.py`와 NCU validation context도 blocks/SM을 같이 매칭한다. 또한 target selection에 사용한 utilization metric, saturation margin, valid no-L2 후보 내 pJ/bit rank, 선택점보다 낮은 pJ/bit 후보 목록을 기록해 "first saturation point" target과 "lowest observed pJ/bit" 후보를 구분한다.
+`blocks_per_sm=8`이 최적이라는 가정도 별도 확인할 수 있다. `configs/fp16_matmul_launch_shape_sweep.json`은 `threads/block = 32,64,96,128,160,192,224,256,288,320,384`와 `blocks/SM = 1,2,4,8`을 함께 훑어 같은 launched `threads_per_sm`이라도 다른 launch shape가 SM utilization, pJ/bit, baseline subtraction 안정성에 어떤 영향을 주는지 확인한다. `analyze_results.py`는 `thread_sweep_summary.csv`를 `threads`와 `blocks_per_sm_requested` 둘 다로 집계하고, `quality_gate.py`와 NCU validation context도 blocks/SM을 같이 매칭한다. 또한 target selection에 사용한 utilization metric, saturation margin, valid no-L2 후보 내 pJ/bit rank, 선택점보다 낮은 pJ/bit 후보 목록을 기록해 "first saturation point" target과 "lowest observed pJ/bit" 후보를 구분한다.
 
 ```bash
 ./scripts/run_strict_fp16_pipeline.sh \
   --gpu 0 \
   --cuda-arch 86 \
   --matrix configs/fp16_matmul_launch_shape_sweep.json \
-  --threads 32,64,128,256 \
+  --threads 32,64,96,128,160,192,224,256,288,320,384 \
   --ncu-blocks-per-sm-csv 1,2,4,8 \
   --outdir results/strict_fp16_launch_shape_rtx3090
 ```
@@ -495,7 +495,7 @@ NCU_BLOCKS_PER_SM_CSV=1,2,4,8 \
   build/fp16_energy_bench \
   results/ncu_launch_shape_gpu0 \
   0 \
-  32,64,128,256
+  32,64,96,128,160,192,224,256,288,320,384
 ```
 
 2026-06-02 RTX 3090 direct launch-shape diagnostic 결과는 `results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/`에 포함했다. 이 환경에서는 WSL이 background GPU telemetry와 Python/nested-shell child CUDA launch를 막아 `run_experiment.py`, dmon, NCU를 동시에 사용할 수 없었다. 따라서 benchmark binary를 foreground command로 직접 32회 실행하고, 에너지는 benchmark 내부 `nvmlDeviceGetTotalEnergyConsumption()` delta만 사용했다. `power.csv`, `sm_util.csv`, NCU validation이 없으므로 이 결과는 strict final target이 아니라 diagnostic이다. Analyzer는 measured SM/GPU utilization 대신 TFLOPS/reference dense peak 기반 `tensor_model_utilization_pct_mean`으로 saturation point를 표시했다.

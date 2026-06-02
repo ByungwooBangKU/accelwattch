@@ -4,12 +4,13 @@
 대상 GPU: NVIDIA GeForce RTX 3090, GA102, sm86
 상세 보고서: `../experiment_progress_report_20260602.md`
 
-이 디렉터리는 현재 `fp16_energy_impl` README와 분석 스크립트가 참조하는 RTX 3090 FP16 matmul energy 결과를 보관한다. 지금까지의 결과는 모두 diagnostic 또는 strict-like diagnostic이며, 아직 최종 publishable strict pJ/bit 값은 없다. RTX 3090 장비에서 Nsight Compute performance counter 접근이 `ERR_NVGPUCTRPERM`으로 막혀 no-L2/global-memory 조건과 Tensor Core HMMA activity를 hardware counter로 증명하지 못했기 때문이다.
+이 디렉터리는 현재 `fp16_energy_impl` README와 분석 스크립트가 참조하는 RTX 3090 FP16 matmul energy 결과를 보관한다. 지금까지의 결과는 모두 diagnostic 또는 strict-like diagnostic이며, 아직 최종 publishable strict pJ/bit 값은 없다. RTX 3090 WSL2 장비에서 Nsight Compute performance counter 접근이 `ERR_NVGPUCTRPERM`으로 막혀 no-L2/global-memory 조건과 Tensor Core HMMA activity를 hardware counter로 증명하지 못했기 때문이다. 2026-06-02 19:43 KST에 diagnostic bypass 없이 strict NCU pipeline을 다시 실행했지만, preflight/build/runtime/architecture check 이후 NCU permission probe에서 동일하게 중단되었다.
 
 ## Current result summary
 
 | 상태 | 결과 디렉터리 | 선택점 | Utilization | TFLOPS | `matmul_input_pj_per_bit` | 비고 |
 |---|---|---:|---:|---:|---:|---|
+| Strict NCU attempt | `strict_fp16_launch_shape_rtx3090_ncu_20260602_194341/` | 없음 | 없음 | 없음 | 없음 | preflight/build/runtime/architecture check 통과 후 `ncu_permission_probe.permission_probe_pass=false`, `ERR_NVGPUCTRPERM`; sweep/quality gate/work-slope 미실행 |
 | Strict-like calibrated diagnostic | `strict_fp16_launch_shape_rtx3090_20260602_115550/` | `threads=256`, `blocks/SM=1`, `threads/SM=256` | Tensor model 98.34%, SM 93.75% | 159.148 | `0.30846 +/- 0.02532` | NVML energy counter와 structural baseline은 통과했지만 NCU evidence가 없어 final strict 아님 |
 | Latest no-NCU diagnostic | `diagnostic_fp16_launch_shape_rtx3090_20260602_125100/` | `threads=256`, `blocks/SM=1`, `threads/SM=256` | Tensor model 98.37%, SM 99.40% | 159.825 | `0.18327 +/- 0.10838` | NCU를 명시적으로 skip한 diagnostic run. `quality_gate_summary.json`의 selected target은 0 |
 | Direct foreground diagnostic | `fp16_launch_shape_warpsync_rtx3090_20260602_direct/` | `threads=64`, `blocks/SM=2`, `threads/SM=128` | Tensor model 104.86%, SM telemetry 없음 | 149.237 | `0.35326` | foreground 1-repeat diagnostic. power/SM/NCU evidence 없음 |
@@ -22,9 +23,10 @@
 ## Sweep range used for the current launch-shape runs
 
 ```text
-threads/block: 32, 64, 128, 256
+threads/block: 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384
 blocks/SM:     1, 2, 4, 8
-threads/SM:    32, 64, 128, 256, 512, 1024, 2048
+threads/SM:    32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384,
+               512, 576, 640, 768, 896, 1024, 1152, 1280, 1536, 1792, 2048, 2304, 2560, 3072
 logical shape: m16n16k16
 input bits:    8192 bit/logical MMA
 FLOPs:         8192 FLOP/logical MMA
@@ -62,4 +64,4 @@ required_diagnostic_only_architectures: ga102
 
 ## Remaining blocker
 
-RTX 3090 local strict run은 `ncu_permission_probe/ncu_permission_probe.json`에서 `permission_probe_pass=false`로 중단되었다. 이는 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 최종 pJ/bit claim을 만들려면 권한 있는 환경에서 strict mode를 실행해야 한다.
+RTX 3090 local strict run은 `ncu_permission_probe/ncu_permission_probe.json`에서 `permission_probe_pass=false`로 중단되었다. 이는 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 이 WSL2 host에서는 Linux user, `sudo`, Nsight Compute 2024.1, Nsight Compute 2026.1 모두 `ERR_NVGPUCTRPERM`이었다. 최종 pJ/bit claim을 만들려면 Windows host NVIDIA Control Panel에서 GPU Performance Counter access를 허용하거나, counter 권한이 열려 있는 A100/H100/RTX3090 환경에서 strict mode를 실행해야 한다.

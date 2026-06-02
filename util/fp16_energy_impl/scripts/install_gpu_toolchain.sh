@@ -334,6 +334,7 @@ fi
 [[ -x "${NVCC_BIN}" ]] || die "nvcc not found at ${NVCC_BIN}"
 [[ -x "${PYTHON_BIN}" ]] || die "python not found at ${PYTHON_BIN}"
 [[ -x "${NCU_BIN}" ]] || die "ncu not found under ${ENV_PREFIX}"
+NCU_BIN_DIR="$(dirname "${NCU_BIN}")"
 
 CUDA_INCLUDE_DIR=""
 for candidate in \
@@ -376,7 +377,7 @@ export NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN}"
 export CMAKE_CUDA_FLAGS="-I${CUDA_INCLUDE_DIR} -L${CUDA_LIB_DIR}"
 export CPATH="${CUDA_INCLUDE_DIR}\${CPATH:+:\${CPATH}}"
 export LIBRARY_PATH="${CUDA_LIB_DIR}\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
-export PATH="${ENV_PREFIX}/bin:\${PATH}"
+export PATH="${NCU_BIN_DIR}:${ENV_PREFIX}/bin:\${PATH}"
 export MPLCONFIGDIR="\${MPLCONFIGDIR:-/tmp/mpl_fp16_${GPU_KIND}_sm${CUDA_ARCH}}"
 EOF
 chmod +x "${ENV_FILE}"
@@ -390,7 +391,7 @@ source "${ENV_FILE}"
   --gpu "${GPU_ID}" \\
   --cuda-arch "${CUDA_ARCH}" \\
   --matrix configs/fp16_matmul_launch_shape_sweep.json \\
-  --threads 32,64,128,256 \\
+  --threads 32,64,96,128,160,192,224,256,288,320,384 \\
   --ncu-blocks-per-sm-csv 1,2,4,8 \\
   --run-work-slope \\
   --outdir "results/strict_fp16_launch_shape_${GPU_KIND}_sm${CUDA_ARCH}"
