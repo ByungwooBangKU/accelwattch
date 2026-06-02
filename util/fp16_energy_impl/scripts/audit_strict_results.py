@@ -1019,6 +1019,189 @@ def plot_metric(rows: List[Dict[str, Any]], outdir: Path, metric: str, ylabel: s
     plt.close(fig)
 
 
+FAILURE_CATEGORY_LABELS = {
+    "required_architecture_coverage": "Required architecture coverage",
+    "required_target_selection": "Required target pair selection",
+    "quality_gate": "Quality gate pass/target flags",
+    "pipeline_manifest": "Strict pipeline manifest/provenance",
+    "pipeline_preflight": "Strict pipeline preflight/toolchain",
+    "ncu_permission": "NCU performance-counter permission",
+    "ncu_validation_context": "NCU launch-context match",
+    "ncu_memory_evidence": "NCU no L2/DRAM/local evidence",
+    "ncu_tensor_activity": "NCU Tensor activity evidence",
+    "ncu_hmma_path": "Common HMMA/no-WGMMA path evidence",
+    "ptxas_resource_context": "ptxas resource context match",
+    "ptxas_spill": "ptxas stack/spill evidence",
+    "strict_energy_source": "Strict NVML energy source",
+    "energy_resolution": "Energy/duration measurement resolution",
+    "energy_signal": "Incremental energy signal quality",
+    "baseline_separation": "Structural baseline separation",
+    "denominator_schema": "m16n16k16 denominator/schema",
+    "memory_provenance": "Timed-kernel memory provenance",
+    "utilization_selection": "Utilization saturation/selection",
+    "other": "Other audit failures",
+}
+
+
+def split_fail_reasons(value: Any) -> List[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split(";") if part.strip()]
+
+
+def failure_category(reason: str) -> str:
+    text = reason.lower()
+    if (
+        "selected target matching" in text
+        or "selected_targets is empty" in text
+        or "required target" in text
+        or "test_kernel is not" in text
+    ):
+        return "required_target_selection"
+    if (
+        "target_pass" in text
+        or "quality_pass" in text
+        or "quality_gate_selected_target" in text
+        or "quality_gate.py" in text
+    ):
+        return "quality_gate"
+    if "manifest" in text or "binary sha256" in text or "git head" in text:
+        return "pipeline_manifest"
+    if "preflight" in text or "toolchain" in text or "compute apps" in text or "skip_preflight" in text:
+        return "pipeline_preflight"
+    if "permission probe" in text or "permission_probe" in text or "err_nvgpuctrperm" in text:
+        return "ncu_permission"
+    if "ncu threads" in text or "ncu blocks_per_sm" in text or "ncu unroll" in text or "ncu suppress" in text:
+        return "ncu_validation_context"
+    if "ncu validation row" in text or "ncu validation did not pass" in text or "ncu_validation" in text:
+        return "ncu_validation_context"
+    if "ncu_required" in text:
+        return "ncu_validation_context"
+    if "memory counter" in text or "l2/global" in text or "dram" in text or "local/spill" in text:
+        return "ncu_memory_evidence"
+    if "tensor activity" in text:
+        return "ncu_tensor_activity"
+    if "hmma" in text or "wgmma" in text or "tensor core/hmma" in text:
+        return "ncu_hmma_path"
+    if (
+        "resource_audit" in text
+        or "resource audit row" in text
+        or "resource threads" in text
+        or "resource blocks_per_sm" in text
+        or "resource unroll" in text
+    ):
+        return "ptxas_resource_context"
+    if "ptxas stack/spill" in text:
+        return "ptxas_spill"
+    if "measurement_grade" in text or "energy_source_reliable" in text:
+        return "strict_energy_source"
+    if "elapsed_s_mean" in text or "energy_j_mean is below" in text:
+        return "energy_resolution"
+    if "incremental_energy" in text or "baseline_energy_fraction" in text:
+        return "energy_signal"
+    if "baseline_match_grade" in text or "baseline_structural" in text:
+        return "baseline_separation"
+    if "matmul_" in text or "benchmark_schema" in text or "schema_features" in text:
+        return "denominator_schema"
+    if (
+        "timed_kernel_memory_provenance" in text
+        or "intended timed-kernel global memory" in text
+        or "timed-kernel global memory operations" in text
+    ):
+        return "memory_provenance"
+    if "util_" in text or "target_selection_note" in text or "tensor_model_utilization" in text:
+        return "utilization_selection"
+    return "other"
+
+
+def failure_summary_rows(rows: List[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
+    required = [x.strip() for x in args.require_architectures.split(",") if x.strip()]
+    passed = {str(r.get("architecture_chip", "")) for r in rows if parse_bool(r.get("audit_pass"))}
+    bucket: Dict[str, Dict[str, Any]] = {}
+
+    def ensure(category: str) -> Dict[str, Any]:
+        if category not in bucket:
+            bucket[category] = {
+                "category": category,
+                "category_label": FAILURE_CATEGORY_LABELS.get(category, category),
+                "fail_count": 0,
+                "affected_result_count": 0,
+                "affected_architectures": set(),
+                "affected_inputs": set(),
+                "example_reasons": [],
+            }
+        return bucket[category]
+
+    for row in rows:
+        categories_for_row = set()
+        for reason in split_fail_reasons(row.get("fail_reasons")):
+            category = failure_category(reason)
+            item = ensure(category)
+            item["fail_count"] += 1
+            if len(item["example_reasons"]) < 3 and reason not in item["example_reasons"]:
+                item["example_reasons"].append(reason)
+            categories_for_row.add(category)
+        for category in categories_for_row:
+            item = ensure(category)
+            item["affected_result_count"] += 1
+            chip = str(row.get("architecture_chip", "") or "unknown")
+            input_dir = str(row.get("input_dir", "") or "")
+            item["affected_architectures"].add(chip)
+            if input_dir:
+                item["affected_inputs"].add(input_dir)
+
+    for chip in required:
+        if chip not in passed:
+            item = ensure("required_architecture_coverage")
+            item["fail_count"] += 1
+            item["affected_result_count"] += 1
+            item["affected_architectures"].add(chip)
+            reason = f"required architecture {chip} has no audit_pass=true result"
+            if len(item["example_reasons"]) < 3:
+                item["example_reasons"].append(reason)
+
+    summary = []
+    for item in bucket.values():
+        summary.append(
+            {
+                "category": item["category"],
+                "category_label": item["category_label"],
+                "fail_count": item["fail_count"],
+                "affected_result_count": item["affected_result_count"],
+                "affected_architectures": ",".join(sorted(item["affected_architectures"])),
+                "affected_inputs": "; ".join(sorted(item["affected_inputs"])),
+                "example_reasons": "; ".join(item["example_reasons"]),
+            }
+        )
+    return sorted(summary, key=lambda row: (-parse_int(row.get("fail_count")), str(row.get("category", ""))))
+
+
+def plot_failure_categories(rows: List[Dict[str, Any]], outdir: Path) -> None:
+    if not rows:
+        return
+    import matplotlib.pyplot as plt
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    plot_rows = sorted(rows, key=lambda row: parse_int(row.get("fail_count")), reverse=True)
+    labels = [str(row.get("category_label", "")) for row in plot_rows]
+    counts = [parse_int(row.get("fail_count")) for row in plot_rows]
+    fig, ax = plt.subplots(figsize=(9.2, max(3.8, 0.48 * len(plot_rows) + 1.8)))
+    y = list(range(len(plot_rows)))
+    ax.barh(y, counts, color="tab:red", alpha=0.82)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("Audit failure count")
+    ax.set_title("Strict FP16 audit blocker categories")
+    ax.grid(True, axis="x", alpha=0.25)
+    for idx, count in enumerate(counts):
+        ax.annotate(str(count), (count, idx), textcoords="offset points", xytext=(5, 0), va="center")
+    fig.tight_layout()
+    fig.savefig(outdir / "strict_result_failure_categories.png", dpi=160)
+    plt.close(fig)
+
+
 def plot_audit_metrics(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plot_audit(rows, outdir)
     plot_metric(
@@ -1200,10 +1383,13 @@ def main() -> int:
     args = parser.parse_args()
 
     rows = [audit_dir(path, args) for path in args.input]
+    failure_rows = failure_summary_rows(rows, args)
     args.outdir.mkdir(parents=True, exist_ok=True)
     write_csv(args.outdir / "strict_result_audit.csv", rows)
+    write_csv(args.outdir / "strict_result_failure_summary.csv", failure_rows)
     write_json(args.outdir / "strict_result_audit.json", rows, args)
     plot_audit_metrics(rows, args.outdir / "figures")
+    plot_failure_categories(failure_rows, args.outdir / "figures")
 
     required = [x.strip() for x in args.require_architectures.split(",") if x.strip()]
     passed = {str(r.get("architecture_chip", "")) for r in rows if parse_bool(r.get("audit_pass"))}
@@ -1211,6 +1397,7 @@ def main() -> int:
     overall_pass = bool(rows) and not missing and all(parse_bool(r.get("audit_pass")) for r in rows)
 
     print(f"Wrote: {args.outdir / 'strict_result_audit.csv'}")
+    print(f"Wrote: {args.outdir / 'strict_result_failure_summary.csv'}")
     print(f"Wrote: {args.outdir / 'strict_result_audit.json'}")
     print(f"Wrote figures under: {args.outdir / 'figures'}")
     if missing:

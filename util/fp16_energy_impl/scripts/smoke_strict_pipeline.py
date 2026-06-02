@@ -654,6 +654,14 @@ def assert_requirement_fail(path: Path, requirement: str) -> None:
     raise AssertionError(f"Requirement {requirement!r} not found in {path}")
 
 
+def assert_failure_category(path: Path, category: str) -> None:
+    rows = read_csv_rows(path)
+    for row in rows:
+        if row.get("category") == category and int(float(row.get("fail_count", "0") or "0")) > 0:
+            return
+    raise AssertionError(f"Failure category {category!r} not found in {path}: {rows}")
+
+
 def smoke(base: Path, env: Dict[str, str]) -> None:
     import analyze_results
     import architecture_models
@@ -1683,6 +1691,10 @@ exit 1
     expected_reason = "quality_gate_summary has no selected target matching tensor_mma_f16acc/tensor_baseline_mov"
     if expected_reason not in bad_row.get("fail_reasons", ""):
         raise AssertionError(f"Negative strict audit missed required-target failure: {bad_row}")
+    assert_failure_category(audit_bad / "strict_result_failure_summary.csv", "required_target_selection")
+    assert_failure_category(audit_bad / "strict_result_failure_summary.csv", "required_architecture_coverage")
+    if not (audit_bad / "figures" / "strict_result_failure_categories.png").exists():
+        raise AssertionError("Negative strict audit did not render failure category figure")
 
     audit_no_tensor = base / "audit_no_tensor_activity"
     run(
@@ -1707,6 +1719,7 @@ exit 1
     expected_tensor_reason = "selected test NCU tensor activity is missing or below threshold"
     if expected_tensor_reason not in no_tensor_row.get("fail_reasons", ""):
         raise AssertionError(f"Missing Tensor activity audit missed expected failure: {no_tensor_row}")
+    assert_failure_category(audit_no_tensor / "strict_result_failure_summary.csv", "ncu_tensor_activity")
 
     audit_bad_resource = base / "audit_bad_resource_context"
     run(
@@ -1729,6 +1742,7 @@ exit 1
         raise AssertionError(f"Wrong resource context strict audit unexpectedly passed: {bad_resource_row}")
     if "resource unroll 8 != measurement 16" not in bad_resource_row.get("fail_reasons", ""):
         raise AssertionError(f"Wrong resource context audit missed expected failure: {bad_resource_row}")
+    assert_failure_category(audit_bad_resource / "strict_result_failure_summary.csv", "ptxas_resource_context")
 
     report_dir = base / "report_good"
     run(

@@ -109,6 +109,7 @@ def load_inputs(
     suite_preflight_json: Path | None,
 ) -> Dict[str, Any]:
     audit_rows: List[Dict[str, Any]] = []
+    audit_failure_rows: List[Dict[str, Any]] = []
     audit_json: Dict[str, Any] = {}
     preflight_json: Dict[str, Any] = {}
     best_rows: List[Dict[str, Any]] = []
@@ -119,6 +120,7 @@ def load_inputs(
 
     if audit_dir:
         audit_rows = read_csv(audit_dir / "strict_result_audit.csv")
+        audit_failure_rows = read_csv(audit_dir / "strict_result_failure_summary.csv")
         audit_json = read_json(audit_dir / "strict_result_audit.json")
     if suite_preflight_json:
         preflight_json = read_json(suite_preflight_json)
@@ -132,6 +134,7 @@ def load_inputs(
 
     return {
         "audit_rows": audit_rows,
+        "audit_failure_rows": audit_failure_rows,
         "audit_json": audit_json,
         "preflight_json": preflight_json,
         "best_rows": best_rows,
@@ -158,6 +161,7 @@ def artifact_links(
                 audit_dir / "figures" / "strict_result_sm_utilization.png",
                 audit_dir / "figures" / "strict_result_tensor_model_utilization.png",
                 audit_dir / "figures" / "strict_result_ncu_tensor_activity.png",
+                audit_dir / "figures" / "strict_result_failure_categories.png",
                 audit_dir / "figures" / "strict_result_incremental_energy_fraction.png",
                 audit_dir / "figures" / "strict_result_counter_trace_ratio.png",
             ]
@@ -590,6 +594,7 @@ def write_markdown(
     compare_dir: Path | None,
     architecture_model_dir: Path | None,
     rows: List[Dict[str, Any]],
+    audit_failure_rows: List[Dict[str, Any]],
     req_rows: List[Dict[str, Any]],
     architecture_model_rows: List[Dict[str, Any]],
     audit_json: Dict[str, Any],
@@ -700,6 +705,27 @@ def write_markdown(
             ]
         )
 
+    if audit_failure_rows:
+        report.extend(
+            [
+                "## Blocker Categories",
+                "",
+                markdown_table(
+                    ["Category", "Fail count", "Affected arch", "Examples"],
+                    [
+                        [
+                            r.get("category_label", r.get("category", "")),
+                            r.get("fail_count", ""),
+                            r.get("affected_architectures", ""),
+                            r.get("example_reasons", ""),
+                        ]
+                        for r in audit_failure_rows
+                    ],
+                ),
+                "",
+            ]
+        )
+
     if architecture_model_rows:
         report.extend(
             [
@@ -799,6 +825,7 @@ def main() -> int:
         args.compare_dir,
         args.architecture_model_dir,
         rows,
+        loaded["audit_failure_rows"],
         req_rows,
         loaded["architecture_model_rows"],
         loaded["audit_json"],

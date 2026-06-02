@@ -632,7 +632,9 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/resource_audit/thread_resource_occupancy.csv` | thread sweep 후보별 static resource occupancy model. strict report는 selected row의 thread/block/unroll context 일치 여부를 별도 requirement로 표시 |
 | `results/p0_gpu0/resource_audit/figures/thread_sweep_resource_occupancy.png` | launched threads/SM 대비 static occupancy와 measured SM utilization 비교 |
 | `results/strict_fp16_audit/strict_result_audit.csv` | 여러 strict 결과 디렉터리의 최종 채택 가능 여부 audit |
+| `results/strict_fp16_audit/strict_result_failure_summary.csv` | audit fail reason을 NCU permission/context, no-memory evidence, resource context, energy source 등 blocker category로 집계 |
 | `results/strict_fp16_audit/figures/strict_result_audit.png` | architecture별 strict audit pass/fail 시각화 |
+| `results/strict_fp16_audit/figures/strict_result_failure_categories.png` | strict audit blocker category별 fail count 시각화 |
 | `results/strict_fp16_audit/figures/strict_result_matmul_input_pj_per_bit.png` | strict selected target의 logical FP16 input pJ/bit 비교 |
 | `results/strict_fp16_audit/figures/strict_result_tflops.png` | strict selected target의 TFLOPS 비교 |
 | `results/strict_fp16_audit/figures/strict_result_elapsed_s.png` | strict selected target의 test duration 비교 |
