@@ -914,8 +914,26 @@ exit 0
     for kernel, row in ncu_pair_kernels.items():
         if row.get("validation_blocks_per_sm") != "4" or row.get("validation_unroll") != "16":
             raise AssertionError(f"NCU helper did not preserve validation context for {kernel}: {row}")
+        if row.get("validation_test_kernel") != "tensor_mma_f32acc":
+            raise AssertionError(f"NCU helper did not record the requested test kernel for {kernel}: {row}")
+        if row.get("validation_baseline_kernel") != "tensor_baseline_f32":
+            raise AssertionError(f"NCU helper did not record the requested baseline kernel for {kernel}: {row}")
         if row.get("validation_pass") != "True":
             raise AssertionError(f"NCU helper fake report did not pass for {kernel}: {row}")
+    if ncu_pair_kernels["tensor_mma_f32acc"].get("validation_pair_role") != "test":
+        raise AssertionError(f"NCU helper did not mark f32acc as test: {ncu_pair_kernels['tensor_mma_f32acc']}")
+    if ncu_pair_kernels["tensor_baseline_f32"].get("validation_pair_role") != "baseline":
+        raise AssertionError(
+            f"NCU helper did not mark tensor_baseline_f32 as baseline: {ncu_pair_kernels['tensor_baseline_f32']}"
+        )
+    ncu_pair_summary = json.loads((ncu_pair_out / "ncu_validation_summary.json").read_text())
+    ncu_validation_context = ncu_pair_summary.get("validation_context", {})
+    if ncu_validation_context.get("test_kernel") != "tensor_mma_f32acc":
+        raise AssertionError(f"NCU summary JSON did not record requested test kernel: {ncu_validation_context}")
+    if ncu_validation_context.get("baseline_kernel") != "tensor_baseline_f32":
+        raise AssertionError(f"NCU summary JSON did not record requested baseline kernel: {ncu_validation_context}")
+    if ncu_validation_context.get("blocks_per_sm_csv") != "4":
+        raise AssertionError(f"NCU summary JSON did not record blocks/SM sweep context: {ncu_validation_context}")
 
     fake_nvcc = base / "fake_nvcc_13_2"
     fake_nvidia_smi = base / "fake_nvidia_smi_cuda_13_1"

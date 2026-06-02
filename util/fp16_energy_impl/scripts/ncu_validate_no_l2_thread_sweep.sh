@@ -11,6 +11,7 @@ IFS=',' read -r -a THREADS_LIST <<< "${THREADS_CSV}"
 
 DEFAULT_NCU_METRICS="smsp__inst_executed_pipe_tensor_op_hmma.sum,smsp__sass_thread_inst_executed_op_hmma_pred_on.sum,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum,dram__bytes_write.sum,lts__t_bytes_read.sum,lts__t_bytes_write.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum"
 NCU_BIN="${NCU_BIN:-ncu}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 NCU_METRICS="${NCU_METRICS:-${DEFAULT_NCU_METRICS}}"
 NCU_BLOCKS_PER_SM="${NCU_BLOCKS_PER_SM:-8}"
 NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV:-${NCU_BLOCKS_PER_SM}}"
@@ -114,18 +115,21 @@ VALIDATE_ARGS=(
   --input "${OUTDIR}" \
   --outdir "${OUTDIR}" \
   --benchmark-blocks-per-sm "${NCU_BLOCKS_PER_SM}" \
+  --benchmark-blocks-per-sm-csv "${NCU_BLOCKS_PER_SM_CSV}" \
   --benchmark-unroll "${NCU_UNROLL}" \
   --benchmark-suppress-output-store "${NCU_SUPPRESS_OUTPUT_STORE_BOOL}" \
   --benchmark-warmup "${NCU_WARMUP}" \
   --benchmark-repeats "${NCU_REPEATS}" \
   --benchmark-iters "${NCU_ITERS}" \
+  --validation-test-kernel "${NCU_TEST_KERNEL}" \
+  --validation-baseline-kernel "${NCU_BASELINE_KERNEL}" \
   --min-tensor-activity-pct "${NCU_MIN_TENSOR_ACTIVITY_PCT}"
 )
 if [[ "${NCU_REQUIRE_TENSOR_ACTIVITY}" != "0" ]]; then
   VALIDATE_ARGS+=(--require-tensor-activity)
 fi
 
-python3 "$(dirname "$0")/validate_ncu_reports.py" "${VALIDATE_ARGS[@]}"
+"${PYTHON_BIN}" "$(dirname "$0")/validate_ncu_reports.py" "${VALIDATE_ARGS[@]}"
 
 echo "Nsight Compute no-L2 thread-sweep reports written to ${OUTDIR}"
 echo "Acceptance check: timed tensor/baseline kernels should show no material L1/L2/DRAM global memory workload beyond profiler noise."

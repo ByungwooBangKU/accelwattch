@@ -376,6 +376,17 @@ def validate_report(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "report": str(path),
         "kernel": kernel,
         "threads": threads,
+        "validation_test_kernel": args.validation_test_kernel,
+        "validation_baseline_kernel": args.validation_baseline_kernel,
+        "validation_pair_role": (
+            "test"
+            if args.validation_test_kernel and kernel == args.validation_test_kernel
+            else (
+                "baseline"
+                if args.validation_baseline_kernel and kernel == args.validation_baseline_kernel
+                else "other"
+            )
+        ),
         "validation_blocks_per_sm": report_blocks_per_sm or args.benchmark_blocks_per_sm,
         "validation_unroll": args.benchmark_unroll,
         "validation_suppress_output_store": args.benchmark_suppress_output_store,
@@ -431,6 +442,9 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "report",
         "kernel",
         "threads",
+        "validation_test_kernel",
+        "validation_baseline_kernel",
+        "validation_pair_role",
         "validation_blocks_per_sm",
         "validation_unroll",
         "validation_suppress_output_store",
@@ -596,6 +610,9 @@ def summarize(rows: List[Dict[str, Any]], input_dir: Path, args: argparse.Namesp
         },
         "validation_context": {
             "blocks_per_sm": args.benchmark_blocks_per_sm,
+            "blocks_per_sm_csv": args.benchmark_blocks_per_sm_csv,
+            "test_kernel": args.validation_test_kernel,
+            "baseline_kernel": args.validation_baseline_kernel,
             "unroll": args.benchmark_unroll,
             "suppress_output_store": args.benchmark_suppress_output_store,
             "warmup": args.benchmark_warmup,
@@ -633,7 +650,10 @@ def main() -> int:
     parser.add_argument("--dram-sector-bytes", type=float, default=32.0)
     parser.add_argument("--local-sector-bytes", type=float, default=32.0)
     parser.add_argument("--min-tensor-activity-pct", type=float, default=0.0)
+    parser.add_argument("--validation-test-kernel", default="")
+    parser.add_argument("--validation-baseline-kernel", default="")
     parser.add_argument("--benchmark-blocks-per-sm", default="")
+    parser.add_argument("--benchmark-blocks-per-sm-csv", default="")
     parser.add_argument("--benchmark-unroll", default="")
     parser.add_argument("--benchmark-suppress-output-store", default="")
     parser.add_argument("--benchmark-warmup", default="")
