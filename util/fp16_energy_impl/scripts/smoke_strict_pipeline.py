@@ -235,6 +235,22 @@ def compare_thread_row(
             "test_ncu_tensor_activity_pct": 81.0,
             "baseline_ncu_tensor_activity_observed": "false",
             "baseline_ncu_tensor_activity_pct": 0.0,
+            "test_ncu_memory_counter_classes_complete": "true",
+            "baseline_ncu_memory_counter_classes_complete": "true",
+            "test_ncu_common_hmma_seen": "true",
+            "baseline_ncu_common_hmma_seen": "false",
+            "test_ncu_hmma_token_seen": "false",
+            "baseline_ncu_hmma_token_seen": "false",
+            "test_ncu_tensor_inst_seen": "true",
+            "baseline_ncu_tensor_inst_seen": "false",
+            "test_ncu_wgmma_token_seen": "false",
+            "baseline_ncu_wgmma_token_seen": "false",
+            "test_ncu_no_l2": "true",
+            "baseline_ncu_no_l2": "true",
+            "test_ncu_no_dram": "true",
+            "baseline_ncu_no_dram": "true",
+            "test_ncu_no_local_spill": "true",
+            "baseline_ncu_no_local_spill": "true",
             "selected_optimal": "true" if target else "false",
             "target_pass": "true" if target else "false",
             "quality_gate_selected_target": "true" if target else "false",
@@ -982,6 +998,10 @@ exit 1
     no_tensor_activity_visual_row = dict(strict_visual_row)
     no_tensor_activity_visual_row["test_ncu_tensor_activity_observed"] = "false"
     no_tensor_activity_visual_row["test_ncu_tensor_activity_pct"] = 0.0
+    no_hmma_visual_row = dict(strict_visual_row)
+    no_hmma_visual_row["test_ncu_common_hmma_seen"] = "false"
+    no_memory_visual_row = dict(strict_visual_row)
+    no_memory_visual_row["test_ncu_no_l2"] = "false"
     if compare_architectures.quality_class(strict_visual_row) != "target":
         raise AssertionError(f"Strict publishable target was not marked as target: {strict_visual_row}")
     if compare_architectures.quality_class(no_ncu_visual_row) != "diagnostic_target":
@@ -990,6 +1010,16 @@ exit 1
         raise AssertionError(
             f"No Tensor-activity target should be visualized as diagnostic: {no_tensor_activity_visual_row}"
         )
+    if compare_architectures.quality_class(no_hmma_visual_row) != "diagnostic_target":
+        raise AssertionError(f"No-HMMA target should be visualized as diagnostic: {no_hmma_visual_row}")
+    if compare_architectures.quality_class(no_memory_visual_row) != "diagnostic_target":
+        raise AssertionError(f"L2-touching target should be visualized as diagnostic: {no_memory_visual_row}")
+    no_hmma_best = compare_architectures.select_best_fp16([no_hmma_visual_row])
+    if no_hmma_best[0].get("selection_note") != "quality_gate_target_pass_without_required_hmma_evidence":
+        raise AssertionError(f"No-HMMA target got wrong rejection note: {no_hmma_best}")
+    no_memory_best = compare_architectures.select_best_fp16([no_memory_visual_row])
+    if no_memory_best[0].get("selection_note") != "quality_gate_target_pass_without_required_no_memory_evidence":
+        raise AssertionError(f"L2-touching target got wrong rejection note: {no_memory_best}")
 
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"
@@ -1155,6 +1185,25 @@ exit 1
     qg_ok_summary = json.loads((quality_gate_ok / "quality_gate_summary.json").read_text())
     if len(qg_ok_summary.get("selected_targets", [])) != 1:
         raise AssertionError(f"Tensor activity quality gate did not select a target: {qg_ok_summary}")
+    qg_ok_rows = read_csv_rows(quality_gate_ok / "quality_gates.csv")
+    qg_ok_row = next((row for row in qg_ok_rows if row.get("target_pass") == "True"), {})
+    if not qg_ok_row:
+        raise AssertionError(f"Quality gate did not write a selected target row: {qg_ok_rows}")
+    for key in (
+        "test_ncu_common_hmma_seen",
+        "test_ncu_memory_counter_classes_complete",
+        "test_ncu_no_l2",
+        "test_ncu_no_dram",
+        "test_ncu_no_local_spill",
+        "baseline_ncu_memory_counter_classes_complete",
+        "baseline_ncu_no_l2",
+        "baseline_ncu_no_dram",
+        "baseline_ncu_no_local_spill",
+    ):
+        if qg_ok_row.get(key) != "true":
+            raise AssertionError(f"Quality gate did not preserve NCU evidence {key}: {qg_ok_row}")
+    if qg_ok_row.get("baseline_ncu_tensor_inst_seen") != "false":
+        raise AssertionError(f"Quality gate did not preserve baseline no-tensor evidence: {qg_ok_row}")
 
     run(
         [

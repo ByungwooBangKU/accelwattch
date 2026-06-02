@@ -225,6 +225,22 @@ def load_result_dir(
                         "baseline_ncu_sm_activity_pct",
                         "test_ncu_tensor_activity_observed",
                         "baseline_ncu_tensor_activity_observed",
+                        "test_ncu_memory_counter_classes_complete",
+                        "baseline_ncu_memory_counter_classes_complete",
+                        "test_ncu_common_hmma_seen",
+                        "baseline_ncu_common_hmma_seen",
+                        "test_ncu_hmma_token_seen",
+                        "baseline_ncu_hmma_token_seen",
+                        "test_ncu_tensor_inst_seen",
+                        "baseline_ncu_tensor_inst_seen",
+                        "test_ncu_wgmma_token_seen",
+                        "baseline_ncu_wgmma_token_seen",
+                        "test_ncu_no_l2",
+                        "baseline_ncu_no_l2",
+                        "test_ncu_no_dram",
+                        "baseline_ncu_no_dram",
+                        "test_ncu_no_local_spill",
+                        "baseline_ncu_no_local_spill",
                         "util_saturated",
                         "util_reference_scope",
                         "util_reference_max_pct",
@@ -322,6 +338,31 @@ def ncu_tensor_activity_ok(row: Dict[str, Any]) -> bool:
     return parse_bool(value) and math.isfinite(pct) and pct > 0.0
 
 
+def ncu_common_hmma_path_ok(row: Dict[str, Any]) -> bool:
+    if not str(row.get("test_kernel", "")).startswith("tensor_mma_"):
+        return True
+    return (
+        parse_bool(row.get("test_ncu_common_hmma_seen"))
+        and not parse_bool(row.get("test_ncu_wgmma_token_seen"))
+        and not parse_bool(row.get("baseline_ncu_common_hmma_seen"))
+        and not parse_bool(row.get("baseline_ncu_tensor_inst_seen"))
+        and not parse_bool(row.get("baseline_ncu_wgmma_token_seen"))
+    )
+
+
+def ncu_no_memory_ok(row: Dict[str, Any]) -> bool:
+    return (
+        parse_bool(row.get("test_ncu_memory_counter_classes_complete"))
+        and parse_bool(row.get("baseline_ncu_memory_counter_classes_complete"))
+        and parse_bool(row.get("test_ncu_no_l2"))
+        and parse_bool(row.get("baseline_ncu_no_l2"))
+        and parse_bool(row.get("test_ncu_no_dram"))
+        and parse_bool(row.get("baseline_ncu_no_dram"))
+        and parse_bool(row.get("test_ncu_no_local_spill"))
+        and parse_bool(row.get("baseline_ncu_no_local_spill"))
+    )
+
+
 def is_strict_publishable_target(row: Dict[str, Any]) -> bool:
     if str(row.get("audit_required_for_publishable", "")).strip() or str(row.get("audit_pass", "")).strip():
         return parse_bool(row.get("audit_pass")) and parse_bool(row.get("target_pass"))
@@ -332,6 +373,8 @@ def is_strict_publishable_target(row: Dict[str, Any]) -> bool:
         and parse_bool(row.get("ncu_validation_pass"))
         and parse_bool(row.get("ncu_validation_context_match"))
         and ncu_tensor_activity_ok(row)
+        and ncu_common_hmma_path_ok(row)
+        and ncu_no_memory_ok(row)
         and str(row.get("baseline_match_grade", "")) == "structural_baseline"
         and parse_bool(row.get("matmul_denominator_valid"))
         and parse_bool(row.get("matmul_denominator_metadata_complete"))
@@ -382,6 +425,9 @@ def select_best_fp16(
             and parse_bool(row.get("ncu_required"))
             and parse_bool(row.get("ncu_validation_pass"))
             and parse_bool(row.get("ncu_validation_context_match"))
+            and ncu_tensor_activity_ok(row)
+            and ncu_common_hmma_path_ok(row)
+            and ncu_no_memory_ok(row)
         ]
         diagnostic_quality = [row for row in group if parse_bool(row.get("quality_pass"))]
         has_quality_info = any(
@@ -408,6 +454,10 @@ def select_best_fp16(
                 )
                 if has_ncu_context and any(not ncu_tensor_activity_ok(row) for row in strict_energy_targets):
                     note = "quality_gate_target_pass_without_required_tensor_activity_evidence"
+                elif has_ncu_context and any(not ncu_common_hmma_path_ok(row) for row in strict_energy_targets):
+                    note = "quality_gate_target_pass_without_required_hmma_evidence"
+                elif has_ncu_context and any(not ncu_no_memory_ok(row) for row in strict_energy_targets):
+                    note = "quality_gate_target_pass_without_required_no_memory_evidence"
                 else:
                     note = "quality_gate_target_pass_without_required_ncu_evidence"
             elif target_rows:

@@ -204,6 +204,19 @@ def ncu_tensor_activity_status(kernel: str, ncu: Dict[str, Any]) -> Tuple[bool, 
     return (False, "NCU tensor activity is missing")
 
 
+def ncu_evidence_fields(prefix: str, ncu: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        f"{prefix}_ncu_memory_counter_classes_complete": ncu.get("memory_counter_classes_complete", ""),
+        f"{prefix}_ncu_common_hmma_seen": ncu.get("common_hmma_seen", ""),
+        f"{prefix}_ncu_hmma_token_seen": ncu.get("hmma_token_seen", ""),
+        f"{prefix}_ncu_tensor_inst_seen": ncu.get("tensor_inst_seen", ""),
+        f"{prefix}_ncu_wgmma_token_seen": ncu.get("wgmma_token_seen", ""),
+        f"{prefix}_ncu_no_l2": ncu.get("no_l2", ""),
+        f"{prefix}_ncu_no_dram": ncu.get("no_dram", ""),
+        f"{prefix}_ncu_no_local_spill": ncu.get("no_local_spill", ""),
+    }
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -763,6 +776,8 @@ def pair_gate_rows(
                 "baseline_ncu_sm_activity_pct": baseline_ncu.get("sm_activity_pct", ""),
                 "test_ncu_tensor_activity_observed": test_ncu.get("tensor_activity_observed", ""),
                 "baseline_ncu_tensor_activity_observed": baseline_ncu.get("tensor_activity_observed", ""),
+                **ncu_evidence_fields("test", test_ncu),
+                **ncu_evidence_fields("baseline", baseline_ncu),
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_available,
                 "common_hmma_path": common_hmma,
@@ -1182,6 +1197,8 @@ def thread_gate_rows(
                 "baseline_ncu_sm_activity_pct": baseline_ncu.get("sm_activity_pct", ""),
                 "test_ncu_tensor_activity_observed": test_ncu.get("tensor_activity_observed", ""),
                 "baseline_ncu_tensor_activity_observed": baseline_ncu.get("tensor_activity_observed", ""),
+                **ncu_evidence_fields("test", test_ncu),
+                **ncu_evidence_fields("baseline", baseline_ncu),
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_observed,
                 "target_util_available": target_util_observed,
