@@ -119,6 +119,7 @@ def ncu_context_status(
     warnings: List[str] = []
 
     comparisons = [
+        ("threads", "threads", "threads"),
         ("blocks_per_sm_requested", "validation_blocks_per_sm", "blocks_per_sm"),
         ("unroll", "validation_unroll", "unroll"),
     ]

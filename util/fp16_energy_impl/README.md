@@ -310,7 +310,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | structural baseline | Tensor Core f16acc는 `tensor_baseline_mov`, f32acc는 `tensor_baseline_f32`, CUDA-core half2는 `baseline_regmove`를 strict baseline으로 사용 |
 | common instruction path | A100/H100/RTX3090 비교에서는 WGMMA가 아니라 공통 HMMA `mma.sync.m16n8k16` pair path |
 | NCU validation | 최종 claim에는 `validate_ncu_reports.py`가 만든 `ncu_validation_summary.csv`를 `--require-ncu`로 연결 |
-| NCU validation context | NCU 검증 run의 `blocks_per_sm`, `unroll`, `suppress_output_store`가 측정 row와 같은지 확인 |
+| NCU validation context | NCU 검증 run의 `threads`, `blocks_per_sm`, `unroll`, `suppress_output_store`가 측정 row와 같은지 확인 |
 | NCU tensor activity | explicit metric 또는 `ComputeWorkloadAnalysis` section에서 Tensor activity percentage를 추출해 selected Tensor Core point의 profiler-side utilization evidence로 기록 |
 | ptxas resource audit | selected test/baseline kernel의 register/thread와 stack/spill bytes를 build log에서 추출 |
 | utilization target | strict quality gate를 통과한 후보군 안에서 Tensor Core matmul은 `tensor_model_utilization_pct_mean`, 그 외 kernel은 SM/GPU utilization 최대값 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
@@ -690,7 +690,7 @@ Thread sweep에서 선택된 후보가 L2/global memory를 의도적으로 touch
   32,64,128,256,512,1024
 ```
 
-이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 기본 `tensor_baseline_mov`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. Helper는 기본적으로 strict matrix와 같은 `blocks_per_sm=8`, `unroll=8`, `suppress_output_store=true` context를 `ncu_validation_summary.csv`에 기록하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`는 이 context가 측정 row와 맞는지와 test kernel의 Tensor pipe activity evidence가 있는지도 확인한다. Launch-shape sweep처럼 여러 `blocks/SM`을 검증할 때는 `NCU_BLOCKS_PER_SM_CSV=1,2,4,8` 또는 pipeline의 `--ncu-blocks-per-sm-csv 1,2,4,8`을 사용하며, validation report 이름과 quality/audit 매칭은 `threads + blocks_per_sm`를 함께 사용한다. `tensor_baseline_mov`는 ptxas가 empty/register-only loop를 제거하지 못하도록 no-memory warp-sync step을 사용한다. 필요한 경우 `NCU_BASELINE_KERNEL`, `NCU_BLOCKS_PER_SM`, `NCU_BLOCKS_PER_SM_CSV`, `NCU_UNROLL`, `NCU_SUPPRESS_OUTPUT_STORE`, `NCU_ITERS`, `NCU_REPEATS`, `NCU_WARMUP`, `NCU_MIN_TENSOR_ACTIVITY_PCT` 환경변수로 profiler validation run의 launch context와 Tensor activity threshold를 override한다. Diagnostic run에서만 `NCU_REQUIRE_TENSOR_ACTIVITY=0`으로 Tensor activity hard gate를 끌 수 있다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
+이 validation은 `--suppress-output-store`로 `tensor_mma_f16acc`와 기본 `tensor_baseline_mov`의 final global store를 제거한 상태에서 Nsight Compute `MemoryWorkloadAnalysis`를 남긴다. Helper는 기본적으로 strict matrix와 같은 `threads`, `blocks_per_sm=8`, `unroll=8`, `suppress_output_store=true` context를 `ncu_validation_summary.csv`에 기록하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`는 이 context가 측정 row와 맞는지와 test kernel의 Tensor pipe activity evidence가 있는지도 확인한다. Launch-shape sweep처럼 여러 `blocks/SM`을 검증할 때는 `NCU_BLOCKS_PER_SM_CSV=1,2,4,8` 또는 pipeline의 `--ncu-blocks-per-sm-csv 1,2,4,8`을 사용하며, validation report 이름과 quality/audit 매칭은 `threads + blocks_per_sm`를 함께 사용한다. `threads`가 누락된 NCU report는 fallback으로 matching될 수 있어도 strict quality/audit context check에서 실패한다. `tensor_baseline_mov`는 ptxas가 empty/register-only loop를 제거하지 못하도록 no-memory warp-sync step을 사용한다. 필요한 경우 `NCU_BASELINE_KERNEL`, `NCU_BLOCKS_PER_SM`, `NCU_BLOCKS_PER_SM_CSV`, `NCU_UNROLL`, `NCU_SUPPRESS_OUTPUT_STORE`, `NCU_ITERS`, `NCU_REPEATS`, `NCU_WARMUP`, `NCU_MIN_TENSOR_ACTIVITY_PCT` 환경변수로 profiler validation run의 launch context와 Tensor activity threshold를 override한다. Diagnostic run에서만 `NCU_REQUIRE_TENSOR_ACTIVITY=0`으로 Tensor activity hard gate를 끌 수 있다. GeForce/WSL 환경에서는 NVIDIA performance counter 권한 때문에 `ERR_NVGPUCTRPERM`으로 막힐 수 있다.
 
 두 validation helper는 실행 후 `validate_ncu_reports.py`를 호출해 다음 산출물을 만든다.
 
@@ -756,7 +756,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `avg_gpu_util_pct`, `max_gpu_util_pct` | test interval 안의 `nvidia-smi utilization.gpu` 평균/최대값 |
 | `avg_sm_util_pct`, `max_sm_util_pct` | test interval 안의 `nvidia-smi dmon -s u` `sm` 컬럼 평균/최대값 |
 | `test_ncu_tensor_activity_pct`, `baseline_ncu_tensor_activity_pct` | NCU validation report에서 추출한 Tensor pipe activity percentage |
-| `ncu_validation_context_match` | NCU validation run의 launch context가 측정 row의 `blocks_per_sm`, `unroll`, `suppress_output_store`와 일치하는지 여부 |
+| `ncu_validation_context_match` | NCU validation run의 launch context가 측정 row의 `threads`, `blocks_per_sm`, `unroll`, `suppress_output_store`와 일치하는지 여부 |
 | `tensor_peak_tflops_model` | run의 SM count와 평균 SM clock으로 계산한 dense FP16 Tensor Core peak model |
 | `tensor_model_accumulator_mode` | peak normalization에 사용한 accumulator mode. `tensor_mma_f16acc`는 `f16acc`, `tensor_mma_f32acc`는 `f32acc` |
 | `tensor_model_flop_per_sm_cycle` | 해당 accumulator mode의 dense FP16 Tensor Core FLOP/SM/cycle |

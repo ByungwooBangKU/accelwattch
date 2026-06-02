@@ -1,8 +1,9 @@
-# FP16 energy experiment progress report
+# FP16 energy experiment results and design delta report
 
 작성일: 2026-06-02
 대상 디렉터리: `util/fp16_energy_impl`
 현재 측정 완료 GPU: NVIDIA GeForce RTX 3090, GA102, sm86
+문서 목적: 지금까지 얻은 RTX 3090 FP16 matmul pJ/bit 결과와 최초 설계 대비 변경점을 기록한다.
 
 ## 1. 현재 결론
 
@@ -48,6 +49,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | `blocks_per_sm=8` 가정 | 고정값처럼 쓰일 수 있었음 | 별도 sweep으로 검증, 현재 target은 `blocks/SM=1`의 첫 saturation point |
 | L2 조건 | 결과 metadata의 `expected_l2_touch=false`에 가까운 software-side 판정 | strict final에서는 NCU MemoryWorkloadAnalysis no-L2/global-memory validation과 Tensor activity evidence 요구 |
 | Memory provenance | `suppress_output_store`와 `memory_bytes_estimate`에서 analyzer가 주로 간접 추론 | benchmark JSON이 `timed_kernel_global_input_loads`, `timed_kernel_global_output_stores`, `timed_kernel_has_intended_global_memory`를 직접 기록하고, analyzer/audit는 test와 baseline 양쪽 모두 no-memory일 때만 no-L2 후보로 인정 |
+| NCU context matching | NCU row가 kernel/thread 후보와 느슨하게 매칭될 여지가 있었고, context 비교는 주로 `blocks_per_sm`, `unroll`, `suppress_output_store` 중심 | quality gate와 strict audit가 NCU validation row의 `threads`, `blocks_per_sm`, `unroll`, `suppress_output_store`를 selected measurement row와 모두 비교. `threads`가 누락된 NCU report는 fallback matching되어도 strict target/audit에서 실패 |
 | Energy source | `nvidia-smi` power trace fallback 중심 legacy 결과 포함 | 최종 비교는 `NVML total energy counter`, `measurement_grade=strict_nvml_counter` selected target만 허용 |
 | Negative pJ/bit 처리 | 초기에는 음수 행이 result table에 섞일 수 있었음 | `all_runs_no_valid`, `not_valid_no_l2_candidate`, quality gate failure로 분리 |
 | Architecture scope | 일반 CUDA 실행 설명 위주 | A100 sm80/GA100, RTX 3090 sm86/GA102, H100 sm90/GH100 metadata 검증 추가 |
@@ -58,6 +60,8 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | Register evidence | 질문 시 별도 확인 필요 | `summarize_kernel_resources.py`와 resource audit로 ptxas register/spill evidence 기록 |
 | Diagnostic mode | strict 실패와 diagnostic 구분이 약함 | `--diagnostic-no-ncu`는 NCU를 명시적으로 skip하고 final claim에서 제외 |
 | Tensor model sanity | model utilization fallback 값이 100%를 넘는 diagnostic row도 analyzer selected로 보일 수 있었음 | `tensor_model_utilization_pct_mean > 105%` row는 analyzer `selected_optimal` 후보와 quality gate target 후보에서 제외 |
+
+최근 코드 검토에서 확인한 설계상 취약점은 NCU validation evidence가 selected thread count와 정확히 같은 launch context인지 충분히 강제하지 않는 부분이었다. 현재는 `quality_gate.py`, `audit_strict_results.py`, `smoke_strict_pipeline.py`, README를 수정해 NCU row의 thread context가 빠지거나 measurement row와 다르면 final strict target으로 채택되지 않도록 했다.
 
 ## 4. 결과 히스토리
 

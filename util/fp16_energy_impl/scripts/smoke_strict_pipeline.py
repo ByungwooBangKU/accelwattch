@@ -86,6 +86,7 @@ def target_row(test_kernel: str, baseline_kernel: str, threads: int) -> Dict[str
         "baseline_kernel": baseline_kernel,
         "threads": threads,
         "unroll": 16,
+        "suppress_output_store": "true",
         "threads_per_sm": 1024,
         "blocks_per_sm_requested": 8,
         "measurement_grade": "strict_nvml_counter",
@@ -582,11 +583,17 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     quality_gate_model_util = base / "quality_gate_model_util_fallback"
     quality_gate_model_util_overmax = base / "quality_gate_model_util_overmax"
     quality_gate_missing_memory_feature = base / "quality_gate_missing_memory_feature"
+    quality_gate_missing_ncu_threads = base / "quality_gate_missing_ncu_threads"
     write_quality_gate_input(quality_gate_ok, tensor_activity_observed=True)
     write_quality_gate_input(quality_gate_bad, tensor_activity_observed=False)
     write_quality_gate_model_util_input(quality_gate_model_util)
     write_quality_gate_model_util_input(quality_gate_model_util_overmax, model_util_pct=108.0)
     write_quality_gate_input(quality_gate_missing_memory_feature, tensor_activity_observed=True)
+    write_quality_gate_input(quality_gate_missing_ncu_threads, tensor_activity_observed=True)
+    missing_thread_ncu_rows = read_csv_rows(quality_gate_missing_ncu_threads / "ncu_validation_summary.csv")
+    for row in missing_thread_ncu_rows:
+        row["threads"] = ""
+    write_csv(quality_gate_missing_ncu_threads / "ncu_validation_summary.csv", missing_thread_ncu_rows)
     legacy_features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
     for csv_name in ("summary.csv", "thread_sweep_summary.csv"):
         rows = read_csv_rows(quality_gate_missing_memory_feature / csv_name)
@@ -1035,6 +1042,29 @@ exit 1
             sys.executable,
             str(SCRIPT_DIR / "quality_gate.py"),
             "--input",
+            str(quality_gate_missing_ncu_threads),
+            "--ncu-summary",
+            str(quality_gate_missing_ncu_threads / "ncu_validation_summary.csv"),
+            "--require-ncu",
+            "--require-ncu-tensor-activity",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    qg_missing_ncu_threads_summary = json.loads(
+        (quality_gate_missing_ncu_threads / "quality_gate_summary.json").read_text()
+    )
+    if qg_missing_ncu_threads_summary.get("selected_targets"):
+        raise AssertionError(f"Missing NCU threads context selected a target: {qg_missing_ncu_threads_summary}")
+    qg_missing_ncu_threads_rows = read_csv_rows(quality_gate_missing_ncu_threads / "quality_gates.csv")
+    if not any("NCU validation threads context is missing" in row.get("fail_reasons", "") for row in qg_missing_ncu_threads_rows):
+        raise AssertionError(f"Missing NCU threads context did not record the failure: {qg_missing_ncu_threads_rows}")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "quality_gate.py"),
+            "--input",
             str(quality_gate_missing_memory_feature),
             "--ncu-summary",
             str(quality_gate_missing_memory_feature / "ncu_validation_summary.csv"),
@@ -1184,6 +1214,8 @@ exit 1
         raise AssertionError(f"Strict audit did not carry passing NCU permission probe evidence: {good_row}")
     if good_row.get("pipeline_ncu_permission_probe_permission_denied") != "False":
         raise AssertionError(f"Strict audit did not carry NCU permission-denied evidence: {good_row}")
+    if good_row.get("test_ncu_threads") != "128" or good_row.get("baseline_ncu_threads") != "128":
+        raise AssertionError(f"Strict audit did not carry exact NCU thread context: {good_row}")
     if good_row.get("timed_kernel_memory_provenance_metadata_all") != "true":
         raise AssertionError(f"Strict audit did not carry memory provenance metadata evidence: {good_row}")
     if good_row.get("timed_kernel_has_intended_global_memory_count") != "0":

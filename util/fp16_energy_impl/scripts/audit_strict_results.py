@@ -152,6 +152,53 @@ def find_resource_row(
     return {}
 
 
+def check_ncu_context(
+    row: Dict[str, Any],
+    *,
+    role: str,
+    target_threads: str,
+    target_blocks_per_sm: str,
+    target_unroll: str,
+    target_suppress_output_store: Any,
+) -> List[str]:
+    failures: List[str] = []
+    observed_threads = normalize_thread(row.get("threads", ""))
+    if not observed_threads:
+        failures.append(f"selected {role} NCU threads context is missing")
+    elif observed_threads != normalize_thread(target_threads):
+        failures.append(
+            f"selected {role} NCU threads {observed_threads} != measurement {normalize_thread(target_threads)}"
+        )
+
+    observed_blocks = normalize_thread(row.get("validation_blocks_per_sm", ""))
+    if not observed_blocks:
+        failures.append(f"selected {role} NCU blocks_per_sm context is missing")
+    elif observed_blocks != normalize_thread(target_blocks_per_sm):
+        failures.append(
+            "selected "
+            f"{role} NCU blocks_per_sm {observed_blocks} != measurement {normalize_thread(target_blocks_per_sm)}"
+        )
+
+    observed_unroll = normalize_thread(row.get("validation_unroll", ""))
+    if not observed_unroll:
+        failures.append(f"selected {role} NCU unroll context is missing")
+    elif target_unroll and observed_unroll != normalize_thread(target_unroll):
+        failures.append(
+            f"selected {role} NCU unroll {observed_unroll} != measurement {normalize_thread(target_unroll)}"
+        )
+
+    observed_suppress = str(row.get("validation_suppress_output_store", "")).strip()
+    if not observed_suppress:
+        failures.append(f"selected {role} NCU suppress_output_store context is missing")
+    elif parse_bool(observed_suppress) != parse_bool(target_suppress_output_store):
+        failures.append(
+            "selected "
+            f"{role} NCU suppress_output_store {parse_bool(observed_suppress)} "
+            f"!= measurement {parse_bool(target_suppress_output_store)}"
+        )
+    return failures
+
+
 def select_target(
     targets: Any,
     quality_rows: List[Dict[str, Any]],
@@ -542,6 +589,28 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("missing NCU validation row for selected test kernel/thread/blocks_per_sm")
     if ncu_rows and not baseline_ncu:
         failed.append("missing NCU validation row for selected baseline kernel/thread/blocks_per_sm")
+    if test_ncu:
+        failed.extend(
+            check_ncu_context(
+                test_ncu,
+                role="test",
+                target_threads=threads,
+                target_blocks_per_sm=blocks_per_sm,
+                target_unroll=unroll,
+                target_suppress_output_store=target.get("suppress_output_store"),
+            )
+        )
+    if baseline_ncu:
+        failed.extend(
+            check_ncu_context(
+                baseline_ncu,
+                role="baseline",
+                target_threads=threads,
+                target_blocks_per_sm=blocks_per_sm,
+                target_unroll=unroll,
+                target_suppress_output_store=target.get("suppress_output_store"),
+            )
+        )
     if test_ncu and not parse_bool(test_ncu.get("validation_pass")):
         failed.append("selected test NCU validation did not pass")
     if baseline_ncu and not parse_bool(baseline_ncu.get("validation_pass")):
@@ -756,6 +825,8 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_ncu_no_dram": baseline_ncu.get("no_dram", "") if baseline_ncu else "",
         "test_ncu_no_local_spill": test_ncu.get("no_local_spill", "") if test_ncu else "",
         "baseline_ncu_no_local_spill": baseline_ncu.get("no_local_spill", "") if baseline_ncu else "",
+        "test_ncu_threads": test_ncu.get("threads", "") if test_ncu else "",
+        "baseline_ncu_threads": baseline_ncu.get("threads", "") if baseline_ncu else "",
         "test_ncu_validation_blocks_per_sm": test_ncu.get("validation_blocks_per_sm", "") if test_ncu else "",
         "baseline_ncu_validation_blocks_per_sm": baseline_ncu.get("validation_blocks_per_sm", "") if baseline_ncu else "",
         "test_ncu_validation_unroll": test_ncu.get("validation_unroll", "") if test_ncu else "",
