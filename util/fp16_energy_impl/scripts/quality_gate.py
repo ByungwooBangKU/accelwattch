@@ -59,29 +59,29 @@ def normalize_int_text(value: Any) -> str:
     return text
 
 
-def load_ncu_validation(path: Path | None) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+def load_ncu_validation(path: Path | None) -> List[Dict[str, Any]]:
     if path is None:
-        return {}
-    rows = read_csv(path)
-    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for row in rows:
-        out[
-            (
-                str(row.get("kernel", "")),
-                normalize_int_text(row.get("threads", "")),
-                normalize_int_text(row.get("validation_blocks_per_sm", "")),
-            )
-        ] = row
-    return out
+        return []
+    return read_csv(path)
 
 
 def ncu_status(
     kernel: str,
     threads: Any,
     blocks_per_sm: Any,
-    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
+    ncu_rows: List[Dict[str, Any]],
+    *,
+    unroll: Any = "",
+    suppress_output_store: Any = "",
 ) -> Tuple[bool, str]:
-    row = ncu_row(kernel, threads, blocks_per_sm, ncu_rows)
+    row = ncu_row(
+        kernel,
+        threads,
+        blocks_per_sm,
+        ncu_rows,
+        unroll=unroll,
+        suppress_output_store=suppress_output_store,
+    )
     if not row:
         return (False, "missing NCU validation row")
     if parse_bool(row.get("validation_pass")):
@@ -94,17 +94,51 @@ def ncu_row(
     kernel: str,
     threads: Any,
     blocks_per_sm: Any,
-    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
+    ncu_rows: List[Dict[str, Any]],
+    *,
+    unroll: Any = "",
+    suppress_output_store: Any = "",
 ) -> Dict[str, Any]:
     thread_text = normalize_int_text(threads)
     blocks_text = normalize_int_text(blocks_per_sm)
-    return (
-        ncu_rows.get((kernel, thread_text, blocks_text))
-        or ncu_rows.get((kernel, thread_text, ""))
-        or ncu_rows.get((kernel, "", blocks_text))
-        or ncu_rows.get((kernel, "", ""))
-        or {}
-    )
+    unroll_text = normalize_int_text(unroll)
+    suppress_text = "" if suppress_output_store is None else str(suppress_output_store).strip()
+
+    def score(row: Dict[str, Any]) -> Tuple[int, int, int, int, int] | None:
+        if str(row.get("kernel", "")) != kernel:
+            return None
+        observed_threads = normalize_int_text(row.get("threads", ""))
+        observed_blocks = normalize_int_text(row.get("validation_blocks_per_sm", ""))
+        if observed_threads and observed_threads != thread_text:
+            return None
+        if observed_blocks and observed_blocks != blocks_text:
+            return None
+
+        observed_unroll = normalize_int_text(row.get("validation_unroll", ""))
+        observed_suppress = str(row.get("validation_suppress_output_store", "")).strip()
+        thread_score = 2 if observed_threads == thread_text else 1 if not observed_threads else 0
+        block_score = 2 if observed_blocks == blocks_text else 1 if not observed_blocks else 0
+        unroll_score = 0
+        if unroll_text:
+            unroll_score = 2 if observed_unroll == unroll_text else 1 if not observed_unroll else 0
+        suppress_score = 0
+        if suppress_text:
+            suppress_score = (
+                2 if observed_suppress and parse_bool(observed_suppress) == parse_bool(suppress_text)
+                else 1 if not observed_suppress
+                else 0
+            )
+        validation_score = 1 if parse_bool(row.get("validation_pass")) else 0
+        return (thread_score, block_score, unroll_score, suppress_score, validation_score)
+
+    candidates: List[Tuple[Tuple[int, int, int, int, int], int, Dict[str, Any]]] = []
+    for index, row in enumerate(ncu_rows):
+        row_score = score(row)
+        if row_score is not None:
+            candidates.append((row_score, -index, row))
+    if not candidates:
+        return {}
+    return max(candidates, key=lambda item: item[:2])[2]
 
 
 def ncu_context_status(
@@ -484,7 +518,7 @@ def matmul_denominator_quality(
 def pair_gate_rows(
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
-    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
+    ncu_rows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in summary_rows:
@@ -541,15 +575,33 @@ def pair_gate_rows(
             row.get("threads", ""),
             blocks_per_sm,
             ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
         )
-        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
+        test_ncu = ncu_row(
+            str(row.get("test_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
+        )
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
             str(row.get("baseline_kernel", "")),
             row.get("threads", ""),
             blocks_per_sm,
             ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
         )
-        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
+        baseline_ncu = ncu_row(
+            str(row.get("baseline_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
+        )
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
         test_context_ok, test_context_failed, test_context_warnings = ncu_context_status(row, test_ncu, args)
         baseline_context_ok, baseline_context_failed, baseline_context_warnings = ncu_context_status(
@@ -861,7 +913,7 @@ def thread_gate_rows(
     thread_rows: List[Dict[str, Any]],
     summary_rows: Iterable[Dict[str, Any]],
     args: argparse.Namespace,
-    ncu_rows: Dict[Tuple[str, str, str], Dict[str, Any]],
+    ncu_rows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     source_by_thread = source_counts_by_thread(summary_rows)
     out: List[Dict[str, Any]] = []
@@ -914,15 +966,33 @@ def thread_gate_rows(
             row.get("threads", ""),
             blocks_per_sm,
             ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
         )
-        test_ncu = ncu_row(str(row.get("test_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
+        test_ncu = ncu_row(
+            str(row.get("test_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
+        )
         baseline_ncu_ok, baseline_ncu_note = ncu_status(
             str(row.get("baseline_kernel", "")),
             row.get("threads", ""),
             blocks_per_sm,
             ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
         )
-        baseline_ncu = ncu_row(str(row.get("baseline_kernel", "")), row.get("threads", ""), blocks_per_sm, ncu_rows)
+        baseline_ncu = ncu_row(
+            str(row.get("baseline_kernel", "")),
+            row.get("threads", ""),
+            blocks_per_sm,
+            ncu_rows,
+            unroll=row.get("unroll", ""),
+            suppress_output_store=row.get("suppress_output_store", ""),
+        )
         ncu_ok = bool(test_ncu_ok and baseline_ncu_ok)
         test_context_ok, test_context_failed, test_context_warnings = ncu_context_status(row, test_ncu, args)
         baseline_context_ok, baseline_context_failed, baseline_context_warnings = ncu_context_status(

@@ -83,29 +83,54 @@ def normalize_thread(value: Any) -> str:
     return str(value or "")
 
 
-def find_ncu_row(rows: List[Dict[str, Any]], kernel: str, threads: str, blocks_per_sm: str) -> Dict[str, Any]:
+def find_ncu_row(
+    rows: List[Dict[str, Any]],
+    kernel: str,
+    threads: str,
+    blocks_per_sm: str,
+    unroll: str,
+    suppress_output_store: Any,
+) -> Dict[str, Any]:
+    threads = normalize_thread(threads)
     blocks_per_sm = normalize_thread(blocks_per_sm)
-    for row in rows:
-        if (
-            str(row.get("kernel", "")) == kernel
-            and normalize_thread(row.get("threads", "")) == threads
-            and normalize_thread(row.get("validation_blocks_per_sm", "")) == blocks_per_sm
-        ):
-            return row
-    for row in rows:
-        if str(row.get("kernel", "")) == kernel and normalize_thread(row.get("threads", "")) == threads:
-            return row
-    for row in rows:
-        if (
-            str(row.get("kernel", "")) == kernel
-            and not str(row.get("threads", ""))
-            and normalize_thread(row.get("validation_blocks_per_sm", "")) == blocks_per_sm
-        ):
-            return row
-    for row in rows:
-        if str(row.get("kernel", "")) == kernel and not str(row.get("threads", "")):
-            return row
-    return {}
+    unroll = normalize_thread(unroll)
+    suppress_text = "" if suppress_output_store is None else str(suppress_output_store).strip()
+
+    def score(row: Dict[str, Any]) -> Tuple[int, int, int, int, int] | None:
+        if str(row.get("kernel", "")) != kernel:
+            return None
+        observed_threads = normalize_thread(row.get("threads", ""))
+        observed_blocks = normalize_thread(row.get("validation_blocks_per_sm", ""))
+        if observed_threads and observed_threads != threads:
+            return None
+        if observed_blocks and observed_blocks != blocks_per_sm:
+            return None
+
+        observed_unroll = normalize_thread(row.get("validation_unroll", ""))
+        observed_suppress = str(row.get("validation_suppress_output_store", "")).strip()
+        thread_score = 2 if observed_threads == threads else 1 if not observed_threads else 0
+        block_score = 2 if observed_blocks == blocks_per_sm else 1 if not observed_blocks else 0
+        unroll_score = 0
+        if unroll:
+            unroll_score = 2 if observed_unroll == unroll else 1 if not observed_unroll else 0
+        suppress_score = 0
+        if suppress_text:
+            suppress_score = (
+                2 if observed_suppress and parse_bool(observed_suppress) == parse_bool(suppress_text)
+                else 1 if not observed_suppress
+                else 0
+            )
+        validation_score = 1 if parse_bool(row.get("validation_pass")) else 0
+        return (thread_score, block_score, unroll_score, suppress_score, validation_score)
+
+    candidates: List[Tuple[Tuple[int, int, int, int, int], int, Dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        row_score = score(row)
+        if row_score is not None:
+            candidates.append((row_score, -index, row))
+    if not candidates:
+        return {}
+    return max(candidates, key=lambda item: item[:2])[2]
 
 
 def find_resource_row(
@@ -294,8 +319,9 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     threads = normalize_thread(target.get("threads", ""))
     blocks_per_sm = normalize_thread(target.get("blocks_per_sm_requested", ""))
     unroll = normalize_thread(target.get("unroll", ""))
-    test_ncu = find_ncu_row(ncu_rows, test_kernel, threads, blocks_per_sm)
-    baseline_ncu = find_ncu_row(ncu_rows, baseline_kernel, threads, blocks_per_sm)
+    suppress_output_store = target.get("suppress_output_store")
+    test_ncu = find_ncu_row(ncu_rows, test_kernel, threads, blocks_per_sm, unroll, suppress_output_store)
+    baseline_ncu = find_ncu_row(ncu_rows, baseline_kernel, threads, blocks_per_sm, unroll, suppress_output_store)
     test_resource = find_resource_row(resource_rows, "test", test_kernel, threads, unroll, blocks_per_sm)
     baseline_resource = find_resource_row(
         resource_rows,

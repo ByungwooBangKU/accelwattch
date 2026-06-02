@@ -174,6 +174,14 @@ def ncu_row(kernel: str, threads: int, *, tensor_activity_observed: bool | None 
     }
 
 
+def ncu_context_decoy(row: Dict[str, Any]) -> Dict[str, Any]:
+    decoy = dict(row)
+    decoy["validation_unroll"] = 8
+    decoy["validation_suppress_output_store"] = "false"
+    decoy["memory_note"] = "synthetic_context_decoy"
+    return decoy
+
+
 def resource_row(role: str, kernel: str, threads: int) -> Dict[str, Any]:
     return {
         "role": role,
@@ -577,15 +585,20 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     write_result_dir(good, include_required_target=True)
     write_result_dir(no_required, include_required_target=False)
     write_result_dir(no_tensor_activity, include_required_target=True, required_tensor_activity=False)
+    good_ncu_rows = read_csv_rows(good / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
+    good_ncu_rows = [ncu_context_decoy(row) for row in good_ncu_rows if str(row.get("threads", "")) == "128"] + good_ncu_rows
+    write_csv(good / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv", good_ncu_rows)
 
     quality_gate_ok = base / "quality_gate_tensor_activity_ok"
     quality_gate_bad = base / "quality_gate_tensor_activity_bad"
+    quality_gate_duplicate_ncu_context = base / "quality_gate_duplicate_ncu_context"
     quality_gate_model_util = base / "quality_gate_model_util_fallback"
     quality_gate_model_util_overmax = base / "quality_gate_model_util_overmax"
     quality_gate_missing_memory_feature = base / "quality_gate_missing_memory_feature"
     quality_gate_missing_ncu_threads = base / "quality_gate_missing_ncu_threads"
     write_quality_gate_input(quality_gate_ok, tensor_activity_observed=True)
     write_quality_gate_input(quality_gate_bad, tensor_activity_observed=False)
+    write_quality_gate_input(quality_gate_duplicate_ncu_context, tensor_activity_observed=True)
     write_quality_gate_model_util_input(quality_gate_model_util)
     write_quality_gate_model_util_input(quality_gate_model_util_overmax, model_util_pct=108.0)
     write_quality_gate_input(quality_gate_missing_memory_feature, tensor_activity_observed=True)
@@ -594,6 +607,9 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     for row in missing_thread_ncu_rows:
         row["threads"] = ""
     write_csv(quality_gate_missing_ncu_threads / "ncu_validation_summary.csv", missing_thread_ncu_rows)
+    duplicate_ncu_rows = read_csv_rows(quality_gate_duplicate_ncu_context / "ncu_validation_summary.csv")
+    duplicate_ncu_rows = duplicate_ncu_rows + [ncu_context_decoy(row) for row in duplicate_ncu_rows]
+    write_csv(quality_gate_duplicate_ncu_context / "ncu_validation_summary.csv", duplicate_ncu_rows)
     legacy_features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
     for csv_name in ("summary.csv", "thread_sweep_summary.csv"):
         rows = read_csv_rows(quality_gate_missing_memory_feature / csv_name)
@@ -1021,6 +1037,41 @@ exit 1
             sys.executable,
             str(SCRIPT_DIR / "quality_gate.py"),
             "--input",
+            str(quality_gate_duplicate_ncu_context),
+            "--ncu-summary",
+            str(quality_gate_duplicate_ncu_context / "ncu_validation_summary.csv"),
+            "--require-ncu",
+            "--require-ncu-tensor-activity",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    qg_duplicate_context_summary = json.loads(
+        (quality_gate_duplicate_ncu_context / "quality_gate_summary.json").read_text()
+    )
+    if len(qg_duplicate_context_summary.get("selected_targets", [])) != 1:
+        raise AssertionError(
+            f"Duplicate NCU context quality gate did not select the exact-context target: "
+            f"{qg_duplicate_context_summary}"
+        )
+    qg_duplicate_context_rows = read_csv_rows(quality_gate_duplicate_ncu_context / "quality_gates.csv")
+    duplicate_targets = [row for row in qg_duplicate_context_rows if row.get("target_pass") == "True"]
+    if not duplicate_targets:
+        raise AssertionError(f"Duplicate NCU context quality gate did not mark a target row: {qg_duplicate_context_rows}")
+    duplicate_target = duplicate_targets[0]
+    if (
+        duplicate_target.get("test_ncu_validation_unroll") != "16"
+        or duplicate_target.get("baseline_ncu_validation_unroll") != "16"
+        or duplicate_target.get("test_ncu_validation_suppress_output_store") != "true"
+        or duplicate_target.get("baseline_ncu_validation_suppress_output_store") != "true"
+    ):
+        raise AssertionError(f"Duplicate NCU context selected a decoy validation row: {duplicate_target}")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "quality_gate.py"),
+            "--input",
             str(quality_gate_bad),
             "--ncu-summary",
             str(quality_gate_bad / "ncu_validation_summary.csv"),
@@ -1216,6 +1267,13 @@ exit 1
         raise AssertionError(f"Strict audit did not carry NCU permission-denied evidence: {good_row}")
     if good_row.get("test_ncu_threads") != "128" or good_row.get("baseline_ncu_threads") != "128":
         raise AssertionError(f"Strict audit did not carry exact NCU thread context: {good_row}")
+    if (
+        good_row.get("test_ncu_validation_unroll") != "16"
+        or good_row.get("baseline_ncu_validation_unroll") != "16"
+        or good_row.get("test_ncu_validation_suppress_output_store") != "true"
+        or good_row.get("baseline_ncu_validation_suppress_output_store") != "true"
+    ):
+        raise AssertionError(f"Strict audit selected a decoy NCU validation context: {good_row}")
     if good_row.get("timed_kernel_memory_provenance_metadata_all") != "true":
         raise AssertionError(f"Strict audit did not carry memory provenance metadata evidence: {good_row}")
     if good_row.get("timed_kernel_has_intended_global_memory_count") != "0":
