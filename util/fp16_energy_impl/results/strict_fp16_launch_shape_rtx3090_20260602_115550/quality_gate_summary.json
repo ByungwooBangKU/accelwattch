@@ -1,6 +1,6 @@
 {
   "input": "results/strict_fp16_launch_shape_rtx3090_20260602_115550",
-  "generated_utc": "2026-06-02T04:57:29.433618+00:00",
+  "generated_utc": "2026-06-02T05:02:50.559913+00:00",
   "thresholds": {
     "max_clock_span_mhz": 60.0,
     "min_power_samples": 3,
@@ -13,6 +13,7 @@
     "min_baseline_elapsed_s": 0.25,
     "min_test_energy_j": 1.0,
     "min_incremental_energy_j": 0.1,
+    "max_tensor_model_util_pct": 105.0,
     "expected_benchmark_schema_version": "fp16-energy-bench-v2",
     "expected_matmul_input_bits_per_logical_mma": 8192.0,
     "expected_mma_flops_per_logical_mma": 8192.0,
@@ -142,6 +143,7 @@
     "strict denominator gates require these values to come from complete benchmark JSON metadata, not analyzer-only legacy fallback formulas.",
     "energy_trace_crosscheck_pass compares NVML total-energy delta with nvidia-smi power trace integration; it is a warning by default because power.draw may be averaged over a different window.",
     "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
-    "For Tensor Core final claims, --require-ncu-tensor-activity should also be enabled so selected tensor_mma rows have profiler-side Tensor pipe activity evidence."
+    "For Tensor Core final claims, --require-ncu-tensor-activity should also be enabled so selected tensor_mma rows have profiler-side Tensor pipe activity evidence.",
+    "Tensor model utilization above max_tensor_model_util_pct fails because it usually indicates architecture model, clock telemetry, or FLOP accounting mismatch."
   ]
 }

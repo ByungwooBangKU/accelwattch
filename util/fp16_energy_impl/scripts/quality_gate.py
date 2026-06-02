@@ -934,6 +934,15 @@ def thread_gate_rows(
             failed.append("target utilization missing")
         elif not sm_util_observed:
             warnings.append(f"SM/GPU utilization missing; using {util_source} fallback")
+        if (
+            target_util_observed
+            and util_source == "tensor_model_utilization_pct_mean"
+            and target_util > args.max_tensor_model_util_pct
+        ):
+            failed.append(
+                f"tensor_model_utilization_pct_mean {target_util:.4g}% exceeds "
+                f"{args.max_tensor_model_util_pct:.4g}% sanity limit"
+            )
         if not source_ok:
             failed.append("energy source is unavailable or undersampled")
         if not baseline_ok:
@@ -1428,6 +1437,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "min_baseline_elapsed_s": args.min_baseline_elapsed_s,
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
+            "max_tensor_model_util_pct": args.max_tensor_model_util_pct,
             "expected_benchmark_schema_version": args.expected_benchmark_schema_version,
             "expected_matmul_input_bits_per_logical_mma": args.expected_matmul_input_bits_per_logical_mma,
             "expected_mma_flops_per_logical_mma": args.expected_mma_flops_per_logical_mma,
@@ -1467,6 +1477,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
             "For Tensor Core final claims, --require-ncu-tensor-activity should also be enabled so "
             "selected tensor_mma rows have profiler-side Tensor pipe activity evidence.",
+            "Tensor model utilization above max_tensor_model_util_pct fails because it usually indicates "
+            "architecture model, clock telemetry, or FLOP accounting mismatch.",
         ],
     }
     with (input_dir / "quality_gate_summary.json").open("w") as f:
@@ -1489,6 +1501,7 @@ def main() -> int:
     parser.add_argument("--warn-baseline-elapsed-s", type=float, default=1.0)
     parser.add_argument("--min-test-energy-j", type=float, default=1.0)
     parser.add_argument("--min-incremental-energy-j", type=float, default=0.1)
+    parser.add_argument("--max-tensor-model-util-pct", type=float, default=105.0)
     parser.add_argument("--expected-benchmark-schema-version", default="fp16-energy-bench-v2")
     parser.add_argument("--expected-matmul-input-bits-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--expected-mma-flops-per-logical-mma", type=float, default=8192.0)

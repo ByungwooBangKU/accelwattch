@@ -312,7 +312,7 @@ def write_quality_gate_input(
     )
 
 
-def write_quality_gate_model_util_input(path: Path) -> None:
+def write_quality_gate_model_util_input(path: Path, *, model_util_pct: float = 97.5) -> None:
     summary = quality_gate_summary_row()
     thread = quality_gate_thread_row()
     for row in (summary, thread):
@@ -323,7 +323,7 @@ def write_quality_gate_model_util_input(path: Path) -> None:
                 "avg_sm_util_pct": "nan",
                 "avg_gpu_util_pct": "nan",
                 "test_sm_util_samples": 0,
-                "tensor_model_utilization_pct_mean": 97.5,
+                "tensor_model_utilization_pct_mean": model_util_pct,
             }
         )
     write_csv(path / "summary.csv", [summary])
@@ -537,9 +537,11 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     quality_gate_ok = base / "quality_gate_tensor_activity_ok"
     quality_gate_bad = base / "quality_gate_tensor_activity_bad"
     quality_gate_model_util = base / "quality_gate_model_util_fallback"
+    quality_gate_model_util_overmax = base / "quality_gate_model_util_overmax"
     write_quality_gate_input(quality_gate_ok, tensor_activity_observed=True)
     write_quality_gate_input(quality_gate_bad, tensor_activity_observed=False)
     write_quality_gate_model_util_input(quality_gate_model_util)
+    write_quality_gate_model_util_input(quality_gate_model_util_overmax, model_util_pct=108.0)
     write_model_dir(model_dir)
     write_preflight(preflight)
 
@@ -930,6 +932,32 @@ exit 1
         raise AssertionError(f"Model-util fallback did not record target utilization availability: {qg_model_row}")
     if "SM/GPU utilization missing" not in qg_model_row.get("warnings", ""):
         raise AssertionError(f"Model-util fallback did not warn about telemetry fallback: {qg_model_row}")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "quality_gate.py"),
+            "--input",
+            str(quality_gate_model_util_overmax),
+            "--ncu-summary",
+            str(quality_gate_model_util_overmax / "ncu_validation_summary.csv"),
+            "--require-ncu",
+            "--require-ncu-tensor-activity",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    qg_overmax_summary = json.loads((quality_gate_model_util_overmax / "quality_gate_summary.json").read_text())
+    if qg_overmax_summary.get("selected_targets"):
+        raise AssertionError(f"Overmax Tensor model utilization selected a target: {qg_overmax_summary}")
+    qg_overmax_rows = [
+        row for row in read_csv_rows(quality_gate_model_util_overmax / "quality_gates.csv")
+        if row.get("scope") == "thread_sweep"
+    ]
+    if len(qg_overmax_rows) != 1:
+        raise AssertionError(f"Expected one overmax model-util thread row: {qg_overmax_rows}")
+    if "tensor_model_utilization_pct_mean" not in qg_overmax_rows[0].get("fail_reasons", ""):
+        raise AssertionError(f"Overmax Tensor model utilization did not fail quality gate: {qg_overmax_rows}")
 
     quality_gate_power_trace = base / "quality_gate_power_trace"
     write_quality_gate_input(
