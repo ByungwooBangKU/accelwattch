@@ -1008,10 +1008,19 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "recommended_cuda_arch": first.get("recommended_cuda_arch", ""),
             "sm_count": first.get("sm_count", ""),
             "tensor_model_architecture_chip": first.get("tensor_model_architecture_chip", ""),
+            "tensor_model_accumulator_mode": first.get("tensor_model_accumulator_mode", ""),
             "tensor_model_reference_note": first.get("tensor_model_reference_note", ""),
             "tensor_model_reference_url": first.get("tensor_model_reference_url", ""),
             "tensor_model_reference_dense_tflops": first.get("tensor_model_reference_dense_tflops", ""),
             "tensor_model_reference_sparse_tflops": first.get("tensor_model_reference_sparse_tflops", ""),
+            "tensor_model_reference_dense_f16acc_tflops": first.get(
+                "tensor_model_reference_dense_f16acc_tflops",
+                "",
+            ),
+            "tensor_model_reference_dense_f32acc_tflops": first.get(
+                "tensor_model_reference_dense_f32acc_tflops",
+                "",
+            ),
             "fp16_path": first.get("fp16_path", ""),
             "test_benchmark_schema_version": first.get("test_benchmark_schema_version", ""),
             "baseline_benchmark_schema_version": first.get("baseline_benchmark_schema_version", ""),
@@ -1149,6 +1158,8 @@ def aggregate_thread_sweep(
         "incremental_energy_fraction",
         "baseline_power_fraction",
         "tensor_peak_tflops_model",
+        "tensor_model_flop_per_sm_cycle",
+        "tensor_model_clock_mhz",
         "achieved_flops_per_sm_cycle",
         "tensor_model_utilization_pct",
         "avg_sm_clock_mhz",
@@ -1173,10 +1184,19 @@ def aggregate_thread_sweep(
             "recommended_cuda_arch": group[0].get("recommended_cuda_arch", ""),
             "sm_count": group[0].get("sm_count", ""),
             "tensor_model_architecture_chip": group[0].get("tensor_model_architecture_chip", ""),
+            "tensor_model_accumulator_mode": group[0].get("tensor_model_accumulator_mode", ""),
             "tensor_model_reference_note": group[0].get("tensor_model_reference_note", ""),
             "tensor_model_reference_url": group[0].get("tensor_model_reference_url", ""),
             "tensor_model_reference_dense_tflops": group[0].get("tensor_model_reference_dense_tflops", ""),
             "tensor_model_reference_sparse_tflops": group[0].get("tensor_model_reference_sparse_tflops", ""),
+            "tensor_model_reference_dense_f16acc_tflops": group[0].get(
+                "tensor_model_reference_dense_f16acc_tflops",
+                "",
+            ),
+            "tensor_model_reference_dense_f32acc_tflops": group[0].get(
+                "tensor_model_reference_dense_f32acc_tflops",
+                "",
+            ),
             "fp16_path": fp16_path,
             "test_benchmark_schema_versions": "; ".join(
                 sorted({str(r.get("test_benchmark_schema_version", "")) for r in group if str(r.get("test_benchmark_schema_version", ""))})

@@ -565,6 +565,7 @@ def assert_requirement_fail(path: Path, requirement: str) -> None:
 
 def smoke(base: Path, env: Dict[str, str]) -> None:
     import analyze_results
+    import architecture_models
     import quality_gate as quality_gate_module
 
     good = base / "good"
@@ -790,6 +791,39 @@ exit 1
     if "Recommended strict-suite toolkit: CUDA 12.1" not in "; ".join(compat.get("fail_reasons", [])):
         raise AssertionError(f"Preflight JSON missed recommended toolkit reason: {compat}")
 
+    ga102_f16 = architecture_models.tensor_peak_metrics(
+        {
+            "architecture_chip": "ga102",
+            "recommended_cuda_arch": "86",
+            "sm_count": 82,
+            "avg_sm_clock_mhz": 1695,
+            "kernel": "tensor_mma_f16acc",
+        },
+        142.0,
+    )
+    ga102_f32 = architecture_models.tensor_peak_metrics(
+        {
+            "architecture_chip": "ga102",
+            "recommended_cuda_arch": "86",
+            "sm_count": 82,
+            "avg_sm_clock_mhz": 1695,
+            "kernel": "tensor_mma_f32acc",
+        },
+        71.0,
+    )
+    if ga102_f16.get("tensor_model_accumulator_mode") != "f16acc":
+        raise AssertionError(f"GA102 f16acc model picked wrong accumulator mode: {ga102_f16}")
+    if ga102_f32.get("tensor_model_accumulator_mode") != "f32acc":
+        raise AssertionError(f"GA102 f32acc model picked wrong accumulator mode: {ga102_f32}")
+    if ga102_f16.get("tensor_model_flop_per_sm_cycle") != 1024.0:
+        raise AssertionError(f"GA102 f16acc model used wrong per-SM capacity: {ga102_f16}")
+    if ga102_f32.get("tensor_model_flop_per_sm_cycle") != 512.0:
+        raise AssertionError(f"GA102 f32acc model used wrong per-SM capacity: {ga102_f32}")
+    if not (140.0 <= ga102_f16.get("tensor_peak_tflops_model", 0.0) <= 145.0):
+        raise AssertionError(f"GA102 f16acc model produced unexpected peak: {ga102_f16}")
+    if not (70.0 <= ga102_f32.get("tensor_peak_tflops_model", 0.0) <= 73.0):
+        raise AssertionError(f"GA102 f32acc model produced unexpected peak: {ga102_f32}")
+
     architecture_model_smoke = base / "architecture_model_smoke"
     run(
         [
@@ -808,6 +842,7 @@ exit 1
         "architecture_model_summary.csv",
         "architecture_model_dense_peak.png",
         "architecture_model_per_sm_capacity.png",
+        "architecture_model_accumulator_modes.png",
         "architecture_model_resource_limits.png",
     ):
         if not (architecture_model_smoke / artifact).exists():

@@ -28,10 +28,16 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "max_blocks_per_sm": 32,
         "max_warps_per_sm": 64,
         "dense_tensor_fp16_flop_per_sm_cycle": 2048.0,
+        "dense_tensor_fp16_f16acc_flop_per_sm_cycle": 2048.0,
+        "dense_tensor_fp16_f32acc_flop_per_sm_cycle": 2048.0,
         "reference_sm_count": 108,
         "reference_boost_clock_mhz": 1410.0,
         "reference_dense_tensor_fp16_tflops": 312.0,
         "reference_sparse_tensor_fp16_tflops": 624.0,
+        "reference_dense_tensor_fp16_f16acc_tflops": 312.0,
+        "reference_sparse_tensor_fp16_f16acc_tflops": 624.0,
+        "reference_dense_tensor_fp16_f32acc_tflops": 312.0,
+        "reference_sparse_tensor_fp16_f32acc_tflops": 624.0,
         "reference_source_url": "https://www.nvidia.com/en-us/data-center/a100/",
         "tensor_core_architecture_source_url": (
             "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/"
@@ -50,10 +56,16 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "max_blocks_per_sm": 16,
         "max_warps_per_sm": 48,
         "dense_tensor_fp16_flop_per_sm_cycle": 1024.0,
+        "dense_tensor_fp16_f16acc_flop_per_sm_cycle": 1024.0,
+        "dense_tensor_fp16_f32acc_flop_per_sm_cycle": 512.0,
         "reference_sm_count": 82,
         "reference_boost_clock_mhz": 1695.0,
         "reference_dense_tensor_fp16_tflops": 142.0,
         "reference_sparse_tensor_fp16_tflops": 284.0,
+        "reference_dense_tensor_fp16_f16acc_tflops": 142.0,
+        "reference_sparse_tensor_fp16_f16acc_tflops": 284.0,
+        "reference_dense_tensor_fp16_f32acc_tflops": 71.0,
+        "reference_sparse_tensor_fp16_f32acc_tflops": 142.0,
         "reference_source_url": (
             "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/"
             "NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf"
@@ -75,10 +87,16 @@ ARCH_MODELS: Dict[str, Dict[str, Any]] = {
         "max_blocks_per_sm": 32,
         "max_warps_per_sm": 64,
         "dense_tensor_fp16_flop_per_sm_cycle": 4096.0,
+        "dense_tensor_fp16_f16acc_flop_per_sm_cycle": 4096.0,
+        "dense_tensor_fp16_f32acc_flop_per_sm_cycle": 4096.0,
         "reference_sm_count": 132,
         "reference_boost_clock_mhz": 1830.0,
         "reference_dense_tensor_fp16_tflops": 989.5,
         "reference_sparse_tensor_fp16_tflops": 1979.0,
+        "reference_dense_tensor_fp16_f16acc_tflops": 989.5,
+        "reference_sparse_tensor_fp16_f16acc_tflops": 1979.0,
+        "reference_dense_tensor_fp16_f32acc_tflops": 989.5,
+        "reference_sparse_tensor_fp16_f32acc_tflops": 1979.0,
         "reference_source_url": "https://www.nvidia.com/en-us/data-center/h100/",
         "tensor_core_architecture_source_url": (
             "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/"
@@ -135,7 +153,9 @@ def architecture_model_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def reference_dense_tflops(model: Dict[str, Any]) -> float:
-    flops_per_sm_cycle = parse_float(model.get("dense_tensor_fp16_flop_per_sm_cycle"))
+    flops_per_sm_cycle = parse_float(model.get("dense_tensor_fp16_f16acc_flop_per_sm_cycle"))
+    if not math.isfinite(flops_per_sm_cycle):
+        flops_per_sm_cycle = parse_float(model.get("dense_tensor_fp16_flop_per_sm_cycle"))
     sm_count = parse_float(model.get("reference_sm_count"))
     clock_mhz = parse_float(model.get("reference_boost_clock_mhz"))
     if (
@@ -149,20 +169,72 @@ def reference_dense_tflops(model: Dict[str, Any]) -> float:
     return math.nan
 
 
+def reference_tflops_for_capacity(model: Dict[str, Any], flops_per_sm_cycle: Any) -> float:
+    flops = parse_float(flops_per_sm_cycle)
+    sm_count = parse_float(model.get("reference_sm_count"))
+    clock_mhz = parse_float(model.get("reference_boost_clock_mhz"))
+    if (
+        math.isfinite(flops)
+        and math.isfinite(sm_count)
+        and sm_count > 0.0
+        and math.isfinite(clock_mhz)
+        and clock_mhz > 0.0
+    ):
+        return flops * sm_count * clock_mhz * 1.0e6 / 1.0e12
+    return math.nan
+
+
+def accumulator_mode_from_row(row: Dict[str, Any]) -> str:
+    text = " ".join(
+        str(row.get(key, "") or "")
+        for key in ("kernel", "test_kernel", "fp16_path")
+    )
+    if "tensor_mma_f32acc" in text:
+        return "f32acc"
+    if "tensor_mma_f16acc" in text:
+        return "f16acc"
+    return "not_applicable"
+
+
 def model_summary_rows() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for model in ARCH_MODELS.values():
         derived = reference_dense_tflops(model)
         reference = parse_float(model.get("reference_dense_tensor_fp16_tflops"))
         sparse_reference = parse_float(model.get("reference_sparse_tensor_fp16_tflops"))
+        f16_capacity = parse_float(
+            model.get("dense_tensor_fp16_f16acc_flop_per_sm_cycle"),
+            parse_float(model.get("dense_tensor_fp16_flop_per_sm_cycle")),
+        )
+        f32_capacity = parse_float(model.get("dense_tensor_fp16_f32acc_flop_per_sm_cycle"))
+        f16_reference = parse_float(model.get("reference_dense_tensor_fp16_f16acc_tflops"), reference)
+        f32_reference = parse_float(model.get("reference_dense_tensor_fp16_f32acc_tflops"))
+        f16_sparse_reference = parse_float(
+            model.get("reference_sparse_tensor_fp16_f16acc_tflops"),
+            sparse_reference,
+        )
+        f32_sparse_reference = parse_float(model.get("reference_sparse_tensor_fp16_f32acc_tflops"))
+        f16_derived = reference_tflops_for_capacity(model, f16_capacity)
+        f32_derived = reference_tflops_for_capacity(model, f32_capacity)
+        f16_error_pct = (
+            (f16_derived - f16_reference) / f16_reference * 100.0
+            if math.isfinite(f16_derived) and math.isfinite(f16_reference) and f16_reference > 0.0
+            else math.nan
+        )
+        f32_error_pct = (
+            (f32_derived - f32_reference) / f32_reference * 100.0
+            if math.isfinite(f32_derived) and math.isfinite(f32_reference) and f32_reference > 0.0
+            else math.nan
+        )
+        accumulator_errors = [
+            abs(value)
+            for value in (f16_error_pct, f32_error_pct)
+            if math.isfinite(value)
+        ]
+        max_accumulator_error_pct = max(accumulator_errors) if accumulator_errors else math.nan
         sparse_to_dense_ratio = (
             sparse_reference / reference
             if math.isfinite(sparse_reference) and math.isfinite(reference) and reference > 0.0
-            else math.nan
-        )
-        error_pct = (
-            (derived - reference) / reference * 100.0
-            if math.isfinite(derived) and math.isfinite(reference) and reference > 0.0
             else math.nan
         )
         rows.append(
@@ -178,15 +250,26 @@ def model_summary_rows() -> List[Dict[str, Any]]:
                     "dense_tensor_fp16_flop_per_sm_cycle",
                     math.nan,
                 ),
+                "dense_tensor_fp16_f16acc_flop_per_sm_cycle": f16_capacity,
+                "dense_tensor_fp16_f32acc_flop_per_sm_cycle": f32_capacity,
                 "reference_sm_count": model.get("reference_sm_count", ""),
                 "reference_boost_clock_mhz": model.get("reference_boost_clock_mhz", ""),
                 "reference_dense_tensor_fp16_tflops": reference,
                 "derived_dense_tensor_fp16_tflops": derived,
-                "reference_error_pct": error_pct,
+                "reference_error_pct": max_accumulator_error_pct,
+                "reference_dense_tensor_fp16_f16acc_tflops": f16_reference,
+                "derived_dense_tensor_fp16_f16acc_tflops": f16_derived,
+                "reference_error_f16acc_pct": f16_error_pct,
+                "reference_dense_tensor_fp16_f32acc_tflops": f32_reference,
+                "derived_dense_tensor_fp16_f32acc_tflops": f32_derived,
+                "reference_error_f32acc_pct": f32_error_pct,
+                "max_accumulator_reference_error_pct": max_accumulator_error_pct,
                 "reference_sparse_tensor_fp16_tflops": model.get(
                     "reference_sparse_tensor_fp16_tflops",
                     math.nan,
                 ),
+                "reference_sparse_tensor_fp16_f16acc_tflops": f16_sparse_reference,
+                "reference_sparse_tensor_fp16_f32acc_tflops": f32_sparse_reference,
                 "sparse_to_dense_ratio": sparse_to_dense_ratio,
                 "sparsity_mode": model.get("sparsity_mode", ""),
                 "uses_wgmma_model": model.get("uses_wgmma_model", ""),
@@ -266,6 +349,31 @@ def plot_per_sm_capacity(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plt.close(fig)
 
 
+def plot_accumulator_modes(rows: List[Dict[str, Any]], outdir: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    labels = [str(row.get("architecture_chip", "")) for row in rows]
+    x = list(range(len(rows)))
+    width = 0.34
+    f16 = [parse_float(row.get("reference_dense_tensor_fp16_f16acc_tflops")) for row in rows]
+    f32 = [parse_float(row.get("reference_dense_tensor_fp16_f32acc_tflops")) for row in rows]
+    if not any(math.isfinite(value) for value in f16 + f32):
+        return
+
+    fig, ax = plt.subplots(figsize=(8.4, 4.8))
+    ax.bar([i - width / 2 for i in x], f16, width=width, label="FP16 input + FP16 accumulate")
+    ax.bar([i + width / 2 for i in x], f32, width=width, label="FP16 input + FP32 accumulate")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Dense FP16 Tensor Core TFLOPS")
+    ax.set_title("Accumulator-aware dense FP16 Tensor Core peak")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(outdir / "architecture_model_accumulator_modes.png", dpi=160)
+    plt.close(fig)
+
+
 def plot_resource_limits(rows: List[Dict[str, Any]], outdir: Path) -> None:
     import matplotlib.pyplot as plt
 
@@ -300,7 +408,32 @@ def plot_resource_limits(rows: List[Dict[str, Any]], outdir: Path) -> None:
 def tensor_peak_metrics(row: Dict[str, Any], achieved_tflops: Any) -> Dict[str, Any]:
     """Return dense Tensor Core peak-normalized metrics for the common HMMA path."""
     model = architecture_model_from_row(row)
-    flops_per_sm_cycle = parse_float(model.get("dense_tensor_fp16_flop_per_sm_cycle"))
+    accumulator_mode = accumulator_mode_from_row(row)
+    if accumulator_mode == "f32acc":
+        flops_per_sm_cycle = parse_float(model.get("dense_tensor_fp16_f32acc_flop_per_sm_cycle"))
+        reference_dense = model.get(
+            "reference_dense_tensor_fp16_f32acc_tflops",
+            model.get("reference_dense_tensor_fp16_tflops", math.nan),
+        )
+        reference_sparse = model.get(
+            "reference_sparse_tensor_fp16_f32acc_tflops",
+            model.get("reference_sparse_tensor_fp16_tflops", math.nan),
+        )
+    else:
+        flops_per_sm_cycle = parse_float(
+            model.get(
+                "dense_tensor_fp16_f16acc_flop_per_sm_cycle",
+                model.get("dense_tensor_fp16_flop_per_sm_cycle"),
+            )
+        )
+        reference_dense = model.get(
+            "reference_dense_tensor_fp16_f16acc_tflops",
+            model.get("reference_dense_tensor_fp16_tflops", math.nan),
+        )
+        reference_sparse = model.get(
+            "reference_sparse_tensor_fp16_f16acc_tflops",
+            model.get("reference_sparse_tensor_fp16_tflops", math.nan),
+        )
     sm_count = parse_float(row.get("sm_count"))
     clock_mhz = parse_float(row.get("avg_sm_clock_mhz"))
     clock_source = "measured_avg_sm_clock_mhz"
@@ -334,11 +467,28 @@ def tensor_peak_metrics(row: Dict[str, Any], achieved_tflops: Any) -> Dict[str, 
     )
     return {
         "tensor_model_architecture_chip": model.get("architecture_chip", ""),
+        "tensor_model_accumulator_mode": accumulator_mode,
         "tensor_model_reference_note": model.get("reference_note", ""),
         "tensor_model_reference_url": model.get("reference_source_url", ""),
-        "tensor_model_reference_dense_tflops": model.get("reference_dense_tensor_fp16_tflops", math.nan),
-        "tensor_model_reference_sparse_tflops": model.get("reference_sparse_tensor_fp16_tflops", math.nan),
+        "tensor_model_reference_dense_tflops": reference_dense,
+        "tensor_model_reference_sparse_tflops": reference_sparse,
+        "tensor_model_reference_dense_f16acc_tflops": model.get(
+            "reference_dense_tensor_fp16_f16acc_tflops",
+            model.get("reference_dense_tensor_fp16_tflops", math.nan),
+        ),
+        "tensor_model_reference_dense_f32acc_tflops": model.get(
+            "reference_dense_tensor_fp16_f32acc_tflops",
+            math.nan,
+        ),
         "tensor_model_flop_per_sm_cycle": flops_per_sm_cycle,
+        "tensor_model_f16acc_flop_per_sm_cycle": model.get(
+            "dense_tensor_fp16_f16acc_flop_per_sm_cycle",
+            model.get("dense_tensor_fp16_flop_per_sm_cycle", math.nan),
+        ),
+        "tensor_model_f32acc_flop_per_sm_cycle": model.get(
+            "dense_tensor_fp16_f32acc_flop_per_sm_cycle",
+            math.nan,
+        ),
         "tensor_model_clock_mhz": clock_mhz,
         "tensor_model_clock_source": clock_source,
         "tensor_model_common_instruction_path": model.get(
@@ -374,6 +524,19 @@ def model_failures(
         ratio = parse_float(row.get("sparse_to_dense_ratio"))
         if not (math.isfinite(dense) and dense > 0.0):
             failures.append(f"{chip} dense FP16 Tensor Core reference is missing")
+        for mode in ("f16acc", "f32acc"):
+            mode_dense = parse_float(row.get(f"reference_dense_tensor_fp16_{mode}_tflops"))
+            mode_derived = parse_float(row.get(f"derived_dense_tensor_fp16_{mode}_tflops"))
+            mode_capacity = parse_float(row.get(f"dense_tensor_fp16_{mode}_flop_per_sm_cycle"))
+            mode_error = abs(parse_float(row.get(f"reference_error_{mode}_pct")))
+            if not (math.isfinite(mode_capacity) and mode_capacity > 0.0):
+                failures.append(f"{chip} missing {mode} FLOP/SM/cycle model")
+            if not (math.isfinite(mode_dense) and mode_dense > 0.0):
+                failures.append(f"{chip} missing {mode} dense FP16 Tensor Core reference")
+            if not math.isfinite(mode_derived):
+                failures.append(f"{chip} missing {mode} derived dense FP16 Tensor Core reference")
+            if not math.isfinite(mode_error):
+                failures.append(f"{chip} missing {mode} reference error")
         if math.isfinite(sparse) and math.isfinite(dense) and dense > 0.0:
             expected_ratio = sparse / dense
             if not math.isfinite(ratio) or abs(ratio - expected_ratio) > 1.0e-9:
@@ -381,6 +544,7 @@ def model_failures(
         if require_metadata:
             for key in (
                 "reference_source_url",
+                "tensor_core_architecture_source_url",
                 "reference_note",
                 "dense_reference_formula",
                 "common_tensor_instruction_path",
@@ -411,11 +575,13 @@ def main() -> int:
     if not args.no_figures:
         plot_model_summary(rows, args.outdir)
         plot_per_sm_capacity(rows, args.outdir)
+        plot_accumulator_modes(rows, args.outdir)
         plot_resource_limits(rows, args.outdir)
     print(f"Wrote: {csv_path}")
     if not args.no_figures:
         print(f"Wrote: {args.outdir / 'architecture_model_dense_peak.png'}")
         print(f"Wrote: {args.outdir / 'architecture_model_per_sm_capacity.png'}")
+        print(f"Wrote: {args.outdir / 'architecture_model_accumulator_modes.png'}")
         print(f"Wrote: {args.outdir / 'architecture_model_resource_limits.png'}")
     if args.fail_on_model_error_pct is not None or args.fail_on_missing_metadata:
         required = [item.strip() for item in args.require_architectures.split(",") if item.strip()]

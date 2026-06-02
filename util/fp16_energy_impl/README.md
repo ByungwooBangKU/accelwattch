@@ -335,6 +335,8 @@ benchmark JSON과 분석 CSV에는 `architecture_generation`, `architecture_chip
 
 분석 CSV는 architecture별 dense Tensor Core peak model도 함께 기록한다. `tensor_peak_tflops_model`은 측정 run의 `sm_count`와 평균 SM clock에서 계산한 dense FP16 Tensor Core peak이고, `achieved_flops_per_sm_cycle`와 `tensor_model_utilization_pct`는 실제 measured TFLOPS가 그 common HMMA model 대비 어느 정도인지 보여준다. 이 값은 thread sweep target을 해석하기 위한 normalization metric이며, pJ/bit의 energy source를 대체하지 않는다. H100에서는 WGMMA 최대 경로가 아니라 이 benchmark가 실제 사용하는 warp-level HMMA `m16n8k16` pair path 기준으로 해석한다. `architecture_models.py`에는 reference dense/sparse TFLOPS, product/reference source URL, Tensor Core architecture source URL을 같이 둔다. H100 public product table의 FP16 Tensor Core 값은 sparsity footnote가 붙어 있고, Hopper architecture table은 dense/sparse throughput을 분리해 제시하므로 dense reference는 common HMMA dense model 기준으로 둔다.
 
+Peak normalization은 accumulator mode도 구분한다. 최종 strict target인 `tensor_mma_f16acc`는 FP16 input + FP16 accumulate 기준이고, diagnostic `tensor_mma_f32acc`는 FP16 input + FP32 accumulate 기준이다. A100/GA100과 H100/GH100은 현재 common HMMA dense model에서 두 mode의 reference를 같은 값으로 둔다. RTX 3090/GA102는 NVIDIA GA102 whitepaper의 `Peak FP16 Tensor TFLOPS with FP16 Accumulate` 142/284와 `with FP32 Accumulate` 71/142 구분을 반영해, f32acc utilization을 f16acc peak의 절반 기준으로 normalize한다. Analyzer output의 `tensor_model_accumulator_mode`, `tensor_model_flop_per_sm_cycle`, `tensor_model_reference_dense_tflops`를 보면 각 row가 어떤 기준으로 normalized 되었는지 확인할 수 있다.
+
 `compare_architectures.py`는 launch-shape sweep 비교에서 `threads`만이 아니라 `threads_per_sm`과 `blocks_per_sm_requested`까지 보존한다. 따라서 `threads=64, blocks/SM=4`와 `threads=64, blocks/SM=8`처럼 thread/block은 같지만 SM당 resident thread 수가 다른 후보가 quality gate/target marker와 pJ/bit annotation에서 서로 덮이지 않는다.
 
 Architecture model 자체의 내부 일관성은 GPU 없이도 확인할 수 있다. 아래 명령은 `dense_tensor_fp16_flop_per_sm_cycle * reference_sm_count * reference_boost_clock_mhz`로 reference dense TFLOPS를 재계산하고, reference table 값과의 오차를 CSV/figure로 남긴다. 또한 per-SM Tensor Core capacity와 thread/register/block resource limit figure를 생성한다.
@@ -560,7 +562,8 @@ python3 scripts/smoke_strict_pipeline.py
 | `architecture_best_incremental_energy_fraction.png` | GPU architecture별 best 후보의 incremental energy signal fraction 비교 |
 | `architecture_models/architecture_model_summary.csv` | A100/H100/RTX3090 dense Tensor Core peak model의 SM/clock/FLOP-per-cycle 구성과 reference 재계산 오차 |
 | `architecture_models/architecture_model_dense_peak.png` | architecture별 reference dense peak와 derived dense peak 비교 |
-| `architecture_models/architecture_model_per_sm_capacity.png` | architecture별 dense FP16 Tensor Core FLOP/SM/cycle 비교 |
+| `architecture_models/architecture_model_per_sm_capacity.png` | architecture별 f16acc dense FP16 Tensor Core FLOP/SM/cycle 비교 |
+| `architecture_models/architecture_model_accumulator_modes.png` | architecture별 f16acc/f32acc dense FP16 Tensor Core reference peak 비교 |
 | `architecture_models/architecture_model_resource_limits.png` | architecture별 max thread/warp/block/register resource limit 비교 |
 | `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교. marker는 strict NVML target, diagnostic target, diagnostic `quality_pass`, fail, legacy/no-gate 상태를 구분하고 selected/target point에는 threads/block와 pJ/bit를 표시 |
 | `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교. marker는 strict target과 diagnostic 상태를 구분 |
@@ -635,7 +638,8 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/strict_fp16_audit/figures/strict_result_baseline_energy_fraction.png` | strict selected target의 baseline-scaled energy fraction 비교 |
 | `results/strict_fp16_postprocess/architecture_models/architecture_model_summary.csv` | postprocess와 함께 기록되는 A100/H100/RTX3090 architecture model sanity table |
 | `results/strict_fp16_postprocess/architecture_models/architecture_model_dense_peak.png` | reference dense TFLOPS와 model-derived dense TFLOPS 비교 |
-| `results/strict_fp16_postprocess/architecture_models/architecture_model_per_sm_capacity.png` | dense FP16 Tensor Core FLOP/SM/cycle 비교 |
+| `results/strict_fp16_postprocess/architecture_models/architecture_model_per_sm_capacity.png` | f16acc dense FP16 Tensor Core FLOP/SM/cycle 비교 |
+| `results/strict_fp16_postprocess/architecture_models/architecture_model_accumulator_modes.png` | f16acc/f32acc dense FP16 Tensor Core reference peak 비교 |
 | `results/strict_fp16_postprocess/architecture_models/architecture_model_resource_limits.png` | thread/warp/block/register resource limit 비교 |
 | `results/strict_fp16_report/fp16_strict_report.md` | strict audit/compare 결과를 사람이 검토하기 위한 최종 Markdown report |
 | `results/strict_fp16_report/fp16_strict_report_dashboard.png` | selected TFLOPS와 logical pJ/bit를 pass/fail 색상으로 표시 |
@@ -754,6 +758,8 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `test_ncu_tensor_activity_pct`, `baseline_ncu_tensor_activity_pct` | NCU validation report에서 추출한 Tensor pipe activity percentage |
 | `ncu_validation_context_match` | NCU validation run의 launch context가 측정 row의 `blocks_per_sm`, `unroll`, `suppress_output_store`와 일치하는지 여부 |
 | `tensor_peak_tflops_model` | run의 SM count와 평균 SM clock으로 계산한 dense FP16 Tensor Core peak model |
+| `tensor_model_accumulator_mode` | peak normalization에 사용한 accumulator mode. `tensor_mma_f16acc`는 `f16acc`, `tensor_mma_f32acc`는 `f32acc` |
+| `tensor_model_flop_per_sm_cycle` | 해당 accumulator mode의 dense FP16 Tensor Core FLOP/SM/cycle |
 | `achieved_flops_per_sm_cycle` | measured TFLOPS를 SM count와 평균 SM clock으로 나눈 FLOP/SM/cycle |
 | `tensor_model_utilization_pct` | measured TFLOPS / `tensor_peak_tflops_model` × 100 |
 | `tensor_model_reference_url` | architecture peak model의 NVIDIA reference URL |

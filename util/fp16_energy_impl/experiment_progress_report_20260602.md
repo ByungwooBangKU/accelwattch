@@ -51,6 +51,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | Energy source | `nvidia-smi` power trace fallback 중심 legacy 결과 포함 | 최종 비교는 `NVML total energy counter`, `measurement_grade=strict_nvml_counter` selected target만 허용 |
 | Negative pJ/bit 처리 | 초기에는 음수 행이 result table에 섞일 수 있었음 | `all_runs_no_valid`, `not_valid_no_l2_candidate`, quality gate failure로 분리 |
 | Architecture scope | 일반 CUDA 실행 설명 위주 | A100 sm80/GA100, RTX 3090 sm86/GA102, H100 sm90/GH100 metadata 검증 추가 |
+| Architecture peak model | architecture별 단일 dense Tensor peak 기준 | `tensor_mma_f16acc`/`tensor_mma_f32acc` accumulator mode를 구분. RTX 3090/GA102는 f32acc peak를 f16acc의 절반 기준으로 normalize |
 | H100 경로 | 명시 부족 | 현재는 공통 warp-level HMMA path 비교이며 H100 WGMMA/TMA 측정은 아님을 명시 |
 | 설치/실행 | 수동 toolchain 의존 | `scripts/install_gpu_toolchain.sh`와 GPU별 env/run script 생성 |
 | Pipeline | build/run/analyze가 분리 | `run_strict_fp16_pipeline.sh`가 preflight, NCU permission probe, calibration, sweep, analyze, resource audit, quality gate까지 orchestration |
