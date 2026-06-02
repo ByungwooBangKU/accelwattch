@@ -1,0 +1,4 @@
+architecture_chip,required,coverage_status,publishable,input_dir_count,input_dirs,thread_row_count,strict_target_count,diagnostic_target_count,quality_pass_count,best_selection_note,best_quality_rejected,best_gpu,best_threads,best_threads_per_sm,best_matmul_input_pj_per_bit_mean,best_tflops_mean,best_tensor_model_utilization_pct_mean,best_measurement_grade,best_target_pass,best_baseline_match_grade
+ga100,True,missing_result,False,0,,0,0,0,0,,,,,,,,,,,
+ga102,True,diagnostic_or_rejected_only,False,3,results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100;results/fp16_launch_shape_warpsync_rtx3090_20260602_direct;results/strict_fp16_launch_shape_rtx3090_20260602_115550,48,0,0,16,quality_gate_target_pass_without_required_ncu_evidence,True,NVIDIA GeForce RTX 3090,64,64.0,nan,nan,nan,strict_nvml_counter,False,structural_baseline
+gh100,True,missing_result,False,0,,0,0,0,0,,,,,,,,,,,

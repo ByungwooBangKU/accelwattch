@@ -113,6 +113,8 @@ results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100/figures/thread_swee
 4. A100과 H100 strict run은 아직 완료되지 않았다.
 5. H100의 경우 현재 kernel은 common HMMA path이고 WGMMA path가 아니다.
 
+`results/architecture_compare_rtx3090_readiness_20260602/`에는 현재 RTX 3090 결과 3개를 architecture comparison tool로 묶은 diagnostic readiness 산출물을 추가했다. 새 `architecture_comparison_summary.json`은 `publishable=false`, `required_strict_pass_count=0/3`, `required_missing_architectures=ga100,gh100`, `required_diagnostic_only_architectures=ga102`로 기록한다. 즉 RTX 3090 결과도 NCU evidence가 없으므로 A100/H100/RTX3090 최종 비교에서는 strict-pass로 세지 않는다.
+
 ## 8. 다음 실행 기준
 
 최종 claim에 사용할 결과는 아래 조건을 모두 만족해야 한다.

@@ -170,6 +170,7 @@ def artifact_links(
                 compare_dir / "architecture_best_tensor_model_utilization.png",
                 compare_dir / "architecture_best_incremental_energy_fraction.png",
                 compare_dir / "architecture_strict_coverage.png",
+                compare_dir / "architecture_comparison_readiness.png",
             ]
         )
         candidates.extend(sorted(compare_dir.glob("architecture_thread_sweep_util_*.png")))

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -66,6 +68,13 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=keys, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
 
 
 def classify_from_row(row: Dict[str, Any]) -> Dict[str, str]:
@@ -271,6 +280,28 @@ def is_fp16_candidate(row: Dict[str, Any]) -> bool:
     return pure_count > 0 or valid_no_l2 > 0 or valid > 0
 
 
+def ncu_tensor_activity_ok(row: Dict[str, Any]) -> bool:
+    value = str(row.get("test_ncu_tensor_activity_observed", "")).strip()
+    if not value:
+        return True
+    return parse_bool(value)
+
+
+def is_strict_publishable_target(row: Dict[str, Any]) -> bool:
+    return (
+        parse_bool(row.get("target_pass"))
+        and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+        and parse_bool(row.get("ncu_required"))
+        and parse_bool(row.get("ncu_validation_pass"))
+        and parse_bool(row.get("ncu_validation_context_match"))
+        and ncu_tensor_activity_ok(row)
+        and str(row.get("baseline_match_grade", "")) == "structural_baseline"
+        and parse_bool(row.get("matmul_denominator_valid"))
+        and parse_bool(row.get("matmul_denominator_metadata_complete"))
+        and str(row.get("matmul_denominator_source", "")) == "bench_json_metadata"
+    )
+
+
 def reject_best_candidate(group: List[Dict[str, Any]], selection_note: str) -> Dict[str, Any]:
     rejected = dict(max(group, key=lambda row: (
         int(parse_float(row.get("pure_fp16_candidate_count"), 0.0)),
@@ -304,13 +335,16 @@ def select_best_fp16(
         strict_targets = [
             row
             for row in target_rows
-            if str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+            if is_strict_publishable_target(row)
         ]
         strict_quality = [
             row
             for row in group
             if parse_bool(row.get("quality_pass"))
             and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+            and parse_bool(row.get("ncu_required"))
+            and parse_bool(row.get("ncu_validation_pass"))
+            and parse_bool(row.get("ncu_validation_context_match"))
         ]
         diagnostic_quality = [row for row in group if parse_bool(row.get("quality_pass"))]
         has_quality_info = any(
@@ -325,7 +359,12 @@ def select_best_fp16(
             pool = diagnostic_quality
             selection_note = "quality_gate_quality_pass_no_target_diagnostic"
         elif has_quality_info:
-            if target_rows:
+            strict_energy_targets = [
+                row for row in target_rows if str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+            ]
+            if strict_energy_targets:
+                note = "quality_gate_target_pass_without_required_ncu_evidence"
+            elif target_rows:
                 note = "quality_gate_target_pass_without_strict_nvml_counter"
             elif strict_quality:
                 note = "quality_gate_no_target_pass"
@@ -727,9 +766,7 @@ def coverage_rows(
         chip_threads = [row for row in thread_rows if str(row.get("architecture_chip", "")) == chip]
         chip_best = [row for row in best_rows if str(row.get("architecture_chip", "")) == chip]
         strict_targets = [
-            row for row in chip_threads
-            if parse_bool(row.get("target_pass"))
-            and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
+            row for row in chip_threads if is_strict_publishable_target(row)
         ]
         diagnostic_targets = [
             row for row in chip_threads
@@ -841,6 +878,111 @@ def plot_coverage(rows: List[Dict[str, Any]], outdir: Path) -> None:
     plt.close(fig)
 
 
+def comparison_summary(
+    coverage: List[Dict[str, Any]],
+    *,
+    required_architectures: List[str],
+    allow_diagnostic_best: bool,
+    allow_legacy_best: bool,
+) -> Dict[str, Any]:
+    required_rows = [row for row in coverage if parse_bool(row.get("required"))]
+    strict_pass = [
+        row for row in required_rows
+        if str(row.get("coverage_status", "")) == "strict_pass" and parse_bool(row.get("publishable"))
+    ]
+    missing_or_nonpublishable = [
+        str(row.get("architecture_chip", ""))
+        for row in required_rows
+        if not parse_bool(row.get("publishable"))
+    ]
+    status_counts: Dict[str, int] = {}
+    for row in coverage:
+        status = str(row.get("coverage_status", "") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    diagnostic_only = [
+        str(row.get("architecture_chip", ""))
+        for row in required_rows
+        if str(row.get("coverage_status", "")) == "diagnostic_or_rejected_only"
+    ]
+    missing = [
+        str(row.get("architecture_chip", ""))
+        for row in required_rows
+        if str(row.get("coverage_status", "")) == "missing_result"
+    ]
+    publishable = bool(required_rows) and len(strict_pass) == len(required_rows)
+    return {
+        "summary_schema": "fp16-architecture-comparison-summary-v1",
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "publishable": publishable,
+        "comparison_status": "publishable_strict" if publishable else "not_publishable_incomplete_coverage",
+        "required_architectures": required_architectures,
+        "required_architecture_count": len(required_rows),
+        "required_strict_pass_count": len(strict_pass),
+        "required_missing_or_nonpublishable_architectures": missing_or_nonpublishable,
+        "required_missing_architectures": missing,
+        "required_diagnostic_only_architectures": diagnostic_only,
+        "coverage_status_counts": status_counts,
+        "allow_diagnostic_best": allow_diagnostic_best,
+        "allow_legacy_best": allow_legacy_best,
+        "final_value_policy": (
+            "Only coverage_status=strict_pass rows with target_pass=true and "
+            "measurement_grade=strict_nvml_counter are publishable FP16 pJ/bit comparison points."
+        ),
+    }
+
+
+def plot_comparison_readiness(summary: Dict[str, Any], coverage: List[Dict[str, Any]], outdir: Path) -> None:
+    required_rows = [row for row in coverage if parse_bool(row.get("required"))]
+    if not required_rows:
+        return
+    counts = {
+        "missing": sum(1 for row in required_rows if str(row.get("coverage_status", "")) == "missing_result"),
+        "diagnostic": sum(
+            1 for row in required_rows if str(row.get("coverage_status", "")) == "diagnostic_or_rejected_only"
+        ),
+        "strict": sum(1 for row in required_rows if str(row.get("coverage_status", "")) == "strict_pass"),
+    }
+    labels = ["missing", "diagnostic", "strict"]
+    values = [counts[label] for label in labels]
+    colors = ["tab:red", "tab:orange", "tab:green"]
+    fig, ax = plt.subplots(figsize=(7.4, 4.6))
+    ax.bar(labels, values, color=colors, alpha=0.88)
+    ax.set_ylabel("Required architecture count")
+    ax.set_title("FP16 architecture comparison readiness")
+    ax.set_ylim(0, max(values + [1]) + 0.6)
+    ax.grid(True, axis="y", alpha=0.25)
+    for idx, value in enumerate(values):
+        ax.annotate(str(value), (idx, value), textcoords="offset points", xytext=(0, 5), ha="center")
+    if not parse_bool(summary.get("publishable")):
+        missing = ",".join(summary.get("required_missing_or_nonpublishable_architectures", []))
+        ax.text(
+            0.5,
+            0.92,
+            f"NOT PUBLISHABLE: missing strict coverage for {missing}",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="tab:red",
+            bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "tab:red", "alpha": 0.9},
+        )
+    else:
+        ax.text(
+            0.5,
+            0.92,
+            "PUBLISHABLE STRICT COVERAGE",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="tab:green",
+            bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "tab:green", "alpha": 0.9},
+        )
+    fig.tight_layout()
+    fig.savefig(outdir / "architecture_comparison_readiness.png", dpi=160)
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare analyzed FP16 energy result directories")
     parser.add_argument("--input", type=Path, nargs="+", required=True, help="One or more analyzed result dirs")
@@ -898,6 +1040,12 @@ def main() -> int:
     )
     required_architectures = parse_csv_list(args.require_architectures)
     coverage = coverage_rows(best, all_threads, all_conditions, required_architectures)
+    summary = comparison_summary(
+        coverage,
+        required_architectures=required_architectures,
+        allow_diagnostic_best=args.allow_diagnostic_best,
+        allow_legacy_best=args.allow_legacy_best,
+    )
     write_csv(args.outdir / "architecture_condition_summary.csv", all_conditions)
     write_csv(args.outdir / "architecture_summary_rows.csv", all_summary)
     write_csv(args.outdir / "architecture_thread_sweep_summary.csv", all_threads)
@@ -905,6 +1053,8 @@ def main() -> int:
     write_csv(args.outdir / "architecture_resource_occupancy.csv", all_resources)
     write_csv(args.outdir / "architecture_best_fp16.csv", best)
     write_csv(args.outdir / "architecture_strict_coverage.csv", coverage)
+    write_csv(args.outdir / "architecture_comparison_summary.csv", [summary])
+    write_json(args.outdir / "architecture_comparison_summary.json", summary)
 
     plot_bar(
         best,
@@ -944,10 +1094,12 @@ def main() -> int:
     plot_thread_compare(all_threads, args.outdir)
     plot_resource_compare(all_resources, args.outdir)
     plot_coverage(coverage, args.outdir)
+    plot_comparison_readiness(summary, coverage, args.outdir)
 
     print(f"Wrote: {args.outdir / 'architecture_condition_summary.csv'}")
     print(f"Wrote: {args.outdir / 'architecture_best_fp16.csv'}")
     print(f"Wrote: {args.outdir / 'architecture_strict_coverage.csv'}")
+    print(f"Wrote: {args.outdir / 'architecture_comparison_summary.json'}")
     print(f"Wrote figures under: {args.outdir}")
     missing = [
         row for row in coverage

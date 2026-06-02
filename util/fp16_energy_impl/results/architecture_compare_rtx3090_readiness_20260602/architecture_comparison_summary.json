@@ -1,0 +1,32 @@
+{
+  "summary_schema": "fp16-architecture-comparison-summary-v1",
+  "generated_utc": "2026-06-02T05:28:56.161498+00:00",
+  "publishable": false,
+  "comparison_status": "not_publishable_incomplete_coverage",
+  "required_architectures": [
+    "ga100",
+    "gh100",
+    "ga102"
+  ],
+  "required_architecture_count": 3,
+  "required_strict_pass_count": 0,
+  "required_missing_or_nonpublishable_architectures": [
+    "ga100",
+    "ga102",
+    "gh100"
+  ],
+  "required_missing_architectures": [
+    "ga100",
+    "gh100"
+  ],
+  "required_diagnostic_only_architectures": [
+    "ga102"
+  ],
+  "coverage_status_counts": {
+    "missing_result": 2,
+    "diagnostic_or_rejected_only": 1
+  },
+  "allow_diagnostic_best": false,
+  "allow_legacy_best": false,
+  "final_value_policy": "Only coverage_status=strict_pass rows with target_pass=true and measurement_grade=strict_nvml_counter are publishable FP16 pJ/bit comparison points."
+}

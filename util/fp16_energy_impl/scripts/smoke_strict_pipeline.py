@@ -853,6 +853,9 @@ exit 1
     )
     for artifact in (
         "architecture_best_fp16.csv",
+        "architecture_comparison_summary.csv",
+        "architecture_comparison_summary.json",
+        "architecture_comparison_readiness.png",
         "architecture_strict_coverage.csv",
         "architecture_strict_coverage.png",
         "architecture_thread_sweep_util_tensor_mma_f16acc_vs_tensor_baseline_mov.png",
@@ -867,6 +870,12 @@ exit 1
     for missing_chip in ("ga100", "ga102"):
         if coverage.get(missing_chip, {}).get("coverage_status") != "missing_result":
             raise AssertionError(f"Strict coverage did not mark {missing_chip} as missing_result: {coverage}")
+    compare_summary = json.loads((compare_out / "architecture_comparison_summary.json").read_text())
+    if compare_summary.get("publishable"):
+        raise AssertionError(f"Architecture comparison summary should not be publishable with missing chips: {compare_summary}")
+    missing_required = set(compare_summary.get("required_missing_architectures", []))
+    if missing_required != {"ga100", "ga102"}:
+        raise AssertionError(f"Architecture comparison summary missed required missing chips: {compare_summary}")
     compare_threads = read_csv_rows(compare_out / "architecture_thread_sweep_summary.csv")
     duplicate_launch_shapes = {
         row.get("blocks_per_sm_requested"): row
