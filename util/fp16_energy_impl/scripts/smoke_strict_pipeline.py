@@ -146,7 +146,7 @@ def target_row(test_kernel: str, baseline_kernel: str, threads: int) -> Dict[str
 
 def ncu_row(kernel: str, threads: int, *, tensor_activity_observed: bool | None = None) -> Dict[str, Any]:
     if tensor_activity_observed is None:
-        tensor_activity_observed = kernel == "tensor_mma_f16acc"
+        tensor_activity_observed = kernel.startswith("tensor_mma_")
     is_tensor_mma = kernel.startswith("tensor_mma_")
     return {
         "kernel": kernel,
@@ -169,7 +169,7 @@ def ncu_row(kernel: str, threads: int, *, tensor_activity_observed: bool | None 
         "dram_counter_total": 0,
         "local_counter_total": 0,
         "tensor_activity_observed": "true" if tensor_activity_observed else "false",
-        "tensor_activity_pct": 81.0 if kernel == "tensor_mma_f16acc" else 0.0,
+        "tensor_activity_pct": 81.0 if is_tensor_mma else 0.0,
         "sm_activity_pct": 92.0,
     }
 
@@ -834,6 +834,88 @@ exit 0
     ok_probe = json.loads((ok_probe_dir / "ncu_permission_probe.json").read_text())
     if ok_probe.get("status") != "pass" or not ok_probe.get("permission_probe_pass"):
         raise AssertionError(f"NCU permission probe did not accept successful profiling command: {ok_probe}")
+
+    fake_ncu_report = base / "fake_ncu_report"
+    write_executable(
+        fake_ncu_report,
+        """#!/usr/bin/env bash
+log_file=""
+prev=""
+for arg in "$@"; do
+  if [[ "${prev}" == "--log-file" ]]; then
+    log_file="${arg}"
+  fi
+  prev="${arg}"
+done
+if [[ -z "${log_file}" ]]; then
+  echo "missing --log-file" >&2
+  exit 2
+fi
+mkdir -p "$(dirname "${log_file}")"
+case "${log_file}" in
+  *tensor_mma_f32acc*)
+    cat > "${log_file}" <<'EOF'
+smsp__inst_executed_pipe_tensor_op_hmma.sum 64
+smsp__sass_thread_inst_executed_op_hmma_pred_on.sum 64
+sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed 73.0
+sm__throughput.avg.pct_of_peak_sustained_elapsed 81.0
+dram__bytes_read.sum 0
+dram__bytes_write.sum 0
+lts__t_bytes_read.sum 0
+lts__t_bytes_write.sum 0
+l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum 0
+l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum 0
+EOF
+    ;;
+  *)
+    cat > "${log_file}" <<'EOF'
+smsp__inst_executed_pipe_tensor_op_hmma.sum 0
+smsp__sass_thread_inst_executed_op_hmma_pred_on.sum 0
+sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed 0
+sm__throughput.avg.pct_of_peak_sustained_elapsed 35.0
+dram__bytes_read.sum 0
+dram__bytes_write.sum 0
+lts__t_bytes_read.sum 0
+lts__t_bytes_write.sum 0
+l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum 0
+l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum 0
+EOF
+    ;;
+esac
+exit 0
+""",
+    )
+    ncu_pair_out = base / "ncu_pair_f32acc"
+    run(
+        [
+            "bash",
+            str(SCRIPT_DIR / "ncu_validate_no_l2_thread_sweep.sh"),
+            "/bin/true",
+            str(ncu_pair_out),
+            "0",
+            "128",
+        ],
+        cwd=ROOT,
+        env={
+            **env,
+            "NCU_BIN": str(fake_ncu_report),
+            "NCU_TEST_KERNEL": "tensor_mma_f32acc",
+            "NCU_BLOCKS_PER_SM_CSV": "4",
+            "NCU_UNROLL": "16",
+            "NCU_ITERS": "1",
+            "NCU_REPEATS": "1",
+            "NCU_WARMUP": "0",
+        },
+    )
+    ncu_pair_rows = read_csv_rows(ncu_pair_out / "ncu_validation_summary.csv")
+    ncu_pair_kernels = {row.get("kernel"): row for row in ncu_pair_rows}
+    if set(ncu_pair_kernels) != {"tensor_mma_f32acc", "tensor_baseline_f32"}:
+        raise AssertionError(f"NCU helper did not validate the requested f32acc pair: {ncu_pair_rows}")
+    for kernel, row in ncu_pair_kernels.items():
+        if row.get("validation_blocks_per_sm") != "4" or row.get("validation_unroll") != "16":
+            raise AssertionError(f"NCU helper did not preserve validation context for {kernel}: {row}")
+        if row.get("validation_pass") != "True":
+            raise AssertionError(f"NCU helper fake report did not pass for {kernel}: {row}")
 
     fake_nvcc = base / "fake_nvcc_13_2"
     fake_nvidia_smi = base / "fake_nvidia_smi_cuda_13_1"

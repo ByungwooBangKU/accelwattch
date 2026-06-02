@@ -414,6 +414,7 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
 QUALITY_ARGS=(--input "${OUTDIR}" --require-kernel "${REQUIRE_KERNEL}" --require-baseline "${REQUIRE_BASELINE}")
 if [[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]]; then
   NCU_BIN="${NCU_BIN}" NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV}" \
+    NCU_TEST_KERNEL="${REQUIRE_KERNEL}" NCU_BASELINE_KERNEL="${REQUIRE_BASELINE}" \
     "${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \
     "${BINARY}" \
     "${NCDIR}" \

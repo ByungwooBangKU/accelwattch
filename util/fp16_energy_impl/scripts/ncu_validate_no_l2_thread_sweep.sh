@@ -21,7 +21,15 @@ NCU_ITERS="${NCU_ITERS:-20000}"
 NCU_SUPPRESS_OUTPUT_STORE="${NCU_SUPPRESS_OUTPUT_STORE:-1}"
 NCU_REQUIRE_TENSOR_ACTIVITY="${NCU_REQUIRE_TENSOR_ACTIVITY:-1}"
 NCU_MIN_TENSOR_ACTIVITY_PCT="${NCU_MIN_TENSOR_ACTIVITY_PCT:-0.0}"
-NCU_BASELINE_KERNEL="${NCU_BASELINE_KERNEL:-tensor_baseline_mov}"
+NCU_TEST_KERNEL="${NCU_TEST_KERNEL:-tensor_mma_f16acc}"
+if [[ -z "${NCU_BASELINE_KERNEL:-}" ]]; then
+  case "${NCU_TEST_KERNEL}" in
+    tensor_mma_f16acc) NCU_BASELINE_KERNEL="tensor_baseline_mov" ;;
+    tensor_mma_f32acc) NCU_BASELINE_KERNEL="tensor_baseline_f32" ;;
+    fp16_half2) NCU_BASELINE_KERNEL="baseline_regmove" ;;
+    *) NCU_BASELINE_KERNEL="tensor_baseline_mov" ;;
+  esac
+fi
 NCU_SUPPRESS_OUTPUT_STORE_BOOL="false"
 NCU_FAILURES_CSV="${OUTDIR}/ncu_run_failures.csv"
 
@@ -91,8 +99,8 @@ for threads in "${THREADS_LIST[@]}"; do
     if [[ "${NCU_BLOCKS_PER_SM_CSV}" != "${NCU_BLOCKS_PER_SM}" || "${blocks_per_sm}" != "${NCU_BLOCKS_PER_SM}" ]]; then
       suffix="${suffix}_b${blocks_per_sm}"
     fi
-    run_ncu "tensor_mma_f16acc_${suffix}" "${blocks_per_sm}" "tensor_mma_f16acc" \
-      --kernel tensor_mma_f16acc \
+    run_ncu "${NCU_TEST_KERNEL}_${suffix}" "${blocks_per_sm}" "${NCU_TEST_KERNEL}" \
+      --kernel "${NCU_TEST_KERNEL}" \
       --threads "${threads}" \
       --iters "${NCU_ITERS}"
     run_ncu "${NCU_BASELINE_KERNEL}_${suffix}" "${blocks_per_sm}" "${NCU_BASELINE_KERNEL}" \
