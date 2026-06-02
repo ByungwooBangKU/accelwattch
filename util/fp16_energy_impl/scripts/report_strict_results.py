@@ -325,6 +325,15 @@ def requirement_rows(
     model_util = bool(audit_rows) and all(
         parse_float(row.get("tensor_model_utilization_pct_mean")) > 0.0 for row in audit_rows
     )
+    work_slope_required = bool(audit_rows) and any(parse_bool(row.get("work_slope_required")) for row in audit_rows)
+    work_slope = bool(audit_rows) and all(
+        parse_bool(row.get("work_slope_valid"))
+        and str(row.get("work_slope_fit_scope", "")) == "valid_no_l2"
+        and parse_float(row.get("work_slope_pj_per_bit")) > 0.0
+        and parse_float(row.get("work_slope_r2")) >= 0.80
+        for row in audit_rows
+        if parse_bool(row.get("work_slope_required"))
+    )
     model_chips = {str(row.get("architecture_chip", "")) for row in architecture_model_rows}
     missing_model_chips = [chip for chip in required_architectures if chip not in model_chips]
     model_error_values = [
@@ -444,6 +453,17 @@ def requirement_rows(
         ),
         row("positive logical FP16 pJ/bit", positive_pjbit, "matmul_input_pj_per_bit_mean > 0"),
         row("positive Tensor Core model utilization", model_util, "tensor_model_utilization_pct_mean > 0"),
+        *(
+            [
+                row(
+                    "work-slope scaling evidence",
+                    work_slope,
+                    "selected target has valid_no_l2 positive work-slope pJ/bit with R2 >= 0.80",
+                )
+            ]
+            if work_slope_required
+            else []
+        ),
         row(
             "architecture peak model sanity",
             model_sanity,
@@ -513,6 +533,9 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                         ("baseline_resource_unroll", "unroll"),
                     )
                 ),
+                "work_slope_valid": row.get("work_slope_valid", ""),
+                "work_slope_pj_per_bit": row.get("work_slope_pj_per_bit", ""),
+                "work_slope_r2": row.get("work_slope_r2", ""),
                 "fail_reasons": row.get("fail_reasons", ""),
             }
             for row in audit_rows
@@ -540,6 +563,9 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
             "ncu_common_hmma_seen": row.get("test_ncu_common_hmma_seen", ""),
             "ncu_no_memory": row.get("test_ncu_no_l2", ""),
             "resource_context_match": "",
+            "work_slope_valid": row.get("work_slope_valid", ""),
+            "work_slope_pj_per_bit": row.get("work_slope_pj_per_bit", ""),
+            "work_slope_r2": row.get("work_slope_r2", ""),
             "fail_reasons": row.get("fail_reasons", ""),
         }
         for row in best_rows
@@ -658,6 +684,9 @@ def write_markdown(
                     "HMMA",
                     "No L2/DRAM/local",
                     "Resource ctx",
+                    "Work slope",
+                    "Slope pJ/bit",
+                    "Slope R2",
                     "NCU tensor %",
                 ],
                 [
@@ -680,6 +709,9 @@ def write_markdown(
                         yes_no(r.get("ncu_common_hmma_seen")),
                         yes_no(r.get("ncu_no_memory")),
                         yes_no(r.get("resource_context_match")),
+                        yes_no(r.get("work_slope_valid")),
+                        fmt_value(r.get("work_slope_pj_per_bit")),
+                        fmt_value(r.get("work_slope_r2")),
                         fmt_value(r.get("ncu_tensor_activity_pct")),
                     ]
                     for r in rows

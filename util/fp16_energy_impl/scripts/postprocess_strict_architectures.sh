@@ -14,7 +14,9 @@ REQUIRE_BASELINE="tensor_baseline_mov"
 NO_FAIL=0
 REQUIRE_COUNTER_TRACE=0
 REQUIRE_NCU_TENSOR_ACTIVITY=1
+REQUIRE_WORK_SLOPE=0
 INPUTS=()
+WORK_SLOPE_DIRS=()
 
 usage() {
   cat <<'USAGE'
@@ -41,6 +43,9 @@ Options:
                         Keep selected NCU tensor activity evidence as a hard audit gate [default]
   --no-require-ncu-tensor-activity
                         Diagnostic mode: do not hard-fail missing selected NCU tensor activity
+  --work-slope-dir DIR  Directory or work_slope_summary.csv with work-scaling diagnostic rows.
+                        May be repeated
+  --require-work-slope  Make selected-target work-slope evidence a hard audit/report gate
   --no-fail             Always return success after writing artifacts
   -h, --help            Show this help
 
@@ -60,6 +65,8 @@ while [[ $# -gt 0 ]]; do
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
     --no-require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=0; shift ;;
+    --work-slope-dir) WORK_SLOPE_DIRS+=("$2"); shift 2 ;;
+    --require-work-slope) REQUIRE_WORK_SLOPE=1; shift ;;
     --no-fail) NO_FAIL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
@@ -116,6 +123,16 @@ fi
 if [[ "${REQUIRE_NCU_TENSOR_ACTIVITY}" -eq 1 ]]; then
   AUDIT_ARGS+=(--require-ncu-tensor-activity)
 fi
+if [[ "${REQUIRE_WORK_SLOPE}" -eq 1 ]]; then
+  AUDIT_ARGS+=(--require-work-slope)
+fi
+for work_slope_dir in "${WORK_SLOPE_DIRS[@]}"; do
+  if [[ "${work_slope_dir}" = /* ]]; then
+    AUDIT_ARGS+=(--work-slope-dir "${work_slope_dir}")
+  else
+    AUDIT_ARGS+=(--work-slope-dir "${ROOT}/${work_slope_dir}")
+  fi
+done
 
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/audit_strict_results.py" "${AUDIT_ARGS[@]}"

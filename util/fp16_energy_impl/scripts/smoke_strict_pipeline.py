@@ -1595,6 +1595,32 @@ exit 1
         raise AssertionError(f"Power-trace fallback diagnostic note was not recorded: {qg_power_rows}")
 
     audit_good = base / "audit_good"
+    work_slope_dir = base / "work_slope"
+    write_csv(
+        work_slope_dir / "work_slope_summary.csv",
+        [
+            {
+                "gpu": "Synthetic H100",
+                "architecture_generation": "hopper",
+                "architecture_chip": "gh100",
+                "recommended_cuda_arch": "90",
+                "fp16_path": "tensor_core_mma_m16n16k16_f16acc",
+                "test_kernel": "tensor_mma_f16acc",
+                "baseline_kernel": "tensor_baseline_mov",
+                "threads": "128",
+                "threads_per_sm": "1024",
+                "blocks_per_sm_requested": "8",
+                "fit_scope": "valid_no_l2",
+                "point_count": "4",
+                "valid_no_l2_count": "4",
+                "slope_matmul_input_pj_per_bit": "0.21",
+                "slope_intercept_energy_j": "0.02",
+                "slope_r2": "0.93",
+                "slope_valid": "True",
+                "slope_note": "positive incremental-energy slope across work sweep",
+            }
+        ],
+    )
     run(
         [
             sys.executable,
@@ -1605,6 +1631,9 @@ exit 1
             str(audit_good),
             "--require-architectures",
             "gh100",
+            "--work-slope-dir",
+            str(work_slope_dir),
+            "--require-work-slope",
         ],
         cwd=ROOT,
         env=env,
@@ -1668,6 +1697,32 @@ exit 1
         or good_row.get("baseline_resource_unroll") != "16"
     ):
         raise AssertionError(f"Strict audit selected a decoy resource context: {good_row}")
+    if good_row.get("work_slope_valid") != "True":
+        raise AssertionError(f"Strict audit did not carry valid work-slope evidence: {good_row}")
+    if good_row.get("work_slope_pj_per_bit") != "0.21" or good_row.get("work_slope_r2") != "0.93":
+        raise AssertionError(f"Strict audit did not carry work-slope fit details: {good_row}")
+
+    audit_missing_work_slope = base / "audit_missing_work_slope"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "audit_strict_results.py"),
+            "--input",
+            str(good),
+            "--outdir",
+            str(audit_missing_work_slope),
+            "--require-architectures",
+            "gh100",
+            "--require-work-slope",
+            "--no-fail",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    missing_work_slope_row = read_single_csv_row(audit_missing_work_slope / "strict_result_audit.csv")
+    if missing_work_slope_row.get("audit_pass") != "False":
+        raise AssertionError(f"Missing work-slope strict audit unexpectedly passed: {missing_work_slope_row}")
+    assert_failure_category(audit_missing_work_slope / "strict_result_failure_summary.csv", "work_slope")
 
     audit_bad = base / "audit_no_required"
     run(
@@ -1786,6 +1841,7 @@ exit 1
         report_dir / "fp16_strict_report_requirements.csv",
         "ptxas resource audit context matches measurement",
     )
+    assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "work-slope scaling evidence")
     report_row = read_single_csv_row(report_dir / "fp16_strict_report_summary.csv")
     if report_row.get("target_selection_source") != "selected_targets_required_kernel_baseline":
         raise AssertionError(f"Report did not carry target selection source: {report_row}")
@@ -1795,6 +1851,8 @@ exit 1
         raise AssertionError(f"Report did not carry no-memory evidence: {report_row}")
     if report_row.get("resource_context_match") != "True":
         raise AssertionError(f"Report did not carry resource context evidence: {report_row}")
+    if report_row.get("work_slope_valid") != "True":
+        raise AssertionError(f"Report did not carry work-slope evidence: {report_row}")
 
     audit_report_bad_resource = base / "audit_report_bad_resource_context"
     mutated_audit_rows = read_csv_rows(audit_good / "strict_result_audit.csv")

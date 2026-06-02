@@ -55,6 +55,15 @@ def read_json(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def read_work_slope_rows(paths: List[Path]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for path in paths:
+        csv_path = path / "work_slope_summary.csv" if path.is_dir() else path
+        for row in read_csv(csv_path):
+            rows.append({**row, "work_slope_source": str(csv_path)})
+    return rows
+
+
 def artifact_exists(info: Any) -> bool:
     return isinstance(info, dict) and parse_bool(info.get("exists"))
 
@@ -175,6 +184,47 @@ def find_resource_row(
         ):
             return row
     return {}
+
+
+def find_work_slope_row(
+    rows: List[Dict[str, Any]],
+    *,
+    chip: str,
+    test_kernel: str,
+    baseline_kernel: str,
+    threads: str,
+    blocks_per_sm: str,
+) -> Dict[str, Any]:
+    threads = normalize_thread(threads)
+    blocks_per_sm = normalize_thread(blocks_per_sm)
+    chip = str(chip or "")
+
+    def score(row: Dict[str, Any]) -> Tuple[int, int, float, float] | None:
+        if str(row.get("test_kernel", "")) != test_kernel:
+            return None
+        if str(row.get("baseline_kernel", "")) != baseline_kernel:
+            return None
+        if normalize_thread(row.get("threads", "")) != threads:
+            return None
+        if normalize_thread(row.get("blocks_per_sm_requested", "")) != blocks_per_sm:
+            return None
+        row_chip = str(row.get("architecture_chip", "") or "")
+        if chip and row_chip and row_chip != chip:
+            return None
+        chip_score = 1 if chip and row_chip == chip else 0
+        valid_score = 1 if parse_bool(row.get("slope_valid")) else 0
+        points = parse_float(row.get("point_count"), 0.0)
+        r2 = parse_float(row.get("slope_r2"), -math.inf)
+        return (chip_score, valid_score, points, r2)
+
+    candidates: List[Tuple[Tuple[int, int, float, float], int, Dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        row_score = score(row)
+        if row_score is not None:
+            candidates.append((row_score, -index, row))
+    if not candidates:
+        return {}
+    return max(candidates, key=lambda item: item[:2])[2]
 
 
 def check_ncu_context(
@@ -345,6 +395,10 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     quality_rows = read_csv(path / "quality_gates.csv")
     ncu_rows = read_csv(path / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
     resource_rows = read_csv(path / "resource_audit" / "thread_resource_occupancy.csv")
+    work_slope_rows = [
+        *read_work_slope_rows([path / "work_slope_summary.csv"]),
+        *getattr(args, "work_slope_rows", []),
+    ]
     targets = summary.get("selected_targets") or []
     target, target_selection = select_target(targets, quality_rows, args)
 
@@ -367,6 +421,14 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         threads,
         unroll,
         blocks_per_sm,
+    )
+    work_slope = find_work_slope_row(
+        work_slope_rows,
+        chip=chip,
+        test_kernel=test_kernel,
+        baseline_kernel=baseline_kernel,
+        threads=threads,
+        blocks_per_sm=blocks_per_sm,
     )
 
     failed: List[str] = []
@@ -752,6 +814,25 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("selected test kernel has ptxas stack/spill usage")
     if baseline_resource and parse_bool(baseline_resource.get("has_spills")):
         failed.append("selected baseline kernel has ptxas stack/spill usage")
+    work_slope_present = bool(work_slope)
+    work_slope_valid = False
+    if work_slope:
+        work_slope_pjbit = parse_float(work_slope.get("slope_matmul_input_pj_per_bit"))
+        work_slope_r2 = parse_float(work_slope.get("slope_r2"))
+        work_slope_valid = bool(
+            parse_bool(work_slope.get("slope_valid"))
+            and str(work_slope.get("fit_scope", "")) == "valid_no_l2"
+            and math.isfinite(work_slope_pjbit)
+            and work_slope_pjbit > 0.0
+            and math.isfinite(work_slope_r2)
+            and work_slope_r2 >= args.min_work_slope_r2
+        )
+    if args.require_work_slope and not work_slope_present:
+        failed.append("missing work-slope row for selected kernel/thread/blocks_per_sm")
+    elif args.require_work_slope and not work_slope_valid:
+        failed.append("selected work-slope evidence is not valid")
+    elif work_slope_present and not work_slope_valid:
+        warnings.append("selected work-slope evidence is diagnostic only")
 
     return {
         "input_dir": str(path),
@@ -964,6 +1045,17 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_thread_occupancy_pct_model": baseline_resource.get("thread_occupancy_pct_model", "") if baseline_resource else "",
         "test_resource_has_spills": test_resource.get("has_spills", "") if test_resource else "",
         "baseline_resource_has_spills": baseline_resource.get("has_spills", "") if baseline_resource else "",
+        "work_slope_required": bool(args.require_work_slope),
+        "work_slope_present": work_slope_present,
+        "work_slope_valid": work_slope_valid,
+        "work_slope_source": work_slope.get("work_slope_source", "") if work_slope else "",
+        "work_slope_fit_scope": work_slope.get("fit_scope", "") if work_slope else "",
+        "work_slope_point_count": work_slope.get("point_count", "") if work_slope else "",
+        "work_slope_valid_no_l2_count": work_slope.get("valid_no_l2_count", "") if work_slope else "",
+        "work_slope_pj_per_bit": work_slope.get("slope_matmul_input_pj_per_bit", "") if work_slope else "",
+        "work_slope_intercept_energy_j": work_slope.get("slope_intercept_energy_j", "") if work_slope else "",
+        "work_slope_r2": work_slope.get("slope_r2", "") if work_slope else "",
+        "work_slope_note": work_slope.get("slope_note", "") if work_slope else "",
         "fail_reasons": "; ".join(failed),
         "warnings": "; ".join(warnings),
     }
@@ -1023,6 +1115,7 @@ FAILURE_CATEGORY_LABELS = {
     "required_architecture_coverage": "Required architecture coverage",
     "required_target_selection": "Required target pair selection",
     "quality_gate": "Quality gate pass/target flags",
+    "work_slope": "Work-slope scaling evidence",
     "pipeline_manifest": "Strict pipeline manifest/provenance",
     "pipeline_preflight": "Strict pipeline preflight/toolchain",
     "ncu_permission": "NCU performance-counter permission",
@@ -1066,6 +1159,8 @@ def failure_category(reason: str) -> str:
         or "quality_gate.py" in text
     ):
         return "quality_gate"
+    if "work-slope" in text or "work_slope" in text:
+        return "work_slope"
     if "manifest" in text or "binary sha256" in text or "git head" in text:
         return "pipeline_manifest"
     if "preflight" in text or "toolchain" in text or "compute apps" in text or "skip_preflight" in text:
@@ -1312,6 +1407,11 @@ def write_json(path: Path, rows: List[Dict[str, Any]], args: argparse.Namespace)
             "min_test_energy_j": args.min_test_energy_j,
             "min_incremental_energy_j": args.min_incremental_energy_j,
         },
+        "work_slope_thresholds": {
+            "require_work_slope": bool(args.require_work_slope),
+            "min_work_slope_r2": args.min_work_slope_r2,
+            "work_slope_dirs": [str(path) for path in args.work_slope_dir],
+        },
         "benchmark_schema_thresholds": {
             "expected_benchmark_schema_version": "fp16-energy-bench-v2",
         },
@@ -1367,6 +1467,19 @@ def main() -> int:
     parser.add_argument("--expected-matmul-input-bits-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--expected-mma-flops-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--require-baseline-elapsed", action="store_true")
+    parser.add_argument(
+        "--work-slope-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help="Directory or work_slope_summary.csv with work-scaling diagnostic rows",
+    )
+    parser.add_argument(
+        "--require-work-slope",
+        action="store_true",
+        help="Fail audit unless selected target has valid positive valid_no_l2 work-slope evidence",
+    )
+    parser.add_argument("--min-work-slope-r2", type=float, default=0.80)
     parser.add_argument("--warn-counter-trace-ratio-low", type=float, default=0.5)
     parser.add_argument("--warn-counter-trace-ratio-high", type=float, default=1.5)
     parser.add_argument(
@@ -1381,6 +1494,7 @@ def main() -> int:
     )
     parser.add_argument("--no-fail", action="store_true", help="Write audit files but return success even if audit fails")
     args = parser.parse_args()
+    args.work_slope_rows = read_work_slope_rows(args.work_slope_dir)
 
     rows = [audit_dir(path, args) for path in args.input]
     failure_rows = failure_summary_rows(rows, args)
