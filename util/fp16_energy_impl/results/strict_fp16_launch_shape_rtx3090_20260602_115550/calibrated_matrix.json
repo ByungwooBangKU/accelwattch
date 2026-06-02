@@ -1,0 +1,263 @@
+{
+  "description": "Launch-shape sweep for FP16 Tensor Core logical m16n16k16. Sweeps both threads/block and blocks/SM so target threads/SM is not tied to the default blocks_per_sm=8 assumption. Uses tensor_baseline_mov no-memory warp-sync structural baseline and suppresses output stores.",
+  "defaults": {
+    "blocks": 0,
+    "warmup": 2,
+    "repeats": 2,
+    "iters": 1000000,
+    "unroll": 8,
+    "suppress_output_store": true
+  },
+  "conditions": [
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t032_b01",
+      "args": {
+        "threads": 32,
+        "blocks_per_sm": 1
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 26
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 8
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t032_b02",
+      "args": {
+        "threads": 32,
+        "blocks_per_sm": 2
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 31
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 8
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t032_b04",
+      "args": {
+        "threads": 32,
+        "blocks_per_sm": 4
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 32
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 8
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t032_b08",
+      "args": {
+        "threads": 32,
+        "blocks_per_sm": 8
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 4
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t064_b01",
+      "args": {
+        "threads": 64,
+        "blocks_per_sm": 1
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 32
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 8
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t064_b02",
+      "args": {
+        "threads": 64,
+        "blocks_per_sm": 2
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 32
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 8
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t064_b04",
+      "args": {
+        "threads": 64,
+        "blocks_per_sm": 4
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 4
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t064_b08",
+      "args": {
+        "threads": 64,
+        "blocks_per_sm": 8
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 29
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 2
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t128_b01",
+      "args": {
+        "threads": 128,
+        "blocks_per_sm": 1
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 32
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 8
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t128_b02",
+      "args": {
+        "threads": 128,
+        "blocks_per_sm": 2
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 29
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 4
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t128_b04",
+      "args": {
+        "threads": 128,
+        "blocks_per_sm": 4
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 29
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 2
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t128_b08",
+      "args": {
+        "threads": 128,
+        "blocks_per_sm": 8
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 16
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 2
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t256_b01",
+      "args": {
+        "threads": 256,
+        "blocks_per_sm": 1
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 4
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t256_b02",
+      "args": {
+        "threads": 256,
+        "blocks_per_sm": 2
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 30
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 2
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t256_b04",
+      "args": {
+        "threads": 256,
+        "blocks_per_sm": 4
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 17
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 2
+      }
+    },
+    {
+      "name": "launch_shape_tensor_mma_f16acc_t256_b08",
+      "args": {
+        "threads": 256,
+        "blocks_per_sm": 8
+      },
+      "baseline": {
+        "kernel": "tensor_baseline_mov",
+        "repeats": 10
+      },
+      "test": {
+        "kernel": "tensor_mma_f16acc",
+        "repeats": 2
+      }
+    }
+  ],
+  "calibration": {
+    "generated_by": "scripts/calibrate_matrix.py",
+    "source_matrix": "/home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl/configs/fp16_matmul_launch_shape_sweep.json",
+    "calibration_source": "binary_probe",
+    "target_test_s": 1.0,
+    "target_baseline_s": 1.0,
+    "min_repeats": 1,
+    "max_repeats": 1000,
+    "allow_shrink": false
+  }
+}

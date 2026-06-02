@@ -1,0 +1,16 @@
+{
+  "architecture_preflight_pass": true,
+  "requested_cuda_arch": "86",
+  "recommended_cuda_arch": "86",
+  "compute_capability_arch": "86",
+  "device_name": "NVIDIA GeForce RTX 3090",
+  "architecture_generation": "ampere",
+  "architecture_chip": "ga102",
+  "expected_generation": "ampere",
+  "expected_chips": [
+    "ga102"
+  ],
+  "benchmark_uses_wgmma": false,
+  "fail_reasons": [],
+  "warnings": []
+}
