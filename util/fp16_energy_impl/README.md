@@ -452,7 +452,7 @@ python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_fine_gp
 
 여러 반복이 있는 thread sweep에서는 `valid_no_l2_count >= max(3, ceil(run_count/2))`인 후보를 우선 선택한다. 이 조건을 만족하는 후보가 없을 때만 더 약한 후보군으로 fallback한다. 최종 `target_pass` 선택 기준은 Tensor Core matmul의 경우 strict `quality_pass=true` 후보 중 max `tensor_model_utilization_pct_mean`에서 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm`이며, 같은 `threads_per_sm`에서는 TFLOPS와 clock stability로 tie-break한다. non-Tensor Core kernel은 measured SM/GPU utilization을 selection metric으로 사용한다.
 
-`blocks_per_sm=8`이 최적이라는 가정도 별도 확인할 수 있다. `configs/fp16_matmul_launch_shape_sweep.json`은 `threads/block = 32,64,128,256`과 `blocks/SM = 1,2,4,8`을 함께 훑어 같은 launched `threads_per_sm`이라도 다른 launch shape가 SM utilization, pJ/bit, baseline subtraction 안정성에 어떤 영향을 주는지 확인한다. `analyze_results.py`는 `thread_sweep_summary.csv`를 `threads`와 `blocks_per_sm_requested` 둘 다로 집계하고, `quality_gate.py`와 NCU validation context도 blocks/SM을 같이 매칭한다.
+`blocks_per_sm=8`이 최적이라는 가정도 별도 확인할 수 있다. `configs/fp16_matmul_launch_shape_sweep.json`은 `threads/block = 32,64,128,256`과 `blocks/SM = 1,2,4,8`을 함께 훑어 같은 launched `threads_per_sm`이라도 다른 launch shape가 SM utilization, pJ/bit, baseline subtraction 안정성에 어떤 영향을 주는지 확인한다. `analyze_results.py`는 `thread_sweep_summary.csv`를 `threads`와 `blocks_per_sm_requested` 둘 다로 집계하고, `quality_gate.py`와 NCU validation context도 blocks/SM을 같이 매칭한다. 또한 target selection에 사용한 utilization metric, saturation margin, valid no-L2 후보 내 pJ/bit rank, 선택점보다 낮은 pJ/bit 후보 목록을 기록해 "first saturation point" target과 "lowest observed pJ/bit" 후보를 구분한다.
 
 ```bash
 ./scripts/run_strict_fp16_pipeline.sh \

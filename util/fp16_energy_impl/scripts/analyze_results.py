@@ -42,6 +42,12 @@ def parse_float(x: Any) -> Optional[float]:
         return None
 
 
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
 def read_power_csv(path: str) -> List[Dict[str, Any]]:
     if not path:
         return []
@@ -1136,6 +1142,15 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         row["selected_optimal"] = False
         row["selection_status"] = "not_evaluated"
         row["selection_note"] = ""
+        row["selection_util_metric_source"] = ""
+        row["selection_util_score_pct"] = math.nan
+        row["selection_util_reference_scope"] = ""
+        row["selection_util_reference_max_pct"] = math.nan
+        row["selection_util_saturation_margin_pct"] = math.nan
+        row["selection_pjbit_rank_valid_no_l2"] = ""
+        row["selection_lower_pjbit_valid_no_l2_count"] = ""
+        row["selection_lower_pjbit_valid_no_l2_points"] = ""
+        row["selection_pjbit_rank_note"] = ""
         out.append(row)
 
     by_kernel: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
@@ -1149,7 +1164,79 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             min_count = 1 if run_count <= 1 else max(3, math.ceil(run_count * 0.5))
             return valid_count >= min_count
 
+        def target_util_metric_source(row: Dict[str, Any]) -> str:
+            if str(row.get("test_kernel", "")).startswith("tensor_mma_"):
+                model_util = finite_float(row.get("tensor_model_utilization_pct_mean"), -math.inf)
+                if math.isfinite(model_util):
+                    return "tensor_model_utilization_pct_mean"
+            util = finite_float(row.get("avg_sm_util_pct_mean"), -math.inf)
+            if math.isfinite(util):
+                return "avg_sm_util_pct_mean"
+            util = finite_float(row.get("avg_gpu_util_pct_mean"), -math.inf)
+            if math.isfinite(util):
+                return "avg_gpu_util_pct_mean"
+            util = finite_float(row.get("tensor_model_utilization_pct_mean"), -math.inf)
+            if math.isfinite(util):
+                return "tensor_model_utilization_pct_mean"
+            return ""
+
+        def target_util_score(row: Dict[str, Any]) -> float:
+            metric = target_util_metric_source(row)
+            if not metric:
+                return -math.inf
+            value = finite_float(row.get(metric), -math.inf)
+            return value if math.isfinite(value) else -math.inf
+
+        for row in group:
+            metric = target_util_metric_source(row)
+            score = target_util_score(row)
+            row["selection_util_metric_source"] = metric
+            row["selection_util_score_pct"] = score if math.isfinite(score) else math.nan
+
         eligible = [r for r in group if has_enough_valid(r, "valid_no_l2_count")]
+        finite_util_scores = [target_util_score(row) for row in eligible if math.isfinite(target_util_score(row))]
+        max_util = max(finite_util_scores) if finite_util_scores else -math.inf
+        reference_scope = "required_valid_no_l2" if eligible else "no_required_valid_no_l2_candidate"
+        for row in group:
+            score = target_util_score(row)
+            row["selection_util_reference_scope"] = reference_scope
+            row["selection_util_reference_max_pct"] = max_util if math.isfinite(max_util) else math.nan
+            row["selection_util_saturation_margin_pct"] = (
+                max_util - score if math.isfinite(max_util) and math.isfinite(score) else math.nan
+            )
+
+        ranked_pjbit = [
+            row
+            for row in eligible
+            if math.isfinite(finite_float(row.get("matmul_input_pj_per_bit_mean")))
+        ]
+        ranked_pjbit = sorted(
+            ranked_pjbit,
+            key=lambda row: (
+                finite_float(row.get("matmul_input_pj_per_bit_mean"), math.inf),
+                finite_float(row.get("threads_per_sm"), finite_float(row.get("threads"), math.inf)),
+                finite_float(row.get("blocks_per_sm_requested"), math.inf),
+            ),
+        )
+        for rank, row in enumerate(ranked_pjbit, start=1):
+            pjbit = finite_float(row.get("matmul_input_pj_per_bit_mean"))
+            lower = [
+                other
+                for other in ranked_pjbit
+                if finite_float(other.get("matmul_input_pj_per_bit_mean"), math.inf) < pjbit
+            ]
+            row["selection_pjbit_rank_valid_no_l2"] = rank
+            row["selection_lower_pjbit_valid_no_l2_count"] = len(lower)
+            row["selection_lower_pjbit_valid_no_l2_points"] = "; ".join(
+                f"{other.get('launch_shape', '')}@{finite_float(other.get('threads_per_sm')):.0f}="
+                f"{finite_float(other.get('matmul_input_pj_per_bit_mean')):.4g}"
+                for other in lower[:8]
+            )
+            row["selection_pjbit_rank_note"] = (
+                "rank among thread points meeting required_valid_no_l2_count; "
+                "lower pJ/bit points can still be rejected by saturation or strict quality gates"
+            )
+
         if not eligible:
             for row in group:
                 row["selection_status"] = "no_valid_no_l2_candidate"
@@ -1159,19 +1246,6 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 )
             continue
 
-        def target_util_score(row: Dict[str, Any]) -> float:
-            if str(row.get("test_kernel", "")).startswith("tensor_mma_"):
-                model_util = finite_float(row.get("tensor_model_utilization_pct_mean"), -math.inf)
-                if math.isfinite(model_util):
-                    return model_util
-            util = finite_float(row.get("avg_sm_util_pct_mean"), -math.inf)
-            if not math.isfinite(util):
-                util = finite_float(row.get("avg_gpu_util_pct_mean"), -math.inf)
-            if not math.isfinite(util):
-                util = finite_float(row.get("tensor_model_utilization_pct_mean"), -math.inf)
-            return util if math.isfinite(util) else -math.inf
-
-        max_util = max(target_util_score(row) for row in eligible)
         saturated = [row for row in eligible if target_util_score(row) >= max_util - 0.1]
         target_pool = saturated if saturated else eligible
 
@@ -1614,6 +1688,37 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
                 if not math.isfinite(sx):
                     sx = float(selected[0]["threads"])
                 ax.axvline(sx, color="tab:green", linestyle="--", linewidth=1.2, label="selected")
+            lowest_valid_no_l2 = [
+                (x, y, row)
+                for x, y, row in zip(plot_xs, pjbit, rows)
+                if math.isfinite(x)
+                and math.isfinite(y)
+                and parse_bool(row.get("valid_no_l2_requirement_met"))
+            ]
+            if lowest_valid_no_l2:
+                low_x, low_y, low_row = min(lowest_valid_no_l2, key=lambda item: item[1])
+                ax.scatter(
+                    [low_x],
+                    [low_y],
+                    marker="*",
+                    s=140,
+                    color="tab:purple",
+                    edgecolor="black",
+                    linewidth=0.6,
+                    zorder=4,
+                    label="lowest valid no-L2 pJ/b",
+                )
+                if not selected or low_row is not selected[0]:
+                    ax.annotate(
+                        f"lowest valid no-L2\n{shape_label(low_row)}\n{low_y:.3g} pJ/b",
+                        (low_x, low_y),
+                        textcoords="offset points",
+                        xytext=(8, -30 if low_y >= 0 else 12),
+                        ha="left",
+                        va="top" if low_y >= 0 else "bottom",
+                        fontsize=8,
+                        bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "none", "alpha": 0.78},
+                    )
             ax.legend(loc="best")
             plt.title(f"Thread sweep pJ/bit: {test_kernel} vs {baseline_kernel}")
             plt.tight_layout()
