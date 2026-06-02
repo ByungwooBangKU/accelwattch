@@ -1,0 +1,77 @@
+{
+  "generated_utc": "2026-06-02T04:08:26.567487+00:00",
+  "ptxas_logs": [
+    "results/strict_fp16_launch_shape_rtx3090_20260602_124900/build_ptxas.log"
+  ],
+  "result_dir": "results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100",
+  "counts": {
+    "kernel_resource_rows": 77,
+    "thread_resource_rows": 0,
+    "spill_rows": 0,
+    "missing_thread_resource_rows": 0
+  },
+  "arch_limits": {
+    "80": {
+      "architecture_generation": "ampere",
+      "architecture_chip": "ga100",
+      "recommended_cuda_arch": "80",
+      "registers_per_sm": 65536,
+      "max_threads_per_sm": 2048,
+      "max_blocks_per_sm": 32,
+      "max_warps_per_sm": 64,
+      "dense_tensor_fp16_flop_per_sm_cycle": 2048.0,
+      "reference_sm_count": 108,
+      "reference_boost_clock_mhz": 1410.0,
+      "reference_dense_tensor_fp16_tflops": 312.0,
+      "reference_sparse_tensor_fp16_tflops": 624.0,
+      "reference_source_url": "https://www.nvidia.com/en-us/data-center/a100/",
+      "tensor_core_architecture_source_url": "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/nvidia-ampere-architecture-whitepaper.pdf",
+      "reference_note": "A100 SXM dense FP16 Tensor Core peak, no sparsity",
+      "sparsity_mode": "dense_no_sparsity",
+      "uses_wgmma_model": false
+    },
+    "86": {
+      "architecture_generation": "ampere",
+      "architecture_chip": "ga102",
+      "recommended_cuda_arch": "86",
+      "registers_per_sm": 65536,
+      "max_threads_per_sm": 1536,
+      "max_blocks_per_sm": 16,
+      "max_warps_per_sm": 48,
+      "dense_tensor_fp16_flop_per_sm_cycle": 1024.0,
+      "reference_sm_count": 82,
+      "reference_boost_clock_mhz": 1695.0,
+      "reference_dense_tensor_fp16_tflops": 142.0,
+      "reference_sparse_tensor_fp16_tflops": 284.0,
+      "reference_source_url": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf",
+      "tensor_core_architecture_source_url": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf",
+      "reference_note": "RTX 3090 FE dense FP16 Tensor Core peak, no sparsity",
+      "sparsity_mode": "dense_no_sparsity",
+      "uses_wgmma_model": false
+    },
+    "90": {
+      "architecture_generation": "hopper",
+      "architecture_chip": "gh100",
+      "recommended_cuda_arch": "90",
+      "registers_per_sm": 65536,
+      "max_threads_per_sm": 2048,
+      "max_blocks_per_sm": 32,
+      "max_warps_per_sm": 64,
+      "dense_tensor_fp16_flop_per_sm_cycle": 4096.0,
+      "reference_sm_count": 132,
+      "reference_boost_clock_mhz": 1830.0,
+      "reference_dense_tensor_fp16_tflops": 989.5,
+      "reference_sparse_tensor_fp16_tflops": 1979.0,
+      "reference_source_url": "https://www.nvidia.com/en-us/data-center/h100/",
+      "tensor_core_architecture_source_url": "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/",
+      "reference_note": "H100 SXM dense FP16 Tensor Core peak model, no sparsity; public H100 product tables mark FP16 Tensor Core values with sparsity, while the Hopper architecture table separates dense and sparse throughput",
+      "sparsity_mode": "dense_no_sparsity",
+      "uses_wgmma_model": false
+    }
+  },
+  "notes": [
+    "Register and spill counts are ptxas compiler evidence for each instantiated kernel/unroll.",
+    "Occupancy is a static resource model, not measured SM utilization.",
+    "Use Nsight Compute counters and quality gates for final no-L2/no-spill validation."
+  ]
+}

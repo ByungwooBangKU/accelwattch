@@ -1,0 +1,155 @@
+{
+  "generated_utc": "2026-06-02T03:50:09.939522+00:00",
+  "preflight_schema": "fp16-strict-architecture-suite-preflight-v1",
+  "overall_pass": true,
+  "required_tools_pass": true,
+  "required_tool_fail_reasons": [],
+  "dry_run": false,
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "",
+    "CUDA_DEVICE_ORDER": "",
+    "CMAKE_CUDA_FLAGS": "-I/tmp/fp16-energy-sm86-cuda121/include -L/tmp/fp16-energy-sm86-cuda121/targets/x86_64-linux/lib",
+    "PATH": "/tmp/fp16-energy-sm86-cuda121/bin:/home/bang001/.local/bin:/home/bang001/.codex/tmp/arg0/codex-arg0sp7Awt:/home/bang001/.vscode-server/bin/8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e/bin/remote-cli:/home/bang001/.local/bin:/home/bang001/.nvm/versions/node/v22.19.0/bin:/home/bang001/.local/bin:/home/bang001/miniforge3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/usr/lib/wsl/lib:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS:/mnt/c/WINDOWS/System32/Wbem:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/:/mnt/c/WINDOWS/System32/OpenSSH/:/mnt/c/Program Files/cursor/resources/app/bin:/mnt/c/Program Files/Microsoft VS Code/bin:/mnt/c/Program Files/NVIDIA Corporation/Nsight Compute 2025.4.1/:/mnt/c/Program Files/Bandizip/:/mnt/c/Program Files/Git/cmd:/mnt/c/Program Files/PowerShell/7/:/mnt/c/Users/DMQA/AppData/Local/Microsoft/WindowsApps:/mnt/c/Users/DMQA/AppData/Local/Programs/Antigravity/bin:/snap/bin:/home/bang001/.vscode-server/extensions/openai.chatgpt-26.527.60818-linux-x64/bin/linux-x86_64"
+  },
+  "tool_results": [
+    {
+      "name": "python",
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/bin/python",
+        "--version"
+      ],
+      "required": true,
+      "path": "/tmp/fp16-energy-sm86-cuda121/bin/python",
+      "available": true,
+      "returncode": 0,
+      "stdout": "Python 3.10.20",
+      "stderr": "",
+      "pass": true,
+      "fail_reasons": [],
+      "warnings": []
+    },
+    {
+      "name": "cmake",
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/bin/cmake",
+        "--version"
+      ],
+      "required": true,
+      "path": "/tmp/fp16-energy-sm86-cuda121/bin/cmake",
+      "available": true,
+      "returncode": 0,
+      "stdout": "cmake version 4.3.3\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).",
+      "stderr": "",
+      "pass": true,
+      "fail_reasons": [],
+      "warnings": []
+    },
+    {
+      "name": "nvidia-smi",
+      "command": [
+        "/usr/lib/wsl/lib/nvidia-smi",
+        "--version"
+      ],
+      "required": true,
+      "path": "/usr/lib/wsl/lib/nvidia-smi",
+      "available": true,
+      "returncode": 0,
+      "stdout": "NVIDIA-SMI version  : 590.57\nNVML version        : 590.57\nDRIVER version      : 591.86\nCUDA Version        : 13.1",
+      "stderr": "",
+      "pass": true,
+      "fail_reasons": [],
+      "warnings": []
+    },
+    {
+      "name": "nvcc",
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/bin/nvcc",
+        "--version"
+      ],
+      "required": true,
+      "path": "/tmp/fp16-energy-sm86-cuda121/bin/nvcc",
+      "available": true,
+      "returncode": 0,
+      "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2023 NVIDIA Corporation\nBuilt on Mon_Apr__3_17:16:06_PDT_2023\nCuda compilation tools, release 12.1, V12.1.105\nBuild cuda_12.1.r12.1/compiler.32688072_0",
+      "stderr": "",
+      "pass": true,
+      "fail_reasons": [],
+      "warnings": []
+    },
+    {
+      "name": "ncu",
+      "command": [
+        "/tmp/fp16-energy-sm86-cuda121/nsight-compute/2024.1.1/ncu",
+        "--version"
+      ],
+      "required": true,
+      "path": "/tmp/fp16-energy-sm86-cuda121/nsight-compute/2024.1.1/ncu",
+      "available": true,
+      "returncode": 0,
+      "stdout": "NVIDIA (R) Nsight Compute Command Line Profiler\nCopyright (c) 2018-2024 NVIDIA Corporation\nVersion 2024.1.1.0 (build 33998838) (public-release)",
+      "stderr": "",
+      "pass": true,
+      "fail_reasons": [],
+      "warnings": []
+    }
+  ],
+  "cuda_toolchain_compatibility": {
+    "checked": true,
+    "pass": true,
+    "nvcc_release": "12.1",
+    "driver_cuda_version": "13.1",
+    "needs_compatible_toolchain": false,
+    "recommended_cuda_toolkit": "",
+    "recovery_commands": [],
+    "recovery_note": "",
+    "fail_reasons": [],
+    "warnings": []
+  },
+  "compute_apps_query": {
+    "command": [
+      "/usr/lib/wsl/lib/nvidia-smi",
+      "--query-compute-apps=pid,process_name,used_memory,gpu_uuid",
+      "--format=csv,noheader,nounits"
+    ],
+    "returncode": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "compute_apps": [],
+  "rows": [
+    {
+      "label": "pipeline",
+      "gpu": "0",
+      "cuda_arch": "86",
+      "nvidia_smi_id": "GPU-6176a2fd-d534-e78c-edd2-78b8db8109b0",
+      "raw_spec": "pipeline:0:86:GPU-6176a2fd-d534-e78c-edd2-78b8db8109b0",
+      "expected_chip": "ga102",
+      "expected_generation": "ampere",
+      "gpu_name": "NVIDIA GeForce RTX 3090",
+      "gpu_uuid": "GPU-6176a2fd-d534-e78c-edd2-78b8db8109b0",
+      "gpu_index": "0",
+      "gpu_pci_bus_id": "00000000:01:00.0",
+      "driver_version": "591.86",
+      "power_limit_w": "370.00",
+      "active_compute_app_count": 0,
+      "active_compute_apps": [],
+      "preflight_pass": true,
+      "fail_reasons": [],
+      "warnings": [],
+      "required_tools_pass": true,
+      "required_tool_fail_reasons": [],
+      "toolchain_compatibility_pass": true,
+      "toolchain_needs_compatible_toolchain": false,
+      "toolchain_nvcc_release": "12.1",
+      "toolchain_driver_cuda_version": "13.1",
+      "toolchain_recommended_cuda_toolkit": "",
+      "toolchain_recovery_commands": [],
+      "toolchain_recovery_note": "",
+      "overall_preflight_pass": true,
+      "publishable_preflight_pass": true,
+      "overall_fail_reasons": [],
+      "target_fail_reasons": []
+    }
+  ],
+  "fail_reasons": []
+}

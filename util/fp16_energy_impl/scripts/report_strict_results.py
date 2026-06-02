@@ -244,6 +244,12 @@ def requirement_rows(
         and not parse_bool(row.get("pipeline_allow_compute_apps"))
         for row in audit_rows
     )
+    ncu_permission_probe = bool(audit_rows) and all(
+        parse_bool(row.get("pipeline_ncu_permission_probe_recorded"))
+        and parse_bool(row.get("pipeline_ncu_permission_probe_pass"))
+        and not parse_bool(row.get("pipeline_ncu_permission_probe_permission_denied"))
+        for row in audit_rows
+    )
     ncu = bool(audit_rows) and all(parse_bool(row.get("ncu_validation_pass")) for row in audit_rows)
     ncu_context = bool(audit_rows) and all(
         parse_bool(row.get("ncu_validation_context_match")) for row in audit_rows
@@ -349,6 +355,11 @@ def requirement_rows(
             "strict pipeline preflight passed",
             pipeline_preflight,
             "strict_pipeline_preflight.json overall/toolchain pass and matching target row",
+        ),
+        row(
+            "NCU performance-counter permission probe passed",
+            ncu_permission_probe,
+            "ncu_permission_probe.json permission_probe_pass=true and no ERR_NVGPUCTRPERM",
         ),
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
         row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),

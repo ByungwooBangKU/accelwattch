@@ -232,6 +232,7 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     summary = read_json(path / "quality_gate_summary.json")
     manifest = read_json(path / "strict_pipeline_manifest.json")
     pipeline_preflight = read_json(path / "strict_pipeline_preflight.json")
+    ncu_permission_probe = read_json(path / "ncu_permission_probe" / "ncu_permission_probe.json")
     quality_rows = read_csv(path / "quality_gates.csv")
     ncu_rows = read_csv(path / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
     resource_rows = read_csv(path / "resource_audit" / "thread_resource_occupancy.csv")
@@ -289,6 +290,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         if isinstance(manifest_artifacts.get("ncu_validation_summary"), dict)
         else {}
     )
+    manifest_ncu_permission_probe_json = (
+        manifest_artifacts.get("ncu_permission_probe_json")
+        if isinstance(manifest_artifacts.get("ncu_permission_probe_json"), dict)
+        else {}
+    )
+    manifest_ncu_permission_probe_log = (
+        manifest_artifacts.get("ncu_permission_probe_log")
+        if isinstance(manifest_artifacts.get("ncu_permission_probe_log"), dict)
+        else {}
+    )
     manifest_resource_audit = (
         manifest_artifacts.get("resource_audit")
         if isinstance(manifest_artifacts.get("resource_audit"), dict)
@@ -319,8 +330,19 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("strict pipeline manifest did not record strict_pipeline_preflight.csv")
     if not parse_bool(manifest_ncu_summary.get("exists")):
         failed.append("strict pipeline manifest did not record NCU validation summary")
+    if not artifact_exists(manifest_ncu_permission_probe_json):
+        failed.append("strict pipeline manifest did not record NCU permission probe JSON")
+    if not artifact_exists(manifest_ncu_permission_probe_log):
+        failed.append("strict pipeline manifest did not record NCU permission probe log")
     if not parse_bool(manifest_resource_audit.get("exists")):
         failed.append("strict pipeline manifest did not record resource audit")
+
+    if not ncu_permission_probe:
+        failed.append("ncu_permission_probe/ncu_permission_probe.json is missing or empty")
+    if ncu_permission_probe and not parse_bool(ncu_permission_probe.get("permission_probe_pass")):
+        failed.append("NCU permission probe did not pass")
+    if ncu_permission_probe and parse_bool(ncu_permission_probe.get("permission_denied")):
+        failed.append("NCU permission probe recorded ERR_NVGPUCTRPERM")
 
     pipeline_preflight_schema = str(pipeline_preflight.get("preflight_schema", "") or "")
     pipeline_preflight_rows = (
@@ -586,6 +608,24 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
             pipeline_toolchain.get("driver_cuda_version", "") if pipeline_toolchain else ""
         ),
         "pipeline_preflight_matching_row_count": len(pipeline_preflight_matching_rows),
+        "pipeline_ncu_permission_probe_recorded": artifact_exists(manifest_ncu_permission_probe_json),
+        "pipeline_ncu_permission_probe_pass": (
+            ncu_permission_probe.get("permission_probe_pass", "") if ncu_permission_probe else ""
+        ),
+        "pipeline_ncu_permission_probe_status": (
+            ncu_permission_probe.get("status", "") if ncu_permission_probe else ""
+        ),
+        "pipeline_ncu_permission_probe_permission_denied": (
+            ncu_permission_probe.get("permission_denied", "") if ncu_permission_probe else ""
+        ),
+        "pipeline_ncu_permission_probe_fail_reasons": (
+            "; ".join(ncu_permission_probe.get("fail_reasons", []))
+            if isinstance(ncu_permission_probe.get("fail_reasons"), list)
+            else ncu_permission_probe.get("fail_reasons", "")
+        ) if ncu_permission_probe else "",
+        "pipeline_ncu_permission_probe_log": (
+            ncu_permission_probe.get("log_file", "") if ncu_permission_probe else ""
+        ),
         "pipeline_invocation": manifest.get("invocation", ""),
         "energy_trace_crosscheck_pass": target.get("energy_trace_crosscheck_pass", ""),
         "target_pass": target.get("target_pass", ""),

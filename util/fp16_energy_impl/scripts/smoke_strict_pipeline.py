@@ -317,6 +317,33 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
     required = target_row("tensor_mma_f16acc", "tensor_baseline_mov", 128)
     selected_targets = [wrong, required] if include_required_target else [wrong]
     write_preflight(path / "strict_pipeline_preflight.json")
+    write_json(
+        path / "ncu_permission_probe" / "ncu_permission_probe.json",
+        {
+            "status": "pass",
+            "permission_probe_pass": True,
+            "permission_denied": False,
+            "profiler_errors": [],
+            "fail_reasons": [],
+            "returncode": 0,
+            "log_file": str(path / "ncu_permission_probe" / "ncu_permission_probe.ncu.txt"),
+        },
+    )
+    write_csv(
+        path / "ncu_permission_probe" / "ncu_permission_probe.csv",
+        [
+            {
+                "status": "pass",
+                "permission_probe_pass": "true",
+                "permission_denied": "false",
+                "returncode": 0,
+                "log_file": str(path / "ncu_permission_probe" / "ncu_permission_probe.ncu.txt"),
+            }
+        ],
+    )
+    (path / "ncu_permission_probe" / "ncu_permission_probe.ncu.txt").write_text(
+        "==PROF== Synthetic NCU permission probe passed\n"
+    )
     write_csv(
         path / "strict_pipeline_preflight.csv",
         [
@@ -372,6 +399,9 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
                 "pipeline_preflight_json": {"exists": True},
                 "pipeline_preflight_csv": {"exists": True},
                 "quality_gate_summary": {"exists": True},
+                "ncu_permission_probe_json": {"exists": True},
+                "ncu_permission_probe_csv": {"exists": True},
+                "ncu_permission_probe_log": {"exists": True},
                 "ncu_validation_summary": {"exists": True},
                 "resource_audit": {"exists": True},
             },
@@ -899,6 +929,12 @@ exit 1
         raise AssertionError(f"Strict audit did not carry passing pipeline preflight evidence: {good_row}")
     if good_row.get("pipeline_preflight_toolchain_pass") != "True":
         raise AssertionError(f"Strict audit did not carry passing toolchain compatibility evidence: {good_row}")
+    if good_row.get("pipeline_ncu_permission_probe_recorded") != "True":
+        raise AssertionError(f"Strict audit did not carry NCU permission probe artifact evidence: {good_row}")
+    if good_row.get("pipeline_ncu_permission_probe_pass") != "True":
+        raise AssertionError(f"Strict audit did not carry passing NCU permission probe evidence: {good_row}")
+    if good_row.get("pipeline_ncu_permission_probe_permission_denied") != "False":
+        raise AssertionError(f"Strict audit did not carry NCU permission-denied evidence: {good_row}")
 
     audit_bad = base / "audit_no_required"
     run(
@@ -970,6 +1006,10 @@ exit 1
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "required kernel target selected")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "suite preflight passed")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "strict pipeline preflight passed")
+    assert_requirement_pass(
+        report_dir / "fp16_strict_report_requirements.csv",
+        "NCU performance-counter permission probe passed",
+    )
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "architecture model metadata")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "NCU Tensor activity observed")
     report_row = read_single_csv_row(report_dir / "fp16_strict_report_summary.csv")
