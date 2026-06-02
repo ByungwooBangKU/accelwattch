@@ -474,9 +474,9 @@ def plot_bar(rows: List[Dict[str, Any]], metric: str, ylabel: str, title: str, p
 
 def quality_class(row: Dict[str, Any]) -> str:
     has_quality = str(row.get("quality_pass", "")).strip() != ""
+    if is_strict_publishable_target(row):
+        return "target"
     if parse_bool(row.get("target_pass")):
-        if str(row.get("measurement_grade", "")) == "strict_nvml_counter":
-            return "target"
         return "diagnostic_target"
     if parse_bool(row.get("quality_pass")):
         return "quality"
@@ -506,7 +506,7 @@ def add_quality_legend(ax: Any) -> None:
 
     handles = [
         Line2D([0], [0], marker="*", color="none", markerfacecolor="0.55", markeredgecolor="black",
-               label="strict target", markersize=10),
+               label="publishable strict target", markersize=10),
         Line2D([0], [0], marker="D", color="none", markerfacecolor="tab:orange", markeredgecolor="black",
                label="diagnostic target", markersize=7),
         Line2D([0], [0], marker="o", color="none", markerfacecolor="white", markeredgecolor="0.35",
@@ -521,7 +521,7 @@ def add_quality_legend(ax: Any) -> None:
 def selected_annotation(row: Dict[str, Any]) -> str:
     cls = quality_class(row)
     if cls == "target":
-        label = "strict target"
+        label = "strict\npublishable"
     elif cls == "diagnostic_target":
         label = "diagnostic\ntarget"
     else:

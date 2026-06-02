@@ -596,6 +596,7 @@ def assert_requirement_fail(path: Path, requirement: str) -> None:
 def smoke(base: Path, env: Dict[str, str]) -> None:
     import analyze_results
     import architecture_models
+    import compare_architectures
     import quality_gate as quality_gate_module
 
     good = base / "good"
@@ -966,6 +967,17 @@ exit 1
         raise AssertionError(f"Analyzer did not select sane utilization candidate: {overmax_shape_summary}")
     if selected_sane.get("selection_util_metric_source") != "tensor_model_utilization_pct_mean":
         raise AssertionError(f"Analyzer used wrong utilization source: {overmax_shape_summary}")
+
+    strict_visual_row = compare_thread_row(64, 256, 95.8, 0.18, target=True, blocks_per_sm=4)
+    no_ncu_visual_row = dict(strict_visual_row)
+    no_ncu_visual_row["ncu_required"] = "false"
+    no_ncu_visual_row["ncu_validation_pass"] = "false"
+    no_ncu_visual_row["ncu_validation_context_match"] = "false"
+    no_ncu_visual_row["test_ncu_tensor_activity_observed"] = ""
+    if compare_architectures.quality_class(strict_visual_row) != "target":
+        raise AssertionError(f"Strict publishable target was not marked as target: {strict_visual_row}")
+    if compare_architectures.quality_class(no_ncu_visual_row) != "diagnostic_target":
+        raise AssertionError(f"No-NCU target should be visualized as diagnostic: {no_ncu_visual_row}")
 
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"

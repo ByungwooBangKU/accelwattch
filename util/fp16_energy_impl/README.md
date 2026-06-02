@@ -566,9 +566,9 @@ python3 scripts/smoke_strict_pipeline.py
 | `architecture_models/architecture_model_per_sm_capacity.png` | architecture별 f16acc dense FP16 Tensor Core FLOP/SM/cycle 비교 |
 | `architecture_models/architecture_model_accumulator_modes.png` | architecture별 f16acc/f32acc dense FP16 Tensor Core reference peak 비교 |
 | `architecture_models/architecture_model_resource_limits.png` | architecture별 max thread/warp/block/register resource limit 비교 |
-| `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교. marker는 strict NVML target, diagnostic target, diagnostic `quality_pass`, fail, legacy/no-gate 상태를 구분하고 selected/target point에는 threads/block와 pJ/bit를 표시 |
-| `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교. marker는 strict target과 diagnostic 상태를 구분 |
-| `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교. strict target point에는 threads/block와 pJ/bit 값을 직접 표시하고, non-strict legacy target은 diagnostic marker로 분리 |
+| `architecture_thread_sweep_util_*.png` | x축 launched threads/SM, y축 SM utilization의 multi-GPU 비교. marker는 publishable strict target, diagnostic target, diagnostic `quality_pass`, fail, legacy/no-gate 상태를 구분하고 selected/target point에는 threads/block와 pJ/bit를 표시 |
+| `architecture_thread_sweep_model_util_*.png` | x축 launched threads/SM, y축 dense Tensor Core model utilization의 multi-GPU 비교. marker는 publishable strict target과 diagnostic 상태를 구분 |
+| `architecture_thread_sweep_pjbit_*.png` | x축 launched threads/SM, y축 logical pJ/bit의 multi-GPU 비교. publishable strict target point에는 threads/block와 pJ/bit 값을 직접 표시하고, NCU/audit 없는 target과 non-strict legacy target은 diagnostic marker로 분리 |
 | `architecture_thread_sweep_energy_fraction_*.png` | x축 launched threads/SM, y축 test energy 대비 FP16 incremental fraction과 baseline-scaled fraction의 multi-GPU 비교. target에는 threads/block, pJ/bit, incremental/base 비율을 표시 |
 | `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
 | `fp16_strict_report.md` | strict audit와 architecture compare를 묶은 publishability 중심 Markdown report |

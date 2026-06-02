@@ -59,7 +59,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | Pipeline | build/run/analyze가 분리 | `run_strict_fp16_pipeline.sh`가 preflight, NCU permission probe, calibration, sweep, analyze, resource audit, quality gate까지 orchestration |
 | Register evidence | 질문 시 별도 확인 필요 | `summarize_kernel_resources.py`와 resource audit로 ptxas register/spill evidence 기록. strict audit는 selected resource row의 `threads`, `blocks_per_sm`, `unroll` context가 measurement row와 같은지도 확인 |
 | Diagnostic mode | strict 실패와 diagnostic 구분이 약함 | `--diagnostic-no-ncu`는 NCU를 명시적으로 skip하고 final claim에서 제외 |
-| Final visualization | 결과 plot이 diagnostic과 strict 상태를 혼동할 수 있었음 | strict report dashboard가 publishable strict point와 diagnostic/rejected point를 다른 marker로 표시하고, requirement matrix가 resource context mismatch를 별도 fail 항목으로 노출 |
+| Final visualization | 결과 plot이 diagnostic과 strict 상태를 혼동할 수 있었음 | strict report dashboard와 architecture thread-sweep plot이 publishable strict point와 diagnostic/rejected point를 다른 marker로 표시하고, NCU/audit 없는 target은 diagnostic marker로 분리. requirement matrix는 resource context mismatch를 별도 fail 항목으로 노출 |
 | Architecture comparison | quality gate target만으로 strict coverage처럼 보일 수 있었음 | `compare_architectures.py --audit-dir`가 `strict_result_audit.csv`의 `audit_pass=true` row만 publishable best로 사용. postprocess wrapper는 audit evidence와 동일한 `--require-architectures` set을 compare 단계에 자동 전달 |
 | Tensor model sanity | model utilization fallback 값이 100%를 넘는 diagnostic row도 analyzer selected로 보일 수 있었음 | `tensor_model_utilization_pct_mean > 105%` row는 analyzer `selected_optimal` 후보와 quality gate target 후보에서 제외 |
 
