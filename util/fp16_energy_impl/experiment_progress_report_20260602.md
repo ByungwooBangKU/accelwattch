@@ -5,6 +5,14 @@
 현재 측정 완료 GPU: NVIDIA GeForce RTX 3090, GA102, sm86
 문서 목적: 지금까지 얻은 RTX 3090 FP16 matmul pJ/bit 결과와 최초 설계 대비 변경점을 기록한다.
 
+## 0. 요약
+
+현재까지 숫자로 말할 수 있는 값은 RTX 3090 diagnostic 결과다. 최종 claim으로 쓸 수 있는 A100/H100/RTX3090 strict pJ/bit 결과는 아직 없다. 가장 신뢰도가 높은 RTX 3090 strict-like 후보는 `0.30846 +/- 0.02532 pJ/bit`이며, latest no-NCU diagnostic 후보는 `0.18327 +/- 0.10838 pJ/bit`이다. 두 값 모두 logical `m16n16k16` FP16 matmul input bit 기준이다.
+
+최초 설계 대비 가장 큰 변화는 단순 FP16 loop energy 측정에서, `tensor_mma_f16acc`와 `tensor_baseline_mov` pair를 strict target으로 고정하고, `threads/block`와 `blocks/SM`을 함께 sweep해 첫 saturation point를 고르는 구조로 바뀐 점이다. 또한 L2/global-memory를 터치하지 않았다는 주장을 software metadata만으로 보지 않고, 최종 strict 결과에서는 Nsight Compute no-L2/global-memory evidence와 Tensor Core activity evidence까지 요구하도록 바꿨다.
+
+최근에는 selected target과 동일한 launch context에서 work amount slope를 재검증하기 위해 `scripts/generate_work_slope_matrix.py`를 추가했다. 예를 들어 현재 RTX 3090 strict-like selected target인 `threads=256`, `blocks/SM=1`에서 work-slope matrix를 자동 생성하면 같은 launch shape로 `unroll=1,2,4,8,16`을 sweep할 수 있다. 이 단계는 baseline subtraction이 우연한 fixed-overhead 희석이 아니라 work 증가에 따라 증가하는 energy slope를 보이는지 확인하기 위한 추가 guard다.
+
 ## 1. 현재 결론
 
 아직 최종 publishable strict pJ/bit 값은 없다. RTX 3090에서 여러 diagnostic sweep과 strict-like pipeline을 수행했지만, 현재 장비에서 Nsight Compute performance counter 접근이 `ERR_NVGPUCTRPERM`으로 막혀 no-L2/global-memory 조건과 Tensor Core HMMA activity를 hardware counter로 증명하지 못했다. 따라서 아래 pJ/bit 값은 모두 `baseline-subtracted incremental FP16 compute energy estimate`이며, 최종 A100/H100/RTX3090 비교값이 아니다.
@@ -60,6 +68,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | Register evidence | 질문 시 별도 확인 필요 | `summarize_kernel_resources.py`와 resource audit로 ptxas register/spill evidence 기록. strict audit는 selected resource row의 `threads`, `blocks_per_sm`, `unroll` context가 measurement row와 같은지도 확인 |
 | Diagnostic mode | strict 실패와 diagnostic 구분이 약함 | `--diagnostic-no-ncu`는 NCU를 명시적으로 skip하고 final claim에서 제외 |
 | Required target pair | 여러 FP16 계열 후보가 동시에 selected target처럼 보일 수 있었음 | `quality_gate.py`도 기본 `--require-kernel tensor_mma_f16acc --require-baseline tensor_baseline_mov` pair 안에서만 `selected_targets`를 만들고, suite/pipeline/manifest/NCU validation/audit/compare가 같은 required pair를 공유 |
+| Work-slope 검증 | 별도 diagnostic으로만 존재해 selected target과 launch context가 다를 수 있었음 | `generate_work_slope_matrix.py`가 `quality_gate_summary.json`의 selected target에서 `threads`와 `blocks/SM`을 읽어 같은 launch context의 work-slope matrix를 생성. strict audit/report는 필요 시 `--work-slope-dir`와 `--require-work-slope`로 positive slope evidence를 요구 |
 | Final visualization | 결과 plot이 diagnostic과 strict 상태를 혼동할 수 있었음 | strict report dashboard와 architecture thread-sweep plot이 publishable strict point와 diagnostic/rejected point를 다른 marker로 표시하고, NCU/audit 없는 target은 diagnostic marker로 분리. requirement matrix는 resource context mismatch를 별도 fail 항목으로 노출 |
 | Architecture comparison | quality gate target만으로 strict coverage처럼 보일 수 있었음 | `compare_architectures.py --audit-dir`가 `strict_result_audit.csv`의 `audit_pass=true` row만 publishable best로 사용. standalone compare에서도 기본 required pair인 `tensor_mma_f16acc/tensor_baseline_mov`, NCU context, Tensor activity observed/pct, common-HMMA, no-L2/no-DRAM/no-local-spill evidence가 있어야 strict marker/coverage로 분류. suite/postprocess wrapper는 동일한 `--require-architectures` set을 audit/compare/report 경로에 전달하고, 동일한 `--require-kernel/--require-baseline` set을 audit/compare 경로에 전달 |
 | Tensor model sanity | model utilization fallback 값이 100%를 넘는 diagnostic row도 analyzer selected로 보일 수 있었음 | `tensor_model_utilization_pct_mean > 105%` row는 analyzer `selected_optimal` 후보와 quality gate target 후보에서 제외 |
@@ -79,6 +88,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | `results/strict_fp16_launch_shape_rtx3090_20260602_115550` | calibrated launch-shape sweep | `threads=256`, `blocks/SM=1`, `threads/SM=256` | `0.30846 +/- 0.02532` | quality gate target은 있었지만 NCU hardware validation이 없어 strict final 아님 |
 | `results/strict_fp16_launch_shape_rtx3090_20260602_124900` | strict pipeline with NCU permission probe | 없음 | 없음 | `ERR_NVGPUCTRPERM`으로 calibration/sweep 전 중단 |
 | `results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100` | latest no-NCU diagnostic launch-shape sweep | `threads=256`, `blocks/SM=1`, `threads/SM=256` | `0.18327 +/- 0.10838` | quality pass 0/176, target pass 0/16, diagnostic only |
+| `/tmp/selected_work_slope_matrix.json` sanity check | selected-target matrix generation check | `threads=256`, `blocks/SM=1`, `unroll=1,2,4` | 측정값 없음 | `strict_fp16_launch_shape_rtx3090_20260602_115550`의 selected target과 같은 launch context로 matrix가 생성되는지 확인 |
 
 ## 5. Thread/SM sweep에서 배운 점
 
@@ -121,6 +131,7 @@ results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100/figures/thread_swee
 3. latest diagnostic run은 `measurement_grade=mixed_or_unavailable`이고 baseline elapsed time이 quality threshold보다 짧아 measurement resolution gate를 통과하지 못했다.
 4. A100과 H100 strict run은 아직 완료되지 않았다.
 5. H100의 경우 현재 kernel은 common HMMA path이고 WGMMA path가 아니다.
+6. selected target과 같은 launch context의 work-slope 측정은 matrix 생성 sanity check까지만 완료되었고, 아직 최종 strict result directory에 붙인 실측 evidence는 없다.
 
 `results/architecture_compare_rtx3090_readiness_20260602/`에는 현재 RTX 3090 결과 3개를 architecture comparison tool로 묶은 diagnostic readiness 산출물을 추가했다. 새 `architecture_comparison_summary.json`은 `publishable=false`, `required_strict_pass_count=0/3`, `required_missing_architectures=ga100,gh100`, `required_diagnostic_only_architectures=ga102`로 기록한다. 즉 RTX 3090 결과도 NCU evidence가 없으므로 A100/H100/RTX3090 최종 비교에서는 strict-pass로 세지 않는다.
 
@@ -136,6 +147,7 @@ results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100/figures/thread_swee
 6. selected target의 denominator는 logical `m16n16k16`, `8192` input bits/logical MMA여야 한다.
 7. selected target은 `timed_kernel_memory_provenance_metadata_all=true`이고 test/baseline의 intended global-memory count가 모두 0이어야 한다.
 8. resource audit에서 selected test/baseline 모두 stack/spill이 없어야 하고, resource row의 `threads`, `blocks_per_sm`, `unroll` context가 selected measurement row와 같아야 한다.
-9. A100/H100/RTX3090 비교는 세 GPU 결과가 모두 audit을 통과한 뒤 `postprocess_strict_architectures.sh`로 묶어야 한다.
+9. `--require-work-slope`를 사용할 경우 selected target과 같은 `threads`, `blocks/SM`, kernel/baseline pair에서 positive work-energy slope와 충분한 R2 evidence가 있어야 한다.
+10. A100/H100/RTX3090 비교는 세 GPU 결과가 모두 audit을 통과한 뒤 `postprocess_strict_architectures.sh`로 묶어야 한다.
 
 권한이 없는 local smoke나 pipeline sanity check는 계속 `--diagnostic-no-ncu`로 실행할 수 있다. 단, 이 결과는 README와 report에서 diagnostic-only로 표시하고 최종 pJ/bit 표에는 넣지 않는다.
