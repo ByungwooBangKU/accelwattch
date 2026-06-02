@@ -1431,6 +1431,10 @@ exit 1
         report_dir / "fp16_strict_report_requirements.csv",
         "NCU no L2/DRAM/local memory evidence",
     )
+    assert_requirement_pass(
+        report_dir / "fp16_strict_report_requirements.csv",
+        "ptxas resource audit context matches measurement",
+    )
     report_row = read_single_csv_row(report_dir / "fp16_strict_report_summary.csv")
     if report_row.get("target_selection_source") != "selected_targets_required_kernel_baseline":
         raise AssertionError(f"Report did not carry target selection source: {report_row}")
@@ -1438,6 +1442,43 @@ exit 1
         raise AssertionError(f"Report did not carry common HMMA evidence: {report_row}")
     if report_row.get("ncu_no_memory") != "True":
         raise AssertionError(f"Report did not carry no-memory evidence: {report_row}")
+    if report_row.get("resource_context_match") != "True":
+        raise AssertionError(f"Report did not carry resource context evidence: {report_row}")
+
+    audit_report_bad_resource = base / "audit_report_bad_resource_context"
+    mutated_audit_rows = read_csv_rows(audit_good / "strict_result_audit.csv")
+    for row in mutated_audit_rows:
+        row["test_resource_unroll"] = "8"
+    write_csv(audit_report_bad_resource / "strict_result_audit.csv", mutated_audit_rows)
+    write_json(
+        audit_report_bad_resource / "strict_result_audit.json",
+        json.loads((audit_good / "strict_result_audit.json").read_text()),
+    )
+    report_bad_resource = base / "report_bad_resource_context"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "report_strict_results.py"),
+            "--audit-dir",
+            str(audit_report_bad_resource),
+            "--architecture-model-dir",
+            str(model_dir),
+            "--suite-preflight-json",
+            str(preflight),
+            "--outdir",
+            str(report_bad_resource),
+            "--require-architectures",
+            "gh100",
+            "--fail-on-missing-requirements",
+        ],
+        cwd=ROOT,
+        env=env,
+        expect_success=False,
+    )
+    assert_requirement_fail(
+        report_bad_resource / "fp16_strict_report_requirements.csv",
+        "ptxas resource audit context matches measurement",
+    )
 
     report_bad = base / "report_no_required"
     run(

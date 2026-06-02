@@ -571,7 +571,7 @@ python3 scripts/smoke_strict_pipeline.py
 | `architecture_thread_sweep_energy_fraction_*.png` | x축 launched threads/SM, y축 test energy 대비 FP16 incremental fraction과 baseline-scaled fraction의 multi-GPU 비교. target에는 threads/block, pJ/bit, incremental/base 비율을 표시 |
 | `architecture_resource_occupancy.csv`, `architecture_resource_occupancy_*.png` | ptxas register 기반 static occupancy model의 architecture 비교 |
 | `fp16_strict_report.md` | strict audit와 architecture compare를 묶은 publishability 중심 Markdown report |
-| `fp16_strict_report_requirements.csv` | strict audit, suite preflight, denominator, NCU, resource, architecture model sanity requirement matrix |
+| `fp16_strict_report_requirements.csv` | strict audit, suite preflight, denominator, NCU, resource context/spill, architecture model sanity requirement matrix |
 | `fp16_strict_report_dashboard.png` | selected TFLOPS 대비 logical pJ/bit dashboard |
 
 For memory/cache-policy calibration and DRAM pJ/bit estimates:
@@ -622,7 +622,7 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/ncu_*/figures/ncu_memory_counter_bytes.png` | NCU DRAM/L2/local memory counter의 normalized bytes 시각화 |
 | `results/ncu_*/figures/ncu_activity_pct.png` | NCU Tensor/SM activity percentage 시각화 |
 | `results/p0_gpu0/resource_audit/kernel_resource_summary.csv` | ptxas kernel별 registers/thread, stack/spill bytes |
-| `results/p0_gpu0/resource_audit/thread_resource_occupancy.csv` | thread sweep 후보별 static resource occupancy model |
+| `results/p0_gpu0/resource_audit/thread_resource_occupancy.csv` | thread sweep 후보별 static resource occupancy model. strict report는 selected row의 thread/block/unroll context 일치 여부를 별도 requirement로 표시 |
 | `results/p0_gpu0/resource_audit/figures/thread_sweep_resource_occupancy.png` | launched threads/SM 대비 static occupancy와 measured SM utilization 비교 |
 | `results/strict_fp16_audit/strict_result_audit.csv` | 여러 strict 결과 디렉터리의 최종 채택 가능 여부 audit |
 | `results/strict_fp16_audit/figures/strict_result_audit.png` | architecture별 strict audit pass/fail 시각화 |
@@ -827,7 +827,7 @@ Analyzer는 `all_runs_no_valid*`, 충분한 `valid_no_l2_count`가 없는 thread
 
 코드와 표에서 baseline/control이라는 표현은 GPU의 control unit 에너지를 의미하지 않는다. 여기서는 같은 launch/loop/register 구조에서 FP16/HMMA instruction만 제거한 기준 루프 비용을 뜻한다. 최종 Tensor Core f16acc pJ/bit에는 `tensor_baseline_mov` no-memory structural baseline을 사용한다. `tensor_baseline_u32`는 integer ALU가 커서 baseline이 test보다 비싸지는지 확인하는 diagnostic baseline이고, legacy `baseline_nop` 결과도 diagnostic으로만 본다.
 
-`resource_audit/thread_resource_occupancy.csv`의 occupancy 값은 ptxas register count와 architecture별 thread/block/register limit을 사용한 static model이다. 이것은 measured SM utilization을 대체하지 않는다. 목적은 selected FP16 후보가 local spill 없이 실행 가능한지, 그리고 thread sweep에서 occupancy/resource limit이 utilization 포화점과 어떻게 맞물리는지 확인하는 것이다.
+`resource_audit/thread_resource_occupancy.csv`의 occupancy 값은 ptxas register count와 architecture별 thread/block/register limit을 사용한 static model이다. 이것은 measured SM utilization을 대체하지 않는다. 목적은 selected FP16 후보가 local spill 없이 실행 가능한지, 그리고 thread sweep에서 occupancy/resource limit이 utilization 포화점과 어떻게 맞물리는지 확인하는 것이다. 최종 report dashboard는 publishable strict point와 diagnostic/rejected point를 다른 marker로 표시하고, requirement matrix는 ptxas resource row의 `threads`, `blocks_per_sm_requested`, `unroll`이 selected measurement와 일치하는지도 별도 gate로 표시한다.
 
 최종 보고서에는 `p0_cuda_core_half2_vs_nop`과 `p0_cuda_core_half2_vs_regmove`를 모두 제시하는 것이 좋다. 두 baseline 간 차이는 baseline sensitivity로 취급한다. Tensor Core는 `f16acc`와 `f32acc`를 분리 보고한다.
 

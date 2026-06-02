@@ -290,6 +290,23 @@ def requirement_rows(
         not parse_bool(row.get("test_resource_has_spills")) and not parse_bool(row.get("baseline_resource_has_spills"))
         for row in audit_rows
     )
+    resource_context = bool(audit_rows) and all(
+        str(row.get("test_resource_threads", "")).strip()
+        and str(row.get("baseline_resource_threads", "")).strip()
+        and str(row.get("test_resource_blocks_per_sm_requested", "")).strip()
+        and str(row.get("baseline_resource_blocks_per_sm_requested", "")).strip()
+        and str(row.get("test_resource_unroll", "")).strip()
+        and str(row.get("baseline_resource_unroll", "")).strip()
+        and parse_float(row.get("test_resource_threads")) == parse_float(row.get("threads"))
+        and parse_float(row.get("baseline_resource_threads")) == parse_float(row.get("threads"))
+        and parse_float(row.get("test_resource_blocks_per_sm_requested"))
+        == parse_float(row.get("blocks_per_sm_requested"))
+        and parse_float(row.get("baseline_resource_blocks_per_sm_requested"))
+        == parse_float(row.get("blocks_per_sm_requested"))
+        and parse_float(row.get("test_resource_unroll")) == parse_float(row.get("unroll"))
+        and parse_float(row.get("baseline_resource_unroll")) == parse_float(row.get("unroll"))
+        for row in audit_rows
+    )
     positive_pjbit = bool(audit_rows) and all(
         parse_float(row.get("matmul_input_pj_per_bit_mean")) > 0.0 for row in audit_rows
     )
@@ -412,6 +429,11 @@ def requirement_rows(
         ),
         row("ptxas resource audit has no spills", no_spill, "test/baseline_resource_has_spills=false"),
         row(
+            "ptxas resource audit context matches measurement",
+            resource_context,
+            "test/baseline resource threads, blocks_per_sm, and unroll match selected target",
+        ),
+        row(
             "logical m16n16k16 denominator",
             denominator,
             "bench_json_metadata with input_bits=8192 and flops=8192",
@@ -476,6 +498,17 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                         "baseline_ncu_no_local_spill",
                     )
                 ),
+                "resource_context_match": all(
+                    parse_float(row.get(resource_key)) == parse_float(row.get(target_key))
+                    for resource_key, target_key in (
+                        ("test_resource_threads", "threads"),
+                        ("baseline_resource_threads", "threads"),
+                        ("test_resource_blocks_per_sm_requested", "blocks_per_sm_requested"),
+                        ("baseline_resource_blocks_per_sm_requested", "blocks_per_sm_requested"),
+                        ("test_resource_unroll", "unroll"),
+                        ("baseline_resource_unroll", "unroll"),
+                    )
+                ),
                 "fail_reasons": row.get("fail_reasons", ""),
             }
             for row in audit_rows
@@ -502,6 +535,7 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
             "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),
             "ncu_common_hmma_seen": row.get("test_ncu_common_hmma_seen", ""),
             "ncu_no_memory": row.get("test_ncu_no_l2", ""),
+            "resource_context_match": "",
             "fail_reasons": row.get("fail_reasons", ""),
         }
         for row in best_rows
@@ -518,10 +552,13 @@ def plot_dashboard(rows: List[Dict[str, Any]], fig_path: Path) -> None:
     if not any(math.isfinite(x) and math.isfinite(y) for x, y in zip(xs, ys)):
         return
     fig, ax = plt.subplots(figsize=(7.4, 5.2))
+    publishable_count = 0
     for row, x, y in zip(rows, xs, ys):
         if not math.isfinite(x) or not math.isfinite(y):
             continue
         passed = parse_bool(row.get("publishable"))
+        if passed:
+            publishable_count += 1
         color = "tab:green" if passed else "tab:red"
         marker = "o" if passed else "x"
         label = str(row.get("architecture_chip", "") or row.get("gpu", "") or "unknown")
@@ -529,8 +566,17 @@ def plot_dashboard(rows: List[Dict[str, Any]], fig_path: Path) -> None:
         ax.annotate(label, (x, y), textcoords="offset points", xytext=(7, 5), fontsize=8)
     ax.set_xlabel("Selected TFLOPS")
     ax.set_ylabel("pJ/logical FP16 input bit")
-    ax.set_title("Strict FP16 selected result dashboard")
+    ax.set_title(f"Strict FP16 selected result dashboard ({publishable_count}/{len(rows)} publishable)")
     ax.grid(True, alpha=0.25)
+    from matplotlib.lines import Line2D
+
+    ax.legend(
+        handles=[
+            Line2D([0], [0], marker="o", color="tab:green", linestyle="", label="publishable strict"),
+            Line2D([0], [0], marker="x", color="tab:red", linestyle="", label="diagnostic/rejected"),
+        ],
+        loc="best",
+    )
     fig.tight_layout()
     fig_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(fig_path, dpi=160)
@@ -606,6 +652,7 @@ def write_markdown(
                     "NCU",
                     "HMMA",
                     "No L2/DRAM/local",
+                    "Resource ctx",
                     "NCU tensor %",
                 ],
                 [
@@ -627,6 +674,7 @@ def write_markdown(
                         yes_no(r.get("ncu_validation_pass")),
                         yes_no(r.get("ncu_common_hmma_seen")),
                         yes_no(r.get("ncu_no_memory")),
+                        yes_no(r.get("resource_context_match")),
                         fmt_value(r.get("ncu_tensor_activity_pct")),
                     ]
                     for r in rows
