@@ -47,6 +47,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | Utilization 기준 | `nvidia-smi dmon`의 coarse SM utilization 중심 | Tensor Core matmul은 `tensor_model_utilization_pct_mean`을 target selection에 우선 사용, SM util은 보조 plot |
 | `blocks_per_sm=8` 가정 | 고정값처럼 쓰일 수 있었음 | 별도 sweep으로 검증, 현재 target은 `blocks/SM=1`의 첫 saturation point |
 | L2 조건 | 결과 metadata의 `expected_l2_touch=false`에 가까운 software-side 판정 | strict final에서는 NCU MemoryWorkloadAnalysis no-L2/global-memory validation과 Tensor activity evidence 요구 |
+| Memory provenance | `suppress_output_store`와 `memory_bytes_estimate`에서 analyzer가 주로 간접 추론 | benchmark JSON이 `timed_kernel_global_input_loads`, `timed_kernel_global_output_stores`, `timed_kernel_has_intended_global_memory`를 직접 기록하고, analyzer/audit는 test와 baseline 양쪽 모두 no-memory일 때만 no-L2 후보로 인정 |
 | Energy source | `nvidia-smi` power trace fallback 중심 legacy 결과 포함 | 최종 비교는 `NVML total energy counter`, `measurement_grade=strict_nvml_counter` selected target만 허용 |
 | Negative pJ/bit 처리 | 초기에는 음수 행이 result table에 섞일 수 있었음 | `all_runs_no_valid`, `not_valid_no_l2_candidate`, quality gate failure로 분리 |
 | Architecture scope | 일반 CUDA 실행 설명 위주 | A100 sm80/GA100, RTX 3090 sm86/GA102, H100 sm90/GH100 metadata 검증 추가 |
@@ -125,7 +126,8 @@ results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100/figures/thread_swee
 4. selected target의 `measurement_grade`는 `strict_nvml_counter`여야 한다.
 5. selected target의 baseline은 `tensor_baseline_mov`여야 한다.
 6. selected target의 denominator는 logical `m16n16k16`, `8192` input bits/logical MMA여야 한다.
-7. resource audit에서 selected test/baseline 모두 stack/spill이 없어야 한다.
-8. A100/H100/RTX3090 비교는 세 GPU 결과가 모두 audit을 통과한 뒤 `postprocess_strict_architectures.sh`로 묶어야 한다.
+7. selected target은 `timed_kernel_memory_provenance_metadata_all=true`이고 test/baseline의 intended global-memory count가 모두 0이어야 한다.
+8. resource audit에서 selected test/baseline 모두 stack/spill이 없어야 한다.
+9. A100/H100/RTX3090 비교는 세 GPU 결과가 모두 audit을 통과한 뒤 `postprocess_strict_architectures.sh`로 묶어야 한다.
 
 권한이 없는 local smoke나 pipeline sanity check는 계속 `--diagnostic-no-ncu`로 실행할 수 있다. 단, 이 결과는 README와 report에서 diagnostic-only로 표시하고 최종 pJ/bit 표에는 넣지 않는다.

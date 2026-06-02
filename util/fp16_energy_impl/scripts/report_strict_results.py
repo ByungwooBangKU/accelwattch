@@ -214,6 +214,13 @@ def requirement_rows(
         str(row.get("baseline_match_grade", "")) == "structural_baseline" for row in audit_rows
     )
     schema_current = bool(audit_rows) and all(parse_bool(row.get("benchmark_schema_current")) for row in audit_rows)
+    memory_provenance = bool(audit_rows) and all(
+        parse_bool(row.get("timed_kernel_memory_provenance_metadata_all"))
+        and parse_float(row.get("timed_kernel_has_intended_global_memory_count"), 1.0) == 0.0
+        and parse_float(row.get("test_timed_kernel_has_intended_global_memory_count"), 1.0) == 0.0
+        and parse_float(row.get("baseline_timed_kernel_has_intended_global_memory_count"), 1.0) == 0.0
+        for row in audit_rows
+    )
     required_target = bool(audit_rows) and all(
         parse_float(row.get("matching_selected_target_count"), 0.0) >= 1.0
         and str(row.get("target_selection_source", "")) == "selected_targets_required_kernel_baseline"
@@ -356,6 +363,11 @@ def requirement_rows(
         row("NVML total-energy counter source", strict_sources, "measurement_grade=strict_nvml_counter"),
         row("structural baseline separation", structural, "baseline_match_grade=structural_baseline"),
         row("current benchmark schema", schema_current, "benchmark_schema_current=true"),
+        row(
+            "timed-kernel memory provenance",
+            memory_provenance,
+            "metadata_all=true and intended global-memory counts are zero for test/baseline",
+        ),
         row(
             "required kernel target selected",
             required_target,

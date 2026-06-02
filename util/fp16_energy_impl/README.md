@@ -66,7 +66,7 @@ Tensor Core kernel은 Ampere/Hopper에서 지원되는 `mma.sync.aligned.m16n8k1
 N_FP16_ops = warps × repeats × iters × unroll × 8192
 ```
 
-benchmark JSON은 `schema_version=fp16-energy-bench-v2`와 `schema_features`를 기록하고, 이 denominator를 `mma_logical_shape`, `mma_logical_count_estimate`, `mma_input_bits_per_logical_mma`, `mma_flops_per_logical_mma`로 직접 기록한다. CMake build에서는 `bench_build_git_commit`도 함께 남긴다. 분석/quality gate는 이 값들이 logical `m16n16k16` 기준의 8192 input bits 및 8192 FLOP과 맞는지 확인한다. 과거 JSON처럼 analyzer가 fallback formula로 denominator를 재계산한 값은 diagnostic table에는 남기지만 strict target/audit는 통과시키지 않는다.
+benchmark JSON은 `schema_version=fp16-energy-bench-v2`와 `schema_features`를 기록하고, 이 denominator를 `mma_logical_shape`, `mma_logical_count_estimate`, `mma_input_bits_per_logical_mma`, `mma_flops_per_logical_mma`로 직접 기록한다. CMake build에서는 `bench_build_git_commit`도 함께 남긴다. 또한 `timed_kernel_global_input_loads`, `timed_kernel_global_output_stores`, `timed_kernel_has_intended_global_memory`를 기록해 timed kernel이 global/L2 traffic을 의도하는지 test/baseline 양쪽에서 추적한다. 분석/quality gate는 이 값들이 logical `m16n16k16` 기준의 8192 input bits 및 8192 FLOP과 맞는지와 required `schema_features`에 `timed_kernel_memory_provenance`가 포함되는지 확인한다. 과거 JSON처럼 analyzer가 fallback formula로 denominator 또는 memory provenance를 재계산한 값은 diagnostic table에는 남기지만 strict target/audit는 통과시키지 않는다.
 
 ## 3. Build
 
@@ -298,7 +298,7 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | Gate | 의미 |
 |---|---|
 | positive increment | baseline subtraction 뒤 incremental power/energy가 양수 |
-| no intended L2/global traffic | `suppress_output_store=true`이고 `memory_bytes_estimate=0`이라 timed kernel이 global/L2 traffic을 의도하지 않음 |
+| no intended L2/global traffic | test/baseline benchmark JSON의 `timed_kernel_has_intended_global_memory=false`가 모두 성립해야 함. Legacy 결과는 `suppress_output_store`와 kernel type으로 fallback 추론되지만 strict target은 직접 metadata가 필요 |
 | enough valid repeats | thread point별 `valid_no_l2_count >= max(3, ceil(run_count/2))` |
 | stable clock | 기본값으로 `clock_span_mhz <= 60` |
 | reliable energy source | `nvml_total_energy_counter` 우선. 미지원 시 power trace fallback은 최소 sample 수를 만족해도 diagnostic grade로만 통과하며, 기본 target selection에는 쓰지 않음 |
@@ -746,7 +746,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `matmul_arithmetic_read_pj_per_bit` | A/B input bits + accumulator read bits 기준 incremental pJ/bit |
 | `matmul_register_read_write_pj_per_bit` | A/B input bits + accumulator read bits + output bits 기준 incremental pJ/bit |
 | `test_benchmark_schema_version`, `baseline_benchmark_schema_version` | test/baseline benchmark JSON schema. strict 결과는 둘 다 `fp16-energy-bench-v2`여야 함 |
-| `test_benchmark_schema_features`, `baseline_benchmark_schema_features` | timed NVML energy counter, explicit denominator, strict denominator provenance feature marker |
+| `test_benchmark_schema_features`, `baseline_benchmark_schema_features` | timed NVML energy counter, explicit denominator, strict denominator provenance, timed-kernel memory provenance feature marker |
 | `test_bench_build_git_commit`, `baseline_bench_build_git_commit` | benchmark binary build 시 CMake가 기록한 source commit |
 | `w_per_tflops` | incremental power / achieved TFLOPS |
 | `avg_gpu_util_pct`, `max_gpu_util_pct` | test interval 안의 `nvidia-smi utilization.gpu` 평균/최대값 |
@@ -758,7 +758,11 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `tensor_model_utilization_pct` | measured TFLOPS / `tensor_peak_tflops_model` × 100 |
 | `tensor_model_reference_url` | architecture peak model의 NVIDIA reference URL |
 | `suppress_output_store` | compute kernel의 final global output store를 제거했는지 여부 |
-| `expected_l2_touch` | timed kernel이 의도적으로 global/L2 traffic을 만들 것으로 예상되는지 여부 |
+| `test_timed_kernel_global_input_loads`, `baseline_timed_kernel_global_input_loads` | timed kernel 안에서 global input load를 의도하는지 여부 |
+| `test_timed_kernel_global_output_stores`, `baseline_timed_kernel_global_output_stores` | timed kernel 안에서 global output store를 의도하는지 여부 |
+| `test_timed_kernel_has_intended_global_memory`, `baseline_timed_kernel_has_intended_global_memory` | test/baseline 각각이 timed kernel 안에서 의도된 global memory op를 가지는지 여부 |
+| `test_timed_kernel_memory_provenance_source`, `baseline_timed_kernel_memory_provenance_source` | `bench_json_metadata`이면 benchmark JSON 직접 기록, `derived_legacy_formula`이면 analyzer fallback 추론 |
+| `expected_l2_touch` | test 또는 baseline timed kernel이 의도적으로 global/L2 traffic을 만들 것으로 예상되는지 여부. 새 strict 결과에서는 두 쪽 모두 `timed_kernel_has_intended_global_memory=false`여야 함 |
 | `valid_basic` | power sample, work estimate, positive incremental power/energy에 대한 최소 sanity flag. Nsight 검증을 대체하지 않음 |
 | `valid_no_l2` | `valid_basic=True`이고 `expected_l2_touch=False`인 pair. 의도된 L2/global traffic이 없다는 metadata gate이며, 실제 L2 traffic 0을 증명하지는 않음 |
 | `pure_fp16_candidate` | `valid_no_l2=True`이고 kernel이 FP16 half2 또는 Tensor Core FP16 compute 계열인 후보 |
@@ -776,6 +780,9 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `valid_no_l2_count` | `valid_basic=True`이고 `expected_l2_touch=False`인 반복 수 |
 | `valid_no_l2_requirement_met` | `valid_no_l2_count >= required_valid_no_l2_count` 여부 |
 | `expected_l2_touch_count` | metadata상 timed kernel이 global/L2 traffic을 의도한다고 분류된 반복 수 |
+| `timed_kernel_memory_provenance_metadata_count` | test/baseline 모두 benchmark JSON에서 timed-kernel memory provenance metadata를 제공한 반복 수 |
+| `timed_kernel_memory_provenance_metadata_all` | 해당 thread point의 모든 반복이 직접 memory provenance metadata를 제공했는지 여부 |
+| `test_timed_kernel_has_intended_global_memory_count`, `baseline_timed_kernel_has_intended_global_memory_count` | test/baseline 중 의도된 timed-kernel global memory op가 있다고 분류된 반복 수 |
 | `valid_basic_expected_l2_touch_count` | energy/power sanity는 통과했지만 no-L2 조건은 만족하지 못한 반복 수 |
 | `invalid_or_nonpositive_increment_count` | baseline subtraction 뒤 incremental power/energy가 양수가 아니거나 reliable energy가 없어 `valid_basic`에 실패한 반복 수 |
 | `separation_quality_counts` | thread point별 `pure_fp16_candidate_no_l2`, `valid_but_expected_l2_touch`, `invalid_or_nonpositive_increment` 분포 |

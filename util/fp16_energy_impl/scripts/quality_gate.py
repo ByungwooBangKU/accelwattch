@@ -16,6 +16,14 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 
 
+REQUIRED_BENCHMARK_SCHEMA_FEATURES = {
+    "nvml_timed_energy_counter",
+    "explicit_m16n16k16_denominator",
+    "strict_denominator_provenance",
+    "timed_kernel_memory_provenance",
+}
+
+
 def parse_float(value: Any, default: float = math.nan) -> float:
     if value is None:
         return default
@@ -368,11 +376,7 @@ def benchmark_schema_quality(
 
     test_features = feature_set(row.get("test_benchmark_schema_features"))
     baseline_features = feature_set(row.get("baseline_benchmark_schema_features"))
-    required_features = {
-        "nvml_timed_energy_counter",
-        "explicit_m16n16k16_denominator",
-        "strict_denominator_provenance",
-    }
+    required_features = REQUIRED_BENCHMARK_SCHEMA_FEATURES
 
     if not current_schema:
         failed.append(
@@ -641,6 +645,43 @@ def pair_gate_rows(
                 "benchmark_schema_current": schema_ok,
                 "test_benchmark_schema_version": schema_info["test_versions"],
                 "baseline_benchmark_schema_version": schema_info["baseline_versions"],
+                "test_timed_kernel_memory_provenance_available": row.get(
+                    "test_timed_kernel_memory_provenance_available",
+                    "",
+                ),
+                "baseline_timed_kernel_memory_provenance_available": row.get(
+                    "baseline_timed_kernel_memory_provenance_available",
+                    "",
+                ),
+                "test_timed_kernel_memory_provenance_source": row.get(
+                    "test_timed_kernel_memory_provenance_source",
+                    "",
+                ),
+                "baseline_timed_kernel_memory_provenance_source": row.get(
+                    "baseline_timed_kernel_memory_provenance_source",
+                    "",
+                ),
+                "test_timed_kernel_global_input_loads": row.get("test_timed_kernel_global_input_loads", ""),
+                "baseline_timed_kernel_global_input_loads": row.get(
+                    "baseline_timed_kernel_global_input_loads",
+                    "",
+                ),
+                "test_timed_kernel_global_output_stores": row.get(
+                    "test_timed_kernel_global_output_stores",
+                    "",
+                ),
+                "baseline_timed_kernel_global_output_stores": row.get(
+                    "baseline_timed_kernel_global_output_stores",
+                    "",
+                ),
+                "test_timed_kernel_has_intended_global_memory": row.get(
+                    "test_timed_kernel_has_intended_global_memory",
+                    "",
+                ),
+                "baseline_timed_kernel_has_intended_global_memory": row.get(
+                    "baseline_timed_kernel_has_intended_global_memory",
+                    "",
+                ),
                 "matmul_denominator_valid": denom_ok,
                 "matmul_denominator_note": denom_info["note"],
                 "matmul_denominator_metadata_complete": denom_info["metadata_complete"],
@@ -1022,6 +1063,26 @@ def thread_gate_rows(
                 "benchmark_schema_current": schema_ok,
                 "test_benchmark_schema_versions": schema_info["test_versions"],
                 "baseline_benchmark_schema_versions": schema_info["baseline_versions"],
+                "timed_kernel_memory_provenance_metadata_count": row.get(
+                    "timed_kernel_memory_provenance_metadata_count",
+                    "",
+                ),
+                "timed_kernel_memory_provenance_metadata_all": row.get(
+                    "timed_kernel_memory_provenance_metadata_all",
+                    "",
+                ),
+                "timed_kernel_has_intended_global_memory_count": row.get(
+                    "timed_kernel_has_intended_global_memory_count",
+                    "",
+                ),
+                "test_timed_kernel_has_intended_global_memory_count": row.get(
+                    "test_timed_kernel_has_intended_global_memory_count",
+                    "",
+                ),
+                "baseline_timed_kernel_has_intended_global_memory_count": row.get(
+                    "baseline_timed_kernel_has_intended_global_memory_count",
+                    "",
+                ),
                 "matmul_denominator_valid": denom_ok,
                 "matmul_denominator_note": denom_info["note"],
                 "matmul_denominator_metadata_complete": denom_info["metadata_complete"],
@@ -1459,7 +1520,7 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
         "selected_targets": targets,
         "selected_diagnostics": selected_diagnostics,
         "notes": [
-            "valid_no_l2 means valid_basic=True and the benchmark metadata does not expect global/L2 traffic.",
+            "valid_no_l2 means valid_basic=True and neither test nor baseline timed-kernel metadata expects global/L2 traffic.",
             "It is not a physical proof of zero L2 traffic; Nsight Compute memory counters are still required.",
             "strict_nvml_counter is required for default target_pass selection; "
             "power_trace_fallback stays diagnostic unless --allow-power-trace-target is used.",

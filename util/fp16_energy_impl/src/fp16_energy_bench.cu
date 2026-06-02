@@ -807,6 +807,47 @@ bool supports_suppress_output_store(const std::string& k) {
   return k == "baseline_nop" || is_tensor_u32_kernel(k) || is_tensor_f32_kernel(k);
 }
 
+bool timed_kernel_global_input_loads(const Args& args) {
+  if (is_memory_kernel(args.kernel)) return true;
+  if (args.kernel == "fp16_half2" || args.kernel == "baseline_regmove") return true;
+  if (args.kernel == "baseline_nop") return !args.suppress_output_store;
+  return false;
+}
+
+bool timed_kernel_global_output_stores(const Args& args) {
+  if (is_memory_kernel(args.kernel)) return true;
+  if (args.kernel == "fp16_half2" || args.kernel == "baseline_regmove") return true;
+  if (args.kernel == "baseline_nop" || is_tensor_u32_kernel(args.kernel) ||
+      is_tensor_f32_kernel(args.kernel)) {
+    return !args.suppress_output_store;
+  }
+  return true;
+}
+
+bool timed_kernel_has_intended_global_memory(const Args& args) {
+  return timed_kernel_global_input_loads(args) || timed_kernel_global_output_stores(args);
+}
+
+std::string timed_kernel_memory_provenance_note(const Args& args) {
+  if (is_memory_kernel(args.kernel)) {
+    return "memory policy workload intentionally performs global load and store operations in the timed kernel";
+  }
+  if (args.kernel == "fp16_half2" || args.kernel == "baseline_regmove") {
+    return "CUDA-core half2/regmove kernel performs global input load and output store operations in the timed kernel";
+  }
+  if (args.kernel == "baseline_nop") {
+    return args.suppress_output_store
+               ? "suppress-output-store baseline_nop uses a per-thread seed and consumes registers; no intended global memory operation in the timed kernel"
+               : "baseline_nop reads one global input and writes one global output in the timed kernel";
+  }
+  if (is_tensor_u32_kernel(args.kernel) || is_tensor_f32_kernel(args.kernel)) {
+    return args.suppress_output_store
+               ? "Tensor HMMA/register baseline uses register operands and consumes registers; no intended global memory operation in the timed kernel"
+               : "Tensor HMMA/register baseline uses register operands but writes a final global output in the timed kernel";
+  }
+  return "unknown kernel memory provenance; treat as intended global memory";
+}
+
 uint64_t tensor_logical_mma_count(const Args& args, int blocks, int threads) {
   const uint64_t total_threads = static_cast<uint64_t>(blocks) * threads;
   const uint64_t warps = total_threads / 32ull;
@@ -1125,7 +1166,8 @@ int main(int argc, char** argv) {
      << "\"nvml_timed_energy_counter\", "
      << "\"explicit_m16n16k16_denominator\", "
      << "\"strict_denominator_provenance\", "
-     << "\"tensor_no_memory_warpsync_baseline\""
+     << "\"tensor_no_memory_warpsync_baseline\", "
+     << "\"timed_kernel_memory_provenance\""
      << "],\n";
   os << "  \"bench_build_git_commit\": \"" << json_escape(FP16_ENERGY_BENCH_GIT_COMMIT)
      << "\",\n";
@@ -1159,6 +1201,14 @@ int main(int argc, char** argv) {
   os << "  \"mem_mib\": " << args.mem_mib << ",\n";
   os << "  \"mem_stride\": " << args.mem_stride << ",\n";
   os << "  \"suppress_output_store\": " << (args.suppress_output_store ? "true" : "false") << ",\n";
+  os << "  \"timed_kernel_global_input_loads\": "
+     << (timed_kernel_global_input_loads(args) ? "true" : "false") << ",\n";
+  os << "  \"timed_kernel_global_output_stores\": "
+     << (timed_kernel_global_output_stores(args) ? "true" : "false") << ",\n";
+  os << "  \"timed_kernel_has_intended_global_memory\": "
+     << (timed_kernel_has_intended_global_memory(args) ? "true" : "false") << ",\n";
+  os << "  \"timed_kernel_memory_provenance_note\": \""
+     << json_escape(timed_kernel_memory_provenance_note(args)) << "\",\n";
   if (args.kernel == "tensor_mma_f16acc" || args.kernel == "tensor_mma_f32acc") {
     const uint64_t mma_count = tensor_logical_mma_count(args, args.blocks, args.threads);
     const uint64_t acc_bits_per_mma = tensor_accumulator_bits_per_logical_mma(args.kernel);

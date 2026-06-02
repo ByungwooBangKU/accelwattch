@@ -73,6 +73,10 @@ def run(cmd: List[str], *, cwd: Path, env: Dict[str, str], expect_success: bool 
 
 
 def target_row(test_kernel: str, baseline_kernel: str, threads: int) -> Dict[str, Any]:
+    features = (
+        "nvml_timed_energy_counter,explicit_m16n16k16_denominator,"
+        "strict_denominator_provenance,timed_kernel_memory_provenance"
+    )
     return {
         "scope": "thread_sweep",
         "gpu": "Synthetic H100",
@@ -100,6 +104,13 @@ def target_row(test_kernel: str, baseline_kernel: str, threads: int) -> Dict[str
         "benchmark_schema_current": "true",
         "test_benchmark_schema_versions": "fp16-energy-bench-v2",
         "baseline_benchmark_schema_versions": "fp16-energy-bench-v2",
+        "test_benchmark_schema_features": features,
+        "baseline_benchmark_schema_features": features,
+        "timed_kernel_memory_provenance_metadata_count": 3,
+        "timed_kernel_memory_provenance_metadata_all": "true",
+        "timed_kernel_has_intended_global_memory_count": 0,
+        "test_timed_kernel_has_intended_global_memory_count": 0,
+        "baseline_timed_kernel_has_intended_global_memory_count": 0,
         "ncu_required": "true",
         "ncu_validation_pass": "true",
         "ncu_validation_context_match": "true",
@@ -246,7 +257,10 @@ def write_compare_dir(path: Path, *, measurement_grade: str = "strict_nvml_count
 
 
 def quality_gate_summary_row(*, energy_source: str = "nvml_total_energy_counter") -> Dict[str, Any]:
-    features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
+    features = (
+        "nvml_timed_energy_counter,explicit_m16n16k16_denominator,"
+        "strict_denominator_provenance,timed_kernel_memory_provenance"
+    )
     row = target_row("tensor_mma_f16acc", "tensor_baseline_mov", 128)
     row.update(
         {
@@ -263,6 +277,16 @@ def quality_gate_summary_row(*, energy_source: str = "nvml_total_energy_counter"
             "valid_no_l2": "true",
             "pure_fp16_candidate": "true",
             "energy_sources_match": "true",
+            "test_timed_kernel_memory_provenance_available": "true",
+            "baseline_timed_kernel_memory_provenance_available": "true",
+            "test_timed_kernel_memory_provenance_source": "bench_json_metadata",
+            "baseline_timed_kernel_memory_provenance_source": "bench_json_metadata",
+            "test_timed_kernel_global_input_loads": "false",
+            "baseline_timed_kernel_global_input_loads": "false",
+            "test_timed_kernel_global_output_stores": "false",
+            "baseline_timed_kernel_global_output_stores": "false",
+            "test_timed_kernel_has_intended_global_memory": "false",
+            "baseline_timed_kernel_has_intended_global_memory": "false",
             "clock_span_mhz": 5.0,
             "benchmark_uses_wgmma": "false",
             "test_sm_util_samples": 2,
@@ -284,7 +308,10 @@ def quality_gate_summary_row(*, energy_source: str = "nvml_total_energy_counter"
 
 
 def quality_gate_thread_row(*, energy_source: str = "nvml_total_energy_counter") -> Dict[str, Any]:
-    features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
+    features = (
+        "nvml_timed_energy_counter,explicit_m16n16k16_denominator,"
+        "strict_denominator_provenance,timed_kernel_memory_provenance"
+    )
     row = quality_gate_summary_row(energy_source=energy_source)
     row.update(
         {
@@ -300,6 +327,11 @@ def quality_gate_thread_row(*, energy_source: str = "nvml_total_energy_counter")
             "baseline_benchmark_schema_versions": "fp16-energy-bench-v2",
             "test_benchmark_schema_features": features,
             "baseline_benchmark_schema_features": features,
+            "timed_kernel_memory_provenance_metadata_count": 3,
+            "timed_kernel_memory_provenance_metadata_all": "true",
+            "timed_kernel_has_intended_global_memory_count": 0,
+            "test_timed_kernel_has_intended_global_memory_count": 0,
+            "baseline_timed_kernel_has_intended_global_memory_count": 0,
         }
     )
     return row
@@ -548,10 +580,21 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     quality_gate_bad = base / "quality_gate_tensor_activity_bad"
     quality_gate_model_util = base / "quality_gate_model_util_fallback"
     quality_gate_model_util_overmax = base / "quality_gate_model_util_overmax"
+    quality_gate_missing_memory_feature = base / "quality_gate_missing_memory_feature"
     write_quality_gate_input(quality_gate_ok, tensor_activity_observed=True)
     write_quality_gate_input(quality_gate_bad, tensor_activity_observed=False)
     write_quality_gate_model_util_input(quality_gate_model_util)
     write_quality_gate_model_util_input(quality_gate_model_util_overmax, model_util_pct=108.0)
+    write_quality_gate_input(quality_gate_missing_memory_feature, tensor_activity_observed=True)
+    legacy_features = "nvml_timed_energy_counter,explicit_m16n16k16_denominator,strict_denominator_provenance"
+    for csv_name in ("summary.csv", "thread_sweep_summary.csv"):
+        rows = read_csv_rows(quality_gate_missing_memory_feature / csv_name)
+        for row in rows:
+            row["test_benchmark_schema_features"] = legacy_features
+            row["baseline_benchmark_schema_features"] = legacy_features
+            if "benchmark_schema_features_required_all" in row:
+                row["benchmark_schema_features_required_all"] = "false"
+        write_csv(quality_gate_missing_memory_feature / csv_name, rows)
     write_model_dir(model_dir)
     write_preflight(preflight)
 
@@ -957,6 +1000,33 @@ exit 1
             sys.executable,
             str(SCRIPT_DIR / "quality_gate.py"),
             "--input",
+            str(quality_gate_missing_memory_feature),
+            "--ncu-summary",
+            str(quality_gate_missing_memory_feature / "ncu_validation_summary.csv"),
+            "--require-ncu",
+            "--require-ncu-tensor-activity",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    qg_missing_feature_summary = json.loads(
+        (quality_gate_missing_memory_feature / "quality_gate_summary.json").read_text()
+    )
+    if qg_missing_feature_summary.get("selected_targets"):
+        raise AssertionError(
+            f"Missing memory provenance schema feature selected a target: {qg_missing_feature_summary}"
+        )
+    qg_missing_feature_rows = read_csv_rows(quality_gate_missing_memory_feature / "quality_gates.csv")
+    if not any("timed_kernel_memory_provenance" in row.get("fail_reasons", "") for row in qg_missing_feature_rows):
+        raise AssertionError(
+            f"Missing memory provenance schema feature did not record the failure: {qg_missing_feature_rows}"
+        )
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "quality_gate.py"),
+            "--input",
             str(quality_gate_model_util),
             "--ncu-summary",
             str(quality_gate_model_util / "ncu_validation_summary.csv"),
@@ -1079,6 +1149,10 @@ exit 1
         raise AssertionError(f"Strict audit did not carry passing NCU permission probe evidence: {good_row}")
     if good_row.get("pipeline_ncu_permission_probe_permission_denied") != "False":
         raise AssertionError(f"Strict audit did not carry NCU permission-denied evidence: {good_row}")
+    if good_row.get("timed_kernel_memory_provenance_metadata_all") != "true":
+        raise AssertionError(f"Strict audit did not carry memory provenance metadata evidence: {good_row}")
+    if good_row.get("timed_kernel_has_intended_global_memory_count") != "0":
+        raise AssertionError(f"Strict audit did not carry no intended global-memory evidence: {good_row}")
     if good_row.get("test_ncu_common_hmma_seen") != "true":
         raise AssertionError(f"Strict audit did not carry test common HMMA evidence: {good_row}")
     if good_row.get("baseline_ncu_common_hmma_seen") != "false":
@@ -1171,6 +1245,7 @@ exit 1
         "NCU performance-counter permission probe passed",
     )
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "architecture model metadata")
+    assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "timed-kernel memory provenance")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "NCU Tensor activity observed")
     assert_requirement_pass(
         report_dir / "fp16_strict_report_requirements.csv",

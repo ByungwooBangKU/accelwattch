@@ -436,6 +436,17 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     valid_no_l2 = parse_int(target.get("valid_no_l2_count"), 0)
     if required_valid <= 0 or valid_no_l2 < required_valid:
         failed.append("valid_no_l2_count does not meet required_valid_count")
+    memory_provenance_all = parse_bool(target.get("timed_kernel_memory_provenance_metadata_all"))
+    intended_memory_count = parse_int(target.get("timed_kernel_has_intended_global_memory_count"), 0)
+    test_intended_memory_count = parse_int(target.get("test_timed_kernel_has_intended_global_memory_count"), 0)
+    baseline_intended_memory_count = parse_int(
+        target.get("baseline_timed_kernel_has_intended_global_memory_count"),
+        0,
+    )
+    if not memory_provenance_all:
+        failed.append("timed_kernel_memory_provenance_metadata_all is not true")
+    if intended_memory_count != 0 or test_intended_memory_count != 0 or baseline_intended_memory_count != 0:
+        failed.append("selected target has intended timed-kernel global memory operations")
     pjbit = parse_float(target.get("matmul_input_pj_per_bit_mean"))
     if not math.isfinite(pjbit) or pjbit <= 0.0:
         failed.append("matmul_input_pj_per_bit_mean is not positive/finite")
@@ -669,6 +680,26 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "ncu_validation_context_match": target.get("ncu_validation_context_match", ""),
         "valid_no_l2_count": target.get("valid_no_l2_count", ""),
         "required_valid_count": target.get("required_valid_count", ""),
+        "timed_kernel_memory_provenance_metadata_count": target.get(
+            "timed_kernel_memory_provenance_metadata_count",
+            "",
+        ),
+        "timed_kernel_memory_provenance_metadata_all": target.get(
+            "timed_kernel_memory_provenance_metadata_all",
+            "",
+        ),
+        "timed_kernel_has_intended_global_memory_count": target.get(
+            "timed_kernel_has_intended_global_memory_count",
+            "",
+        ),
+        "test_timed_kernel_has_intended_global_memory_count": target.get(
+            "test_timed_kernel_has_intended_global_memory_count",
+            "",
+        ),
+        "baseline_timed_kernel_has_intended_global_memory_count": target.get(
+            "baseline_timed_kernel_has_intended_global_memory_count",
+            "",
+        ),
         "avg_sm_util_pct_mean": target.get("avg_sm_util_pct_mean", ""),
         "tflops_mean": target.get("tflops_mean", ""),
         "elapsed_s_mean": target.get("elapsed_s_mean", ""),

@@ -18,6 +18,12 @@ from architecture_models import tensor_peak_metrics
 
 
 DEFAULT_MAX_TENSOR_MODEL_UTIL_PCT = 105.0
+REQUIRED_BENCHMARK_SCHEMA_FEATURES = {
+    "nvml_timed_energy_counter",
+    "explicit_m16n16k16_denominator",
+    "strict_denominator_provenance",
+    "timed_kernel_memory_provenance",
+}
 
 
 def read_runs(path: Path) -> List[Dict[str, Any]]:
@@ -327,6 +333,55 @@ def estimate_threads_per_sm(run: Dict[str, Any]) -> float:
     return math.nan
 
 
+def _field_present(row: Dict[str, Any], key: str) -> bool:
+    return key in row and str(row.get(key, "")).strip() != ""
+
+
+def infer_timed_kernel_memory(run: Dict[str, Any], mem_bytes: float = 0.0) -> Dict[str, Any]:
+    """Return intended timed-kernel global-memory provenance for new and legacy benchmark JSON."""
+    metadata_available = all(
+        _field_present(run, key)
+        for key in (
+            "timed_kernel_global_input_loads",
+            "timed_kernel_global_output_stores",
+            "timed_kernel_has_intended_global_memory",
+        )
+    )
+    if metadata_available:
+        input_loads = parse_bool(run.get("timed_kernel_global_input_loads"))
+        output_stores = parse_bool(run.get("timed_kernel_global_output_stores"))
+        has_global = parse_bool(run.get("timed_kernel_has_intended_global_memory"))
+        note = str(run.get("timed_kernel_memory_provenance_note", "") or "")
+        source = "bench_json_metadata"
+    else:
+        kernel = str(run.get("kernel", "") or "")
+        suppress = parse_bool(run.get("suppress_output_store"))
+        memory_kernel = kernel in {"memory_default", "memory_cg", "memory_cs"}
+        half2_memory = kernel in {"fp16_half2", "baseline_regmove"}
+        suppressible = kernel in {
+            "baseline_nop",
+            "tensor_mma_f16acc",
+            "tensor_baseline_mov",
+            "tensor_baseline_u32",
+            "tensor_mma_f32acc",
+            "tensor_baseline_f32",
+        }
+        input_loads = bool(memory_kernel or half2_memory or (kernel == "baseline_nop" and not suppress))
+        output_stores = bool(memory_kernel or half2_memory or (suppressible and not suppress))
+        has_global = bool(input_loads or output_stores or mem_bytes > 0.0)
+        note = "derived_legacy_from_kernel_and_suppress_output_store"
+        source = "derived_legacy_formula"
+
+    return {
+        "timed_kernel_memory_provenance_available": metadata_available,
+        "timed_kernel_memory_provenance_source": source,
+        "timed_kernel_global_input_loads": input_loads,
+        "timed_kernel_global_output_stores": output_stores,
+        "timed_kernel_has_intended_global_memory": has_global,
+        "timed_kernel_memory_provenance_note": note,
+    }
+
+
 def sort_key(run: Dict[str, Any]) -> Tuple[int, str]:
     return (int(run.get("runner_wall_start_unix_ns", run.get("host_start_unix_ns", 0))), run.get("run_id", ""))
 
@@ -485,6 +540,7 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for pair_index, s in enumerate(sorted(singles, key=sort_key)):
         ops = finite_float(s.get("fp16_ops_estimate", 0.0), 0.0)
         mem_bytes = finite_float(s.get("memory_bytes_estimate", 0.0), 0.0)
+        memory_info = infer_timed_kernel_memory(s, mem_bytes)
         mem_bits = mem_bytes * 8.0
         matmul_bits = matmul_bit_estimates(s, ops)
         elapsed_s = finite_float(s.get("cuda_elapsed_ms", 0.0), 0.0) / 1000.0
@@ -530,7 +586,24 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 **matmul_bits,
                 **peak_metrics,
                 "suppress_output_store": bool(s.get("suppress_output_store", False)),
-                "expected_l2_touch": bool(mem_bytes > 0 or not s.get("suppress_output_store", False)),
+                "test_timed_kernel_memory_provenance_available": memory_info[
+                    "timed_kernel_memory_provenance_available"
+                ],
+                "baseline_timed_kernel_memory_provenance_available": "",
+                "test_timed_kernel_memory_provenance_source": memory_info["timed_kernel_memory_provenance_source"],
+                "baseline_timed_kernel_memory_provenance_source": "",
+                "test_timed_kernel_global_input_loads": memory_info["timed_kernel_global_input_loads"],
+                "baseline_timed_kernel_global_input_loads": "",
+                "test_timed_kernel_global_output_stores": memory_info["timed_kernel_global_output_stores"],
+                "baseline_timed_kernel_global_output_stores": "",
+                "test_timed_kernel_has_intended_global_memory": memory_info[
+                    "timed_kernel_has_intended_global_memory"
+                ],
+                "baseline_timed_kernel_has_intended_global_memory": "",
+                "test_timed_kernel_memory_provenance_note": memory_info["timed_kernel_memory_provenance_note"],
+                "baseline_timed_kernel_memory_provenance_note": "",
+                "timed_kernel_has_intended_global_memory": memory_info["timed_kernel_has_intended_global_memory"],
+                "expected_l2_touch": bool(memory_info["timed_kernel_has_intended_global_memory"]),
                 "tflops": tflops,
                 "memory_gbps": memory_gbps,
                 "test_avg_power_w": s.get("avg_power_w", math.nan),
@@ -600,6 +673,8 @@ def group_pairs(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     ops = finite_float(t.get("fp16_ops_estimate", 0.0), 0.0)
     mem_bytes = finite_float(t.get("memory_bytes_estimate", 0.0), 0.0)
+    t_memory_info = infer_timed_kernel_memory(t, mem_bytes)
+    b_memory_info = infer_timed_kernel_memory(b, finite_float(b.get("memory_bytes_estimate", 0.0), 0.0))
     mem_bits = mem_bytes * 8.0
     matmul_bits = matmul_bit_estimates(t, ops)
     elapsed_s = finite_float(t.get("cuda_elapsed_ms", 0.0), 0.0) / 1000.0
@@ -662,7 +737,10 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         and math.isfinite(inc_energy)
         and inc_energy > 0
     )
-    expected_l2_touch = bool(mem_bytes > 0 or not t.get("suppress_output_store", False))
+    expected_l2_touch = bool(
+        t_memory_info["timed_kernel_has_intended_global_memory"]
+        or b_memory_info["timed_kernel_has_intended_global_memory"]
+    )
     valid_no_l2 = bool(valid_basic and not expected_l2_touch)
     pure_fp16_candidate = bool(
         valid_no_l2
@@ -712,6 +790,29 @@ def summarize_pair(cond: str, pair_index: int, t: Dict[str, Any], b: Dict[str, A
         **matmul_bits,
         **peak_metrics,
         "suppress_output_store": bool(t.get("suppress_output_store", False)),
+        "test_timed_kernel_memory_provenance_available": t_memory_info[
+            "timed_kernel_memory_provenance_available"
+        ],
+        "baseline_timed_kernel_memory_provenance_available": b_memory_info[
+            "timed_kernel_memory_provenance_available"
+        ],
+        "test_timed_kernel_memory_provenance_source": t_memory_info["timed_kernel_memory_provenance_source"],
+        "baseline_timed_kernel_memory_provenance_source": b_memory_info[
+            "timed_kernel_memory_provenance_source"
+        ],
+        "test_timed_kernel_global_input_loads": t_memory_info["timed_kernel_global_input_loads"],
+        "baseline_timed_kernel_global_input_loads": b_memory_info["timed_kernel_global_input_loads"],
+        "test_timed_kernel_global_output_stores": t_memory_info["timed_kernel_global_output_stores"],
+        "baseline_timed_kernel_global_output_stores": b_memory_info["timed_kernel_global_output_stores"],
+        "test_timed_kernel_has_intended_global_memory": t_memory_info[
+            "timed_kernel_has_intended_global_memory"
+        ],
+        "baseline_timed_kernel_has_intended_global_memory": b_memory_info[
+            "timed_kernel_has_intended_global_memory"
+        ],
+        "test_timed_kernel_memory_provenance_note": t_memory_info["timed_kernel_memory_provenance_note"],
+        "baseline_timed_kernel_memory_provenance_note": b_memory_info["timed_kernel_memory_provenance_note"],
+        "timed_kernel_has_intended_global_memory": expected_l2_touch,
         "expected_l2_touch": expected_l2_touch,
         "tflops": tflops,
         "memory_gbps": gbps,
@@ -924,6 +1025,26 @@ def aggregate_conditions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "valid_count": len(valid),
             "valid_no_l2_count": sum(1 for r in group if bool(r.get("valid_no_l2", False))),
             "expected_l2_touch_count": sum(1 for r in group if bool(r.get("expected_l2_touch", True))),
+            "timed_kernel_memory_provenance_metadata_count": sum(
+                1
+                for r in group
+                if bool(r.get("test_timed_kernel_memory_provenance_available", False))
+                and bool(r.get("baseline_timed_kernel_memory_provenance_available", False))
+            ),
+            "timed_kernel_memory_provenance_metadata_all": all(
+                bool(r.get("test_timed_kernel_memory_provenance_available", False))
+                and bool(r.get("baseline_timed_kernel_memory_provenance_available", False))
+                for r in group
+            ),
+            "timed_kernel_has_intended_global_memory_count": sum(
+                1 for r in group if bool(r.get("timed_kernel_has_intended_global_memory", True))
+            ),
+            "test_timed_kernel_has_intended_global_memory_count": sum(
+                1 for r in group if bool(r.get("test_timed_kernel_has_intended_global_memory", True))
+            ),
+            "baseline_timed_kernel_has_intended_global_memory_count": sum(
+                1 for r in group if bool(r.get("baseline_timed_kernel_has_intended_global_memory", True))
+            ),
             "valid_basic_expected_l2_touch_count": sum(
                 1
                 for r in group
@@ -1083,18 +1204,8 @@ def aggregate_thread_sweep(
                 for r in group
             ),
             "benchmark_schema_features_required_all": all(
-                {
-                    "nvml_timed_energy_counter",
-                    "explicit_m16n16k16_denominator",
-                    "strict_denominator_provenance",
-                }
-                <= schema_feature_set(r.get("test_benchmark_schema_features"))
-                and {
-                    "nvml_timed_energy_counter",
-                    "explicit_m16n16k16_denominator",
-                    "strict_denominator_provenance",
-                }
-                <= schema_feature_set(r.get("baseline_benchmark_schema_features"))
+                REQUIRED_BENCHMARK_SCHEMA_FEATURES <= schema_feature_set(r.get("test_benchmark_schema_features"))
+                and REQUIRED_BENCHMARK_SCHEMA_FEATURES <= schema_feature_set(r.get("baseline_benchmark_schema_features"))
                 for r in group
             ),
             "test_kernel": test_kernel,
@@ -1114,6 +1225,26 @@ def aggregate_thread_sweep(
             "valid_no_l2_count": len(valid_no_l2),
             "valid_no_l2_requirement_met": len(valid_no_l2) >= required_valid,
             "expected_l2_touch_count": sum(1 for r in group if bool(r.get("expected_l2_touch", True))),
+            "timed_kernel_memory_provenance_metadata_count": sum(
+                1
+                for r in group
+                if bool(r.get("test_timed_kernel_memory_provenance_available", False))
+                and bool(r.get("baseline_timed_kernel_memory_provenance_available", False))
+            ),
+            "timed_kernel_memory_provenance_metadata_all": all(
+                bool(r.get("test_timed_kernel_memory_provenance_available", False))
+                and bool(r.get("baseline_timed_kernel_memory_provenance_available", False))
+                for r in group
+            ),
+            "timed_kernel_has_intended_global_memory_count": sum(
+                1 for r in group if bool(r.get("timed_kernel_has_intended_global_memory", True))
+            ),
+            "test_timed_kernel_has_intended_global_memory_count": sum(
+                1 for r in group if bool(r.get("test_timed_kernel_has_intended_global_memory", True))
+            ),
+            "baseline_timed_kernel_has_intended_global_memory_count": sum(
+                1 for r in group if bool(r.get("baseline_timed_kernel_has_intended_global_memory", True))
+            ),
             "valid_basic_expected_l2_touch_count": sum(
                 1
                 for r in group
