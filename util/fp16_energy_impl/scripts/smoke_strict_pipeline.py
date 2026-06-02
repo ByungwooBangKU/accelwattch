@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1891,6 +1892,102 @@ exit 1
         raise AssertionError(f"Report did not carry resource context evidence: {report_row}")
     if report_row.get("work_slope_valid") != "True":
         raise AssertionError(f"Report did not carry work-slope evidence: {report_row}")
+
+    suite_run_status = base / "strict_architecture_suite_runs.csv"
+    write_csv(
+        suite_run_status,
+        [
+            {
+                "label": "synthetic",
+                "gpu": "0",
+                "cuda_arch": "90",
+                "nvidia_smi_id": "GPU-synthetic",
+                "result_dir": str(good),
+                "status": "completed",
+                "exit_code": "0",
+            }
+        ],
+    )
+    postprocess_like = base / "postprocess_like"
+    shutil.copytree(audit_good, postprocess_like / "strict_fp16_audit")
+    shutil.copytree(report_dir, postprocess_like / "strict_fp16_report")
+    suite_summary = base / "strict_architecture_suite_summary.json"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "write_strict_suite_summary.py"),
+            "--out",
+            str(suite_summary),
+            "--outdir",
+            str(base / "suite"),
+            "--spec",
+            "synthetic:0:90",
+            "--preflight-json",
+            str(preflight),
+            "--run-status-csv",
+            str(suite_run_status),
+            "--postprocess-dir",
+            str(postprocess_like),
+            "--postprocess-exit-code",
+            "0",
+            "--require-architectures",
+            "gh100",
+            "--run-work-slope",
+            "--require-work-slope",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    suite_payload = json.loads(suite_summary.read_text())
+    if not suite_payload.get("checks", {}).get("work_slope_pass"):
+        raise AssertionError(f"Suite summary did not pass work-slope check: {suite_payload}")
+    if not suite_payload.get("checks", {}).get("publishable_pass"):
+        raise AssertionError(f"Suite summary did not remain publishable with valid work-slope: {suite_payload}")
+    if suite_payload.get("counts", {}).get("work_slope_required_targets") != 1:
+        raise AssertionError(f"Suite summary did not count required work-slope target: {suite_payload}")
+
+    postprocess_bad_slope = base / "postprocess_bad_slope"
+    shutil.copytree(audit_good, postprocess_bad_slope / "strict_fp16_audit")
+    shutil.copytree(report_dir, postprocess_bad_slope / "strict_fp16_report")
+    bad_slope_rows = read_csv_rows(postprocess_bad_slope / "strict_fp16_audit" / "strict_result_audit.csv")
+    for row in bad_slope_rows:
+        row["work_slope_valid"] = "False"
+        row["work_slope_r2"] = "0.2"
+    write_csv(postprocess_bad_slope / "strict_fp16_audit" / "strict_result_audit.csv", bad_slope_rows)
+    suite_summary_bad_slope = base / "strict_architecture_suite_summary_bad_slope.json"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "write_strict_suite_summary.py"),
+            "--out",
+            str(suite_summary_bad_slope),
+            "--outdir",
+            str(base / "suite_bad_slope"),
+            "--spec",
+            "synthetic:0:90",
+            "--preflight-json",
+            str(preflight),
+            "--run-status-csv",
+            str(suite_run_status),
+            "--postprocess-dir",
+            str(postprocess_bad_slope),
+            "--postprocess-exit-code",
+            "0",
+            "--require-architectures",
+            "gh100",
+            "--run-work-slope",
+            "--require-work-slope",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    bad_slope_payload = json.loads(suite_summary_bad_slope.read_text())
+    if bad_slope_payload.get("checks", {}).get("work_slope_pass"):
+        raise AssertionError(f"Suite summary accepted invalid work-slope audit row: {bad_slope_payload}")
+    if bad_slope_payload.get("checks", {}).get("publishable_pass"):
+        raise AssertionError(f"Suite summary remained publishable with invalid work-slope: {bad_slope_payload}")
+    if bad_slope_payload.get("counts", {}).get("work_slope_invalid_targets") != 1:
+        raise AssertionError(f"Suite summary did not count invalid work-slope target: {bad_slope_payload}")
 
     audit_report_bad_resource = base / "audit_report_bad_resource_context"
     mutated_audit_rows = read_csv_rows(audit_good / "strict_result_audit.csv")

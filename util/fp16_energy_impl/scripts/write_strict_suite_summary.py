@@ -11,6 +11,20 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+def parse_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
 def parse_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -75,6 +89,11 @@ def main() -> int:
     preflight = read_json(args.preflight_json)
     runs = read_csv(args.run_status_csv)
     audit_json = read_json(args.postprocess_dir / "strict_fp16_audit" / "strict_result_audit.json" if args.postprocess_dir else None)
+    audit_rows = read_csv(
+        args.postprocess_dir / "strict_fp16_audit" / "strict_result_audit.csv"
+        if args.postprocess_dir
+        else None
+    )
     report_requirements = read_csv(
         args.postprocess_dir / "strict_fp16_report" / "fp16_strict_report_requirements.csv"
         if args.postprocess_dir
@@ -99,6 +118,24 @@ def main() -> int:
     report_requirements_pass = bool(report_requirements) and all(
         str(row.get("status", "")) == "pass" for row in report_requirements
     )
+    required_work_slope_rows = [row for row in audit_rows if parse_bool(row.get("work_slope_required"))]
+    effective_work_slope_required = bool(args.require_work_slope) or bool(required_work_slope_rows)
+    invalid_work_slope_rows = [
+        row
+        for row in required_work_slope_rows
+        if not (
+            parse_bool(row.get("work_slope_valid"))
+            and str(row.get("work_slope_fit_scope", "")) == "valid_no_l2"
+            and parse_float(row.get("work_slope_pj_per_bit")) > 0.0
+            and parse_float(row.get("work_slope_r2")) >= 0.80
+        )
+    ]
+    missing_work_slope_rows = [
+        row for row in required_work_slope_rows if not parse_bool(row.get("work_slope_present"))
+    ]
+    work_slope_pass = (not effective_work_slope_required) or (
+        bool(required_work_slope_rows) and not invalid_work_slope_rows
+    )
     postprocess_pass = args.no_postprocess or (
         not args.postprocess_skipped
         and str(args.postprocess_exit_code) == "0"
@@ -112,6 +149,7 @@ def main() -> int:
         and not parse_bool(args.suite_failed)
         and all_runs_completed
         and postprocess_pass
+        and work_slope_pass
     )
 
     payload = {
@@ -126,7 +164,7 @@ def main() -> int:
             "trace_role": "fallback_or_counter_trace_sanity_check",
             "logical_matmul_shape": "m16n16k16",
             "logical_input_bits_per_mma": 8192,
-            "work_slope_required": bool(args.require_work_slope),
+            "work_slope_required": effective_work_slope_required,
             "note": (
                 "Final FP16 pJ/bit claims require benchmark timed-loop "
                 "nvmlDeviceGetTotalEnergyConsumption() deltas; nvidia-smi power traces are "
@@ -155,6 +193,7 @@ def main() -> int:
             "audit_pass": audit_pass,
             "report_requirements_pass": report_requirements_pass,
             "postprocess_pass": postprocess_pass,
+            "work_slope_pass": work_slope_pass,
             "diagnostic_only": diagnostic_only,
             "publishable_pass": publishable_pass,
         },
@@ -166,6 +205,9 @@ def main() -> int:
             "report_requirements_failed": sum(
                 1 for row in report_requirements if str(row.get("status", "")) != "pass"
             ),
+            "work_slope_required_targets": len(required_work_slope_rows),
+            "work_slope_missing_targets": len(missing_work_slope_rows),
+            "work_slope_invalid_targets": len(invalid_work_slope_rows),
         },
         "postprocess_exit_code": args.postprocess_exit_code,
         "preflight_overall_pass": preflight.get("overall_pass", ""),
