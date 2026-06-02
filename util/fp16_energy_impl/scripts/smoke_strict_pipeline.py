@@ -273,6 +273,19 @@ def write_compare_dir(path: Path, *, measurement_grade: str = "strict_nvml_count
     )
 
 
+def write_compare_audit_dir(path: Path, input_dir: Path, *, audit_pass: bool) -> None:
+    row = compare_thread_row(64, 256, 95.8, 0.18, target=True, blocks_per_sm=4)
+    row.update(
+        {
+            "input_dir": str(input_dir),
+            "audit_pass": "True" if audit_pass else "False",
+            "fail_reasons": "" if audit_pass else "synthetic strict audit failure",
+        }
+    )
+    write_csv(path / "strict_result_audit.csv", [row])
+    write_json(path / "strict_result_audit.json", {"overall_pass": audit_pass})
+
+
 def quality_gate_summary_row(*, energy_source: str = "nvml_total_energy_counter") -> Dict[str, Any]:
     features = (
         "nvml_timed_energy_counter,explicit_m16n16k16_denominator,"
@@ -956,9 +969,15 @@ exit 1
 
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"
+    compare_audit_pass = base / "compare_audit_pass"
+    compare_audit_pass_out = base / "compare_audit_pass_out"
+    compare_audit_fail = base / "compare_audit_fail"
+    compare_audit_fail_out = base / "compare_audit_fail_out"
     compare_power_trace_input = base / "compare_power_trace_input"
     compare_power_trace_out = base / "compare_power_trace_out"
     write_compare_dir(compare_input)
+    write_compare_audit_dir(compare_audit_pass, compare_input, audit_pass=True)
+    write_compare_audit_dir(compare_audit_fail, compare_input, audit_pass=False)
     write_compare_dir(compare_power_trace_input, measurement_grade="power_trace_fallback")
     run(
         [
@@ -1009,6 +1028,61 @@ exit 1
         raise AssertionError(f"Architecture compare lost target_pass for blocks/SM=4: {duplicate_launch_shapes}")
     if duplicate_launch_shapes["8"].get("target_pass") != "false":
         raise AssertionError(f"Architecture compare copied target_pass across blocks/SM=8: {duplicate_launch_shapes}")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "compare_architectures.py"),
+            "--input",
+            str(compare_input),
+            "--outdir",
+            str(compare_audit_pass_out),
+            "--audit-dir",
+            str(compare_audit_pass),
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    audit_pass_best = read_single_csv_row(compare_audit_pass_out / "architecture_best_fp16.csv")
+    if audit_pass_best.get("selection_note") != "strict_audit_pass":
+        raise AssertionError(f"Audit-pass compare did not use audit evidence: {audit_pass_best}")
+    audit_pass_coverage = {
+        row.get("architecture_chip"): row
+        for row in read_csv_rows(compare_audit_pass_out / "architecture_strict_coverage.csv")
+    }
+    if audit_pass_coverage.get("gh100", {}).get("coverage_status") != "strict_pass":
+        raise AssertionError(f"Audit-pass compare did not mark GH100 strict: {audit_pass_coverage}")
+    audit_pass_summary = json.loads((compare_audit_pass_out / "architecture_comparison_summary.json").read_text())
+    if not audit_pass_summary.get("audit_required_for_publishable"):
+        raise AssertionError(f"Audit-pass compare summary did not record audit requirement: {audit_pass_summary}")
+    if not (compare_audit_pass_out / "architecture_audit_strict.csv").exists():
+        raise AssertionError("Audit-pass compare did not write architecture_audit_strict.csv")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "compare_architectures.py"),
+            "--input",
+            str(compare_input),
+            "--outdir",
+            str(compare_audit_fail_out),
+            "--audit-dir",
+            str(compare_audit_fail),
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    audit_fail_best = read_single_csv_row(compare_audit_fail_out / "architecture_best_fp16.csv")
+    if audit_fail_best.get("selection_note") != "strict_audit_failed":
+        raise AssertionError(f"Audit-fail compare did not expose audit failure: {audit_fail_best}")
+    if audit_fail_best.get("quality_rejected") != "True":
+        raise AssertionError(f"Audit-fail compare best row was not rejected: {audit_fail_best}")
+    audit_fail_coverage = {
+        row.get("architecture_chip"): row
+        for row in read_csv_rows(compare_audit_fail_out / "architecture_strict_coverage.csv")
+    }
+    if audit_fail_coverage.get("gh100", {}).get("coverage_status") != "diagnostic_or_rejected_only":
+        raise AssertionError(f"Audit-fail compare still marked GH100 strict: {audit_fail_coverage}")
 
     run(
         [

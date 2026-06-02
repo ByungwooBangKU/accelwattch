@@ -270,6 +270,39 @@ def load_resource_rows(path: Path) -> List[Dict[str, Any]]:
     ]
 
 
+def load_audit_rows(audit_dir: Optional[Path]) -> List[Dict[str, Any]]:
+    if not audit_dir:
+        return []
+    rows = read_csv(audit_dir / "strict_result_audit.csv")
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        arch = classify_from_row(row)
+        input_dir = Path(str(row.get("input_dir", "") or audit_dir))
+        out.append(
+            {
+                **row,
+                **arch,
+                "input_dir": str(input_dir),
+                "architecture_label": result_label(input_dir, arch),
+                "audit_evidence_source": str(audit_dir / "strict_result_audit.csv"),
+            }
+        )
+    return out
+
+
+def audit_best_rows(audit_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in audit_rows:
+        publishable = parse_bool(row.get("audit_pass"))
+        best = dict(row)
+        best["selection_note"] = "strict_audit_pass" if publishable else "strict_audit_failed"
+        best["quality_rejected"] = not publishable
+        best["audit_required_for_publishable"] = True
+        best["publishable_strict_audit"] = publishable
+        out.append(best)
+    return out
+
+
 def is_fp16_candidate(row: Dict[str, Any]) -> bool:
     test_kernel = str(row.get("test_kernel", ""))
     if test_kernel not in {"tensor_mma_f16acc", "tensor_mma_f32acc", "fp16_half2"}:
@@ -288,6 +321,8 @@ def ncu_tensor_activity_ok(row: Dict[str, Any]) -> bool:
 
 
 def is_strict_publishable_target(row: Dict[str, Any]) -> bool:
+    if str(row.get("audit_required_for_publishable", "")).strip() or str(row.get("audit_pass", "")).strip():
+        return parse_bool(row.get("audit_pass")) and parse_bool(row.get("target_pass"))
     return (
         parse_bool(row.get("target_pass"))
         and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
@@ -404,6 +439,10 @@ def plot_bar(rows: List[Dict[str, Any]], metric: str, ylabel: str, title: str, p
         return
     labels = [str(r.get("architecture_label", r.get("input_dir", ""))) for r in clean]
     vals = [parse_float(r.get(metric)) for r in clean]
+    colors = [
+        "tab:green" if is_strict_publishable_target(r) else ("tab:red" if parse_bool(r.get("quality_rejected")) else "tab:orange")
+        for r in clean
+    ]
     yerr = []
     for r in clean:
         std_key = metric.replace("_mean", "_std") if metric.endswith("_mean") else ""
@@ -411,12 +450,23 @@ def plot_bar(rows: List[Dict[str, Any]], metric: str, ylabel: str, title: str, p
         yerr.append(v if math.isfinite(v) and v >= 0.0 else 0.0)
 
     fig, ax = plt.subplots(figsize=(max(7.5, 1.7 * len(clean)), 5.0))
-    ax.bar(range(len(clean)), vals, yerr=yerr, capsize=4)
+    ax.bar(range(len(clean)), vals, yerr=yerr, capsize=4, color=colors, alpha=0.86)
     ax.set_xticks(range(len(clean)))
     ax.set_xticklabels(labels, rotation=20, ha="right")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, axis="y", alpha=0.25)
+    from matplotlib.patches import Patch
+
+    ax.legend(
+        handles=[
+            Patch(facecolor="tab:green", label="strict audit publishable"),
+            Patch(facecolor="tab:red", label="rejected/diagnostic"),
+            Patch(facecolor="tab:orange", label="diagnostic best"),
+        ],
+        loc="best",
+        fontsize=8,
+    )
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -765,22 +815,22 @@ def coverage_rows(
         chip_conditions = [row for row in condition_rows if str(row.get("architecture_chip", "")) == chip]
         chip_threads = [row for row in thread_rows if str(row.get("architecture_chip", "")) == chip]
         chip_best = [row for row in best_rows if str(row.get("architecture_chip", "")) == chip]
-        strict_targets = [
+        strict_thread_targets = [
             row for row in chip_threads if is_strict_publishable_target(row)
         ]
+        strict_best = [
+            row for row in chip_best
+            if not parse_bool(row.get("quality_rejected"))
+            and is_strict_publishable_target(row)
+        ]
+        strict_targets = [*strict_thread_targets, *strict_best]
         diagnostic_targets = [
             row for row in chip_threads
             if parse_bool(row.get("target_pass"))
             and str(row.get("measurement_grade", "")) != "strict_nvml_counter"
         ]
         quality_pass = [row for row in chip_threads if parse_bool(row.get("quality_pass"))]
-        strict_best = [
-            row for row in chip_best
-            if not parse_bool(row.get("quality_rejected"))
-            and parse_bool(row.get("target_pass"))
-            and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
-        ]
-        if strict_targets and strict_best:
+        if strict_best:
             status = "strict_pass"
             publishable = True
         elif chip_conditions or chip_threads or chip_best:
@@ -884,6 +934,7 @@ def comparison_summary(
     required_architectures: List[str],
     allow_diagnostic_best: bool,
     allow_legacy_best: bool,
+    audit_dir: Optional[Path],
 ) -> Dict[str, Any]:
     required_rows = [row for row in coverage if parse_bool(row.get("required"))]
     strict_pass = [
@@ -924,9 +975,12 @@ def comparison_summary(
         "coverage_status_counts": status_counts,
         "allow_diagnostic_best": allow_diagnostic_best,
         "allow_legacy_best": allow_legacy_best,
+        "audit_dir": str(audit_dir or ""),
+        "audit_required_for_publishable": bool(audit_dir),
         "final_value_policy": (
-            "Only coverage_status=strict_pass rows with target_pass=true and "
-            "measurement_grade=strict_nvml_counter are publishable FP16 pJ/bit comparison points."
+            "When --audit-dir is supplied, only audit_pass=true rows are publishable FP16 pJ/bit "
+            "comparison points. Without --audit-dir, strict quality-gate targets are diagnostic "
+            "readiness evidence and should still be audited before final claims."
         ),
     }
 
@@ -987,6 +1041,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare analyzed FP16 energy result directories")
     parser.add_argument("--input", type=Path, nargs="+", required=True, help="One or more analyzed result dirs")
     parser.add_argument("--outdir", type=Path, required=True, help="Output directory for comparison CSVs/figures")
+    parser.add_argument("--audit-dir", type=Path, default=None, help="Directory from audit_strict_results.py")
     parser.add_argument(
         "--require-architectures",
         default="ga100,gh100,ga102",
@@ -1021,6 +1076,7 @@ def main() -> int:
     all_threads: List[Dict[str, Any]] = []
     all_quality: List[Dict[str, Any]] = []
     all_resources: List[Dict[str, Any]] = []
+    audit_rows = load_audit_rows(args.audit_dir)
     for path in args.input:
         conditions, summary, threads, quality = load_result_dir(path)
         if not conditions and not summary:
@@ -1032,12 +1088,15 @@ def main() -> int:
         all_resources.extend(load_resource_rows(path))
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    best_source = all_threads if all_threads else all_conditions
-    best = select_best_fp16(
-        best_source,
-        allow_diagnostic_fallback=args.allow_diagnostic_best,
-        allow_legacy_best=args.allow_legacy_best,
-    )
+    if audit_rows:
+        best = audit_best_rows(audit_rows)
+    else:
+        best_source = all_threads if all_threads else all_conditions
+        best = select_best_fp16(
+            best_source,
+            allow_diagnostic_fallback=args.allow_diagnostic_best,
+            allow_legacy_best=args.allow_legacy_best,
+        )
     required_architectures = parse_csv_list(args.require_architectures)
     coverage = coverage_rows(best, all_threads, all_conditions, required_architectures)
     summary = comparison_summary(
@@ -1045,12 +1104,14 @@ def main() -> int:
         required_architectures=required_architectures,
         allow_diagnostic_best=args.allow_diagnostic_best,
         allow_legacy_best=args.allow_legacy_best,
+        audit_dir=args.audit_dir,
     )
     write_csv(args.outdir / "architecture_condition_summary.csv", all_conditions)
     write_csv(args.outdir / "architecture_summary_rows.csv", all_summary)
     write_csv(args.outdir / "architecture_thread_sweep_summary.csv", all_threads)
     write_csv(args.outdir / "architecture_quality_gates.csv", all_quality)
     write_csv(args.outdir / "architecture_resource_occupancy.csv", all_resources)
+    write_csv(args.outdir / "architecture_audit_strict.csv", audit_rows)
     write_csv(args.outdir / "architecture_best_fp16.csv", best)
     write_csv(args.outdir / "architecture_strict_coverage.csv", coverage)
     write_csv(args.outdir / "architecture_comparison_summary.csv", [summary])
