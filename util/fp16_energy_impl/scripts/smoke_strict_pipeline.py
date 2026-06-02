@@ -1594,6 +1594,44 @@ exit 1
     ):
         raise AssertionError(f"Power-trace fallback diagnostic note was not recorded: {qg_power_rows}")
 
+    generated_work_slope_matrix = base / "generated_work_slope_matrix.json"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "generate_work_slope_matrix.py"),
+            "--result-dir",
+            str(good),
+            "--out-matrix",
+            str(generated_work_slope_matrix),
+            "--unrolls",
+            "1,2,4",
+            "--baseline-repeats",
+            "7",
+            "--test-repeats",
+            "3",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    generated_matrix = json.loads(generated_work_slope_matrix.read_text())
+    generated_defaults = generated_matrix.get("defaults", {})
+    generated_conditions = generated_matrix.get("conditions", [])
+    if generated_defaults.get("blocks_per_sm") != 8 or generated_defaults.get("repeats") != 3:
+        raise AssertionError(f"Generated work-slope matrix defaults do not match selected target: {generated_matrix}")
+    if len(generated_conditions) != 3:
+        raise AssertionError(f"Generated work-slope matrix did not honor unroll list: {generated_matrix}")
+    for condition, expected_unroll in zip(generated_conditions, [1, 2, 4]):
+        if condition.get("args", {}).get("threads") != 128:
+            raise AssertionError(f"Generated work-slope matrix did not copy selected threads: {condition}")
+        if condition.get("args", {}).get("unroll") != expected_unroll:
+            raise AssertionError(f"Generated work-slope matrix unroll mismatch: {condition}")
+        if condition.get("baseline", {}).get("kernel") != "tensor_baseline_mov":
+            raise AssertionError(f"Generated work-slope matrix baseline mismatch: {condition}")
+        if condition.get("baseline", {}).get("repeats") != 7:
+            raise AssertionError(f"Generated work-slope matrix baseline repeats mismatch: {condition}")
+        if condition.get("test", {}).get("kernel") != "tensor_mma_f16acc":
+            raise AssertionError(f"Generated work-slope matrix test mismatch: {condition}")
+
     audit_good = base / "audit_good"
     work_slope_dir = base / "work_slope"
     write_csv(

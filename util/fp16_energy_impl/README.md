@@ -22,6 +22,7 @@
 | `scripts/audit_strict_results.py` | A100/H100/RTX3090 strict 결과 디렉터리가 최종 비교 조건을 모두 만족하는지 일괄 audit |
 | `scripts/report_strict_results.py` | strict audit/architecture compare 산출물을 최종 검토용 Markdown report와 dashboard figure로 요약 |
 | `scripts/smoke_strict_pipeline.py` | GPU 없이 strict audit/report target-selection invariant를 synthetic fixture로 회귀 검증 |
+| `scripts/generate_work_slope_matrix.py` | `quality_gate_summary.json`의 selected target과 같은 launch context로 work-slope matrix 생성 |
 | `scripts/install_gpu_toolchain.sh` | GPU별 CUDA/Nsight Compute conda toolchain 설치와 strict pipeline용 env file 생성 |
 | `scripts/postprocess_strict_architectures.sh` | A100/H100/RTX3090 결과 디렉터리를 받아 audit/compare/report/visualization을 한 번에 생성 |
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
@@ -249,12 +250,16 @@ python3 scripts/calibrate_matrix.py \
   --outdir results/diagnostic_h100
 ```
 
-baseline subtraction이 불안정하거나 `incremental_energy_j`가 음수로 흔들리면, 같은 thread 조건에서 work amount를 바꾸는 slope diagnostic을 별도로 실행한다. 이 matrix는 unroll별 work 차이를 유지해야 하므로 strict pipeline calibration 대신 raw runner를 사용한다.
+baseline subtraction이 불안정하거나 `incremental_energy_j`가 음수로 흔들리면, 같은 thread 조건에서 work amount를 바꾸는 slope diagnostic을 별도로 실행한다. 이 matrix는 unroll별 work 차이를 유지해야 하므로 strict pipeline calibration 대신 raw runner를 사용한다. 최종 audit에 연결할 work-slope는 selected target과 같은 `threads` 및 `blocks_per_sm` context여야 하므로, 먼저 selected target에서 matrix를 자동 생성한다.
 
 ```bash
+python3 scripts/generate_work_slope_matrix.py \
+  --result-dir results/strict_fp16_rtx3090 \
+  --out-matrix results/strict_fp16_rtx3090/work_slope_matrix.json
+
 python3 scripts/run_experiment.py \
   --binary build/fp16_energy_bench \
-  --matrix configs/fp16_matmul_work_slope_mov.json \
+  --matrix results/strict_fp16_rtx3090/work_slope_matrix.json \
   --gpu 0 \
   --sample-ms 100 \
   --outdir results/strict_fp16_rtx3090_work_slope
