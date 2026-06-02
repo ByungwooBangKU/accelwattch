@@ -39,6 +39,7 @@
 | `scripts/lock_clocks.sh` | GPU clock lock helper |
 | `scripts/reset_clocks.sh` | GPU clock reset helper |
 | `scripts/query_env.sh` | 실험 환경 metadata 수집 |
+| `experiment_progress_report_20260602.md` | 지금까지 RTX 3090 결과, strict-final 미완료 사유, 최초 설계 대비 변경점 요약 |
 
 ## 2. 구현된 kernel
 
