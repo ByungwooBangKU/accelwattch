@@ -1039,6 +1039,8 @@ exit 1
             str(compare_audit_pass_out),
             "--audit-dir",
             str(compare_audit_pass),
+            "--require-architectures",
+            "gh100",
         ],
         cwd=ROOT,
         env=env,
@@ -1055,6 +1057,10 @@ exit 1
     audit_pass_summary = json.loads((compare_audit_pass_out / "architecture_comparison_summary.json").read_text())
     if not audit_pass_summary.get("audit_required_for_publishable"):
         raise AssertionError(f"Audit-pass compare summary did not record audit requirement: {audit_pass_summary}")
+    if not audit_pass_summary.get("publishable"):
+        raise AssertionError(f"Audit-pass compare should be publishable for required gh100 only: {audit_pass_summary}")
+    if audit_pass_summary.get("required_architectures") != ["gh100"]:
+        raise AssertionError(f"Audit-pass compare did not honor --require-architectures gh100: {audit_pass_summary}")
     if not (compare_audit_pass_out / "architecture_audit_strict.csv").exists():
         raise AssertionError("Audit-pass compare did not write architecture_audit_strict.csv")
 

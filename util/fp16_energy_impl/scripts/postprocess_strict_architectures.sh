@@ -114,7 +114,8 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/compare_architectures.py" \
   --input "${ABS_INPUTS[@]}" \
   --outdir "${COMPARE_DIR}" \
-  --audit-dir "${AUDIT_DIR}"
+  --audit-dir "${AUDIT_DIR}" \
+  --require-architectures "${REQUIRE_ARCHITECTURES}"
 
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/architecture_models.py" \

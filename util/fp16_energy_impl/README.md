@@ -502,7 +502,7 @@ results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/figures/quality_gate_
 
 Fine + dmon legacy run에서는 `threads_per_sm=512`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 후보 thread count는 512 threads/SM, 즉 64 threads/block이다. pJ/bit 자체는 224 threads/block 후보에서 `0.0819 +/- 0.0121 pJ/bit`로 더 낮게 관찰되었지만, valid no-L2 count가 5/10이고 incremental power가 3.23 W 수준이라 target saturation point로 채택하지 않았다. 256 threads/block 이상 후보는 baseline subtraction 후 incremental power가 음수로 나와 `all_runs_no_valid`로 집계되었다. 이 값들은 board-level `nvidia-smi` power trace와 `baseline_nop` subtraction 기반 estimate이므로, 최종 수치 채택 전에는 현재 matrix로 재실행하고 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
 
-여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 strict pipeline을 완료한 다음 아래 wrapper를 실행한다. 이 wrapper는 strict audit이 실패해도 compare/report 산출물을 먼저 남기고, 기본적으로 마지막에 nonzero로 종료한다. 실패 상태까지 report로 남기고 싶을 때는 `--no-fail`을 추가한다.
+여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 strict pipeline을 완료한 다음 아래 wrapper를 실행한다. 이 wrapper는 strict audit이 실패해도 compare/report 산출물을 먼저 남기고, 기본적으로 마지막에 nonzero로 종료한다. `--require-architectures`는 audit, compare, architecture model, report 단계에 동일하게 전달된다. 실패 상태까지 report로 남기고 싶을 때는 `--no-fail`을 추가한다.
 
 ```bash
 ./scripts/postprocess_strict_architectures.sh \
