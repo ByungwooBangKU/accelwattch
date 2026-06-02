@@ -259,6 +259,25 @@ def requirement_rows(
         and parse_float(row.get("test_ncu_tensor_activity_pct")) > 0.0
         for row in audit_rows
     )
+    ncu_common_hmma = bool(audit_rows) and all(
+        parse_bool(row.get("test_ncu_common_hmma_seen"))
+        and not parse_bool(row.get("test_ncu_wgmma_token_seen"))
+        and not parse_bool(row.get("baseline_ncu_common_hmma_seen"))
+        and not parse_bool(row.get("baseline_ncu_tensor_inst_seen"))
+        and not parse_bool(row.get("baseline_ncu_wgmma_token_seen"))
+        for row in audit_rows
+    )
+    ncu_no_memory = bool(audit_rows) and all(
+        parse_bool(row.get("test_ncu_memory_counter_classes_complete"))
+        and parse_bool(row.get("baseline_ncu_memory_counter_classes_complete"))
+        and parse_bool(row.get("test_ncu_no_l2"))
+        and parse_bool(row.get("baseline_ncu_no_l2"))
+        and parse_bool(row.get("test_ncu_no_dram"))
+        and parse_bool(row.get("baseline_ncu_no_dram"))
+        and parse_bool(row.get("test_ncu_no_local_spill"))
+        and parse_bool(row.get("baseline_ncu_no_local_spill"))
+        for row in audit_rows
+    )
     no_spill = bool(audit_rows) and all(
         not parse_bool(row.get("test_resource_has_spills")) and not parse_bool(row.get("baseline_resource_has_spills"))
         for row in audit_rows
@@ -364,6 +383,16 @@ def requirement_rows(
         row("Nsight Compute no-L2/HMMA validation", ncu, "ncu_validation_pass=true"),
         row("NCU validation context matches measurement", ncu_context, "ncu_validation_context_match=true"),
         row(
+            "NCU common HMMA and no WGMMA evidence",
+            ncu_common_hmma,
+            "test common_hmma_seen=true; baseline has no tensor_inst/common_hmma; wgmma_token_seen=false",
+        ),
+        row(
+            "NCU no L2/DRAM/local memory evidence",
+            ncu_no_memory,
+            "memory counter classes complete and no_l2/no_dram/no_local_spill true for test and baseline",
+        ),
+        row(
             "NCU Tensor activity observed",
             ncu_tensor_activity,
             "test_ncu_tensor_activity_observed=true and test_ncu_tensor_activity_pct > 0",
@@ -422,6 +451,18 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
                 "ncu_validation_pass": row.get("ncu_validation_pass", ""),
                 "ncu_validation_context_match": row.get("ncu_validation_context_match", ""),
                 "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),
+                "ncu_common_hmma_seen": row.get("test_ncu_common_hmma_seen", ""),
+                "ncu_no_memory": all(
+                    parse_bool(row.get(key))
+                    for key in (
+                        "test_ncu_no_l2",
+                        "baseline_ncu_no_l2",
+                        "test_ncu_no_dram",
+                        "baseline_ncu_no_dram",
+                        "test_ncu_no_local_spill",
+                        "baseline_ncu_no_local_spill",
+                    )
+                ),
                 "fail_reasons": row.get("fail_reasons", ""),
             }
             for row in audit_rows
@@ -446,6 +487,8 @@ def summary_rows(audit_rows: List[Dict[str, Any]], best_rows: List[Dict[str, Any
             "baseline_match_grade": row.get("baseline_match_grade", ""),
             "ncu_validation_pass": row.get("ncu_validation_pass", ""),
             "ncu_tensor_activity_pct": row.get("test_ncu_tensor_activity_pct", ""),
+            "ncu_common_hmma_seen": row.get("test_ncu_common_hmma_seen", ""),
+            "ncu_no_memory": row.get("test_ncu_no_l2", ""),
             "fail_reasons": row.get("fail_reasons", ""),
         }
         for row in best_rows
@@ -548,6 +591,8 @@ def write_markdown(
                     "Energy source",
                     "Baseline",
                     "NCU",
+                    "HMMA",
+                    "No L2/DRAM/local",
                     "NCU tensor %",
                 ],
                 [
@@ -567,6 +612,8 @@ def write_markdown(
                         r.get("measurement_grade", ""),
                         r.get("baseline_match_grade", ""),
                         yes_no(r.get("ncu_validation_pass")),
+                        yes_no(r.get("ncu_common_hmma_seen")),
+                        yes_no(r.get("ncu_no_memory")),
                         fmt_value(r.get("ncu_tensor_activity_pct")),
                     ]
                     for r in rows

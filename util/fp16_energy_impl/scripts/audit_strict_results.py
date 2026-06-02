@@ -535,6 +535,34 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("selected test NCU validation did not pass")
     if baseline_ncu and not parse_bool(baseline_ncu.get("validation_pass")):
         failed.append("selected baseline NCU validation did not pass")
+    if test_ncu:
+        if not parse_bool(test_ncu.get("common_hmma_seen")):
+            failed.append("selected test NCU common HMMA evidence is missing")
+        if parse_bool(test_ncu.get("wgmma_token_seen")):
+            failed.append("selected test NCU WGMMA evidence was found")
+        if not parse_bool(test_ncu.get("memory_counter_classes_complete")):
+            failed.append("selected test NCU memory counter classes are incomplete")
+        for key, label in (
+            ("no_l2", "L2/global"),
+            ("no_dram", "DRAM"),
+            ("no_local_spill", "local/spill"),
+        ):
+            if not parse_bool(test_ncu.get(key)):
+                failed.append(f"selected test NCU {label} traffic evidence failed")
+    if baseline_ncu:
+        if parse_bool(baseline_ncu.get("common_hmma_seen")) or parse_bool(baseline_ncu.get("tensor_inst_seen")):
+            failed.append("selected baseline NCU shows Tensor Core/HMMA evidence")
+        if parse_bool(baseline_ncu.get("wgmma_token_seen")):
+            failed.append("selected baseline NCU WGMMA evidence was found")
+        if not parse_bool(baseline_ncu.get("memory_counter_classes_complete")):
+            failed.append("selected baseline NCU memory counter classes are incomplete")
+        for key, label in (
+            ("no_l2", "L2/global"),
+            ("no_dram", "DRAM"),
+            ("no_local_spill", "local/spill"),
+        ):
+            if not parse_bool(baseline_ncu.get(key)):
+                failed.append(f"selected baseline NCU {label} traffic evidence failed")
     if test_ncu and not parse_bool(test_ncu.get("tensor_activity_observed")):
         msg = "selected test NCU tensor activity is missing or below threshold"
         if args.require_ncu_tensor_activity:
@@ -679,6 +707,24 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_ncu_pass": baseline_ncu.get("validation_pass", "") if baseline_ncu else "",
         "test_ncu_memory_counter_classes_complete": test_ncu.get("memory_counter_classes_complete", "") if test_ncu else "",
         "baseline_ncu_memory_counter_classes_complete": baseline_ncu.get("memory_counter_classes_complete", "") if baseline_ncu else "",
+        "test_ncu_memory_note": test_ncu.get("memory_note", "") if test_ncu else "",
+        "baseline_ncu_memory_note": baseline_ncu.get("memory_note", "") if baseline_ncu else "",
+        "test_ncu_common_hmma_seen": test_ncu.get("common_hmma_seen", "") if test_ncu else "",
+        "baseline_ncu_common_hmma_seen": baseline_ncu.get("common_hmma_seen", "") if baseline_ncu else "",
+        "test_ncu_hmma_metric_seen": test_ncu.get("hmma_metric_seen", "") if test_ncu else "",
+        "baseline_ncu_hmma_metric_seen": baseline_ncu.get("hmma_metric_seen", "") if baseline_ncu else "",
+        "test_ncu_hmma_token_seen": test_ncu.get("hmma_token_seen", "") if test_ncu else "",
+        "baseline_ncu_hmma_token_seen": baseline_ncu.get("hmma_token_seen", "") if baseline_ncu else "",
+        "test_ncu_tensor_inst_seen": test_ncu.get("tensor_inst_seen", "") if test_ncu else "",
+        "baseline_ncu_tensor_inst_seen": baseline_ncu.get("tensor_inst_seen", "") if baseline_ncu else "",
+        "test_ncu_wgmma_token_seen": test_ncu.get("wgmma_token_seen", "") if test_ncu else "",
+        "baseline_ncu_wgmma_token_seen": baseline_ncu.get("wgmma_token_seen", "") if baseline_ncu else "",
+        "test_ncu_no_l2": test_ncu.get("no_l2", "") if test_ncu else "",
+        "baseline_ncu_no_l2": baseline_ncu.get("no_l2", "") if baseline_ncu else "",
+        "test_ncu_no_dram": test_ncu.get("no_dram", "") if test_ncu else "",
+        "baseline_ncu_no_dram": baseline_ncu.get("no_dram", "") if baseline_ncu else "",
+        "test_ncu_no_local_spill": test_ncu.get("no_local_spill", "") if test_ncu else "",
+        "baseline_ncu_no_local_spill": baseline_ncu.get("no_local_spill", "") if baseline_ncu else "",
         "test_ncu_validation_blocks_per_sm": test_ncu.get("validation_blocks_per_sm", "") if test_ncu else "",
         "baseline_ncu_validation_blocks_per_sm": baseline_ncu.get("validation_blocks_per_sm", "") if baseline_ncu else "",
         "test_ncu_validation_unroll": test_ncu.get("validation_unroll", "") if test_ncu else "",
@@ -703,6 +749,10 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_ncu_tensor_activity_observed": (
             baseline_ncu.get("tensor_activity_observed", "") if baseline_ncu else ""
         ),
+        "test_ncu_fail_reasons": test_ncu.get("fail_reasons", "") if test_ncu else "",
+        "baseline_ncu_fail_reasons": baseline_ncu.get("fail_reasons", "") if baseline_ncu else "",
+        "test_ncu_warnings": test_ncu.get("warnings", "") if test_ncu else "",
+        "baseline_ncu_warnings": baseline_ncu.get("warnings", "") if baseline_ncu else "",
         "test_registers_per_thread": test_resource.get("registers_per_thread", "") if test_resource else "",
         "baseline_registers_per_thread": baseline_resource.get("registers_per_thread", "") if baseline_resource else "",
         "test_thread_occupancy_pct_model": test_resource.get("thread_occupancy_pct_model", "") if test_resource else "",

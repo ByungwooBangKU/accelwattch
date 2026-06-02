@@ -135,14 +135,24 @@ def target_row(test_kernel: str, baseline_kernel: str, threads: int) -> Dict[str
 def ncu_row(kernel: str, threads: int, *, tensor_activity_observed: bool | None = None) -> Dict[str, Any]:
     if tensor_activity_observed is None:
         tensor_activity_observed = kernel == "tensor_mma_f16acc"
+    is_tensor_mma = kernel.startswith("tensor_mma_")
     return {
         "kernel": kernel,
         "threads": threads,
         "validation_pass": "true",
         "memory_counter_classes_complete": "true",
+        "memory_note": "counter_based",
         "validation_blocks_per_sm": 8,
         "validation_unroll": 16,
         "validation_suppress_output_store": "true",
+        "common_hmma_seen": "true" if is_tensor_mma else "false",
+        "hmma_metric_seen": "true" if is_tensor_mma else "false",
+        "hmma_token_seen": "false",
+        "tensor_inst_seen": "true" if is_tensor_mma else "false",
+        "wgmma_token_seen": "false",
+        "no_l2": "true",
+        "no_dram": "true",
+        "no_local_spill": "true",
         "l2_counter_total": 0,
         "dram_counter_total": 0,
         "local_counter_total": 0,
@@ -1060,6 +1070,22 @@ exit 1
         raise AssertionError(f"Strict audit did not carry passing NCU permission probe evidence: {good_row}")
     if good_row.get("pipeline_ncu_permission_probe_permission_denied") != "False":
         raise AssertionError(f"Strict audit did not carry NCU permission-denied evidence: {good_row}")
+    if good_row.get("test_ncu_common_hmma_seen") != "true":
+        raise AssertionError(f"Strict audit did not carry test common HMMA evidence: {good_row}")
+    if good_row.get("baseline_ncu_common_hmma_seen") != "false":
+        raise AssertionError(f"Strict audit did not carry baseline no-HMMA evidence: {good_row}")
+    if good_row.get("test_ncu_wgmma_token_seen") != "false":
+        raise AssertionError(f"Strict audit did not carry no-WGMMA evidence: {good_row}")
+    for key in (
+        "test_ncu_no_l2",
+        "baseline_ncu_no_l2",
+        "test_ncu_no_dram",
+        "baseline_ncu_no_dram",
+        "test_ncu_no_local_spill",
+        "baseline_ncu_no_local_spill",
+    ):
+        if good_row.get(key) != "true":
+            raise AssertionError(f"Strict audit did not carry no-memory evidence {key}: {good_row}")
 
     audit_bad = base / "audit_no_required"
     run(
@@ -1137,9 +1163,21 @@ exit 1
     )
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "architecture model metadata")
     assert_requirement_pass(report_dir / "fp16_strict_report_requirements.csv", "NCU Tensor activity observed")
+    assert_requirement_pass(
+        report_dir / "fp16_strict_report_requirements.csv",
+        "NCU common HMMA and no WGMMA evidence",
+    )
+    assert_requirement_pass(
+        report_dir / "fp16_strict_report_requirements.csv",
+        "NCU no L2/DRAM/local memory evidence",
+    )
     report_row = read_single_csv_row(report_dir / "fp16_strict_report_summary.csv")
     if report_row.get("target_selection_source") != "selected_targets_required_kernel_baseline":
         raise AssertionError(f"Report did not carry target selection source: {report_row}")
+    if report_row.get("ncu_common_hmma_seen") != "true":
+        raise AssertionError(f"Report did not carry common HMMA evidence: {report_row}")
+    if report_row.get("ncu_no_memory") != "True":
+        raise AssertionError(f"Report did not carry no-memory evidence: {report_row}")
 
     report_bad = base / "report_no_required"
     run(
