@@ -788,6 +788,41 @@ exit 1
     ):
         raise AssertionError(f"Quality gate source grouping collapsed distinct launch shapes: {source_keys}")
 
+    overmax_shape_rows = []
+    for threads, blocks_per_sm, model_util_pct, pjbit in (
+        (32, 8, 108.0, 0.12),
+        (64, 4, 104.0, 0.15),
+    ):
+        row = {
+            "fp16_path": "tensor_mma_f16acc_vs_tensor_baseline_mov",
+            "test_kernel": "tensor_mma_f16acc",
+            "baseline_kernel": "tensor_baseline_mov",
+            "threads": threads,
+            "blocks_per_sm_requested": blocks_per_sm,
+            "threads_per_sm": threads * blocks_per_sm,
+            "valid_basic": True,
+            "expected_l2_touch": False,
+            "tensor_model_utilization_pct": model_util_pct,
+            "matmul_input_pj_per_bit": pjbit,
+            "tflops": 100.0 + model_util_pct,
+        }
+        overmax_shape_rows.append(row)
+    overmax_shape_summary = analyze_results.aggregate_thread_sweep(overmax_shape_rows)
+    overmax_rows = {
+        (str(row.get("threads")), str(row.get("blocks_per_sm_requested"))): row
+        for row in overmax_shape_summary
+    }
+    rejected_overmax = overmax_rows.get(("32", "8"), {})
+    selected_sane = overmax_rows.get(("64", "4"), {})
+    if rejected_overmax.get("selected_optimal"):
+        raise AssertionError(f"Analyzer selected overmax Tensor model utilization: {overmax_shape_summary}")
+    if rejected_overmax.get("selection_status") != "not_selected_tensor_model_util_overmax":
+        raise AssertionError(f"Analyzer did not flag overmax utilization candidate: {overmax_shape_summary}")
+    if not selected_sane.get("selected_optimal"):
+        raise AssertionError(f"Analyzer did not select sane utilization candidate: {overmax_shape_summary}")
+    if selected_sane.get("selection_util_metric_source") != "tensor_model_utilization_pct_mean":
+        raise AssertionError(f"Analyzer used wrong utilization source: {overmax_shape_summary}")
+
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"
     compare_power_trace_input = base / "compare_power_trace_input"

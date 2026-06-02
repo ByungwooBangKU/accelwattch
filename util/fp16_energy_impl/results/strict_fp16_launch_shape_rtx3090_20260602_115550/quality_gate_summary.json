@@ -1,6 +1,6 @@
 {
   "input": "results/strict_fp16_launch_shape_rtx3090_20260602_115550",
-  "generated_utc": "2026-06-02T05:02:50.559913+00:00",
+  "generated_utc": "2026-06-02T05:13:24.543478+00:00",
   "thresholds": {
     "max_clock_span_mhz": 60.0,
     "min_power_samples": 3,

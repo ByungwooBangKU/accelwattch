@@ -55,6 +55,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | Pipeline | build/run/analyze가 분리 | `run_strict_fp16_pipeline.sh`가 preflight, NCU permission probe, calibration, sweep, analyze, resource audit, quality gate까지 orchestration |
 | Register evidence | 질문 시 별도 확인 필요 | `summarize_kernel_resources.py`와 resource audit로 ptxas register/spill evidence 기록 |
 | Diagnostic mode | strict 실패와 diagnostic 구분이 약함 | `--diagnostic-no-ncu`는 NCU를 명시적으로 skip하고 final claim에서 제외 |
+| Tensor model sanity | model utilization fallback 값이 100%를 넘는 diagnostic row도 analyzer selected로 보일 수 있었음 | `tensor_model_utilization_pct_mean > 105%` row는 analyzer `selected_optimal` 후보와 quality gate target 후보에서 제외 |
 
 ## 4. 결과 히스토리
 
@@ -63,7 +64,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | `results/fp16_matmul_pjbit_gpu0_default_clock_cuda132_20260528_1331` | 초기 single matmul, `tensor_mma_f16acc` vs `baseline_nop` | 5 repeats | `0.22637 +/- 0.15864` | TFLOPS 158.08, valid 5/5, legacy diagnostic |
 | `results/fp16_matmul_thread_sweep_rtx3090_20260528` | 초기 thread sweep | `threads=256` | `0.10961 +/- 0.01497` | valid no-L2 8/10, NCU 없음. 음수 pJ/bit 행은 invalid로 분리 필요 |
 | `results/fp16_matmul_thread_sweep_fine_m16n16_smutil_rtx3090_20260528` | 낮은 thread 후보 포함, dmon SM util | `threads=64`, `threads/SM=512` | `0.25140 +/- 0.01425` | 평균 SM util 100%, `measurement_grade=power_trace_fallback`, quality pass 아님 |
-| `results/fp16_launch_shape_warpsync_rtx3090_20260602_direct` | foreground direct diagnostic, 1 repeat | `threads=32`, `blocks/SM=8`, `threads/SM=256` | `0.28748` | power/sm util/NCU 없음, direct NVML delta만 사용 |
+| `results/fp16_launch_shape_warpsync_rtx3090_20260602_direct` | foreground direct diagnostic, 1 repeat | `threads=64`, `blocks/SM=2`, `threads/SM=128` | `0.35326` | power/sm util/NCU 없음, direct NVML delta만 사용. 105% 초과 Tensor model utilization 후보 9개 제외 후 analyzer diagnostic 선택점 |
 | `results/fp16_work_slope_bar_repeat30_rtx3090_20260601` | work amount slope diagnostic | `threads=64`, `blocks/SM=8` | `0.20249` slope | work sweep에서 positive incremental-energy slope 확인 |
 | `results/fp16_work_slope_bar_repeat30_rtx3090_20260601` | work amount slope diagnostic | `threads=128`, `blocks/SM=8` | `0.17906` slope | work sweep에서 positive incremental-energy slope 확인 |
 | `results/strict_fp16_launch_shape_rtx3090_20260602_115550` | calibrated launch-shape sweep | `threads=256`, `blocks/SM=1`, `threads/SM=256` | `0.30846 +/- 0.02532` | quality gate target은 있었지만 NCU hardware validation이 없어 strict final 아님 |
@@ -80,7 +81,9 @@ blocks/SM:     1, 2, 4, 8
 threads/SM:    32, 64, 128, 256, 512, 1024, 2048
 ```
 
-Tensor Core throughput은 RTX 3090에서 대략 `threads/SM=256` 근처부터 saturation에 도달한다. 따라서 target selection은 "가장 낮은 pJ/bit"가 아니라 "quality gate를 통과한 행 중 Tensor model utilization이 충분히 포화되는 첫 point"를 우선한다. 이 기준을 쓰는 이유는 너무 많은 resident threads/blocks가 fixed overhead를 희석해 pJ/bit를 낮게 보이게 할 수 있지만, 동시에 baseline subtraction과 L2/global-memory validation이 더 취약해질 수 있기 때문이다.
+Tensor Core throughput은 RTX 3090에서 대략 `threads/SM=256` 근처부터 saturation에 도달한다. Strict-like calibrated sweep과 latest no-NCU diagnostic에서는 `threads=256`, `blocks/SM=1`, `threads/SM=256`이 첫 saturation point였다. Direct foreground diagnostic은 clock/SM telemetry가 없어 TFLOPS/reference peak fallback만 사용했으며, 이 fallback이 105%를 넘는 후보는 model/clock/accounting mismatch 가능성이 있으므로 selection에서 제외했다. 그 결과 direct diagnostic analyzer 선택점은 `threads=64`, `blocks/SM=2`, `threads/SM=128`로 바뀌었다.
+
+따라서 target selection은 "가장 낮은 pJ/bit"가 아니라 "quality gate를 통과하고 Tensor model sanity를 만족한 행 중 Tensor model utilization이 충분히 포화되는 첫 point"를 우선한다. 이 기준을 쓰는 이유는 너무 많은 resident threads/blocks가 fixed overhead를 희석해 pJ/bit를 낮게 보이게 할 수 있지만, 동시에 baseline subtraction과 L2/global-memory validation이 더 취약해질 수 있기 때문이다.
 
 SM utilization figure의 x축은 `threads_per_sm`이고, y축은 SM utilization 또는 Tensor model utilization이다. pJ/bit는 별도 figure 또는 marker/annotation으로 같이 봐야 한다. 현재 주요 figure는 다음 위치에 있다.
 

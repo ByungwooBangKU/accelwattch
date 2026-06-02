@@ -17,6 +17,9 @@ from matplotlib.ticker import ScalarFormatter
 from architecture_models import tensor_peak_metrics
 
 
+DEFAULT_MAX_TENSOR_MODEL_UTIL_PCT = 105.0
+
+
 def read_runs(path: Path) -> List[Dict[str, Any]]:
     runs_file = path / "runs.jsonl"
     rows: List[Dict[str, Any]] = []
@@ -968,7 +971,11 @@ def grouped_metric_stats(rows: List[Dict[str, Any]], metric: str) -> List[Dict[s
     return out
 
 
-def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def aggregate_thread_sweep(
+    rows: List[Dict[str, Any]],
+    *,
+    max_tensor_model_util_pct: float = DEFAULT_MAX_TENSOR_MODEL_UTIL_PCT,
+) -> List[Dict[str, Any]]:
     launch_shapes = {
         (int(r["threads"]), str(r.get("blocks_per_sm_requested", "")))
         for r in rows
@@ -1144,6 +1151,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         row["selection_note"] = ""
         row["selection_util_metric_source"] = ""
         row["selection_util_score_pct"] = math.nan
+        row["selection_util_sanity_pass"] = True
+        row["selection_util_sanity_note"] = ""
         row["selection_util_reference_scope"] = ""
         row["selection_util_reference_max_pct"] = math.nan
         row["selection_util_saturation_margin_pct"] = math.nan
@@ -1190,13 +1199,33 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for row in group:
             metric = target_util_metric_source(row)
             score = target_util_score(row)
+            sane = True
+            sanity_note = ""
+            if (
+                metric == "tensor_model_utilization_pct_mean"
+                and math.isfinite(score)
+                and score > max_tensor_model_util_pct
+            ):
+                sane = False
+                sanity_note = (
+                    f"Tensor model utilization {score:.3g}% exceeds "
+                    f"{max_tensor_model_util_pct:.3g}% sanity limit"
+                )
             row["selection_util_metric_source"] = metric
             row["selection_util_score_pct"] = score if math.isfinite(score) else math.nan
+            row["selection_util_sanity_pass"] = sane
+            row["selection_util_sanity_note"] = sanity_note
 
-        eligible = [r for r in group if has_enough_valid(r, "valid_no_l2_count")]
+        valid_no_l2_candidates = [r for r in group if has_enough_valid(r, "valid_no_l2_count")]
+        eligible = [r for r in valid_no_l2_candidates if bool(r.get("selection_util_sanity_pass", True))]
         finite_util_scores = [target_util_score(row) for row in eligible if math.isfinite(target_util_score(row))]
         max_util = max(finite_util_scores) if finite_util_scores else -math.inf
-        reference_scope = "required_valid_no_l2" if eligible else "no_required_valid_no_l2_candidate"
+        if eligible:
+            reference_scope = "required_valid_no_l2_sane_util"
+        elif valid_no_l2_candidates:
+            reference_scope = "no_sane_required_valid_no_l2_candidate"
+        else:
+            reference_scope = "no_required_valid_no_l2_candidate"
         for row in group:
             score = target_util_score(row)
             row["selection_util_reference_scope"] = reference_scope
@@ -1233,17 +1262,30 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 for other in lower[:8]
             )
             row["selection_pjbit_rank_note"] = (
-                "rank among thread points meeting required_valid_no_l2_count; "
+                "rank among thread points meeting required_valid_no_l2_count and utilization sanity; "
                 "lower pJ/bit points can still be rejected by saturation or strict quality gates"
             )
 
-        if not eligible:
+        if not valid_no_l2_candidates:
             for row in group:
                 row["selection_status"] = "no_valid_no_l2_candidate"
                 row["selection_note"] = (
                     "selected_optimal is not set because no thread point met "
                     "required_valid_no_l2_count"
                 )
+            continue
+
+        if not eligible:
+            for row in group:
+                if row in valid_no_l2_candidates:
+                    row["selection_status"] = "not_selected_tensor_model_util_overmax"
+                    row["selection_note"] = (
+                        row.get("selection_util_sanity_note")
+                        or "valid no-L2 candidate rejected by utilization sanity limit"
+                    )
+                else:
+                    row["selection_status"] = "not_valid_no_l2_candidate"
+                    row["selection_note"] = "valid_no_l2_count did not meet required_valid_no_l2_count"
             continue
 
         saturated = [row for row in eligible if target_util_score(row) >= max_util - 0.1]
@@ -1267,7 +1309,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         best["selected_optimal"] = True
         best["selection_status"] = "selected_valid_no_l2_saturation_point"
         best["selection_note"] = (
-            "first Tensor Core model utilization saturation point among required valid no-L2 candidates"
+            "first Tensor Core model utilization saturation point among required valid no-L2 candidates "
+            "within utilization sanity limit"
             if str(best.get("test_kernel", "")).startswith("tensor_mma_")
             else "first utilization saturation point among required valid no-L2 candidates"
         )
@@ -1277,6 +1320,12 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if id(row) in eligible_ids:
                 row["selection_status"] = "valid_no_l2_not_selected"
                 row["selection_note"] = "valid no-L2 candidate but not first saturation point"
+            elif row in valid_no_l2_candidates:
+                row["selection_status"] = "not_selected_tensor_model_util_overmax"
+                row["selection_note"] = (
+                    row.get("selection_util_sanity_note")
+                    or "valid no-L2 candidate rejected by utilization sanity limit"
+                )
             else:
                 row["selection_status"] = "not_valid_no_l2_candidate"
                 row["selection_note"] = "valid_no_l2_count did not meet required_valid_no_l2_count"
@@ -1694,6 +1743,7 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
                 if math.isfinite(x)
                 and math.isfinite(y)
                 and parse_bool(row.get("valid_no_l2_requirement_met"))
+                and parse_bool(row.get("selection_util_sanity_pass", True))
             ]
             if lowest_valid_no_l2:
                 low_x, low_y, low_row = min(lowest_valid_no_l2, key=lambda item: item[1])
@@ -1706,11 +1756,11 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
                     edgecolor="black",
                     linewidth=0.6,
                     zorder=4,
-                    label="lowest valid no-L2 pJ/b",
+                    label="lowest sane valid no-L2 pJ/b",
                 )
                 if not selected or low_row is not selected[0]:
                     ax.annotate(
-                        f"lowest valid no-L2\n{shape_label(low_row)}\n{low_y:.3g} pJ/b",
+                        f"lowest sane valid no-L2\n{shape_label(low_row)}\n{low_y:.3g} pJ/b",
                         (low_x, low_y),
                         textcoords="offset points",
                         xytext=(8, -30 if low_y >= 0 else 12),
@@ -1848,13 +1898,25 @@ def plot_clock_temp(rows: List[Dict[str, Any]], figdir: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze FP16 energy experiment output")
     parser.add_argument("--input", type=Path, required=True, help="Run directory containing runs.jsonl")
+    parser.add_argument(
+        "--max-tensor-model-util-pct",
+        type=float,
+        default=DEFAULT_MAX_TENSOR_MODEL_UTIL_PCT,
+        help=(
+            "Reject Tensor model utilization candidates above this percent when selecting "
+            "thread-sweep targets; default matches quality_gate.py"
+        ),
+    )
     args = parser.parse_args()
 
     raw_runs = read_runs(args.input)
     enriched = [summarize_run(r) for r in raw_runs]
     summary = group_pairs(enriched)
     condition_summary = aggregate_conditions(summary)
-    thread_sweep_summary = aggregate_thread_sweep(summary)
+    thread_sweep_summary = aggregate_thread_sweep(
+        summary,
+        max_tensor_model_util_pct=args.max_tensor_model_util_pct,
+    )
     work_slope_summary = aggregate_work_slope(summary)
 
     write_csv(args.input / "run_level_summary.csv", enriched)
