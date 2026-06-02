@@ -41,6 +41,9 @@ Runs the strict FP16 Tensor Core pJ/bit pipeline:
   -> Nsight Compute no-L2 validation -> quality gate --require-ncu
   --require-ncu-tensor-activity
 
+With --diagnostic-no-ncu, the pipeline skips NCU preflight/probe/validation and
+runs quality_gate.py without NCU requirements. That mode is diagnostic only.
+
 Options:
   --gpu N              CUDA/NVML GPU index [0]
   --nvidia-smi-id ID   Physical nvidia-smi id/UUID for telemetry [auto]
@@ -62,7 +65,8 @@ Options:
   --target-baseline-s S Target baseline CUDA-event duration for calibrated matrix [1.0]
   --max-calibrated-repeats N
                         Upper bound for calibrated per-role repeats [1000]
-  --diagnostic-no-ncu  Do not require NCU in quality gate; for local diagnostic only
+  --diagnostic-no-ncu  Skip NCU probe/validation and do not require NCU in quality gate;
+                       for local diagnostic only
   -h, --help           Show this help
 
 Environment overrides:
@@ -397,17 +401,19 @@ fi
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/summarize_kernel_resources.py" "${RESOURCE_ARGS[@]}"
 
-NCU_BIN="${NCU_BIN}" NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV}" \
-  "${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \
-  "${BINARY}" \
-  "${NCDIR}" \
-  "${GPU_ID}" \
-  "${THREADS_CSV}"
-
-QUALITY_ARGS=(--input "${OUTDIR}" --ncu-summary "${NCDIR}/ncu_validation_summary.csv")
+QUALITY_ARGS=(--input "${OUTDIR}")
 if [[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]]; then
+  NCU_BIN="${NCU_BIN}" NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV}" \
+    "${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \
+    "${BINARY}" \
+    "${NCDIR}" \
+    "${GPU_ID}" \
+    "${THREADS_CSV}"
+  QUALITY_ARGS+=(--ncu-summary "${NCDIR}/ncu_validation_summary.csv")
   QUALITY_ARGS+=(--require-ncu)
   QUALITY_ARGS+=(--require-ncu-tensor-activity)
+else
+  echo "Diagnostic no-NCU mode: skipping Nsight Compute no-L2 validation." >&2
 fi
 
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
@@ -422,7 +428,7 @@ Strict FP16 pipeline complete:
   start manifest: ${START_MANIFEST}
   final manifest: ${FINAL_MANIFEST}
   resource audit: ${RESOURCE_DIR}/kernel_resource_summary.csv
-  NCU validation: ${NCDIR}/ncu_validation_summary.csv
+  NCU validation: $([[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]] && echo "${NCDIR}/ncu_validation_summary.csv" || echo "skipped (--diagnostic-no-ncu)")
   quality gate: ${OUTDIR}/quality_gates.csv
   selected target summary: ${OUTDIR}/quality_gate_summary.json
 EOF
