@@ -210,6 +210,7 @@ def load_result_dir(
                         "ncu_validation_pass",
                         "ncu_validation_context_match",
                         "ncu_required",
+                        "ncu_tensor_activity_required",
                         "test_ncu_note",
                         "baseline_ncu_note",
                         "test_ncu_validation_blocks_per_sm",
@@ -314,10 +315,11 @@ def is_fp16_candidate(row: Dict[str, Any]) -> bool:
 
 
 def ncu_tensor_activity_ok(row: Dict[str, Any]) -> bool:
-    value = str(row.get("test_ncu_tensor_activity_observed", "")).strip()
-    if not value:
+    if not str(row.get("test_kernel", "")).startswith("tensor_mma_"):
         return True
-    return parse_bool(value)
+    value = str(row.get("test_ncu_tensor_activity_observed", "")).strip()
+    pct = parse_float(row.get("test_ncu_tensor_activity_pct"))
+    return parse_bool(value) and math.isfinite(pct) and pct > 0.0
 
 
 def is_strict_publishable_target(row: Dict[str, Any]) -> bool:
@@ -398,7 +400,16 @@ def select_best_fp16(
                 row for row in target_rows if str(row.get("measurement_grade", "")) == "strict_nvml_counter"
             ]
             if strict_energy_targets:
-                note = "quality_gate_target_pass_without_required_ncu_evidence"
+                has_ncu_context = any(
+                    parse_bool(row.get("ncu_required"))
+                    and parse_bool(row.get("ncu_validation_pass"))
+                    and parse_bool(row.get("ncu_validation_context_match"))
+                    for row in strict_energy_targets
+                )
+                if has_ncu_context and any(not ncu_tensor_activity_ok(row) for row in strict_energy_targets):
+                    note = "quality_gate_target_pass_without_required_tensor_activity_evidence"
+                else:
+                    note = "quality_gate_target_pass_without_required_ncu_evidence"
             elif target_rows:
                 note = "quality_gate_target_pass_without_strict_nvml_counter"
             elif strict_quality:

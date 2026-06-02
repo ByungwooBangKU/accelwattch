@@ -230,6 +230,11 @@ def compare_thread_row(
             "pure_fp16_candidate_count": 3,
             "valid_no_l2_count": 3,
             "valid_count": 3,
+            "ncu_tensor_activity_required": "true",
+            "test_ncu_tensor_activity_observed": "true",
+            "test_ncu_tensor_activity_pct": 81.0,
+            "baseline_ncu_tensor_activity_observed": "false",
+            "baseline_ncu_tensor_activity_pct": 0.0,
             "selected_optimal": "true" if target else "false",
             "target_pass": "true" if target else "false",
             "quality_gate_selected_target": "true" if target else "false",
@@ -974,10 +979,17 @@ exit 1
     no_ncu_visual_row["ncu_validation_pass"] = "false"
     no_ncu_visual_row["ncu_validation_context_match"] = "false"
     no_ncu_visual_row["test_ncu_tensor_activity_observed"] = ""
+    no_tensor_activity_visual_row = dict(strict_visual_row)
+    no_tensor_activity_visual_row["test_ncu_tensor_activity_observed"] = "false"
+    no_tensor_activity_visual_row["test_ncu_tensor_activity_pct"] = 0.0
     if compare_architectures.quality_class(strict_visual_row) != "target":
         raise AssertionError(f"Strict publishable target was not marked as target: {strict_visual_row}")
     if compare_architectures.quality_class(no_ncu_visual_row) != "diagnostic_target":
         raise AssertionError(f"No-NCU target should be visualized as diagnostic: {no_ncu_visual_row}")
+    if compare_architectures.quality_class(no_tensor_activity_visual_row) != "diagnostic_target":
+        raise AssertionError(
+            f"No Tensor-activity target should be visualized as diagnostic: {no_tensor_activity_visual_row}"
+        )
 
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"
