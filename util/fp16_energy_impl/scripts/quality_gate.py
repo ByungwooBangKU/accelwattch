@@ -749,6 +749,29 @@ def util_metric_source(row: Dict[str, Any]) -> str:
     return ""
 
 
+def target_util_value(row: Dict[str, Any]) -> float:
+    if str(row.get("test_kernel", "")).startswith("tensor_mma_"):
+        model_util = parse_float(row.get("tensor_model_utilization_pct_mean"))
+        if math.isfinite(model_util):
+            return model_util
+    util = util_value(row)
+    if math.isfinite(util):
+        return util
+    return parse_float(row.get("tensor_model_utilization_pct_mean"))
+
+
+def target_util_metric_source(row: Dict[str, Any]) -> str:
+    if str(row.get("test_kernel", "")).startswith("tensor_mma_"):
+        if math.isfinite(parse_float(row.get("tensor_model_utilization_pct_mean"))):
+            return "tensor_model_utilization_pct_mean"
+    source = util_metric_source(row)
+    if source:
+        return source
+    if math.isfinite(parse_float(row.get("tensor_model_utilization_pct_mean"))):
+        return "tensor_model_utilization_pct_mean"
+    return ""
+
+
 def thread_gate_rows(
     thread_rows: List[Dict[str, Any]],
     summary_rows: Iterable[Dict[str, Any]],
@@ -783,7 +806,7 @@ def thread_gate_rows(
         clock_span = parse_float(row.get("clock_span_mhz_mean"))
         clock_stable = math.isfinite(clock_span) and clock_span <= args.max_clock_span_mhz
         util = util_value(row)
-        util_source = util_metric_source(row)
+        util_source = target_util_metric_source(row)
         sm_util_observed = math.isfinite(util)
         selected = parse_bool(row.get("selected_optimal"))
 
@@ -1040,7 +1063,7 @@ def thread_gate_rows(
             ]
 
         if not target_pool:
-            max_quality_util = max(util_value(row) for row in quality_rows)
+            max_quality_util = max(target_util_value(row) for row in quality_rows)
             for row in group:
                 row["util_reference_scope"] = "quality_pass_no_strict_nvml_counter"
                 row["util_reference_max_pct"] = max_quality_util
@@ -1054,11 +1077,11 @@ def thread_gate_rows(
                 )
             continue
 
-        max_quality_util = max(util_value(row) for row in target_pool)
+        max_quality_util = max(target_util_value(row) for row in target_pool)
         saturated = [
             row
             for row in target_pool
-            if util_value(row) >= max_quality_util - args.util_tolerance_pct
+            if target_util_value(row) >= max_quality_util - args.util_tolerance_pct
         ]
 
         def target_score(row: Dict[str, Any]) -> Tuple[float, float, float]:
@@ -1165,7 +1188,9 @@ def plot_thread_quality(rows: List[Dict[str, Any]], figdir: Path) -> None:
         ax.set_xticks(xs)
         ax.get_xaxis().set_major_formatter(ScalarFormatter())
         ax.grid(True, axis="y", alpha=0.3)
-        ax.set_title(f"Quality-gated thread sweep: {test_kernel} vs {baseline_kernel}", pad=12)
+        source_labels = sorted({str(r.get("util_metric_source", "")) for r in group if str(r.get("util_metric_source", ""))})
+        source_note = f"\ntarget metric: {', '.join(source_labels)}" if source_labels else ""
+        ax.set_title(f"Quality-gated thread sweep: {test_kernel} vs {baseline_kernel}{source_note}", pad=12)
         ax.legend(loc="best")
         fig.tight_layout()
         safe = f"quality_gate_thread_sweep_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")

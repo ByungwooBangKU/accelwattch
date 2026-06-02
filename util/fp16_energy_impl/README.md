@@ -311,9 +311,9 @@ Gate가 확인하는 핵심 조건은 다음과 같다.
 | NCU validation context | NCU 검증 run의 `blocks_per_sm`, `unroll`, `suppress_output_store`가 측정 row와 같은지 확인 |
 | NCU tensor activity | explicit metric 또는 `ComputeWorkloadAnalysis` section에서 Tensor activity percentage를 추출해 selected Tensor Core point의 profiler-side utilization evidence로 기록 |
 | ptxas resource audit | selected test/baseline kernel의 register/thread와 stack/spill bytes를 build log에서 추출 |
-| utilization target | strict quality gate를 통과한 후보군 안에서 SM utilization 최대값 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
+| utilization target | strict quality gate를 통과한 후보군 안에서 Tensor Core matmul은 `tensor_model_utilization_pct_mean`, 그 외 kernel은 SM/GPU utilization 최대값 0.1 percentage point 이내로 포화된 가장 작은 `threads_per_sm` |
 
-출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이며 `quality_gate_summary.json`의 `selected_targets`에 들어간다. Target 판정은 기본적으로 `quality_pass=true`이고 `measurement_grade=strict_nvml_counter`인 row만 utilization reference pool로 사용하므로, L2/global traffic, NCU, energy source, denominator, 측정 해상도 gate를 통과하지 못한 high-utilization row가 최종 target을 밀어내지 못한다. `quality_gates.csv`에는 `quality_gate_selected_target`, `util_reference_scope`, `util_reference_max_pct`, `util_metric_source`, `target_selection_note`를 기록한다. 기존 sweep logic이 고른 point라도 strict gate를 통과하지 못하면 `selected_diagnostics`로만 남긴다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다. power-trace 결과를 임시 target으로 보고 싶을 때만 `quality_gate.py --allow-power-trace-target`을 명시한다. `baseline_match_grade=generic_nop_baseline`인 결과는 utilization diagnostic으로만 보고, 최종 FP16 pJ/bit에는 쓰지 않는다.
+출력은 `quality_gates.csv`, `quality_gate_summary.json`, `figures/quality_gate_thread_sweep_*.png`이다. `target_pass=true`인 row가 최종 thread-count 추천점이며 `quality_gate_summary.json`의 `selected_targets`에 들어간다. Target 판정은 기본적으로 `quality_pass=true`이고 `measurement_grade=strict_nvml_counter`인 row만 utilization reference pool로 사용하므로, L2/global traffic, NCU, energy source, denominator, 측정 해상도 gate를 통과하지 못한 high-utilization row가 최종 target을 밀어내지 못한다. Tensor Core matmul kernel은 NVML SM utilization이 낮은 occupancy에서도 100%로 포화될 수 있으므로, target selection에는 `tensor_model_utilization_pct_mean`을 우선 사용한다. `quality_gates.csv`에는 `quality_gate_selected_target`, `util_reference_scope`, `util_reference_max_pct`, `util_metric_source`, `target_selection_note`를 기록한다. 기존 sweep logic이 고른 point라도 strict gate를 통과하지 못하면 `selected_diagnostics`로만 남긴다. `measurement_grade=power_trace_fallback`은 기존 RTX 3090 결과처럼 NVML energy counter가 없는 legacy run을 의미하므로, A100/H100 최종 비교에서는 같은 matrix를 다시 실행해 `strict_nvml_counter` 결과를 우선 사용한다. power-trace 결과를 임시 target으로 보고 싶을 때만 `quality_gate.py --allow-power-trace-target`을 명시한다. `baseline_match_grade=generic_nop_baseline`인 결과는 utilization diagnostic으로만 보고, 최종 FP16 pJ/bit에는 쓰지 않는다.
 
 최종 보고용 gate는 Nsight Compute 검증 결과까지 묶어서 실행한다.
 
@@ -431,7 +431,7 @@ python3 scripts/analyze_results.py --input results/fp16_matmul_thread_sweep_gpu0
 python3 scripts/quality_gate.py --input results/fp16_matmul_thread_sweep_gpu0
 ```
 
-이 sweep은 `threads = 32, 64, 128, 256, 512, 1024`를 훑는다. Matrix default의 `suppress_output_store=true`가 test와 `tensor_baseline_mov` timed kernel의 final global store를 끄므로, 의도된 timed-loop L2/global memory traffic 없이 Tensor Core utilization만 비교한다. `tensor_baseline_mov`는 no-memory warp-sync baseline이라 ptxas가 empty/register-only loop를 제거하는 문제를 피한다. 분석기는 `thread_sweep_summary.csv`를 만들고, 충분한 valid no-L2 후보 중 dmon `avg_sm_util_pct_mean`이 포화되는 가장 작은 `threads_per_sm` point를 `selected_optimal=True`로 표시한다. SM utilization이 없으면 `avg_gpu_util_pct_mean`, 그것도 없으면 diagnostic plot/selection에 한해 dense Tensor Core peak model 대비 `tensor_model_utilization_pct_mean`으로 fallback한다.
+이 sweep은 `threads = 32, 64, 128, 256, 512, 1024`를 훑는다. Matrix default의 `suppress_output_store=true`가 test와 `tensor_baseline_mov` timed kernel의 final global store를 끄므로, 의도된 timed-loop L2/global memory traffic 없이 Tensor Core utilization만 비교한다. `tensor_baseline_mov`는 no-memory warp-sync baseline이라 ptxas가 empty/register-only loop를 제거하는 문제를 피한다. 분석기는 `thread_sweep_summary.csv`를 만들고, 충분한 valid no-L2 후보 중 Tensor Core matmul은 `tensor_model_utilization_pct_mean`이 포화되는 가장 작은 `threads_per_sm` point를 `selected_optimal=True`로 표시한다. non-Tensor Core kernel은 dmon `avg_sm_util_pct_mean`, `avg_gpu_util_pct_mean` 순서로 selection metric을 사용하고, measured utilization이 없을 때만 diagnostic plot/selection에 한해 dense Tensor Core peak model 대비 `tensor_model_utilization_pct_mean`으로 fallback한다.
 
 Coarse sweep에서 유효 후보가 좁혀지면 fine sweep을 추가로 실행한다. Fine matrix는 `threads = 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384`를 훑는다. 160 이상 후보는 test `repeats=2`, baseline `repeats=20`을 사용한다. 32/64/96/128 후보는 duration과 sample 수를 맞추기 위해 각각 더 큰 repeats를 사용한다.
 
@@ -776,7 +776,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `avg_sm_util_pct_mean` | thread point별 평균 SM utilization |
 | `avg_gpu_util_pct_mean` | dmon SM utilization이 없을 때 fallback으로 쓰는 평균 GPU utilization |
 | `tflops_mean` | thread point별 평균 Tensor Core throughput |
-| `tensor_model_utilization_pct_mean` | thread point별 dense Tensor Core peak model 대비 평균 utilization. measured SM/GPU utilization이 모두 없을 때 diagnostic plot/selection fallback으로만 사용 |
+| `tensor_model_utilization_pct_mean` | thread point별 dense Tensor Core peak model 대비 평균 utilization. Tensor Core matmul target selection의 primary saturation metric이며, non-Tensor Core kernel에서는 measured SM/GPU utilization이 없을 때 diagnostic plot/selection fallback으로만 사용 |
 | `incremental_energy_fraction_mean` | thread point별 평균 incremental energy signal fraction |
 | `incremental_energy_j_mean` | thread point별 평균 incremental energy magnitude |
 | `test_energy_counter_vs_trace_ratio_mean` | thread point별 평균 test NVML-counter/power-trace ratio |
@@ -788,7 +788,7 @@ P0 결과 채택 기준은 최소한 다음을 확인해야 한다.
 | `matmul_denominator_metadata_complete_count` | 해당 thread point에서 benchmark JSON denominator metadata가 complete한 반복 수 |
 | `benchmark_schema_v2_count`, `benchmark_schema_v2_all` | 해당 thread point의 test/baseline이 현재 schema에서 나온 반복 수와 all-pass 여부 |
 | `benchmark_schema_features_required_all` | 해당 thread point의 모든 반복이 required `schema_features`를 포함하는지 여부 |
-| `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 SM utilization 첫 포화점으로 선택한 추천 point. 후보가 없으면 어떤 row에도 표시하지 않음 |
+| `selected_optimal` | 충분한 반복 수의 valid no-L2 후보 중 Tensor Core matmul은 Tensor Core model utilization 첫 포화점, 그 외 kernel은 SM/GPU utilization 첫 포화점으로 선택한 추천 point. 후보가 없으면 어떤 row에도 표시하지 않음 |
 | `selection_status`, `selection_note` | `selected_optimal`이 설정되었는지 또는 왜 설정되지 않았는지에 대한 analyzer-side selection evidence |
 
 `stats_scope=all_runs_no_valid` 또는 `all_runs_no_valid_basic`은 해당 thread point/condition에서 `valid_basic=True`인 반복이 없었다는 뜻이다. 이 경우 mean/std는 plot과 원인 분석을 위한 전체 run 통계일 뿐, 최종 pJ/bit 후보로 쓰면 안 된다. 원인은 `separation_quality_counts`, `invalid_or_nonpositive_increment_count`, `expected_l2_touch_count`로 분리해서 본다. `valid_no_l2` 역시 “코드가 의도적으로 L2/global memory를 touch하지 않는다”는 조건이지, hardware counter 기반 증명은 아니므로 최종 보고 전에는 Nsight Compute로 `MemoryWorkloadAnalysis`를 확인한다.

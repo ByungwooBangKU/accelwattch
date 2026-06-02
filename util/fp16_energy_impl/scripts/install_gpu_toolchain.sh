@@ -324,18 +324,38 @@ CMAKE_BIN="${ENV_PREFIX}/bin/cmake"
 NVCC_BIN="${ENV_PREFIX}/bin/nvcc"
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 NCU_BIN="${ENV_PREFIX}/bin/ncu"
-if [[ ! -x "${NCU_BIN}" ]]; then
+if [[ ! -x "${NCU_BIN}" ]] || ! "${NCU_BIN}" --version >/dev/null 2>&1; then
   NCU_BIN="$(find "${ENV_PREFIX}" -path '*nsight-compute-*' -type f -name ncu -perm -111 2>/dev/null | sort | head -n 1 || true)"
+fi
+if [[ ! -x "${NCU_BIN}" ]] || ! "${NCU_BIN}" --version >/dev/null 2>&1; then
+  NCU_BIN="$(find "${ENV_PREFIX}/nsight-compute" -type f -name ncu -perm -111 2>/dev/null | sort | head -n 1 || true)"
 fi
 [[ -x "${CMAKE_BIN}" ]] || die "cmake not found at ${CMAKE_BIN}"
 [[ -x "${NVCC_BIN}" ]] || die "nvcc not found at ${NVCC_BIN}"
 [[ -x "${PYTHON_BIN}" ]] || die "python not found at ${PYTHON_BIN}"
 [[ -x "${NCU_BIN}" ]] || die "ncu not found under ${ENV_PREFIX}"
 
-CUDA_INCLUDE_DIR="${ENV_PREFIX}/targets/x86_64-linux/include"
-CUDA_LIB_DIR="${ENV_PREFIX}/targets/x86_64-linux/lib"
-[[ -d "${CUDA_INCLUDE_DIR}" ]] || die "CUDA include dir not found: ${CUDA_INCLUDE_DIR}"
-[[ -d "${CUDA_LIB_DIR}" ]] || die "CUDA lib dir not found: ${CUDA_LIB_DIR}"
+CUDA_INCLUDE_DIR=""
+for candidate in \
+  "${ENV_PREFIX}/targets/x86_64-linux/include" \
+  "${ENV_PREFIX}/include"; do
+  if [[ -f "${candidate}/cuda_runtime.h" ]]; then
+    CUDA_INCLUDE_DIR="${candidate}"
+    break
+  fi
+done
+[[ -n "${CUDA_INCLUDE_DIR}" ]] || die "CUDA include dir with cuda_runtime.h not found under ${ENV_PREFIX}"
+
+CUDA_LIB_DIR=""
+for candidate in \
+  "${ENV_PREFIX}/targets/x86_64-linux/lib" \
+  "${ENV_PREFIX}/lib"; do
+  if [[ -d "${candidate}" ]]; then
+    CUDA_LIB_DIR="${candidate}"
+    break
+  fi
+done
+[[ -n "${CUDA_LIB_DIR}" ]] || die "CUDA lib dir not found under ${ENV_PREFIX}"
 
 mkdir -p "$(dirname "${ENV_FILE}")" "$(dirname "${RUN_FILE}")"
 cat > "${ENV_FILE}" <<EOF

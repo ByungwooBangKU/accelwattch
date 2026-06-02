@@ -1159,7 +1159,11 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 )
             continue
 
-        def util_score(row: Dict[str, Any]) -> float:
+        def target_util_score(row: Dict[str, Any]) -> float:
+            if str(row.get("test_kernel", "")).startswith("tensor_mma_"):
+                model_util = finite_float(row.get("tensor_model_utilization_pct_mean"), -math.inf)
+                if math.isfinite(model_util):
+                    return model_util
             util = finite_float(row.get("avg_sm_util_pct_mean"), -math.inf)
             if not math.isfinite(util):
                 util = finite_float(row.get("avg_gpu_util_pct_mean"), -math.inf)
@@ -1167,8 +1171,8 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 util = finite_float(row.get("tensor_model_utilization_pct_mean"), -math.inf)
             return util if math.isfinite(util) else -math.inf
 
-        max_util = max(util_score(row) for row in eligible)
-        saturated = [row for row in eligible if util_score(row) >= max_util - 0.1]
+        max_util = max(target_util_score(row) for row in eligible)
+        saturated = [row for row in eligible if target_util_score(row) >= max_util - 0.1]
         target_pool = saturated if saturated else eligible
 
         def target_score(row: Dict[str, Any]) -> Tuple[float, float, float]:
@@ -1188,7 +1192,11 @@ def aggregate_thread_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         best = min(target_pool, key=target_score)
         best["selected_optimal"] = True
         best["selection_status"] = "selected_valid_no_l2_saturation_point"
-        best["selection_note"] = "first utilization saturation point among required valid no-L2 candidates"
+        best["selection_note"] = (
+            "first Tensor Core model utilization saturation point among required valid no-L2 candidates"
+            if str(best.get("test_kernel", "")).startswith("tensor_mma_")
+            else "first utilization saturation point among required valid no-L2 candidates"
+        )
         for row in group:
             if row is best:
                 continue
@@ -1553,11 +1561,14 @@ def plot_thread_sweep(thread_rows: List[Dict[str, Any]], figdir: Path) -> None:
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines + lines2, labels + labels2, loc="best")
         title_note = ""
+        uses_tensor_target = test_kernel.startswith("tensor_mma_") and has_model_util
         if not has_sm_util and not has_gpu_util and has_model_util:
             title_note = " (no dmon telemetry; TFLOPS/peak fallback)"
         plot_title = "Launch-shape sweep: utilization vs threads/SM"
         if title_note:
             plot_title += "\nlabels show t/b and pJ/b; no dmon telemetry -> TFLOPS/peak fallback"
+        elif uses_tensor_target:
+            plot_title += "\nlabels show t/b and pJ/b; target uses Tensor model utilization"
         else:
             plot_title += "\nlabels show t/b and pJ/b"
         ax1.set_title(plot_title, fontsize=11)
