@@ -37,8 +37,9 @@ Usage: run_strict_fp16_pipeline.sh [options]
 
 Runs the strict FP16 Tensor Core pJ/bit pipeline:
   build -> env capture -> runtime preflight -> matrix repeat calibration
-  -> structural-baseline thread sweep -> analyze -> Nsight Compute no-L2 validation
-  -> quality gate --require-ncu --require-ncu-tensor-activity
+  -> NCU permission probe -> structural-baseline thread sweep -> analyze
+  -> Nsight Compute no-L2 validation -> quality gate --require-ncu
+  --require-ncu-tensor-activity
 
 Options:
   --gpu N              CUDA/NVML GPU index [0]
@@ -115,6 +116,7 @@ fi
 BUILD_PATH="${ROOT}/${BUILD_DIR}"
 BINARY="${BUILD_PATH}/fp16_energy_bench"
 NCDIR="${OUTDIR}/ncu_no_l2_thread_sweep"
+NCU_PROBE_DIR="${OUTDIR}/ncu_permission_probe"
 ENV_OUT="${OUTDIR}/env_gpu${GPU_ID}.txt"
 BUILD_LOG="${OUTDIR}/build_ptxas.log"
 RESOURCE_DIR="${OUTDIR}/resource_audit"
@@ -349,6 +351,14 @@ ARCH_PREFLIGHT_JSON="${OUTDIR}/architecture_preflight.json"
   --strict-chip \
   --require-common-hmma \
   --out "${ARCH_PREFLIGHT_JSON}"
+
+if [[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]]; then
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/probe_ncu_permissions.py" \
+    --binary "${BINARY}" \
+    --outdir "${NCU_PROBE_DIR}" \
+    --gpu "${GPU_ID}" \
+    --ncu-bin "${NCU_BIN}"
+fi
 
 if [[ "${CALIBRATE_MATRIX}" -eq 1 ]]; then
   MATRIX_PATH="${OUTDIR}/calibrated_matrix.json"

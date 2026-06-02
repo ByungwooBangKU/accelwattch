@@ -522,6 +522,86 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     if "nvidia-smi GPU metadata query returned incomplete output" not in bad_preflight_row.get("fail_reasons", ""):
         raise AssertionError(f"Preflight CSV missed malformed GPU metadata failure: {bad_preflight_row}")
 
+    fake_ncu_denied = base / "fake_ncu_denied"
+    write_executable(
+        fake_ncu_denied,
+        """#!/usr/bin/env bash
+log_file=""
+prev=""
+for arg in "$@"; do
+  if [[ "${prev}" == "--log-file" ]]; then
+    log_file="${arg}"
+  fi
+  prev="${arg}"
+done
+if [[ -n "${log_file}" ]]; then
+  mkdir -p "$(dirname "${log_file}")"
+  cat > "${log_file}" <<'EOF'
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters
+==WARNING== No kernels were profiled.
+EOF
+fi
+exit 1
+""",
+    )
+    denied_probe_dir = base / "ncu_probe_denied"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "probe_ncu_permissions.py"),
+            "--binary",
+            "/bin/true",
+            "--outdir",
+            str(denied_probe_dir),
+            "--ncu-bin",
+            str(fake_ncu_denied),
+        ],
+        cwd=ROOT,
+        env=env,
+        expect_success=False,
+    )
+    denied_probe = json.loads((denied_probe_dir / "ncu_permission_probe.json").read_text())
+    if denied_probe.get("status") != "permission_denied" or not denied_probe.get("permission_denied"):
+        raise AssertionError(f"NCU permission probe missed ERR_NVGPUCTRPERM: {denied_probe}")
+
+    fake_ncu_ok = base / "fake_ncu_ok"
+    write_executable(
+        fake_ncu_ok,
+        """#!/usr/bin/env bash
+log_file=""
+prev=""
+for arg in "$@"; do
+  if [[ "${prev}" == "--log-file" ]]; then
+    log_file="${arg}"
+  fi
+  prev="${arg}"
+done
+if [[ -n "${log_file}" ]]; then
+  mkdir -p "$(dirname "${log_file}")"
+  echo "==PROF== Disconnected from process 1" > "${log_file}"
+fi
+exit 0
+""",
+    )
+    ok_probe_dir = base / "ncu_probe_ok"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "probe_ncu_permissions.py"),
+            "--binary",
+            "/bin/true",
+            "--outdir",
+            str(ok_probe_dir),
+            "--ncu-bin",
+            str(fake_ncu_ok),
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    ok_probe = json.loads((ok_probe_dir / "ncu_permission_probe.json").read_text())
+    if ok_probe.get("status") != "pass" or not ok_probe.get("permission_probe_pass"):
+        raise AssertionError(f"NCU permission probe did not accept successful profiling command: {ok_probe}")
+
     fake_nvcc = base / "fake_nvcc_13_2"
     fake_nvidia_smi = base / "fake_nvidia_smi_cuda_13_1"
     write_executable(

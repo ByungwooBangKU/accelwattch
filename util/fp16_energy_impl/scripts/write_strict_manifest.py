@@ -157,6 +157,15 @@ def main() -> int:
             "matrix": path_info(args.matrix.resolve()),
             "quality_gates": path_info((outdir / "quality_gates.csv").resolve()),
             "quality_gate_summary": path_info((outdir / "quality_gate_summary.json").resolve()),
+            "ncu_permission_probe_json": path_info(
+                (outdir / "ncu_permission_probe" / "ncu_permission_probe.json").resolve()
+            ),
+            "ncu_permission_probe_csv": path_info(
+                (outdir / "ncu_permission_probe" / "ncu_permission_probe.csv").resolve()
+            ),
+            "ncu_permission_probe_log": path_info(
+                (outdir / "ncu_permission_probe" / "ncu_permission_probe.ncu.txt").resolve()
+            ),
             "ncu_validation_summary": path_info((args.ncu_dir / "ncu_validation_summary.csv").resolve()),
             "resource_audit": path_info((args.resource_dir / "thread_resource_occupancy.csv").resolve()),
         },

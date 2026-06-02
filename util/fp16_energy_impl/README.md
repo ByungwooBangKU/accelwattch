@@ -28,6 +28,7 @@
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
 | `scripts/run_strict_architecture_suite.sh` | 여러 GPU spec의 strict pipeline을 순차 실행하고 audit/compare/report까지 자동 생성 |
 | `scripts/preflight_strict_architecture_suite.py` | suite 실행 전 tool, GPU target, active compute process 상태를 JSON/CSV로 검사 |
+| `scripts/probe_ncu_permissions.py` | 긴 sweep 전에 Nsight Compute performance-counter 권한을 짧은 HMMA profile로 확인 |
 | `scripts/write_strict_suite_summary.py` | suite-level publishability, energy policy, preflight/run/postprocess provenance를 JSON으로 고정 |
 | `scripts/compare_architectures.py` | A100/H100/RTX3090 등 여러 결과 디렉터리의 FP16 energy/throughput/thread-sweep 비교 시각화 |
 | `scripts/calibrate_matrix.py` | GPU별 timed duration을 맞추기 위해 matrix의 per-role `repeats`를 probe 또는 기존 `summary.csv` 기준으로 보정 |
@@ -134,7 +135,7 @@ source env/toolchain_rtx3090_sm86_cuda121.sh
 ./scripts/install_gpu_toolchain.sh --gpu-kind h100 --build-smoke
 ```
 
-공유 서버나 Docker/Slurm 환경에서 GPU auto-detect가 안 되면 `--gpu-kind` 또는 `--cuda-arch`를 명시한다. `CUDA_VISIBLE_DEVICES` 때문에 CUDA ordinal과 physical GPU id가 다르면 strict pipeline 실행 시 `--nvidia-smi-id GPU-...`를 함께 넘긴다. Nsight Compute가 `ERR_NVGPUCTRPERM`으로 실패하면 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 이 경우 cluster/admin policy로 profiling counter 접근을 허용하거나 권한 있는 job에서 NCU validation을 실행해야 한다.
+공유 서버나 Docker/Slurm 환경에서 GPU auto-detect가 안 되면 `--gpu-kind` 또는 `--cuda-arch`를 명시한다. `CUDA_VISIBLE_DEVICES` 때문에 CUDA ordinal과 physical GPU id가 다르면 strict pipeline 실행 시 `--nvidia-smi-id GPU-...`를 함께 넘긴다. Nsight Compute가 `ERR_NVGPUCTRPERM`으로 실패하면 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 이 경우 cluster/admin policy로 profiling counter 접근을 허용하거나 권한 있는 job에서 NCU validation을 실행해야 한다. Strict pipeline은 긴 sweep 전에 `ncu_permission_probe/` 아래 짧은 probe log/JSON/CSV를 남기고, counter 권한이 없으면 즉시 중단한다. 권한 없는 local 확인만 할 때는 `--diagnostic-no-ncu`를 명시해야 하며, 이 결과는 최종 pJ/bit claim에 사용하지 않는다.
 
 ## 4. A100/H100 실행 범위와 자동화 범위
 
@@ -224,7 +225,7 @@ GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   --outdir results/strict_fp16_h100
 ```
 
-이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, build 전에 `strict_pipeline_preflight.json/csv`로 toolchain/GPU/process 상태를 검사한 뒤, 환경 수집 후 짧은 CUDA runtime preflight를 실행한다. 또한 시작 시 `strict_pipeline_manifest_start.json`, 완료 시 `strict_pipeline_manifest.json`을 남겨 실행 인자, git head, tool version, binary hash, NCU `blocks/SM` validation list, preflight/quality/NCU/resource 산출물 존재 여부를 고정한다. 이 단계가 실패하면 driver/runtime mismatch 또는 오래된 binary 문제이므로 긴 sweep을 시작하지 않는다. Runtime preflight JSON은 이어서 `verify_architecture.py --strict-chip --require-common-hmma`로 검증한다. 즉 `--cuda-arch 80`은 A100/GA100, `86`은 RTX 3090/GA102, `90`은 H100/GH100 metadata와 맞아야 하며, 공통 HMMA path가 아니라 WGMMA를 쓴 경우 strict pipeline은 중단된다. 이후 `calibrate_matrix.py`로 기본 `fp16_matmul_thread_sweep_fine.json`의 test/baseline timed duration이 기본 1초 이상이 되도록 per-role `repeats`를 GPU별로 보정하고, 보정된 `calibrated_matrix.json`으로 structural baseline sweep을 실행한다. 이 calibration은 기존 matrix의 repeats를 기본적으로 줄이지 않고, 필요한 경우만 늘린다. `--matrix`로 다른 matrix를 지정할 수 있고, `--no-calibrate-matrix`를 주면 원본 matrix를 그대로 사용한다. Sweep 뒤에는 `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`까지 실행한다. NCU가 performance counter 권한 문제 등으로 실패하면 `ncu_no_l2_thread_sweep/ncu_run_failures.csv`에 실패 kernel, exit code, log path, 재현 command가 남는다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
+이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, build 전에 `strict_pipeline_preflight.json/csv`로 toolchain/GPU/process 상태를 검사한 뒤, 환경 수집 후 짧은 CUDA runtime preflight를 실행한다. 또한 시작 시 `strict_pipeline_manifest_start.json`, 완료 시 `strict_pipeline_manifest.json`을 남겨 실행 인자, git head, tool version, binary hash, NCU `blocks/SM` validation list, preflight/quality/NCU/resource 산출물 존재 여부를 고정한다. 이 단계가 실패하면 driver/runtime mismatch 또는 오래된 binary 문제이므로 긴 sweep을 시작하지 않는다. Runtime preflight JSON은 이어서 `verify_architecture.py --strict-chip --require-common-hmma`로 검증한다. 즉 `--cuda-arch 80`은 A100/GA100, `86`은 RTX 3090/GA102, `90`은 H100/GH100 metadata와 맞아야 하며, 공통 HMMA path가 아니라 WGMMA를 쓴 경우 strict pipeline은 중단된다. Strict mode에서는 그 다음 `probe_ncu_permissions.py`로 짧은 Tensor Core HMMA profile을 실행해 NCU performance counter 권한을 확인한다. 이 probe가 `ERR_NVGPUCTRPERM`을 기록하면 `ncu_permission_probe/ncu_permission_probe.json`에 원인이 남고, calibration/sweep을 시작하기 전에 중단한다. 이후 `calibrate_matrix.py`로 기본 `fp16_matmul_thread_sweep_fine.json`의 test/baseline timed duration이 기본 1초 이상이 되도록 per-role `repeats`를 GPU별로 보정하고, 보정된 `calibrated_matrix.json`으로 structural baseline sweep을 실행한다. 이 calibration은 기존 matrix의 repeats를 기본적으로 줄이지 않고, 필요한 경우만 늘린다. `--matrix`로 다른 matrix를 지정할 수 있고, `--no-calibrate-matrix`를 주면 원본 matrix를 그대로 사용한다. Sweep 뒤에는 `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity`까지 실행한다. NCU가 performance counter 권한 문제 등으로 실패하면 `ncu_no_l2_thread_sweep/ncu_run_failures.csv`에 실패 kernel, exit code, log path, 재현 command가 남는다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
 
 Calibration만 별도로 실행할 수도 있다. 새 장비에서는 binary probe를 사용하고, 이미 짧은 diagnostic run을 분석한 뒤에는 `summary.csv`를 이용해 반복 수를 재계산할 수 있다.
 
@@ -591,6 +592,8 @@ python3 scripts/analyze_results.py --input results/p1_gpu0
 | `results/p0_gpu0/raw/*/bench.json` | timed loop의 CUDA event timing과 optional NVML total-energy counter delta |
 | `results/p0_gpu0/strict_pipeline_manifest_start.json` | strict pipeline 시작 시점의 invocation, git/tool/env, binary/build/matrix provenance snapshot |
 | `results/p0_gpu0/strict_pipeline_manifest.json` | strict pipeline 완료 또는 실패 시점의 provenance snapshot. `status=completed/failed`, binary hash와 quality/NCU/resource 산출물 존재 여부를 포함 |
+| `results/p0_gpu0/ncu_permission_probe/ncu_permission_probe.json` | 긴 sweep 전에 수행한 Nsight Compute performance-counter 권한 probe 결과 |
+| `results/p0_gpu0/ncu_permission_probe/ncu_permission_probe.ncu.txt` | 권한 probe의 raw Nsight Compute log. `ERR_NVGPUCTRPERM`이면 strict run은 최종 결과가 될 수 없음 |
 | `results/p0_gpu0/strict_pipeline_preflight.json` | 단일 strict pipeline의 build 전 toolchain/GPU/process preflight 결과 |
 | `results/p0_gpu0/strict_pipeline_preflight.csv` | 단일 strict pipeline preflight의 CSV 요약 |
 | `results/strict_fp16_suite/strict_architecture_suite_preflight.json` | suite 실행 전 tool/GPU/process preflight 결과 |
