@@ -195,6 +195,14 @@ def resource_row(role: str, kernel: str, threads: int) -> Dict[str, Any]:
     }
 
 
+def resource_context_decoy(row: Dict[str, Any]) -> Dict[str, Any]:
+    decoy = dict(row)
+    decoy["blocks_per_sm_requested"] = 4
+    decoy["unroll"] = 8
+    decoy["registers_per_thread"] = 99
+    return decoy
+
+
 def compare_thread_row(
     threads: int,
     threads_per_sm: int,
@@ -580,14 +588,26 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     good = base / "good"
     no_required = base / "no_required"
     no_tensor_activity = base / "no_tensor_activity"
+    bad_resource_context = base / "bad_resource_context"
     model_dir = base / "models"
     preflight = base / "strict_architecture_suite_preflight.json"
     write_result_dir(good, include_required_target=True)
     write_result_dir(no_required, include_required_target=False)
     write_result_dir(no_tensor_activity, include_required_target=True, required_tensor_activity=False)
+    write_result_dir(bad_resource_context, include_required_target=True)
     good_ncu_rows = read_csv_rows(good / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv")
     good_ncu_rows = [ncu_context_decoy(row) for row in good_ncu_rows if str(row.get("threads", "")) == "128"] + good_ncu_rows
     write_csv(good / "ncu_no_l2_thread_sweep" / "ncu_validation_summary.csv", good_ncu_rows)
+    good_resource_rows = read_csv_rows(good / "resource_audit" / "thread_resource_occupancy.csv")
+    good_resource_rows = [
+        resource_context_decoy(row) for row in good_resource_rows if str(row.get("threads", "")) == "128"
+    ] + good_resource_rows
+    write_csv(good / "resource_audit" / "thread_resource_occupancy.csv", good_resource_rows)
+    bad_resource_rows = read_csv_rows(bad_resource_context / "resource_audit" / "thread_resource_occupancy.csv")
+    for row in bad_resource_rows:
+        if str(row.get("threads", "")) == "128":
+            row["unroll"] = "8"
+    write_csv(bad_resource_context / "resource_audit" / "thread_resource_occupancy.csv", bad_resource_rows)
 
     quality_gate_ok = base / "quality_gate_tensor_activity_ok"
     quality_gate_bad = base / "quality_gate_tensor_activity_bad"
@@ -1294,6 +1314,15 @@ exit 1
     ):
         if good_row.get(key) != "true":
             raise AssertionError(f"Strict audit did not carry no-memory evidence {key}: {good_row}")
+    if (
+        good_row.get("test_resource_threads") != "128"
+        or good_row.get("baseline_resource_threads") != "128"
+        or good_row.get("test_resource_blocks_per_sm_requested") != "8"
+        or good_row.get("baseline_resource_blocks_per_sm_requested") != "8"
+        or good_row.get("test_resource_unroll") != "16"
+        or good_row.get("baseline_resource_unroll") != "16"
+    ):
+        raise AssertionError(f"Strict audit selected a decoy resource context: {good_row}")
 
     audit_bad = base / "audit_no_required"
     run(
@@ -1341,6 +1370,28 @@ exit 1
     expected_tensor_reason = "selected test NCU tensor activity is missing or below threshold"
     if expected_tensor_reason not in no_tensor_row.get("fail_reasons", ""):
         raise AssertionError(f"Missing Tensor activity audit missed expected failure: {no_tensor_row}")
+
+    audit_bad_resource = base / "audit_bad_resource_context"
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "audit_strict_results.py"),
+            "--input",
+            str(bad_resource_context),
+            "--outdir",
+            str(audit_bad_resource),
+            "--require-architectures",
+            "gh100",
+            "--no-fail",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    bad_resource_row = read_single_csv_row(audit_bad_resource / "strict_result_audit.csv")
+    if bad_resource_row.get("audit_pass") != "False":
+        raise AssertionError(f"Wrong resource context strict audit unexpectedly passed: {bad_resource_row}")
+    if "resource unroll 8 != measurement 16" not in bad_resource_row.get("fail_reasons", ""):
+        raise AssertionError(f"Wrong resource context audit missed expected failure: {bad_resource_row}")
 
     report_dir = base / "report_good"
     run(

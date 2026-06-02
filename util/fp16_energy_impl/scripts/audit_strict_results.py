@@ -224,6 +224,43 @@ def check_ncu_context(
     return failures
 
 
+def check_resource_context(
+    row: Dict[str, Any],
+    *,
+    role: str,
+    target_threads: str,
+    target_blocks_per_sm: str,
+    target_unroll: str,
+) -> List[str]:
+    failures: List[str] = []
+    observed_threads = normalize_thread(row.get("threads", ""))
+    if not observed_threads:
+        failures.append(f"selected {role} resource threads context is missing")
+    elif observed_threads != normalize_thread(target_threads):
+        failures.append(
+            f"selected {role} resource threads {observed_threads} != measurement {normalize_thread(target_threads)}"
+        )
+
+    observed_blocks = normalize_thread(row.get("blocks_per_sm_requested", ""))
+    if not observed_blocks:
+        failures.append(f"selected {role} resource blocks_per_sm context is missing")
+    elif observed_blocks != normalize_thread(target_blocks_per_sm):
+        failures.append(
+            "selected "
+            f"{role} resource blocks_per_sm {observed_blocks} != measurement "
+            f"{normalize_thread(target_blocks_per_sm)}"
+        )
+
+    observed_unroll = normalize_thread(row.get("unroll", ""))
+    if not observed_unroll:
+        failures.append(f"selected {role} resource unroll context is missing")
+    elif target_unroll and observed_unroll != normalize_thread(target_unroll):
+        failures.append(
+            f"selected {role} resource unroll {observed_unroll} != measurement {normalize_thread(target_unroll)}"
+        )
+    return failures
+
+
 def select_target(
     targets: Any,
     quality_rows: List[Dict[str, Any]],
@@ -681,6 +718,26 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("missing resource audit row for selected test kernel/thread/blocks_per_sm")
     if resource_rows and not baseline_resource:
         failed.append("missing resource audit row for selected baseline kernel/thread/blocks_per_sm")
+    if test_resource:
+        failed.extend(
+            check_resource_context(
+                test_resource,
+                role="test",
+                target_threads=threads,
+                target_blocks_per_sm=blocks_per_sm,
+                target_unroll=unroll,
+            )
+        )
+    if baseline_resource:
+        failed.extend(
+            check_resource_context(
+                baseline_resource,
+                role="baseline",
+                target_threads=threads,
+                target_blocks_per_sm=blocks_per_sm,
+                target_unroll=unroll,
+            )
+        )
     if test_resource and parse_bool(test_resource.get("has_spills")):
         failed.append("selected test kernel has ptxas stack/spill usage")
     if baseline_resource and parse_bool(baseline_resource.get("has_spills")):
@@ -883,6 +940,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "baseline_ncu_warnings": baseline_ncu.get("warnings", "") if baseline_ncu else "",
         "test_registers_per_thread": test_resource.get("registers_per_thread", "") if test_resource else "",
         "baseline_registers_per_thread": baseline_resource.get("registers_per_thread", "") if baseline_resource else "",
+        "test_resource_threads": test_resource.get("threads", "") if test_resource else "",
+        "baseline_resource_threads": baseline_resource.get("threads", "") if baseline_resource else "",
+        "test_resource_blocks_per_sm_requested": (
+            test_resource.get("blocks_per_sm_requested", "") if test_resource else ""
+        ),
+        "baseline_resource_blocks_per_sm_requested": (
+            baseline_resource.get("blocks_per_sm_requested", "") if baseline_resource else ""
+        ),
+        "test_resource_unroll": test_resource.get("unroll", "") if test_resource else "",
+        "baseline_resource_unroll": baseline_resource.get("unroll", "") if baseline_resource else "",
         "test_thread_occupancy_pct_model": test_resource.get("thread_occupancy_pct_model", "") if test_resource else "",
         "baseline_thread_occupancy_pct_model": baseline_resource.get("thread_occupancy_pct_model", "") if baseline_resource else "",
         "test_resource_has_spills": test_resource.get("has_spills", "") if test_resource else "",

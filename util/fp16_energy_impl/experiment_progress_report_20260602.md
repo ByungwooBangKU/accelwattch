@@ -57,7 +57,7 @@ FLOPs          = 2 * 16 * 16 * 16 = 8192 FLOP/logical MMA
 | H100 경로 | 명시 부족 | 현재는 공통 warp-level HMMA path 비교이며 H100 WGMMA/TMA 측정은 아님을 명시 |
 | 설치/실행 | 수동 toolchain 의존 | `scripts/install_gpu_toolchain.sh`와 GPU별 env/run script 생성 |
 | Pipeline | build/run/analyze가 분리 | `run_strict_fp16_pipeline.sh`가 preflight, NCU permission probe, calibration, sweep, analyze, resource audit, quality gate까지 orchestration |
-| Register evidence | 질문 시 별도 확인 필요 | `summarize_kernel_resources.py`와 resource audit로 ptxas register/spill evidence 기록 |
+| Register evidence | 질문 시 별도 확인 필요 | `summarize_kernel_resources.py`와 resource audit로 ptxas register/spill evidence 기록. strict audit는 selected resource row의 `threads`, `blocks_per_sm`, `unroll` context가 measurement row와 같은지도 확인 |
 | Diagnostic mode | strict 실패와 diagnostic 구분이 약함 | `--diagnostic-no-ncu`는 NCU를 명시적으로 skip하고 final claim에서 제외 |
 | Tensor model sanity | model utilization fallback 값이 100%를 넘는 diagnostic row도 analyzer selected로 보일 수 있었음 | `tensor_model_utilization_pct_mean > 105%` row는 analyzer `selected_optimal` 후보와 quality gate target 후보에서 제외 |
 
@@ -132,7 +132,7 @@ results/diagnostic_fp16_launch_shape_rtx3090_20260602_125100/figures/thread_swee
 5. selected target의 baseline은 `tensor_baseline_mov`여야 한다.
 6. selected target의 denominator는 logical `m16n16k16`, `8192` input bits/logical MMA여야 한다.
 7. selected target은 `timed_kernel_memory_provenance_metadata_all=true`이고 test/baseline의 intended global-memory count가 모두 0이어야 한다.
-8. resource audit에서 selected test/baseline 모두 stack/spill이 없어야 한다.
+8. resource audit에서 selected test/baseline 모두 stack/spill이 없어야 하고, resource row의 `threads`, `blocks_per_sm`, `unroll` context가 selected measurement row와 같아야 한다.
 9. A100/H100/RTX3090 비교는 세 GPU 결과가 모두 audit을 통과한 뒤 `postprocess_strict_architectures.sh`로 묶어야 한다.
 
 권한이 없는 local smoke나 pipeline sanity check는 계속 `--diagnostic-no-ncu`로 실행할 수 있다. 단, 이 결과는 README와 report에서 diagnostic-only로 표시하고 최종 pJ/bit 표에는 넣지 않는다.
