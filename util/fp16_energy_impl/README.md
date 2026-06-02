@@ -27,6 +27,7 @@
 | `scripts/postprocess_strict_architectures.sh` | A100/H100/RTX3090 결과 디렉터리를 받아 audit/compare/report/visualization을 한 번에 생성 |
 | `scripts/summarize_kernel_resources.py` | ptxas register/spill evidence와 thread별 static occupancy model 산출 |
 | `scripts/run_strict_fp16_pipeline.sh` | build/env/sweep/analyze/NCU/strict quality gate를 한 번에 실행하는 A100/H100/RTX3090용 pipeline |
+| `scripts/run_rtx3090_strict_ncu_after_counter_enable.sh` | RTX 3090 WSL/native Linux에서 counter 권한 확인 후 strict NCU pipeline을 실행하는 helper |
 | `scripts/run_strict_architecture_suite.sh` | 여러 GPU spec의 strict pipeline을 순차 실행하고 audit/compare/report까지 자동 생성 |
 | `scripts/preflight_strict_architecture_suite.py` | suite 실행 전 tool, GPU target, active compute process 상태를 JSON/CSV로 검사 |
 | `scripts/probe_ncu_permissions.py` | 긴 sweep 전에 Nsight Compute performance-counter 권한을 짧은 HMMA profile로 확인 |
@@ -138,6 +139,20 @@ source env/toolchain_rtx3090_sm86_cuda121.sh
 ```
 
 공유 서버나 Docker/Slurm 환경에서 GPU auto-detect가 안 되면 `--gpu-kind` 또는 `--cuda-arch`를 명시한다. `CUDA_VISIBLE_DEVICES` 때문에 CUDA ordinal과 physical GPU id가 다르면 strict pipeline 실행 시 `--nvidia-smi-id GPU-...`를 함께 넘긴다. Nsight Compute가 `ERR_NVGPUCTRPERM`으로 실패하면 package 설치 문제가 아니라 NVIDIA performance counter 권한 문제다. 이 경우 cluster/admin policy로 profiling counter 접근을 허용하거나 권한 있는 job에서 NCU validation을 실행해야 한다. WSL2에서는 Linux `sudo`만으로 해결되지 않을 수 있으며, Windows host의 NVIDIA Control Panel에서 Developer settings와 GPU Performance Counters access를 허용한 뒤 WSL을 재시작해야 한다. Strict pipeline은 긴 sweep 전에 `ncu_permission_probe/` 아래 짧은 probe log/JSON/CSV를 남기고, counter 권한이 없으면 즉시 중단한다. 권한 없는 local 확인만 할 때는 `--diagnostic-no-ncu`를 명시해야 하며, 이 결과는 최종 pJ/bit claim에 사용하지 않는다.
+
+RTX 3090 WSL2 host에서는 먼저 Windows host에서 NVIDIA Control Panel을 관리자 권한으로 열고 `Desktop > Enable Developer Settings`를 켠 뒤, `Developer > Manage GPU Performance Counters`에서 모든 사용자 접근을 허용한다. 그 다음 Windows PowerShell에서 `wsl --shutdown`을 실행하고 WSL을 다시 열어 아래 helper를 실행한다. 이 helper는 toolchain env를 재생성하고, `ncu` 경로를 확인한 뒤, `--probe-only`에서는 짧은 HMMA NCU permission probe만 수행한다. Full mode는 같은 thread/block sweep과 selected-target work-slope까지 실행한다.
+
+```bash
+cd /home/bang001/gpupowermodeling/accelwattch/util/fp16_energy_impl
+
+# 권한 설정이 제대로 열렸는지 빠르게 확인
+./scripts/run_rtx3090_strict_ncu_after_counter_enable.sh --probe-only
+
+# probe가 통과하면 최종 strict RTX 3090 run 실행
+./scripts/run_rtx3090_strict_ncu_after_counter_enable.sh
+```
+
+Native Linux에서 관리자가 profiling을 admin-only로 제한한 경우에만 `--use-sudo`를 붙인다. WSL2에서는 Windows host counter setting이 우선이며, 이 repository에서 확인한 RTX 3090 WSL2 run은 Linux `sudo`로도 `ERR_NVGPUCTRPERM`이 해결되지 않았다.
 
 ## 4. A100/H100 실행 범위와 자동화 범위
 
