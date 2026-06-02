@@ -85,6 +85,8 @@ def main() -> int:
     parser.add_argument("--target-test-s", required=True)
     parser.add_argument("--target-baseline-s", required=True)
     parser.add_argument("--max-calibrated-repeats", required=True)
+    parser.add_argument("--require-kernel", required=True)
+    parser.add_argument("--require-baseline", required=True)
     parser.add_argument("--invocation", default="")
     parser.add_argument("--cmake-bin", default="cmake")
     parser.add_argument("--nvcc-bin", default="nvcc")
@@ -118,6 +120,8 @@ def main() -> int:
             "target_test_s": args.target_test_s,
             "target_baseline_s": args.target_baseline_s,
             "max_calibrated_repeats": args.max_calibrated_repeats,
+            "require_kernel": args.require_kernel,
+            "require_baseline": args.require_baseline,
         },
         "environment": {
             key: os.environ.get(key, "")

@@ -428,6 +428,16 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         failed.append("strict pipeline manifest indicates allow_compute_apps=1")
     if parse_bool(manifest_params.get("diagnostic_no_ncu")):
         failed.append("strict pipeline manifest indicates diagnostic_no_ncu=1")
+    if args.require_kernel and str(manifest_params.get("require_kernel", "") or "") != args.require_kernel:
+        failed.append(
+            "strict pipeline manifest require_kernel "
+            f"{manifest_params.get('require_kernel', '') or 'missing'} != {args.require_kernel}"
+        )
+    if args.require_baseline and str(manifest_params.get("require_baseline", "") or "") != args.require_baseline:
+        failed.append(
+            "strict pipeline manifest require_baseline "
+            f"{manifest_params.get('require_baseline', '') or 'missing'} != {args.require_baseline}"
+        )
     if not manifest_head:
         failed.append("strict pipeline manifest git head is missing")
     if not str(manifest_binary.get("sha256", "") or ""):

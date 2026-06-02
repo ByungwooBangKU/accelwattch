@@ -30,6 +30,8 @@ CALIBRATE_MATRIX=1
 TARGET_TEST_S=1.0
 TARGET_BASELINE_S=1.0
 MAX_CALIBRATED_REPEATS=1000
+REQUIRE_KERNEL="tensor_mma_f16acc"
+REQUIRE_BASELINE="tensor_baseline_mov"
 
 usage() {
   cat <<'USAGE'
@@ -65,6 +67,10 @@ Options:
   --target-baseline-s S Target baseline CUDA-event duration for calibrated matrix [1.0]
   --max-calibrated-repeats N
                         Upper bound for calibrated per-role repeats [1000]
+  --require-kernel KERNEL
+                        Kernel allowed to become quality_gate selected target [tensor_mma_f16acc]
+  --require-baseline KERNEL
+                        Baseline allowed to become quality_gate selected target [tensor_baseline_mov]
   --diagnostic-no-ncu  Skip NCU probe/validation and do not require NCU in quality gate;
                        for local diagnostic only
   -h, --help           Show this help
@@ -94,6 +100,8 @@ while [[ $# -gt 0 ]]; do
     --target-test-s) TARGET_TEST_S="$2"; shift 2 ;;
     --target-baseline-s) TARGET_BASELINE_S="$2"; shift 2 ;;
     --max-calibrated-repeats) MAX_CALIBRATED_REPEATS="$2"; shift 2 ;;
+    --require-kernel) REQUIRE_KERNEL="$2"; shift 2 ;;
+    --require-baseline) REQUIRE_BASELINE="$2"; shift 2 ;;
     --diagnostic-no-ncu) DIAGNOSTIC_NO_NCU=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -273,6 +281,8 @@ write_manifest() {
     --target-test-s "${TARGET_TEST_S}" \
     --target-baseline-s "${TARGET_BASELINE_S}" \
     --max-calibrated-repeats "${MAX_CALIBRATED_REPEATS}" \
+    --require-kernel "${REQUIRE_KERNEL}" \
+    --require-baseline "${REQUIRE_BASELINE}" \
     --invocation "${ORIGINAL_INVOCATION}" \
     --cmake-bin "${CMAKE_BIN}" \
     --nvcc-bin "${NVCC_BIN}" \
@@ -401,7 +411,7 @@ fi
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/summarize_kernel_resources.py" "${RESOURCE_ARGS[@]}"
 
-QUALITY_ARGS=(--input "${OUTDIR}")
+QUALITY_ARGS=(--input "${OUTDIR}" --require-kernel "${REQUIRE_KERNEL}" --require-baseline "${REQUIRE_BASELINE}")
 if [[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]]; then
   NCU_BIN="${NCU_BIN}" NCU_BLOCKS_PER_SM_CSV="${NCU_BLOCKS_PER_SM_CSV}" \
     "${SCRIPT_DIR}/ncu_validate_no_l2_thread_sweep.sh" \

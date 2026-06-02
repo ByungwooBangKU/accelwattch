@@ -283,6 +283,14 @@ def baseline_match_grade(test_kernel: str, baseline_kernel: str) -> Tuple[str, b
     return ("baseline_mismatch", False, f"expected {expected}")
 
 
+def required_pair_matches(row: Dict[str, Any], args: argparse.Namespace) -> bool:
+    if args.require_kernel and str(row.get("test_kernel", "")) != args.require_kernel:
+        return False
+    if args.require_baseline and str(row.get("baseline_kernel", "")) != args.require_baseline:
+        return False
+    return True
+
+
 def signal_quality(
     incremental_fraction: Any,
     baseline_fraction: Any,
@@ -550,6 +558,7 @@ def pair_gate_rows(
             str(row.get("test_kernel", "")),
             str(row.get("baseline_kernel", "")),
         )
+        required_pair = required_pair_matches(row, args)
         positive = parse_bool(row.get("valid_basic"))
         no_l2 = parse_bool(row.get("valid_no_l2"))
         pure = parse_bool(row.get("pure_fp16_candidate"))
@@ -700,6 +709,9 @@ def pair_gate_rows(
                 "unroll": row.get("unroll", ""),
                 "measurement_grade": grade,
                 "baseline_match_grade": baseline_grade,
+                "required_kernel": args.require_kernel,
+                "required_baseline": args.require_baseline,
+                "required_kernel_baseline_pair": required_pair,
                 "quality_pass": not failed,
                 "target_pass": False,
                 "positive_increment": positive,
@@ -976,6 +988,7 @@ def thread_gate_rows(
             str(row.get("test_kernel", "")),
             str(row.get("baseline_kernel", "")),
         )
+        required_pair = required_pair_matches(row, args)
         test_ncu_ok, test_ncu_note = ncu_status(
             str(row.get("test_kernel", "")),
             row.get("threads", ""),
@@ -1132,6 +1145,9 @@ def thread_gate_rows(
                 "pure_fp16_candidate_count": pure_count,
                 "measurement_grade": grade,
                 "baseline_match_grade": baseline_grade,
+                "required_kernel": args.require_kernel,
+                "required_baseline": args.require_baseline,
+                "required_kernel_baseline_pair": required_pair,
                 "quality_pass": quality_pass,
                 "target_pass": False,
                 "selected_optimal": selected,
@@ -1247,11 +1263,23 @@ def thread_gate_rows(
         by_target_key[key].append(row)
 
     for group in by_target_key.values():
+        required_group = all(required_pair_matches(row, args) for row in group)
         quality_rows = [
             row
             for row in group
             if parse_bool(row.get("quality_pass")) and math.isfinite(target_util_value(row))
         ]
+        if not required_group:
+            max_quality_util = max((target_util_value(row) for row in quality_rows), default=math.nan)
+            for row in group:
+                row["util_reference_scope"] = "not_required_kernel_baseline"
+                row["util_reference_max_pct"] = max_quality_util
+                row["util_saturated"] = False
+                row["quality_gate_selected_target"] = False
+                row["target_pass"] = False
+                row["target_selection_note"] = "not_required_kernel_baseline_target_scope"
+            continue
+
         if not quality_rows:
             for row in group:
                 row["util_reference_scope"] = "no_quality_pass"
@@ -1595,6 +1623,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "require_counter_trace_agreement": bool(args.require_counter_trace_agreement),
             "require_ncu": bool(args.require_ncu),
             "require_ncu_tensor_activity": bool(args.require_ncu_tensor_activity),
+            "require_kernel": args.require_kernel,
+            "require_baseline": args.require_baseline,
             "allow_power_trace_target": bool(args.allow_power_trace_target),
             "ncu_summary": str(args.ncu_summary) if args.ncu_summary else "",
         },
@@ -1626,6 +1656,8 @@ def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Na
             "For final claims, run quality_gate.py with --require-ncu and a validated ncu_validation_summary.csv.",
             "For Tensor Core final claims, --require-ncu-tensor-activity should also be enabled so "
             "selected tensor_mma rows have profiler-side Tensor pipe activity evidence.",
+            "selected_targets is limited to --require-kernel/--require-baseline; other FP16 kernels "
+            "remain diagnostic rows unless the required pair is explicitly changed.",
             "Tensor model utilization above max_tensor_model_util_pct fails because it usually indicates "
             "architecture model, clock telemetry, or FLOP accounting mismatch.",
         ],
@@ -1654,6 +1686,8 @@ def main() -> int:
     parser.add_argument("--expected-benchmark-schema-version", default="fp16-energy-bench-v2")
     parser.add_argument("--expected-matmul-input-bits-per-logical-mma", type=float, default=8192.0)
     parser.add_argument("--expected-mma-flops-per-logical-mma", type=float, default=8192.0)
+    parser.add_argument("--require-kernel", default="tensor_mma_f16acc", help="Kernel allowed to become target_pass")
+    parser.add_argument("--require-baseline", default="tensor_baseline_mov", help="Baseline allowed to become target_pass")
     parser.add_argument("--require-baseline-elapsed", action="store_true")
     parser.add_argument("--warn-counter-trace-ratio-low", type=float, default=0.5)
     parser.add_argument("--warn-counter-trace-ratio-high", type=float, default=1.5)

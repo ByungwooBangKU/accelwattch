@@ -405,6 +405,44 @@ def write_quality_gate_input(
     )
 
 
+def write_quality_gate_mixed_pair_input(path: Path) -> None:
+    required_summary = quality_gate_summary_row()
+    required_thread = quality_gate_thread_row()
+    nonrequired_summary = quality_gate_summary_row()
+    nonrequired_thread = quality_gate_thread_row()
+    for row in (nonrequired_summary, nonrequired_thread):
+        row.update(
+            {
+                "test_kernel": "fp16_half2",
+                "baseline_kernel": "baseline_regmove",
+                "fp16_path": "fp16_half2_vs_baseline_regmove",
+                "threads": 64,
+                "threads_per_sm": 512,
+                "avg_sm_util_pct_mean": 99.0,
+                "tensor_model_utilization_pct_mean": "nan",
+                "matmul_denominator_valid": "true",
+                "matmul_denominator_metadata_complete": "false",
+                "matmul_denominator_source": "not_applicable",
+                "matmul_denominator_note": "not_tensor_matmul_kernel",
+                "matmul_input_bits_per_logical_mma": "nan",
+                "matmul_flops_per_logical_mma": "nan",
+                "matmul_logical_mma_count": "nan",
+                "matmul_logical_mma_count_mean": "nan",
+            }
+        )
+    write_csv(path / "summary.csv", [required_summary, nonrequired_summary])
+    write_csv(path / "thread_sweep_summary.csv", [required_thread, nonrequired_thread])
+    write_csv(
+        path / "ncu_validation_summary.csv",
+        [
+            ncu_row("tensor_mma_f16acc", 128, tensor_activity_observed=True),
+            ncu_row("tensor_baseline_mov", 128),
+            ncu_row("fp16_half2", 64),
+            ncu_row("baseline_regmove", 64),
+        ],
+    )
+
+
 def write_quality_gate_model_util_input(path: Path, *, model_util_pct: float = 97.5) -> None:
     summary = quality_gate_summary_row()
     thread = quality_gate_thread_row()
@@ -510,6 +548,8 @@ def write_result_dir(path: Path, *, include_required_target: bool, required_tens
                 "skip_preflight": False,
                 "allow_compute_apps": False,
                 "diagnostic_no_ncu": False,
+                "require_kernel": "tensor_mma_f16acc",
+                "require_baseline": "tensor_baseline_mov",
             },
             "git": {"head": {"stdout": "synthetic-smoke"}},
             "artifacts": {
@@ -645,6 +685,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     write_csv(bad_resource_context / "resource_audit" / "thread_resource_occupancy.csv", bad_resource_rows)
 
     quality_gate_ok = base / "quality_gate_tensor_activity_ok"
+    quality_gate_mixed_pair = base / "quality_gate_mixed_pair"
     quality_gate_bad = base / "quality_gate_tensor_activity_bad"
     quality_gate_duplicate_ncu_context = base / "quality_gate_duplicate_ncu_context"
     quality_gate_model_util = base / "quality_gate_model_util_fallback"
@@ -652,6 +693,7 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     quality_gate_missing_memory_feature = base / "quality_gate_missing_memory_feature"
     quality_gate_missing_ncu_threads = base / "quality_gate_missing_ncu_threads"
     write_quality_gate_input(quality_gate_ok, tensor_activity_observed=True)
+    write_quality_gate_mixed_pair_input(quality_gate_mixed_pair)
     write_quality_gate_input(quality_gate_bad, tensor_activity_observed=False)
     write_quality_gate_input(quality_gate_duplicate_ncu_context, tensor_activity_observed=True)
     write_quality_gate_model_util_input(quality_gate_model_util)
@@ -1216,6 +1258,36 @@ exit 1
             raise AssertionError(f"Quality gate did not preserve NCU evidence {key}: {qg_ok_row}")
     if qg_ok_row.get("baseline_ncu_tensor_inst_seen") != "false":
         raise AssertionError(f"Quality gate did not preserve baseline no-tensor evidence: {qg_ok_row}")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "quality_gate.py"),
+            "--input",
+            str(quality_gate_mixed_pair),
+            "--ncu-summary",
+            str(quality_gate_mixed_pair / "ncu_validation_summary.csv"),
+            "--require-ncu",
+            "--require-ncu-tensor-activity",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    qg_mixed_summary = json.loads((quality_gate_mixed_pair / "quality_gate_summary.json").read_text())
+    mixed_targets = qg_mixed_summary.get("selected_targets", [])
+    if len(mixed_targets) != 1 or mixed_targets[0].get("test_kernel") != "tensor_mma_f16acc":
+        raise AssertionError(f"Quality gate selected outside the required pair: {qg_mixed_summary}")
+    qg_mixed_rows = read_csv_rows(quality_gate_mixed_pair / "quality_gates.csv")
+    nonrequired_rows = [
+        row for row in qg_mixed_rows
+        if row.get("scope") == "thread_sweep" and row.get("test_kernel") == "fp16_half2"
+    ]
+    if not nonrequired_rows:
+        raise AssertionError(f"Mixed-pair quality gate did not keep the non-required diagnostic row: {qg_mixed_rows}")
+    if any(row.get("target_pass") == "True" for row in nonrequired_rows):
+        raise AssertionError(f"Non-required FP16 pair became a target: {nonrequired_rows}")
+    if not all(row.get("target_selection_note") == "not_required_kernel_baseline_target_scope" for row in nonrequired_rows):
+        raise AssertionError(f"Non-required FP16 pair did not get the target-scope note: {nonrequired_rows}")
 
     run(
         [

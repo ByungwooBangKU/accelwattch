@@ -78,9 +78,9 @@ Options:
   --require-architectures CSV
                        Required architecture chips for postprocess [ga100,gh100,ga102]
   --require-kernel KERNEL
-                       Required postprocess test kernel [tensor_mma_f16acc]
+                       Required quality/postprocess test kernel [tensor_mma_f16acc]
   --require-baseline KERNEL
-                       Required postprocess baseline kernel [tensor_baseline_mov]
+                       Required quality/postprocess baseline kernel [tensor_baseline_mov]
   --require-counter-trace-agreement
                        Make NVML-counter/power-trace agreement a hard audit gate
   --require-ncu-tensor-activity
@@ -242,6 +242,8 @@ for spec in "${SPECS[@]}"; do
     --target-test-s "${TARGET_TEST_S}"
     --target-baseline-s "${TARGET_BASELINE_S}"
     --max-calibrated-repeats "${MAX_CALIBRATED_REPEATS}"
+    --require-kernel "${REQUIRE_KERNEL}"
+    --require-baseline "${REQUIRE_BASELINE}"
   )
   if [[ -n "${MATRIX_OVERRIDE}" ]]; then
     cmd+=(--matrix "${MATRIX_OVERRIDE}")
