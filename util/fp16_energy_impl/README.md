@@ -196,6 +196,8 @@ Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--c
 
 GPU가 서로 다른 서버에 있으면 각 서버에서 `run_strict_fp16_pipeline.sh`를 실행해 결과 디렉터리를 한 곳으로 복사한 뒤 `postprocess_strict_architectures.sh`를 실행한다. 단일 GPU만 재실험할 때는 suite helper에 `--require-architectures gh100`처럼 현재 architecture만 지정하거나 `--no-postprocess`를 사용한다.
 
+Suite/postprocess helper의 기본 required pair는 `tensor_mma_f16acc/tensor_baseline_mov`이다. `tensor_mma_f32acc`나 `fp16_half2`를 별도 diagnostic 비교로 묶을 때는 `--require-kernel/--require-baseline`을 명시하며, suite helper는 이 값을 postprocess의 audit과 compare 단계에 동일하게 전달한다.
+
 Preflight에서 toolchain이 빠졌거나, GPU metadata가 비어 있거나, 다른 compute process가 보이면 기본적으로 중단한다. Suite helper가 만든 preflight JSON/CSV는 postprocess report까지 전달되어 completion evidence matrix의 필수 항목으로 표시된다. 단일 GPU용 `run_strict_fp16_pipeline.sh`도 build 전에 같은 preflight를 실행해 `strict_pipeline_preflight.json/csv`를 남기고, compile은 되지만 runtime에서 실패할 CUDA driver/toolkit mismatch를 긴 sweep 전에 차단한다. CSV에는 target별 pass/fail뿐 아니라 `required_tools_pass`, `required_tool_fail_reasons`, `overall_preflight_pass`, `publishable_preflight_pass`도 기록해 GPU target은 맞지만 `cmake`/`nvcc`/`ncu`가 빠진 상황을 구분한다. 공유 장비에서 diagnostic만 하고 싶을 때는 `--allow-compute-apps`를 명시한다. `ncu`가 없거나 performance counter 권한이 없는 local smoke는 `--diagnostic-no-ncu`로 NCU preflight/probe/validation을 모두 건너뛰거나, 필요한 경우 `--skip-preflight`로만 수행한다. 최종 A100/H100/RTX3090 pJ/bit claim에는 이 예외 옵션을 쓰지 않는다.
 
 Toolchain이 기본 PATH 밖에 있으면 `CMAKE_BIN`, `NVCC_BIN`, `NCU_BIN`, `NVIDIA_SMI_BIN`으로 명시한다. 추가 include/library flag가 필요한 split CUDA package 환경에서는 `CMAKE_CUDA_FLAGS`도 넘길 수 있다. Strict pipeline helper는 `CMAKE_CUDA_FLAGS`의 `-I`/`-L` 항목을 CMake compiler-id 단계에서도 보이도록 `CPATH`/`LIBRARY_PATH`에 자동으로 prepend한다. 예를 들어 conda CUDA toolchain을 쓰는 WSL 환경에서는 다음처럼 실행한다.
@@ -502,11 +504,13 @@ results/fp16_launch_shape_warpsync_rtx3090_20260602_direct/figures/quality_gate_
 
 Fine + dmon legacy run에서는 `threads_per_sm=512`에서 평균 SM utilization이 100%에 도달했다. 따라서 SM utilization 첫 포화점 기준 후보 thread count는 512 threads/SM, 즉 64 threads/block이다. pJ/bit 자체는 224 threads/block 후보에서 `0.0819 +/- 0.0121 pJ/bit`로 더 낮게 관찰되었지만, valid no-L2 count가 5/10이고 incremental power가 3.23 W 수준이라 target saturation point로 채택하지 않았다. 256 threads/block 이상 후보는 baseline subtraction 후 incremental power가 음수로 나와 `all_runs_no_valid`로 집계되었다. 이 값들은 board-level `nvidia-smi` power trace와 `baseline_nop` subtraction 기반 estimate이므로, 최종 수치 채택 전에는 현재 matrix로 재실행하고 Nsight Compute로 no-L2/global-memory 조건과 HMMA instruction path를 별도 확인해야 한다.
 
-여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 strict pipeline을 완료한 다음 아래 wrapper를 실행한다. 이 wrapper는 strict audit이 실패해도 compare/report 산출물을 먼저 남기고, 기본적으로 마지막에 nonzero로 종료한다. `--require-architectures`는 audit, compare, architecture model, report 단계에 동일하게 전달된다. 실패 상태까지 report로 남기고 싶을 때는 `--no-fail`을 추가한다.
+여러 GPU에서 같은 matrix를 실행한 뒤 architecture-level 비교 figure를 생성하려면 각 결과 디렉터리에 대해 strict pipeline을 완료한 다음 아래 wrapper를 실행한다. 이 wrapper는 strict audit이 실패해도 compare/report 산출물을 먼저 남기고, 기본적으로 마지막에 nonzero로 종료한다. `--require-architectures`는 audit, compare, architecture model, report 단계에 동일하게 전달되고, `--require-kernel/--require-baseline`은 audit과 compare 단계에 동일하게 전달된다. 실패 상태까지 report로 남기고 싶을 때는 `--no-fail`을 추가한다.
 
 ```bash
 ./scripts/postprocess_strict_architectures.sh \
   --outdir results/strict_fp16_postprocess \
+  --require-kernel tensor_mma_f16acc \
+  --require-baseline tensor_baseline_mov \
   results/strict_fp16_a100 \
   results/strict_fp16_h100 \
   results/strict_fp16_rtx3090

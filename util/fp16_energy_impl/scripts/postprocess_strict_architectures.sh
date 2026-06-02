@@ -9,6 +9,8 @@ OUTDIR=""
 SUITE_PREFLIGHT_JSON=""
 SUITE_PREFLIGHT_CSV=""
 REQUIRE_ARCHITECTURES="ga100,gh100,ga102"
+REQUIRE_KERNEL="tensor_mma_f16acc"
+REQUIRE_BASELINE="tensor_baseline_mov"
 NO_FAIL=0
 REQUIRE_COUNTER_TRACE=0
 REQUIRE_NCU_TENSOR_ACTIVITY=1
@@ -29,6 +31,10 @@ Options:
                         Suite-level strict_architecture_suite_preflight.csv evidence
   --require-architectures CSV
                         Required architecture chips [ga100,gh100,ga102]
+  --require-kernel KERNEL
+                        Required test kernel [tensor_mma_f16acc]
+  --require-baseline KERNEL
+                        Required baseline kernel [tensor_baseline_mov]
   --require-counter-trace-agreement
                         Make NVML-counter/power-trace agreement a hard audit gate
   --require-ncu-tensor-activity
@@ -49,6 +55,8 @@ while [[ $# -gt 0 ]]; do
     --suite-preflight-json) SUITE_PREFLIGHT_JSON="$2"; shift 2 ;;
     --suite-preflight-csv) SUITE_PREFLIGHT_CSV="$2"; shift 2 ;;
     --require-architectures) REQUIRE_ARCHITECTURES="$2"; shift 2 ;;
+    --require-kernel) REQUIRE_KERNEL="$2"; shift 2 ;;
+    --require-baseline) REQUIRE_BASELINE="$2"; shift 2 ;;
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
     --no-require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=0; shift ;;
@@ -98,6 +106,8 @@ AUDIT_ARGS=(
   --input "${ABS_INPUTS[@]}"
   --outdir "${AUDIT_DIR}"
   --require-architectures "${REQUIRE_ARCHITECTURES}"
+  --require-kernel "${REQUIRE_KERNEL}"
+  --require-baseline "${REQUIRE_BASELINE}"
   --no-fail
 )
 if [[ "${REQUIRE_COUNTER_TRACE}" -eq 1 ]]; then
@@ -115,7 +125,9 @@ MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   --input "${ABS_INPUTS[@]}" \
   --outdir "${COMPARE_DIR}" \
   --audit-dir "${AUDIT_DIR}" \
-  --require-architectures "${REQUIRE_ARCHITECTURES}"
+  --require-architectures "${REQUIRE_ARCHITECTURES}" \
+  --require-kernel "${REQUIRE_KERNEL}" \
+  --require-baseline "${REQUIRE_BASELINE}"
 
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_postprocess}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/architecture_models.py" \

@@ -24,6 +24,8 @@ TARGET_BASELINE_S=1.0
 MAX_CALIBRATED_REPEATS=1000
 DIAGNOSTIC_NO_NCU=0
 REQUIRE_ARCHITECTURES="ga100,gh100,ga102"
+REQUIRE_KERNEL="tensor_mma_f16acc"
+REQUIRE_BASELINE="tensor_baseline_mov"
 REQUIRE_COUNTER_TRACE=0
 REQUIRE_NCU_TENSOR_ACTIVITY=1
 CONTINUE_ON_FAIL=0
@@ -75,6 +77,10 @@ Options:
   --diagnostic-no-ncu  Pass diagnostic no-NCU mode to each strict run
   --require-architectures CSV
                        Required architecture chips for postprocess [ga100,gh100,ga102]
+  --require-kernel KERNEL
+                       Required postprocess test kernel [tensor_mma_f16acc]
+  --require-baseline KERNEL
+                       Required postprocess baseline kernel [tensor_baseline_mov]
   --require-counter-trace-agreement
                        Make NVML-counter/power-trace agreement a hard audit gate
   --require-ncu-tensor-activity
@@ -111,6 +117,8 @@ while [[ $# -gt 0 ]]; do
     --max-calibrated-repeats) MAX_CALIBRATED_REPEATS="$2"; shift 2 ;;
     --diagnostic-no-ncu) DIAGNOSTIC_NO_NCU=1; shift ;;
     --require-architectures) REQUIRE_ARCHITECTURES="$2"; shift 2 ;;
+    --require-kernel) REQUIRE_KERNEL="$2"; shift 2 ;;
+    --require-baseline) REQUIRE_BASELINE="$2"; shift 2 ;;
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
     --no-require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=0; shift ;;
@@ -291,6 +299,8 @@ if [[ "${NO_POSTPROCESS}" -eq 0 && "${#COMPLETED_DIRS[@]}" -gt 0 ]]; then
     "${SCRIPT_DIR}/postprocess_strict_architectures.sh"
     --outdir "${POSTPROCESS_DIR}"
     --require-architectures "${REQUIRE_ARCHITECTURES}"
+    --require-kernel "${REQUIRE_KERNEL}"
+    --require-baseline "${REQUIRE_BASELINE}"
   )
   if [[ "${SKIP_PREFLIGHT}" -eq 0 ]]; then
     post_cmd+=(--suite-preflight-json "${PREFLIGHT_JSON}" --suite-preflight-csv "${PREFLIGHT_CSV}")
