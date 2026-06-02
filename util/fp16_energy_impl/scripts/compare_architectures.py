@@ -307,15 +307,35 @@ def load_audit_rows(audit_dir: Optional[Path]) -> List[Dict[str, Any]]:
     return out
 
 
-def audit_best_rows(audit_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def required_pair_matches(row: Dict[str, Any], required_kernel: str, required_baseline: str) -> bool:
+    if required_kernel and str(row.get("test_kernel", "")) != required_kernel:
+        return False
+    if required_baseline and str(row.get("baseline_kernel", "")) != required_baseline:
+        return False
+    return True
+
+
+def audit_best_rows(
+    audit_rows: List[Dict[str, Any]],
+    *,
+    required_kernel: str,
+    required_baseline: str,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in audit_rows:
-        publishable = parse_bool(row.get("audit_pass"))
+        pair_matches = required_pair_matches(row, required_kernel, required_baseline)
+        publishable = parse_bool(row.get("audit_pass")) and pair_matches
         best = dict(row)
-        best["selection_note"] = "strict_audit_pass" if publishable else "strict_audit_failed"
+        best["selection_note"] = (
+            "strict_audit_pass"
+            if publishable
+            else ("strict_audit_required_kernel_baseline_mismatch" if not pair_matches else "strict_audit_failed")
+        )
         best["quality_rejected"] = not publishable
         best["audit_required_for_publishable"] = True
         best["publishable_strict_audit"] = publishable
+        best["required_kernel"] = required_kernel
+        best["required_baseline"] = required_baseline
         out.append(best)
     return out
 
@@ -365,7 +385,11 @@ def ncu_no_memory_ok(row: Dict[str, Any]) -> bool:
 
 def is_strict_publishable_target(row: Dict[str, Any]) -> bool:
     if str(row.get("audit_required_for_publishable", "")).strip() or str(row.get("audit_pass", "")).strip():
-        return parse_bool(row.get("audit_pass")) and parse_bool(row.get("target_pass"))
+        return (
+            not parse_bool(row.get("quality_rejected"))
+            and parse_bool(row.get("audit_pass"))
+            and parse_bool(row.get("target_pass"))
+        )
     return (
         parse_bool(row.get("target_pass"))
         and str(row.get("measurement_grade", "")) == "strict_nvml_counter"
@@ -398,11 +422,19 @@ def reject_best_candidate(group: List[Dict[str, Any]], selection_note: str) -> D
     return rejected
 
 
+def tag_required_pair(row: Dict[str, Any], required_kernel: str, required_baseline: str) -> Dict[str, Any]:
+    row["required_kernel"] = required_kernel
+    row["required_baseline"] = required_baseline
+    return row
+
+
 def select_best_fp16(
     rows: List[Dict[str, Any]],
     *,
     allow_diagnostic_fallback: bool = False,
     allow_legacy_best: bool = False,
+    required_kernel: str = "tensor_mma_f16acc",
+    required_baseline: str = "tensor_baseline_mov",
 ) -> List[Dict[str, Any]]:
     by_input: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -411,6 +443,20 @@ def select_best_fp16(
 
     selected: List[Dict[str, Any]] = []
     for group in by_input.values():
+        required_group = [
+            row for row in group
+            if required_pair_matches(row, required_kernel, required_baseline)
+        ]
+        if not required_group:
+            selected.append(
+                tag_required_pair(
+                    reject_best_candidate(group, "missing_required_kernel_baseline"),
+                    required_kernel,
+                    required_baseline,
+                )
+            )
+            continue
+        group = required_group
         target_rows = [row for row in group if parse_bool(row.get("target_pass"))]
         strict_targets = [
             row
@@ -468,10 +514,16 @@ def select_best_fp16(
                 note = "quality_gate_quality_pass_without_strict_nvml_counter"
             else:
                 note = "quality_gate_failed_no_best"
-            selected.append(reject_best_candidate(group, note))
+            selected.append(tag_required_pair(reject_best_candidate(group, note), required_kernel, required_baseline))
             continue
         elif not allow_legacy_best:
-            selected.append(reject_best_candidate(group, "missing_quality_gate_no_best"))
+            selected.append(
+                tag_required_pair(
+                    reject_best_candidate(group, "missing_quality_gate_no_best"),
+                    required_kernel,
+                    required_baseline,
+                )
+            )
             continue
         else:
             pool = group
@@ -490,7 +542,7 @@ def select_best_fp16(
         best = dict(max(pool, key=score))
         best["selection_note"] = selection_note
         best["quality_rejected"] = False
-        selected.append(best)
+        selected.append(tag_required_pair(best, required_kernel, required_baseline))
     return selected
 
 
@@ -993,6 +1045,8 @@ def comparison_summary(
     coverage: List[Dict[str, Any]],
     *,
     required_architectures: List[str],
+    required_kernel: str,
+    required_baseline: str,
     allow_diagnostic_best: bool,
     allow_legacy_best: bool,
     audit_dir: Optional[Path],
@@ -1028,6 +1082,8 @@ def comparison_summary(
         "publishable": publishable,
         "comparison_status": "publishable_strict" if publishable else "not_publishable_incomplete_coverage",
         "required_architectures": required_architectures,
+        "required_kernel": required_kernel,
+        "required_baseline": required_baseline,
         "required_architecture_count": len(required_rows),
         "required_strict_pass_count": len(strict_pass),
         "required_missing_or_nonpublishable_architectures": missing_or_nonpublishable,
@@ -1108,6 +1164,12 @@ def main() -> int:
         default="ga100,gh100,ga102",
         help="Required architecture chips for coverage CSV/figure [ga100,gh100,ga102]",
     )
+    parser.add_argument("--require-kernel", default="tensor_mma_f16acc", help="Required test kernel for best/coverage")
+    parser.add_argument(
+        "--require-baseline",
+        default="tensor_baseline_mov",
+        help="Required baseline kernel for best/coverage",
+    )
     parser.add_argument(
         "--fail-on-missing-required-architectures",
         action="store_true",
@@ -1150,19 +1212,27 @@ def main() -> int:
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     if audit_rows:
-        best = audit_best_rows(audit_rows)
+        best = audit_best_rows(
+            audit_rows,
+            required_kernel=args.require_kernel,
+            required_baseline=args.require_baseline,
+        )
     else:
         best_source = all_threads if all_threads else all_conditions
         best = select_best_fp16(
             best_source,
             allow_diagnostic_fallback=args.allow_diagnostic_best,
             allow_legacy_best=args.allow_legacy_best,
+            required_kernel=args.require_kernel,
+            required_baseline=args.require_baseline,
         )
     required_architectures = parse_csv_list(args.require_architectures)
     coverage = coverage_rows(best, all_threads, all_conditions, required_architectures)
     summary = comparison_summary(
         coverage,
         required_architectures=required_architectures,
+        required_kernel=args.require_kernel,
+        required_baseline=args.require_baseline,
         allow_diagnostic_best=args.allow_diagnostic_best,
         allow_legacy_best=args.allow_legacy_best,
         audit_dir=args.audit_dir,

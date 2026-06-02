@@ -1020,6 +1020,18 @@ exit 1
     no_memory_best = compare_architectures.select_best_fp16([no_memory_visual_row])
     if no_memory_best[0].get("selection_note") != "quality_gate_target_pass_without_required_no_memory_evidence":
         raise AssertionError(f"L2-touching target got wrong rejection note: {no_memory_best}")
+    f32acc_visual_row = dict(strict_visual_row)
+    f32acc_visual_row["test_kernel"] = "tensor_mma_f32acc"
+    default_pair_best = compare_architectures.select_best_fp16([f32acc_visual_row])
+    if default_pair_best[0].get("selection_note") != "missing_required_kernel_baseline":
+        raise AssertionError(f"Default compare accepted a non-required kernel: {default_pair_best}")
+    override_pair_best = compare_architectures.select_best_fp16(
+        [f32acc_visual_row],
+        required_kernel="tensor_mma_f32acc",
+        required_baseline="tensor_baseline_mov",
+    )
+    if override_pair_best[0].get("selection_note") != "quality_gate_strict_nvml_target_pass":
+        raise AssertionError(f"Explicit compare kernel override did not accept f32acc target: {override_pair_best}")
 
     compare_input = base / "compare_input"
     compare_out = base / "compare_out"
