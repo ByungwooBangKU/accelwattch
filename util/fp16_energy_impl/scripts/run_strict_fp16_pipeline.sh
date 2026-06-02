@@ -32,6 +32,13 @@ TARGET_BASELINE_S=1.0
 MAX_CALIBRATED_REPEATS=1000
 REQUIRE_KERNEL="tensor_mma_f16acc"
 REQUIRE_BASELINE="tensor_baseline_mov"
+RUN_WORK_SLOPE=0
+WORK_SLOPE_UNROLLS="1,2,4,8,16"
+WORK_SLOPE_ITERS=2000000
+WORK_SLOPE_WARMUP=2
+WORK_SLOPE_TEST_REPEATS=2
+WORK_SLOPE_BASELINE_REPEATS=30
+WORK_SLOPE_REPEAT=1
 
 usage() {
   cat <<'USAGE'
@@ -71,6 +78,16 @@ Options:
                         Kernel allowed to become quality_gate selected target [tensor_mma_f16acc]
   --require-baseline KERNEL
                         Baseline allowed to become quality_gate selected target [tensor_baseline_mov]
+  --run-work-slope      After quality_gate.py, run a selected-target work-amount slope diagnostic
+  --work-slope-unrolls CSV
+                        Unroll/work points for selected-target work-slope [1,2,4,8,16]
+  --work-slope-iters N  Iterations per work-slope run [2000000]
+  --work-slope-warmup N Warmup repeats for work-slope runs [2]
+  --work-slope-test-repeats N
+                        Per-condition test repeats in generated work-slope matrix [2]
+  --work-slope-baseline-repeats N
+                        Per-condition baseline repeats in generated work-slope matrix [30]
+  --work-slope-repeat N Whole work-slope matrix repeat count passed to run_experiment.py [1]
   --diagnostic-no-ncu  Skip NCU probe/validation and do not require NCU in quality gate;
                        for local diagnostic only
   -h, --help           Show this help
@@ -102,6 +119,13 @@ while [[ $# -gt 0 ]]; do
     --max-calibrated-repeats) MAX_CALIBRATED_REPEATS="$2"; shift 2 ;;
     --require-kernel) REQUIRE_KERNEL="$2"; shift 2 ;;
     --require-baseline) REQUIRE_BASELINE="$2"; shift 2 ;;
+    --run-work-slope) RUN_WORK_SLOPE=1; shift ;;
+    --work-slope-unrolls) WORK_SLOPE_UNROLLS="$2"; shift 2 ;;
+    --work-slope-iters) WORK_SLOPE_ITERS="$2"; shift 2 ;;
+    --work-slope-warmup) WORK_SLOPE_WARMUP="$2"; shift 2 ;;
+    --work-slope-test-repeats) WORK_SLOPE_TEST_REPEATS="$2"; shift 2 ;;
+    --work-slope-baseline-repeats) WORK_SLOPE_BASELINE_REPEATS="$2"; shift 2 ;;
+    --work-slope-repeat) WORK_SLOPE_REPEAT="$2"; shift 2 ;;
     --diagnostic-no-ncu) DIAGNOSTIC_NO_NCU=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -132,6 +156,8 @@ NCU_PROBE_DIR="${OUTDIR}/ncu_permission_probe"
 ENV_OUT="${OUTDIR}/env_gpu${GPU_ID}.txt"
 BUILD_LOG="${OUTDIR}/build_ptxas.log"
 RESOURCE_DIR="${OUTDIR}/resource_audit"
+WORK_SLOPE_MATRIX="${OUTDIR}/work_slope_matrix.json"
+WORK_SLOPE_DIR="${OUTDIR}/work_slope"
 BASE_MATRIX="${ROOT}/configs/fp16_matmul_thread_sweep_fine.json"
 if [[ -n "${MATRIX_OVERRIDE}" ]]; then
   if [[ "${MATRIX_OVERRIDE}" == /* ]]; then
@@ -283,6 +309,15 @@ write_manifest() {
     --max-calibrated-repeats "${MAX_CALIBRATED_REPEATS}" \
     --require-kernel "${REQUIRE_KERNEL}" \
     --require-baseline "${REQUIRE_BASELINE}" \
+    --run-work-slope "${RUN_WORK_SLOPE}" \
+    --work-slope-matrix "${WORK_SLOPE_MATRIX}" \
+    --work-slope-dir "${WORK_SLOPE_DIR}" \
+    --work-slope-unrolls "${WORK_SLOPE_UNROLLS}" \
+    --work-slope-iters "${WORK_SLOPE_ITERS}" \
+    --work-slope-warmup "${WORK_SLOPE_WARMUP}" \
+    --work-slope-test-repeats "${WORK_SLOPE_TEST_REPEATS}" \
+    --work-slope-baseline-repeats "${WORK_SLOPE_BASELINE_REPEATS}" \
+    --work-slope-repeat "${WORK_SLOPE_REPEAT}" \
     --invocation "${ORIGINAL_INVOCATION}" \
     --cmake-bin "${CMAKE_BIN}" \
     --nvcc-bin "${NVCC_BIN}" \
@@ -430,6 +465,39 @@ fi
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
   "${PYTHON_BIN}" "${SCRIPT_DIR}/quality_gate.py" "${QUALITY_ARGS[@]}"
 
+if [[ "${RUN_WORK_SLOPE}" -eq 1 ]]; then
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/generate_work_slope_matrix.py" \
+    --result-dir "${OUTDIR}" \
+    --out-matrix "${WORK_SLOPE_MATRIX}" \
+    --require-kernel "${REQUIRE_KERNEL}" \
+    --require-baseline "${REQUIRE_BASELINE}" \
+    --unrolls "${WORK_SLOPE_UNROLLS}" \
+    --iters "${WORK_SLOPE_ITERS}" \
+    --warmup "${WORK_SLOPE_WARMUP}" \
+    --test-repeats "${WORK_SLOPE_TEST_REPEATS}" \
+    --baseline-repeats "${WORK_SLOPE_BASELINE_REPEATS}"
+
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/run_experiment.py" \
+    --binary "${BINARY}" \
+    --matrix "${WORK_SLOPE_MATRIX}" \
+    --gpu "${GPU_ID}" \
+    --nvidia-smi "${NVIDIA_SMI_BIN}" \
+    --nvidia-smi-id "${NVIDIA_SMI_ID}" \
+    --sample-ms "${SAMPLE_MS}" \
+    --repeat "${WORK_SLOPE_REPEAT}" \
+    --outdir "${WORK_SLOPE_DIR}"
+
+  MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl_fp16_strict}" \
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/analyze_results.py" --input "${WORK_SLOPE_DIR}"
+
+  if [[ -f "${WORK_SLOPE_DIR}/work_slope_summary.csv" ]]; then
+    cp "${WORK_SLOPE_DIR}/work_slope_summary.csv" "${OUTDIR}/work_slope_summary.csv"
+  else
+    echo "Work-slope run did not produce ${WORK_SLOPE_DIR}/work_slope_summary.csv" >&2
+    exit 1
+  fi
+fi
+
 write_manifest completed "${FINAL_MANIFEST}"
 PIPELINE_DONE=1
 
@@ -442,4 +510,5 @@ Strict FP16 pipeline complete:
   NCU validation: $([[ "${DIAGNOSTIC_NO_NCU}" -eq 0 ]] && echo "${NCDIR}/ncu_validation_summary.csv" || echo "skipped (--diagnostic-no-ncu)")
   quality gate: ${OUTDIR}/quality_gates.csv
   selected target summary: ${OUTDIR}/quality_gate_summary.json
+  work-slope: $([[ "${RUN_WORK_SLOPE}" -eq 1 ]] && echo "${WORK_SLOPE_DIR}/work_slope_summary.csv" || echo "skipped")
 EOF

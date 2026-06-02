@@ -28,6 +28,14 @@ REQUIRE_KERNEL="tensor_mma_f16acc"
 REQUIRE_BASELINE="tensor_baseline_mov"
 REQUIRE_COUNTER_TRACE=0
 REQUIRE_NCU_TENSOR_ACTIVITY=1
+RUN_WORK_SLOPE=0
+REQUIRE_WORK_SLOPE=0
+WORK_SLOPE_UNROLLS="1,2,4,8,16"
+WORK_SLOPE_ITERS=2000000
+WORK_SLOPE_WARMUP=2
+WORK_SLOPE_TEST_REPEATS=2
+WORK_SLOPE_BASELINE_REPEATS=30
+WORK_SLOPE_REPEAT=1
 CONTINUE_ON_FAIL=0
 SKIP_PREFLIGHT=0
 ALLOW_COMPUTE_APPS=0
@@ -87,6 +95,19 @@ Options:
                        Keep selected NCU tensor activity evidence as a hard audit gate [default]
   --no-require-ncu-tensor-activity
                        Diagnostic mode: do not hard-fail missing selected NCU tensor activity
+  --run-work-slope     Run selected-target work-slope diagnostic inside each completed pipeline
+  --require-work-slope Run work-slope and make it a hard postprocess audit/report gate
+  --work-slope-unrolls CSV
+                       Unroll/work points for selected-target work-slope [1,2,4,8,16]
+  --work-slope-iters N Iterations per work-slope run [2000000]
+  --work-slope-warmup N
+                       Warmup repeats for work-slope runs [2]
+  --work-slope-test-repeats N
+                       Per-condition test repeats in generated work-slope matrix [2]
+  --work-slope-baseline-repeats N
+                       Per-condition baseline repeats in generated work-slope matrix [30]
+  --work-slope-repeat N
+                       Whole work-slope matrix repeat count passed to run_experiment.py [1]
   --continue-on-fail   Continue remaining specs after a strict run fails
   --skip-preflight     Skip suite-level tool/GPU/process checks before long runs
   --allow-compute-apps Allow active compute processes on target GPUs during preflight
@@ -122,6 +143,14 @@ while [[ $# -gt 0 ]]; do
     --require-counter-trace-agreement) REQUIRE_COUNTER_TRACE=1; shift ;;
     --require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=1; shift ;;
     --no-require-ncu-tensor-activity) REQUIRE_NCU_TENSOR_ACTIVITY=0; shift ;;
+    --run-work-slope) RUN_WORK_SLOPE=1; shift ;;
+    --require-work-slope) REQUIRE_WORK_SLOPE=1; RUN_WORK_SLOPE=1; shift ;;
+    --work-slope-unrolls) WORK_SLOPE_UNROLLS="$2"; shift 2 ;;
+    --work-slope-iters) WORK_SLOPE_ITERS="$2"; shift 2 ;;
+    --work-slope-warmup) WORK_SLOPE_WARMUP="$2"; shift 2 ;;
+    --work-slope-test-repeats) WORK_SLOPE_TEST_REPEATS="$2"; shift 2 ;;
+    --work-slope-baseline-repeats) WORK_SLOPE_BASELINE_REPEATS="$2"; shift 2 ;;
+    --work-slope-repeat) WORK_SLOPE_REPEAT="$2"; shift 2 ;;
     --continue-on-fail) CONTINUE_ON_FAIL=1; shift ;;
     --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
     --allow-compute-apps) ALLOW_COMPUTE_APPS=1; shift ;;
@@ -263,6 +292,17 @@ for spec in "${SPECS[@]}"; do
   if [[ "${ALLOW_COMPUTE_APPS}" -eq 1 ]]; then
     cmd+=(--allow-compute-apps)
   fi
+  if [[ "${RUN_WORK_SLOPE}" -eq 1 ]]; then
+    cmd+=(
+      --run-work-slope
+      --work-slope-unrolls "${WORK_SLOPE_UNROLLS}"
+      --work-slope-iters "${WORK_SLOPE_ITERS}"
+      --work-slope-warmup "${WORK_SLOPE_WARMUP}"
+      --work-slope-test-repeats "${WORK_SLOPE_TEST_REPEATS}"
+      --work-slope-baseline-repeats "${WORK_SLOPE_BASELINE_REPEATS}"
+      --work-slope-repeat "${WORK_SLOPE_REPEAT}"
+    )
+  fi
 
   echo "Strict FP16 suite target: ${label} (gpu=${gpu}, cuda_arch=${cuda_arch}, out=${run_dir})"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -313,6 +353,9 @@ if [[ "${NO_POSTPROCESS}" -eq 0 && "${#COMPLETED_DIRS[@]}" -gt 0 ]]; then
   if [[ "${REQUIRE_NCU_TENSOR_ACTIVITY}" -eq 1 ]]; then
     post_cmd+=(--require-ncu-tensor-activity)
   fi
+  if [[ "${REQUIRE_WORK_SLOPE}" -eq 1 ]]; then
+    post_cmd+=(--require-work-slope)
+  fi
   if [[ "${NO_FAIL}" -eq 1 ]]; then
     post_cmd+=(--no-fail)
   fi
@@ -361,6 +404,12 @@ if [[ "${SKIP_PREFLIGHT}" -eq 1 ]]; then
 fi
 if [[ "${NO_POSTPROCESS}" -eq 1 ]]; then
   SUMMARY_ARGS+=(--no-postprocess)
+fi
+if [[ "${RUN_WORK_SLOPE}" -eq 1 ]]; then
+  SUMMARY_ARGS+=(--run-work-slope)
+fi
+if [[ "${REQUIRE_WORK_SLOPE}" -eq 1 ]]; then
+  SUMMARY_ARGS+=(--require-work-slope)
 fi
 SUMMARY_ARGS+=(--require-architectures "${REQUIRE_ARCHITECTURES}")
 "${PYTHON_BIN}" "${SCRIPT_DIR}/write_strict_suite_summary.py" "${SUMMARY_ARGS[@]}"

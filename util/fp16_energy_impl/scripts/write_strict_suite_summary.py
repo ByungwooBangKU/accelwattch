@@ -68,6 +68,8 @@ def main() -> int:
     parser.add_argument("--skip-preflight", action="store_true")
     parser.add_argument("--no-postprocess", action="store_true")
     parser.add_argument("--require-architectures", default="")
+    parser.add_argument("--run-work-slope", action="store_true")
+    parser.add_argument("--require-work-slope", action="store_true")
     args = parser.parse_args()
 
     preflight = read_json(args.preflight_json)
@@ -124,10 +126,13 @@ def main() -> int:
             "trace_role": "fallback_or_counter_trace_sanity_check",
             "logical_matmul_shape": "m16n16k16",
             "logical_input_bits_per_mma": 8192,
+            "work_slope_required": bool(args.require_work_slope),
             "note": (
                 "Final FP16 pJ/bit claims require benchmark timed-loop "
                 "nvmlDeviceGetTotalEnergyConsumption() deltas; nvidia-smi power traces are "
-                "diagnostic unless explicitly downgraded to fallback-grade results."
+                "diagnostic unless explicitly downgraded to fallback-grade results. When "
+                "work_slope_required=true, each selected target must also have matching "
+                "positive work-energy slope evidence."
             ),
         },
         "flags": {
@@ -136,6 +141,8 @@ def main() -> int:
             "no_postprocess": bool(args.no_postprocess),
             "postprocess_skipped": bool(args.postprocess_skipped),
             "suite_failed": parse_bool(args.suite_failed),
+            "run_work_slope": bool(args.run_work_slope),
+            "require_work_slope": bool(args.require_work_slope),
         },
         "artifacts": {
             "preflight_json": artifact_info(args.preflight_json),

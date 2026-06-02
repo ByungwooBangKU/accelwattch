@@ -192,6 +192,7 @@ Strict 재실험은 아래 helper 하나로 실행할 수 있다. GPU별로 `--c
   --spec a100:0:80 \
   --spec rtx3090:1:86 \
   --spec h100:2:90 \
+  --require-work-slope \
   --outdir results/strict_fp16_suite
 ```
 
@@ -229,7 +230,7 @@ GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   --outdir results/strict_fp16_h100
 ```
 
-이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, build 전에 `strict_pipeline_preflight.json/csv`로 toolchain/GPU/process 상태를 검사한 뒤, 환경 수집 후 짧은 CUDA runtime preflight를 실행한다. 또한 시작 시 `strict_pipeline_manifest_start.json`, 완료 시 `strict_pipeline_manifest.json`을 남겨 실행 인자, git head, tool version, binary hash, required kernel/baseline pair, NCU `blocks/SM` validation list, preflight/quality/NCU/resource 산출물 존재 여부를 고정한다. 이 단계가 실패하면 driver/runtime mismatch 또는 오래된 binary 문제이므로 긴 sweep을 시작하지 않는다. Runtime preflight JSON은 이어서 `verify_architecture.py --strict-chip --require-common-hmma`로 검증한다. 즉 `--cuda-arch 80`은 A100/GA100, `86`은 RTX 3090/GA102, `90`은 H100/GH100 metadata와 맞아야 하며, 공통 HMMA path가 아니라 WGMMA를 쓴 경우 strict pipeline은 중단된다. Strict mode에서는 그 다음 `probe_ncu_permissions.py`로 짧은 Tensor Core HMMA profile을 실행해 NCU performance counter 권한을 확인한다. 이 probe가 `ERR_NVGPUCTRPERM`을 기록하면 `ncu_permission_probe/ncu_permission_probe.json`에 원인이 남고, calibration/sweep을 시작하기 전에 중단한다. 이후 `calibrate_matrix.py`로 기본 `fp16_matmul_thread_sweep_fine.json`의 test/baseline timed duration이 기본 1초 이상이 되도록 per-role `repeats`를 GPU별로 보정하고, 보정된 `calibrated_matrix.json`으로 structural baseline sweep을 실행한다. 이 calibration은 기존 matrix의 repeats를 기본적으로 줄이지 않고, 필요한 경우만 늘린다. `--matrix`로 다른 matrix를 지정할 수 있고, `--no-calibrate-matrix`를 주면 원본 matrix를 그대로 사용한다. Sweep 뒤에는 `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. Strict mode에서는 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity --require-kernel tensor_mma_f16acc --require-baseline tensor_baseline_mov`까지 실행한다. Pipeline은 `--require-kernel/--require-baseline` 값을 `NCU_TEST_KERNEL/NCU_BASELINE_KERNEL`로 profiler validation helper에도 전달하므로 quality gate, NCU evidence, audit target이 같은 kernel pair를 본다. `--diagnostic-no-ncu`를 명시하면 NCU preflight/probe/validation을 모두 건너뛰고 `quality_gate.py`도 NCU summary 없이 실행하므로 결과는 diagnostic-only로 남는다. NCU가 performance counter 권한 문제 등으로 실패하면 `ncu_no_l2_thread_sweep/ncu_run_failures.csv`에 실패 kernel, exit code, log path, 재현 command가 남는다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. 기본 selected target은 `tensor_mma_f16acc/tensor_baseline_mov` pair로 제한되며, 다른 FP16 path는 `--require-kernel/--require-baseline`을 바꾸지 않는 한 diagnostic row로만 남는다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
+이 pipeline은 clean build log를 `build_ptxas.log`로 저장하고, build 전에 `strict_pipeline_preflight.json/csv`로 toolchain/GPU/process 상태를 검사한 뒤, 환경 수집 후 짧은 CUDA runtime preflight를 실행한다. 또한 시작 시 `strict_pipeline_manifest_start.json`, 완료 시 `strict_pipeline_manifest.json`을 남겨 실행 인자, git head, tool version, binary hash, required kernel/baseline pair, NCU `blocks/SM` validation list, preflight/quality/NCU/resource 산출물 존재 여부를 고정한다. 이 단계가 실패하면 driver/runtime mismatch 또는 오래된 binary 문제이므로 긴 sweep을 시작하지 않는다. Runtime preflight JSON은 이어서 `verify_architecture.py --strict-chip --require-common-hmma`로 검증한다. 즉 `--cuda-arch 80`은 A100/GA100, `86`은 RTX 3090/GA102, `90`은 H100/GH100 metadata와 맞아야 하며, 공통 HMMA path가 아니라 WGMMA를 쓴 경우 strict pipeline은 중단된다. Strict mode에서는 그 다음 `probe_ncu_permissions.py`로 짧은 Tensor Core HMMA profile을 실행해 NCU performance counter 권한을 확인한다. 이 probe가 `ERR_NVGPUCTRPERM`을 기록하면 `ncu_permission_probe/ncu_permission_probe.json`에 원인이 남고, calibration/sweep을 시작하기 전에 중단한다. 이후 `calibrate_matrix.py`로 기본 `fp16_matmul_thread_sweep_fine.json`의 test/baseline timed duration이 기본 1초 이상이 되도록 per-role `repeats`를 GPU별로 보정하고, 보정된 `calibrated_matrix.json`으로 structural baseline sweep을 실행한다. 이 calibration은 기존 matrix의 repeats를 기본적으로 줄이지 않고, 필요한 경우만 늘린다. `--matrix`로 다른 matrix를 지정할 수 있고, `--no-calibrate-matrix`를 주면 원본 matrix를 그대로 사용한다. Sweep 뒤에는 `summarize_kernel_resources.py`로 register/spill/resource occupancy evidence를 남긴다. Strict mode에서는 이후 `ncu_validate_no_l2_thread_sweep.sh`로 같은 thread 후보의 NCU 검증을 수행하고, `quality_gate.py --require-ncu --require-ncu-tensor-activity --require-kernel tensor_mma_f16acc --require-baseline tensor_baseline_mov`까지 실행한다. Pipeline은 `--require-kernel/--require-baseline` 값을 `NCU_TEST_KERNEL/NCU_BASELINE_KERNEL`로 profiler validation helper에도 전달하므로 quality gate, NCU evidence, audit target이 같은 kernel pair를 본다. `--run-work-slope`를 명시하면 quality-gated selected target과 같은 `threads`/`blocks/SM`으로 `work_slope_matrix.json`을 생성하고, calibration 없이 raw work amount sweep을 실행해 `work_slope/work_slope_summary.csv`와 root-level `work_slope_summary.csv`를 남긴다. `--diagnostic-no-ncu`를 명시하면 NCU preflight/probe/validation을 모두 건너뛰고 `quality_gate.py`도 NCU summary 없이 실행하므로 결과는 diagnostic-only로 남는다. NCU가 performance counter 권한 문제 등으로 실패하면 `ncu_no_l2_thread_sweep/ncu_run_failures.csv`에 실패 kernel, exit code, log path, 재현 command가 남는다. 최종 pJ/bit 후보는 `quality_gate_summary.json`의 `selected_targets`가 비어 있지 않을 때만 채택한다. 기본 selected target은 `tensor_mma_f16acc/tensor_baseline_mov` pair로 제한되며, 다른 FP16 path는 `--require-kernel/--require-baseline`을 바꾸지 않는 한 diagnostic row로만 남는다. NCU metric 이름이 장비/버전에서 다르면 `NCU_METRICS="..." ./scripts/run_strict_fp16_pipeline.sh ...`처럼 override한다.
 
 Calibration만 별도로 실행할 수도 있다. 새 장비에서는 binary probe를 사용하고, 이미 짧은 diagnostic run을 분석한 뒤에는 `summary.csv`를 이용해 반복 수를 재계산할 수 있다.
 
@@ -250,7 +251,17 @@ python3 scripts/calibrate_matrix.py \
   --outdir results/diagnostic_h100
 ```
 
-baseline subtraction이 불안정하거나 `incremental_energy_j`가 음수로 흔들리면, 같은 thread 조건에서 work amount를 바꾸는 slope diagnostic을 별도로 실행한다. 이 matrix는 unroll별 work 차이를 유지해야 하므로 strict pipeline calibration 대신 raw runner를 사용한다. 최종 audit에 연결할 work-slope는 selected target과 같은 `threads` 및 `blocks_per_sm` context여야 하므로, 먼저 selected target에서 matrix를 자동 생성한다.
+baseline subtraction이 불안정하거나 `incremental_energy_j`가 음수로 흔들리면, 같은 thread 조건에서 work amount를 바꾸는 slope diagnostic을 실행한다. Strict pipeline에서는 `--run-work-slope`로 자동 실행할 수 있다. Suite 전체에서 final hard gate까지 같이 걸려면 `run_strict_architecture_suite.sh --require-work-slope`를 사용한다.
+
+```bash
+./scripts/run_strict_fp16_pipeline.sh \
+  --gpu 0 \
+  --cuda-arch 86 \
+  --outdir results/strict_fp16_rtx3090 \
+  --run-work-slope
+```
+
+수동으로 실행할 때도 matrix는 unroll별 work 차이를 유지해야 하므로 strict pipeline calibration 대신 raw runner를 사용한다. 최종 audit에 연결할 work-slope는 selected target과 같은 `threads` 및 `blocks_per_sm` context여야 하므로, 먼저 selected target에서 matrix를 자동 생성한다.
 
 ```bash
 python3 scripts/generate_work_slope_matrix.py \
@@ -267,7 +278,7 @@ python3 scripts/run_experiment.py \
 python3 scripts/analyze_results.py --input results/strict_fp16_rtx3090_work_slope
 ```
 
-이 결과는 `work_slope_summary.csv`와 `figures/work_slope_*.png`를 만든다. 최종 strict audit에서 selected target과 같은 `test_kernel`, `baseline_kernel`, `threads`, `blocks_per_sm`의 work-slope evidence까지 hard gate로 요구하려면 postprocess에 `--work-slope-dir results/strict_fp16_rtx3090_work_slope --require-work-slope`를 추가한다. 이 gate는 `fit_scope=valid_no_l2`, positive `slope_matmul_input_pj_per_bit`, 기본 `slope_r2 >= 0.80`을 요구한다. Work-slope는 단일 pJ/bit point를 대체하지 않고, work amount 증가에 따라 incremental energy가 선형으로 증가하는지 확인하는 baseline-subtraction 안정성 evidence다.
+이 결과는 `work_slope_summary.csv`와 `figures/work_slope_*.png`를 만든다. `--run-work-slope`로 pipeline 내부에서 실행한 경우 root-level `work_slope_summary.csv`도 함께 복사되어 `audit_strict_results.py`가 자동으로 읽는다. 수동 work-slope 결과를 별도 디렉터리에 둔 경우에는 postprocess에 `--work-slope-dir results/strict_fp16_rtx3090_work_slope --require-work-slope`를 추가한다. 이 gate는 selected target과 같은 `test_kernel`, `baseline_kernel`, `threads`, `blocks_per_sm`, `fit_scope=valid_no_l2`, positive `slope_matmul_input_pj_per_bit`, 기본 `slope_r2 >= 0.80`을 요구한다. Work-slope는 단일 pJ/bit point를 대체하지 않고, work amount 증가에 따라 incremental energy가 선형으로 증가하는지 확인하는 baseline-subtraction 안정성 evidence다.
 
 ### Energy source policy
 

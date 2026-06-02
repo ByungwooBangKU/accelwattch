@@ -87,6 +87,15 @@ def main() -> int:
     parser.add_argument("--max-calibrated-repeats", required=True)
     parser.add_argument("--require-kernel", required=True)
     parser.add_argument("--require-baseline", required=True)
+    parser.add_argument("--run-work-slope", required=True)
+    parser.add_argument("--work-slope-matrix", type=Path, required=True)
+    parser.add_argument("--work-slope-dir", type=Path, required=True)
+    parser.add_argument("--work-slope-unrolls", required=True)
+    parser.add_argument("--work-slope-iters", required=True)
+    parser.add_argument("--work-slope-warmup", required=True)
+    parser.add_argument("--work-slope-test-repeats", required=True)
+    parser.add_argument("--work-slope-baseline-repeats", required=True)
+    parser.add_argument("--work-slope-repeat", required=True)
     parser.add_argument("--invocation", default="")
     parser.add_argument("--cmake-bin", default="cmake")
     parser.add_argument("--nvcc-bin", default="nvcc")
@@ -122,6 +131,13 @@ def main() -> int:
             "max_calibrated_repeats": args.max_calibrated_repeats,
             "require_kernel": args.require_kernel,
             "require_baseline": args.require_baseline,
+            "run_work_slope": args.run_work_slope,
+            "work_slope_unrolls": args.work_slope_unrolls,
+            "work_slope_iters": args.work_slope_iters,
+            "work_slope_warmup": args.work_slope_warmup,
+            "work_slope_test_repeats": args.work_slope_test_repeats,
+            "work_slope_baseline_repeats": args.work_slope_baseline_repeats,
+            "work_slope_repeat": args.work_slope_repeat,
         },
         "environment": {
             key: os.environ.get(key, "")
@@ -172,6 +188,9 @@ def main() -> int:
             ),
             "ncu_validation_summary": path_info((args.ncu_dir / "ncu_validation_summary.csv").resolve()),
             "resource_audit": path_info((args.resource_dir / "thread_resource_occupancy.csv").resolve()),
+            "work_slope_matrix": path_info(args.work_slope_matrix.resolve()),
+            "work_slope_summary": path_info((outdir / "work_slope_summary.csv").resolve()),
+            "work_slope_nested_summary": path_info((args.work_slope_dir / "work_slope_summary.csv").resolve()),
         },
     }
 

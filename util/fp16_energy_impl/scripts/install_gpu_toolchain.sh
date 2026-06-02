@@ -392,6 +392,7 @@ source "${ENV_FILE}"
   --matrix configs/fp16_matmul_launch_shape_sweep.json \\
   --threads 32,64,128,256 \\
   --ncu-blocks-per-sm-csv 1,2,4,8 \\
+  --run-work-slope \\
   --outdir "results/strict_fp16_launch_shape_${GPU_KIND}_sm${CUDA_ARCH}"
 EOF
 chmod +x "${RUN_FILE}"
@@ -434,7 +435,7 @@ cat <<EOF
 Next:
   cd "${ROOT}"
   source "${ENV_FILE}"
-  ./scripts/run_strict_fp16_pipeline.sh --gpu ${GPU_ID} --cuda-arch ${CUDA_ARCH} --outdir results/strict_fp16_${GPU_KIND}_sm${CUDA_ARCH}
+  ./scripts/run_strict_fp16_pipeline.sh --gpu ${GPU_ID} --cuda-arch ${CUDA_ARCH} --run-work-slope --outdir results/strict_fp16_${GPU_KIND}_sm${CUDA_ARCH}
 
 Launch-shape sweep:
   "${RUN_FILE}"
