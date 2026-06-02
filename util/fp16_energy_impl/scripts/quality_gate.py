@@ -772,6 +772,49 @@ def target_util_metric_source(row: Dict[str, Any]) -> str:
     return ""
 
 
+def target_util_axis_label(metric_sources: Iterable[str]) -> str:
+    sources = {source for source in metric_sources if source}
+    if sources == {"tensor_model_utilization_pct_mean"}:
+        return "Dense Tensor Core model utilization (%)"
+    if sources == {"avg_sm_util_pct_mean"}:
+        return "Avg SM utilization (%)"
+    if sources == {"avg_gpu_util_pct_mean"}:
+        return "Avg GPU utilization (%)"
+    if sources:
+        return "Target selection utilization (%)"
+    return "Utilization (%)"
+
+
+def spread_thread_x_positions(xs: List[float]) -> Tuple[List[float], Dict[int, Tuple[float, float]]]:
+    grouped: Dict[float, List[int]] = defaultdict(list)
+    for idx, x in enumerate(xs):
+        if math.isfinite(x):
+            grouped[x].append(idx)
+
+    plot_xs = list(xs)
+    label_offsets: Dict[int, Tuple[float, float]] = {}
+    for x, idxs in grouped.items():
+        if len(idxs) <= 1:
+            label_offsets[idxs[0]] = (0.0, 7.0)
+            continue
+        for order, idx in enumerate(idxs):
+            centered = order - (len(idxs) - 1) / 2.0
+            if x > 0.0:
+                plot_xs[idx] = x * (2.0 ** (centered * 0.055))
+            else:
+                plot_xs[idx] = x + centered * 2.0
+            label_offsets[idx] = (centered * 22.0, 7.0 + 5.0 * order)
+    return plot_xs, label_offsets
+
+
+def configure_thread_x_axis(ax: Any, xs: List[float]) -> None:
+    finite_xs = sorted({x for x in xs if math.isfinite(x)})
+    if finite_xs and all(x > 0.0 for x in finite_xs):
+        ax.set_xscale("log", base=2)
+    ax.set_xticks(finite_xs)
+    ax.get_xaxis().set_major_formatter(ScalarFormatter())
+
+
 def thread_gate_rows(
     thread_rows: List[Dict[str, Any]],
     summary_rows: Iterable[Dict[str, Any]],
@@ -1132,6 +1175,7 @@ def plot_thread_quality(rows: List[Dict[str, Any]], figdir: Path) -> None:
     for (test_kernel, baseline_kernel), group in grouped.items():
         group = sorted(group, key=lambda r: parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"), 0.0)))
         xs = [parse_float(r.get("threads_per_sm"), parse_float(r.get("threads"))) for r in group]
+        plot_xs, label_offsets = spread_thread_x_positions(xs)
         util = []
         for r in group:
             value = parse_float(r.get("avg_sm_util_pct_mean"))
@@ -1146,26 +1190,65 @@ def plot_thread_quality(rows: List[Dict[str, Any]], figdir: Path) -> None:
             ("tab:blue" if parse_bool(r.get("quality_pass")) else "tab:red")
             for r in group
         ]
-        ax.scatter(xs, util, c=colors, s=48, zorder=3)
-        ax.plot(xs, util, color="0.45", linewidth=1.0, alpha=0.8, zorder=2)
+        ax.scatter(plot_xs, util, c=colors, s=48, zorder=3)
+        ax.plot(plot_xs, util, color="0.45", linewidth=1.0, alpha=0.8, zorder=2)
         finite_util = [v for v in util if math.isfinite(v)]
         top_util = max(finite_util) if finite_util else math.nan
-        for x, y, pj, r in zip(xs, util, pjbit, group):
-            if not math.isfinite(y):
+        lowest_pjbit_rows = [
+            (idx, row, pj)
+            for idx, (row, pj) in enumerate(zip(group, pjbit))
+            if math.isfinite(pj) and parse_bool(row.get("no_intended_l2"))
+        ]
+        lowest_pjbit_idx = (
+            min(lowest_pjbit_rows, key=lambda item: item[2])[0]
+            if lowest_pjbit_rows
+            else None
+        )
+        label_indices = {
+            idx
+            for idx, row in enumerate(group)
+            if parse_bool(row.get("target_pass")) or parse_bool(row.get("selected_optimal"))
+        }
+        if lowest_pjbit_idx is not None:
+            label_indices.add(lowest_pjbit_idx)
+        for idx, (x, y, pj, r) in enumerate(zip(plot_xs, util, pjbit, group)):
+            if idx not in label_indices or not math.isfinite(y):
                 continue
             label = str(r.get("threads", ""))
+            blocks = str(r.get("blocks_per_sm_requested", "") or "")
+            if blocks:
+                label += f"/b{blocks}"
             if math.isfinite(pj):
                 label += f"\n{pj:.3g} pJ/b"
+            if idx == lowest_pjbit_idx and not parse_bool(r.get("target_pass")):
+                label = f"lowest pJ/b\n{label}"
             near_top = y >= 99.98 or (math.isfinite(top_util) and y >= top_util - 0.01)
+            dx, dy = label_offsets.get(idx, (0.0, 7.0))
             ax.annotate(
                 label,
                 (x, y),
                 textcoords="offset points",
-                xytext=(0, -24 if near_top else 7),
+                xytext=(dx, -24 if near_top else dy),
                 ha="center",
                 va="top" if near_top else "bottom",
                 fontsize=8,
+                bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "none", "alpha": 0.78},
             )
+        if lowest_pjbit_idx is not None:
+            low_x = plot_xs[lowest_pjbit_idx]
+            low_y = util[lowest_pjbit_idx]
+            if math.isfinite(low_x) and math.isfinite(low_y):
+                ax.scatter(
+                    [low_x],
+                    [low_y],
+                    marker="*",
+                    s=135,
+                    color="tab:purple",
+                    edgecolor="black",
+                    linewidth=0.6,
+                    zorder=5,
+                    label="lowest no-L2 pJ/b",
+                )
         targets = [r for r in group if parse_bool(r.get("target_pass"))]
         if targets:
             sx = parse_float(targets[0].get("threads_per_sm"), parse_float(targets[0].get("threads")))
@@ -1185,8 +1268,7 @@ def plot_thread_quality(rows: List[Dict[str, Any]], figdir: Path) -> None:
                     )
         ax.set_xlabel("Launched threads per SM")
         ax.set_ylabel("Avg SM utilization (%)")
-        ax.set_xticks(xs)
-        ax.get_xaxis().set_major_formatter(ScalarFormatter())
+        configure_thread_x_axis(ax, xs)
         ax.grid(True, axis="y", alpha=0.3)
         source_labels = sorted({str(r.get("util_metric_source", "")) for r in group if str(r.get("util_metric_source", ""))})
         source_note = f"\ntarget metric: {', '.join(source_labels)}" if source_labels else ""
@@ -1196,6 +1278,127 @@ def plot_thread_quality(rows: List[Dict[str, Any]], figdir: Path) -> None:
         safe = f"quality_gate_thread_sweep_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
         fig.savefig(figdir / safe, dpi=160)
         plt.close(fig)
+
+        target_util = [target_util_value(r) for r in group]
+        if any(math.isfinite(v) for v in target_util):
+            fig, ax = plt.subplots(figsize=(8.8, 5.0))
+            ax.scatter(plot_xs, target_util, c=colors, s=52, zorder=3)
+            ax.plot(plot_xs, target_util, color="0.45", linewidth=1.0, alpha=0.8, zorder=2)
+
+            finite_target_util = [v for v in target_util if math.isfinite(v)]
+            for idx, (x, y, pj, r) in enumerate(zip(plot_xs, target_util, pjbit, group)):
+                if idx not in label_indices or not math.isfinite(y):
+                    continue
+                label = str(r.get("threads", ""))
+                blocks = str(r.get("blocks_per_sm_requested", "") or "")
+                if blocks:
+                    label += f"/b{blocks}"
+                if math.isfinite(pj):
+                    label += f"\n{pj:.3g} pJ/b"
+                if idx == lowest_pjbit_idx and not parse_bool(r.get("target_pass")):
+                    label = f"lowest pJ/b\n{label}"
+                dx, dy = label_offsets.get(idx, (0.0, 7.0))
+                ax.annotate(
+                    label,
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(dx, -28 if y >= 95.0 else dy),
+                    ha="center",
+                    va="top" if y >= 95.0 else "bottom",
+                    fontsize=8,
+                    bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "none", "alpha": 0.78},
+                )
+
+            if lowest_pjbit_idx is not None:
+                low_x = plot_xs[lowest_pjbit_idx]
+                low_y = target_util[lowest_pjbit_idx]
+                if math.isfinite(low_x) and math.isfinite(low_y):
+                    ax.scatter(
+                        [low_x],
+                        [low_y],
+                        marker="*",
+                        s=135,
+                        color="tab:purple",
+                        edgecolor="black",
+                        linewidth=0.6,
+                        zorder=5,
+                        label="lowest no-L2 pJ/b",
+                    )
+
+            saturated_x = [
+                x for x, r in zip(plot_xs, group)
+                if math.isfinite(x) and parse_bool(r.get("util_saturated"))
+            ]
+            saturated_y = [
+                y for y, r in zip(target_util, group)
+                if math.isfinite(y) and parse_bool(r.get("util_saturated"))
+            ]
+            if saturated_x:
+                ax.scatter(
+                    saturated_x,
+                    saturated_y,
+                    facecolors="none",
+                    edgecolors="black",
+                    s=96,
+                    linewidths=1.0,
+                    zorder=4,
+                    label="saturation band",
+                )
+
+            reference_values = [
+                parse_float(r.get("util_reference_max_pct"))
+                for r in group
+                if math.isfinite(parse_float(r.get("util_reference_max_pct")))
+            ]
+            if reference_values:
+                ax.axhline(
+                    max(reference_values),
+                    color="0.25",
+                    linestyle=":",
+                    linewidth=1.0,
+                    label="reference max",
+                )
+
+            if targets:
+                sx = parse_float(targets[0].get("threads_per_sm"), parse_float(targets[0].get("threads")))
+                if math.isfinite(sx):
+                    ax.axvline(sx, color="tab:green", linestyle="--", linewidth=1.2, label="target_pass")
+            else:
+                selected = [r for r in group if parse_bool(r.get("selected_optimal"))]
+                if selected:
+                    sx = parse_float(selected[0].get("threads_per_sm"), parse_float(selected[0].get("threads")))
+                    if math.isfinite(sx):
+                        ax.axvline(
+                            sx,
+                            color="0.35",
+                            linestyle=":",
+                            linewidth=1.0,
+                            label="analyzer selected diagnostic",
+                        )
+
+            ax.set_xlabel("Launched threads per SM")
+            ax.set_ylabel(
+                target_util_axis_label(str(r.get("util_metric_source", "")) for r in group)
+            )
+            configure_thread_x_axis(ax, xs)
+            ax.grid(True, axis="y", alpha=0.3)
+            if finite_target_util:
+                ymin, ymax = min(finite_target_util), max(finite_target_util)
+                pad = max(4.0, 0.18 * max(abs(ymax - ymin), 1.0))
+                ax.set_ylim(max(0.0, ymin - pad), ymax + 2.0 * pad)
+            target_source_labels = sorted(
+                {str(r.get("util_metric_source", "")) for r in group if str(r.get("util_metric_source", ""))}
+            )
+            source_note = f"\ntarget metric: {', '.join(target_source_labels)}" if target_source_labels else ""
+            ax.set_title(
+                f"Quality-gated target metric: {test_kernel} vs {baseline_kernel}{source_note}",
+                pad=12,
+            )
+            ax.legend(loc="best")
+            fig.tight_layout()
+            safe = f"quality_gate_target_metric_thread_sweep_{test_kernel}_vs_{baseline_kernel}.png".replace("/", "_")
+            fig.savefig(figdir / safe, dpi=160)
+            plt.close(fig)
 
 
 def write_summary(input_dir: Path, rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
