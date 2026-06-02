@@ -669,6 +669,60 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
     import compare_architectures
     import quality_gate as quality_gate_module
 
+    schema_features = ",".join(sorted(analyze_results.REQUIRED_BENCHMARK_SCHEMA_FEATURES))
+    work_slope_input_rows = []
+    for idx, bits in enumerate((8192.0, 16384.0, 32768.0), start=1):
+        work_slope_input_rows.append(
+            {
+                "gpu": "Synthetic H100",
+                "architecture_generation": "hopper",
+                "architecture_chip": "gh100",
+                "recommended_cuda_arch": "90",
+                "fp16_path": "tensor_core_mma_m16n16k16_f16acc",
+                "test_kernel": "tensor_mma_f16acc",
+                "baseline_kernel": "tensor_baseline_mov",
+                "threads": "128",
+                "threads_per_sm": "1024",
+                "blocks_per_sm_requested": "8",
+                "unroll": str(idx),
+                "iters": "1",
+                "valid_basic": True,
+                "valid_no_l2": True,
+                "matmul_input_bits": bits,
+                "incremental_energy_j": bits * 2.0e-13,
+                "test_energy_j": 1.0,
+                "baseline_scaled_energy_j": 0.99,
+                "matmul_denominator_valid": True,
+                "matmul_denominator_metadata_complete": True,
+                "test_benchmark_schema_features": schema_features,
+                "baseline_benchmark_schema_features": schema_features,
+                "test_timed_kernel_memory_provenance_available": True,
+                "baseline_timed_kernel_memory_provenance_available": True,
+                "test_timed_kernel_has_intended_global_memory": False,
+                "baseline_timed_kernel_has_intended_global_memory": False,
+                "test_energy_source": "nvml_total_energy_counter",
+                "baseline_energy_source": "nvml_total_energy_counter",
+            }
+        )
+    work_slope_rows = analyze_results.aggregate_work_slope(work_slope_input_rows)
+    if len(work_slope_rows) != 1 or not work_slope_rows[0].get("slope_valid"):
+        raise AssertionError(f"Analyzer did not produce valid strict work-slope row: {work_slope_rows}")
+    for key in (
+        "fit_denominator_valid_all",
+        "fit_denominator_metadata_complete_all",
+        "fit_benchmark_schema_features_required_all",
+        "fit_timed_kernel_memory_provenance_all",
+        "fit_no_intended_global_memory_all",
+        "fit_strict_nvml_counter_all",
+    ):
+        if not work_slope_rows[0].get(key):
+            raise AssertionError(f"Analyzer work-slope row missed provenance field {key}: {work_slope_rows[0]}")
+    bad_work_slope_input_rows = [dict(row) for row in work_slope_input_rows]
+    bad_work_slope_input_rows[0]["test_timed_kernel_memory_provenance_available"] = False
+    bad_work_slope_rows = analyze_results.aggregate_work_slope(bad_work_slope_input_rows)
+    if len(bad_work_slope_rows) != 1 or bad_work_slope_rows[0].get("slope_valid"):
+        raise AssertionError(f"Analyzer accepted work-slope with missing provenance: {bad_work_slope_rows}")
+
     good = base / "good"
     no_required = base / "no_required"
     no_tensor_activity = base / "no_tensor_activity"
@@ -1652,7 +1706,14 @@ exit 1
                 "blocks_per_sm_requested": "8",
                 "fit_scope": "valid_no_l2",
                 "point_count": "4",
+                "fit_run_count": "4",
                 "valid_no_l2_count": "4",
+                "fit_denominator_valid_all": "True",
+                "fit_denominator_metadata_complete_all": "True",
+                "fit_benchmark_schema_features_required_all": "True",
+                "fit_timed_kernel_memory_provenance_all": "True",
+                "fit_no_intended_global_memory_all": "True",
+                "fit_strict_nvml_counter_all": "True",
                 "slope_matmul_input_pj_per_bit": "0.21",
                 "slope_intercept_energy_j": "0.02",
                 "slope_r2": "0.93",
@@ -1741,6 +1802,16 @@ exit 1
         raise AssertionError(f"Strict audit did not carry valid work-slope evidence: {good_row}")
     if good_row.get("work_slope_pj_per_bit") != "0.21" or good_row.get("work_slope_r2") != "0.93":
         raise AssertionError(f"Strict audit did not carry work-slope fit details: {good_row}")
+    for key in (
+        "work_slope_fit_denominator_valid_all",
+        "work_slope_fit_denominator_metadata_complete_all",
+        "work_slope_fit_benchmark_schema_features_required_all",
+        "work_slope_fit_timed_kernel_memory_provenance_all",
+        "work_slope_fit_no_intended_global_memory_all",
+        "work_slope_fit_strict_nvml_counter_all",
+    ):
+        if good_row.get(key) != "True":
+            raise AssertionError(f"Strict audit did not carry work-slope provenance field {key}: {good_row}")
 
     audit_missing_work_slope = base / "audit_missing_work_slope"
     run(
@@ -1763,6 +1834,35 @@ exit 1
     if missing_work_slope_row.get("audit_pass") != "False":
         raise AssertionError(f"Missing work-slope strict audit unexpectedly passed: {missing_work_slope_row}")
     assert_failure_category(audit_missing_work_slope / "strict_result_failure_summary.csv", "work_slope")
+
+    bad_work_slope_provenance = base / "bad_work_slope_provenance"
+    work_slope_bad_provenance_dir = base / "work_slope_bad_provenance"
+    bad_work_slope_rows = read_csv_rows(work_slope_dir / "work_slope_summary.csv")
+    for row in bad_work_slope_rows:
+        row["fit_timed_kernel_memory_provenance_all"] = "False"
+    write_csv(work_slope_bad_provenance_dir / "work_slope_summary.csv", bad_work_slope_rows)
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "audit_strict_results.py"),
+            "--input",
+            str(good),
+            "--outdir",
+            str(bad_work_slope_provenance),
+            "--require-architectures",
+            "gh100",
+            "--work-slope-dir",
+            str(work_slope_bad_provenance_dir),
+            "--require-work-slope",
+            "--no-fail",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    bad_work_slope_row = read_single_csv_row(bad_work_slope_provenance / "strict_result_audit.csv")
+    if bad_work_slope_row.get("audit_pass") != "False":
+        raise AssertionError(f"Bad work-slope provenance strict audit unexpectedly passed: {bad_work_slope_row}")
+    assert_failure_category(bad_work_slope_provenance / "strict_result_failure_summary.csv", "work_slope")
 
     audit_bad = base / "audit_no_required"
     run(

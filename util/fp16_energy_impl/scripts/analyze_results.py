@@ -1566,6 +1566,42 @@ def aggregate_work_slope(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ys = [finite_float(p["incremental_energy_j_mean"]) for p in points]
         fit = linear_fit(xs, ys)
         slope_pj_per_bit = fit["slope"] * 1.0e12 if math.isfinite(fit["slope"]) else math.nan
+        fit_schema_features_required_all = all(
+            REQUIRED_BENCHMARK_SCHEMA_FEATURES <= schema_feature_set(r.get("test_benchmark_schema_features"))
+            and REQUIRED_BENCHMARK_SCHEMA_FEATURES <= schema_feature_set(r.get("baseline_benchmark_schema_features"))
+            for r in fit_rows
+        )
+        fit_denominator_valid_count = sum(1 for r in fit_rows if bool(r.get("matmul_denominator_valid", False)))
+        fit_denominator_valid_all = bool(fit_rows) and fit_denominator_valid_count == len(fit_rows)
+        fit_denominator_metadata_complete_count = sum(
+            1 for r in fit_rows if bool(r.get("matmul_denominator_metadata_complete", False))
+        )
+        fit_denominator_metadata_complete_all = (
+            bool(fit_rows) and fit_denominator_metadata_complete_count == len(fit_rows)
+        )
+        fit_memory_provenance_count = sum(
+            1
+            for r in fit_rows
+            if bool(r.get("test_timed_kernel_memory_provenance_available", False))
+            and bool(r.get("baseline_timed_kernel_memory_provenance_available", False))
+        )
+        fit_memory_provenance_all = bool(fit_rows) and fit_memory_provenance_count == len(fit_rows)
+        fit_no_intended_global_memory_count = sum(
+            1
+            for r in fit_rows
+            if not bool(r.get("test_timed_kernel_has_intended_global_memory", False))
+            and not bool(r.get("baseline_timed_kernel_has_intended_global_memory", False))
+        )
+        fit_no_intended_global_memory_all = (
+            bool(fit_rows) and fit_no_intended_global_memory_count == len(fit_rows)
+        )
+        fit_strict_nvml_counter_count = sum(
+            1
+            for r in fit_rows
+            if str(r.get("test_energy_source", "")) == "nvml_total_energy_counter"
+            and str(r.get("baseline_energy_source", "")) == "nvml_total_energy_counter"
+        )
+        fit_strict_nvml_counter_all = bool(fit_rows) and fit_strict_nvml_counter_count == len(fit_rows)
         slope_valid = bool(
             len(points) >= 3
             and fit_scope == "valid_no_l2"
@@ -1573,6 +1609,12 @@ def aggregate_work_slope(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             and slope_pj_per_bit > 0.0
             and math.isfinite(fit["r2"])
             and fit["r2"] >= 0.80
+            and fit_schema_features_required_all
+            and fit_denominator_valid_all
+            and fit_denominator_metadata_complete_all
+            and fit_memory_provenance_all
+            and fit_no_intended_global_memory_all
+            and fit_strict_nvml_counter_all
         )
         first = group[0]
         out.append(
@@ -1590,11 +1632,23 @@ def aggregate_work_slope(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "fit_scope": fit_scope,
                 "point_count": len(points),
                 "run_count": len(group),
+                "fit_run_count": len(fit_rows),
                 "distinct_matmul_input_bits": ";".join(f"{p['matmul_input_bits']:.12g}" for p in points),
                 "unroll_values": ";".join(sorted({str(r.get("unroll", "")) for r in group})),
                 "iters_values": ";".join(sorted({str(r.get("iters", "")) for r in group})),
                 "valid_no_l2_count": sum(1 for r in group if bool(r.get("valid_no_l2", False))),
                 "denominator_valid_count": sum(1 for r in group if bool(r.get("matmul_denominator_valid", False))),
+                "fit_denominator_valid_count": fit_denominator_valid_count,
+                "fit_denominator_valid_all": fit_denominator_valid_all,
+                "fit_denominator_metadata_complete_count": fit_denominator_metadata_complete_count,
+                "fit_denominator_metadata_complete_all": fit_denominator_metadata_complete_all,
+                "fit_benchmark_schema_features_required_all": fit_schema_features_required_all,
+                "fit_timed_kernel_memory_provenance_count": fit_memory_provenance_count,
+                "fit_timed_kernel_memory_provenance_all": fit_memory_provenance_all,
+                "fit_no_intended_global_memory_count": fit_no_intended_global_memory_count,
+                "fit_no_intended_global_memory_all": fit_no_intended_global_memory_all,
+                "fit_strict_nvml_counter_count": fit_strict_nvml_counter_count,
+                "fit_strict_nvml_counter_all": fit_strict_nvml_counter_all,
                 "slope_incremental_j_per_input_bit": fit["slope"],
                 "slope_matmul_input_pj_per_bit": slope_pj_per_bit,
                 "slope_intercept_energy_j": fit["intercept"],
@@ -1603,7 +1657,10 @@ def aggregate_work_slope(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "slope_note": (
                     "positive incremental-energy slope across work sweep"
                     if slope_valid
-                    else "diagnostic only; need >=3 valid no-L2 work points, positive slope, and r2>=0.80"
+                    else (
+                        "diagnostic only; need >=3 valid no-L2 work points, positive slope, r2>=0.80, "
+                        "current schema, denominator provenance, no-memory provenance, and strict NVML counters"
+                    )
                 ),
             }
         )

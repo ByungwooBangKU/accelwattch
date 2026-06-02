@@ -128,6 +128,12 @@ def main() -> int:
             and str(row.get("work_slope_fit_scope", "")) == "valid_no_l2"
             and parse_float(row.get("work_slope_pj_per_bit")) > 0.0
             and parse_float(row.get("work_slope_r2")) >= 0.80
+            and parse_bool(row.get("work_slope_fit_denominator_valid_all"))
+            and parse_bool(row.get("work_slope_fit_denominator_metadata_complete_all"))
+            and parse_bool(row.get("work_slope_fit_benchmark_schema_features_required_all"))
+            and parse_bool(row.get("work_slope_fit_timed_kernel_memory_provenance_all"))
+            and parse_bool(row.get("work_slope_fit_no_intended_global_memory_all"))
+            and parse_bool(row.get("work_slope_fit_strict_nvml_counter_all"))
         )
     ]
     missing_work_slope_rows = [

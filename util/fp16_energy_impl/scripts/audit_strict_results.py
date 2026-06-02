@@ -826,6 +826,12 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
             and work_slope_pjbit > 0.0
             and math.isfinite(work_slope_r2)
             and work_slope_r2 >= args.min_work_slope_r2
+            and parse_bool(work_slope.get("fit_benchmark_schema_features_required_all"))
+            and parse_bool(work_slope.get("fit_denominator_valid_all"))
+            and parse_bool(work_slope.get("fit_denominator_metadata_complete_all"))
+            and parse_bool(work_slope.get("fit_timed_kernel_memory_provenance_all"))
+            and parse_bool(work_slope.get("fit_no_intended_global_memory_all"))
+            and parse_bool(work_slope.get("fit_strict_nvml_counter_all"))
         )
     if args.require_work_slope and not work_slope_present:
         failed.append("missing work-slope row for selected kernel/thread/blocks_per_sm")
@@ -1051,7 +1057,26 @@ def audit_dir(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "work_slope_source": work_slope.get("work_slope_source", "") if work_slope else "",
         "work_slope_fit_scope": work_slope.get("fit_scope", "") if work_slope else "",
         "work_slope_point_count": work_slope.get("point_count", "") if work_slope else "",
+        "work_slope_fit_run_count": work_slope.get("fit_run_count", "") if work_slope else "",
         "work_slope_valid_no_l2_count": work_slope.get("valid_no_l2_count", "") if work_slope else "",
+        "work_slope_fit_denominator_valid_all": (
+            work_slope.get("fit_denominator_valid_all", "") if work_slope else ""
+        ),
+        "work_slope_fit_denominator_metadata_complete_all": (
+            work_slope.get("fit_denominator_metadata_complete_all", "") if work_slope else ""
+        ),
+        "work_slope_fit_benchmark_schema_features_required_all": (
+            work_slope.get("fit_benchmark_schema_features_required_all", "") if work_slope else ""
+        ),
+        "work_slope_fit_timed_kernel_memory_provenance_all": (
+            work_slope.get("fit_timed_kernel_memory_provenance_all", "") if work_slope else ""
+        ),
+        "work_slope_fit_no_intended_global_memory_all": (
+            work_slope.get("fit_no_intended_global_memory_all", "") if work_slope else ""
+        ),
+        "work_slope_fit_strict_nvml_counter_all": (
+            work_slope.get("fit_strict_nvml_counter_all", "") if work_slope else ""
+        ),
         "work_slope_pj_per_bit": work_slope.get("slope_matmul_input_pj_per_bit", "") if work_slope else "",
         "work_slope_intercept_energy_j": work_slope.get("slope_intercept_energy_j", "") if work_slope else "",
         "work_slope_r2": work_slope.get("slope_r2", "") if work_slope else "",
