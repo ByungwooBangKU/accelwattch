@@ -1,10 +1,10 @@
 {
   "input": "results/fp16_launch_shape_warpsync_rtx3090_20260602_direct",
-  "generated_utc": "2026-06-01T19:26:12.449466+00:00",
+  "generated_utc": "2026-06-02T04:57:29.648168+00:00",
   "thresholds": {
     "max_clock_span_mhz": 60.0,
-    "min_power_samples": 0,
-    "min_sm_util_samples": 0,
+    "min_power_samples": 3,
+    "min_sm_util_samples": 1,
     "util_tolerance_pct": 0.1,
     "min_incremental_energy_fraction": 0.01,
     "warn_incremental_energy_fraction": 0.05,
@@ -60,7 +60,7 @@
       "util_saturated": false,
       "util_reference_scope": "no_quality_pass",
       "util_reference_max_pct": NaN,
-      "util_metric_source": "",
+      "util_metric_source": "tensor_model_utilization_pct_mean",
       "target_selection_note": "not_quality_pass",
       "no_intended_l2": true,
       "pure_fp16_candidate": true,
@@ -97,6 +97,8 @@
       "baseline_ncu_tensor_activity_observed": "",
       "clock_stable": false,
       "sm_util_available": false,
+      "target_util_available": true,
+      "target_util_value_pct": 108.59936685886397,
       "avg_sm_util_pct_mean": "nan",
       "avg_gpu_util_pct_mean": "nan",
       "tflops_mean": "154.56487423706628",
@@ -124,8 +126,8 @@
       "baseline_energy_counter_vs_trace_ratio_mean": NaN,
       "test_energy_counter_vs_trace_delta_j_mean": "nan",
       "baseline_energy_counter_vs_trace_delta_j_mean": "nan",
-      "fail_reasons": "SM clock span exceeds threshold or is missing; SM/GPU utilization missing",
-      "warnings": "test NVML-counter/power-trace ratio is missing; baseline NVML-counter/power-trace ratio is missing"
+      "fail_reasons": "SM clock span exceeds threshold or is missing",
+      "warnings": "SM/GPU utilization missing; using tensor_model_utilization_pct_mean fallback; test NVML-counter/power-trace ratio is missing; baseline NVML-counter/power-trace ratio is missing"
     }
   ],
   "notes": [

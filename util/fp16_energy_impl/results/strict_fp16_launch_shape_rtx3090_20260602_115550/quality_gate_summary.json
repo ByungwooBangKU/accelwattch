@@ -1,6 +1,6 @@
 {
-  "input": "util/fp16_energy_impl/results/strict_fp16_launch_shape_rtx3090_20260602_115550",
-  "generated_utc": "2026-06-02T03:23:57.441129+00:00",
+  "input": "results/strict_fp16_launch_shape_rtx3090_20260602_115550",
+  "generated_utc": "2026-06-02T04:57:29.433618+00:00",
   "thresholds": {
     "max_clock_span_mhz": 60.0,
     "min_power_samples": 3,
@@ -96,6 +96,8 @@
       "baseline_ncu_tensor_activity_observed": "",
       "clock_stable": true,
       "sm_util_available": true,
+      "target_util_available": true,
+      "target_util_value_pct": 98.33951728154186,
       "avg_sm_util_pct_mean": "93.75",
       "avg_gpu_util_pct_mean": "97.26904761904761",
       "tflops_mean": "159.1479705254172",

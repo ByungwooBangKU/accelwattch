@@ -848,9 +848,11 @@ def thread_gate_rows(
         )
         clock_span = parse_float(row.get("clock_span_mhz_mean"))
         clock_stable = math.isfinite(clock_span) and clock_span <= args.max_clock_span_mhz
-        util = util_value(row)
+        measured_util = util_value(row)
+        target_util = target_util_value(row)
         util_source = target_util_metric_source(row)
-        sm_util_observed = math.isfinite(util)
+        sm_util_observed = math.isfinite(measured_util)
+        target_util_observed = math.isfinite(target_util)
         selected = parse_bool(row.get("selected_optimal"))
 
         blocks_per_sm = row.get("blocks_per_sm_requested", "")
@@ -928,8 +930,10 @@ def thread_gate_rows(
             failed.append("matmul_input_pj_per_bit is not positive/finite")
         if not clock_stable:
             failed.append("SM clock span exceeds threshold or is missing")
-        if not sm_util_observed:
-            failed.append("SM/GPU utilization missing")
+        if not target_util_observed:
+            failed.append("target utilization missing")
+        elif not sm_util_observed:
+            warnings.append(f"SM/GPU utilization missing; using {util_source} fallback")
         if not source_ok:
             failed.append("energy source is unavailable or undersampled")
         if not baseline_ok:
@@ -1039,6 +1043,8 @@ def thread_gate_rows(
                 "baseline_ncu_tensor_activity_observed": baseline_ncu.get("tensor_activity_observed", ""),
                 "clock_stable": clock_stable,
                 "sm_util_available": sm_util_observed,
+                "target_util_available": target_util_observed,
+                "target_util_value_pct": target_util if target_util_observed else math.nan,
                 "avg_sm_util_pct_mean": row.get("avg_sm_util_pct_mean", ""),
                 "avg_gpu_util_pct_mean": row.get("avg_gpu_util_pct_mean", ""),
                 "tflops_mean": row.get("tflops_mean", ""),
@@ -1086,7 +1092,7 @@ def thread_gate_rows(
         quality_rows = [
             row
             for row in group
-            if parse_bool(row.get("quality_pass")) and math.isfinite(util_value(row))
+            if parse_bool(row.get("quality_pass")) and math.isfinite(target_util_value(row))
         ]
         if not quality_rows:
             for row in group:

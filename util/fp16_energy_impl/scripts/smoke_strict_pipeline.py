@@ -312,6 +312,31 @@ def write_quality_gate_input(
     )
 
 
+def write_quality_gate_model_util_input(path: Path) -> None:
+    summary = quality_gate_summary_row()
+    thread = quality_gate_thread_row()
+    for row in (summary, thread):
+        row.update(
+            {
+                "avg_sm_util_pct_mean": "nan",
+                "avg_gpu_util_pct_mean": "nan",
+                "avg_sm_util_pct": "nan",
+                "avg_gpu_util_pct": "nan",
+                "test_sm_util_samples": 0,
+                "tensor_model_utilization_pct_mean": 97.5,
+            }
+        )
+    write_csv(path / "summary.csv", [summary])
+    write_csv(path / "thread_sweep_summary.csv", [thread])
+    write_csv(
+        path / "ncu_validation_summary.csv",
+        [
+            ncu_row("tensor_mma_f16acc", 128, tensor_activity_observed=True),
+            ncu_row("tensor_baseline_mov", 128),
+        ],
+    )
+
+
 def write_result_dir(path: Path, *, include_required_target: bool, required_tensor_activity: bool = True) -> None:
     wrong = target_row("fp16_half2", "baseline_regmove", 64)
     required = target_row("tensor_mma_f16acc", "tensor_baseline_mov", 128)
@@ -511,8 +536,10 @@ def smoke(base: Path, env: Dict[str, str]) -> None:
 
     quality_gate_ok = base / "quality_gate_tensor_activity_ok"
     quality_gate_bad = base / "quality_gate_tensor_activity_bad"
+    quality_gate_model_util = base / "quality_gate_model_util_fallback"
     write_quality_gate_input(quality_gate_ok, tensor_activity_observed=True)
     write_quality_gate_input(quality_gate_bad, tensor_activity_observed=False)
+    write_quality_gate_model_util_input(quality_gate_model_util)
     write_model_dir(model_dir)
     write_preflight(preflight)
 
@@ -868,6 +895,41 @@ exit 1
     qg_bad_rows = read_csv_rows(quality_gate_bad / "quality_gates.csv")
     if not any("test NCU tensor activity" in row.get("fail_reasons", "") for row in qg_bad_rows):
         raise AssertionError(f"Missing Tensor activity quality gate did not record the failure: {qg_bad_rows}")
+
+    run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "quality_gate.py"),
+            "--input",
+            str(quality_gate_model_util),
+            "--ncu-summary",
+            str(quality_gate_model_util / "ncu_validation_summary.csv"),
+            "--require-ncu",
+            "--require-ncu-tensor-activity",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    qg_model_summary = json.loads((quality_gate_model_util / "quality_gate_summary.json").read_text())
+    if len(qg_model_summary.get("selected_targets", [])) != 1:
+        raise AssertionError(f"Model-util fallback quality gate did not select a target: {qg_model_summary}")
+    qg_model_rows = [
+        row for row in read_csv_rows(quality_gate_model_util / "quality_gates.csv")
+        if row.get("scope") == "thread_sweep"
+    ]
+    if len(qg_model_rows) != 1:
+        raise AssertionError(f"Expected one model-util thread row: {qg_model_rows}")
+    qg_model_row = qg_model_rows[0]
+    if qg_model_row.get("target_pass") != "True":
+        raise AssertionError(f"Model-util fallback row was not selected: {qg_model_row}")
+    if qg_model_row.get("util_metric_source") != "tensor_model_utilization_pct_mean":
+        raise AssertionError(f"Model-util fallback used the wrong target metric: {qg_model_row}")
+    if qg_model_row.get("sm_util_available") != "False":
+        raise AssertionError(f"Model-util fallback should record missing SM/GPU telemetry: {qg_model_row}")
+    if qg_model_row.get("target_util_available") != "True":
+        raise AssertionError(f"Model-util fallback did not record target utilization availability: {qg_model_row}")
+    if "SM/GPU utilization missing" not in qg_model_row.get("warnings", ""):
+        raise AssertionError(f"Model-util fallback did not warn about telemetry fallback: {qg_model_row}")
 
     quality_gate_power_trace = base / "quality_gate_power_trace"
     write_quality_gate_input(
